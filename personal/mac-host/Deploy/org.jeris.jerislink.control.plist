@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>org.jeris.jerislink.control</string>
+  <key>ProgramArguments</key><array>
+    <string>__HOME__/Library/Application Support/JerisLink/bin/JerisLinkHost</string>
+    <string>--control-only</string><string>--bind-ip</string><string>127.0.0.1</string>
+    <string>--control-port</string><string>38411</string>
+    <string>--control-client-ip</string><string>127.0.0.1</string><string>--control-inject</string>
+  </array>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/tmp/jerislink-control-service.log</string>
+  <key>StandardErrorPath</key><string>/tmp/jerislink-control-service.err</string>
+</dict></plist>

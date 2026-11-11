@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.20)
+project(Jerislink LANGUAGES CXX RC)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32)
+
+add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS})
+if(MSVC)
+    target_link_options(Jerislink PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/jerislink.manifest")
+endif()
+
+configure_file(setup.rc.in ${CMAKE_CURRENT_BINARY_DIR}/setup.generated.rc @ONLY)
+add_executable(JerislinkSetup WIN32 setup_gui.cpp ${CMAKE_CURRENT_BINARY_DIR}/setup.generated.rc)
+target_compile_definitions(JerislinkSetup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkSetup PRIVATE ole32 shell32 advapi32 user32 gdi32 dwmapi)
+if(MSVC)
+    target_link_options(JerislinkSetup PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/setup.manifest")
+endif()
+
+option(JERISLINK_BUILD_DIAGNOSTICS "Build decoder/control diagnostic probes" OFF)
+if(JERISLINK_BUILD_DIAGNOSTICS)
+    add_executable(JerislinkDecodeProbe decoder_probe.cpp)
+    target_compile_definitions(JerislinkDecodeProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(JerislinkDecodeProbe PRIVATE ${JERISLINK_LIBS})
+
+    add_executable(JerislinkControlProbe control_client.cpp)
+    target_compile_definitions(JerislinkControlProbe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(JerislinkControlProbe PRIVATE ws2_32)
+endif()

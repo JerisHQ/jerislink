@@ -1,0 +1,21 @@
+JerisLink
+Copyright 2026 jeris.org
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The JerisLink Support component (support/) depends on third-party Go modules.
+Their licences are listed in THIRD_PARTY_LICENSES.md. Modules under the
+Apache License 2.0 include:
+
+  - gvisor.dev/gvisor (Copyright The gVisor Authors)
+  - github.com/golang/groupcache (Copyright Google Inc.)
+  - github.com/google/btree (Copyright Google Inc.)
+  - go4.org/mem (Copyright The Go4 Authors)
+  - github.com/pires/go-proxyproto (Copyright Paulo Pires)
+  - github.com/safchain/ethtool (Copyright Sylvain Afchain)
+
+None of these modules ship a NOTICE file of their own.
+
+The JerisLink core (personal/) contains no third-party source code. It links
+only against operating-system frameworks and libraries (Apple macOS frameworks,
+Microsoft Windows SDK libraries).

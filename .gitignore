@@ -1,0 +1,33 @@
+# Build outputs
+build/
+dist/
+.dist/
+.build/
+bin/
+setup_payload/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Packaged binaries / installers
+*.exe
+*.msi
+*.zip
+*.tar.gz
+
+# Runtime/test artifacts
+*.log
+*.bmp
+*.h264
+.DS_Store
+
+# Secrets / local environment
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+network.conf

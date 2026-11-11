@@ -1,0 +1,27 @@
+name: windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: personal/windows-client
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build (unsigned)
+        run: cmake --build build --config Release --target Jerislink
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-windows-unsigned
+          path: personal/windows-client/build/Release/Jerislink.exe
