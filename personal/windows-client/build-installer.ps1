@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
+$version = (Get-Content (Join-Path $here "..\..\VERSION") -TotalCount 1).Trim()
 
 & (Join-Path $here "build-release.ps1")
 if ($LASTEXITCODE -ne 0) { throw "Jerislink release build failed: $LASTEXITCODE" }
@@ -25,6 +26,6 @@ if (-not $iscc) {
 & $iscc (Join-Path $here "Jerislink.iss")
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed: $LASTEXITCODE" }
 
-$setup = Join-Path $here "dist\Jerislink-0.0.9.5-windows-x64-setup.exe"
+$setup = Join-Path $here "dist\Jerislink-$version-windows-x64-setup.exe"
 if (-not (Test-Path $setup)) { throw "Installer compile completed but setup EXE was not found: $setup" }
 Write-Host "INSTALLER_OK = $setup"

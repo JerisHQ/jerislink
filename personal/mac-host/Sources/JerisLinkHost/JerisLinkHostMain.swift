@@ -166,7 +166,8 @@ struct JerisLinkHostMain {
         }
         let autoResolution = o.width == nil
         let outputURL = URL(fileURLWithPath: o.outputPath).standardizedFileURL
-        print("JerisLink Host v0.0.9.4")
+        let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        print("JerisLink Host v\(hostVersion)")
         print("Output: \(outputURL.path)")
         if autoResolution {
             print("Resolution: auto-native framebuffer")

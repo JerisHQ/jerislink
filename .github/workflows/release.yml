@@ -1,0 +1,136 @@
+name: release
+
+# Builds the release artifacts on GitHub-hosted runners.
+# On a tag push (v*) it also creates a DRAFT GitHub release with the artifacts.
+# workflow_dispatch only builds and uploads artifacts; it never creates a release.
+# The tag must match the VERSION file (e.g. VERSION 0.1.0 -> tag v0.1.0).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read VERSION and check the tag
+        shell: bash
+        run: |
+          version="$(head -n 1 VERSION | tr -d '[:space:]')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must be MAJOR.MINOR.PATCH, got '$version'"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: personal/windows-client
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build viewer (Release x64, unsigned)
+        run: cmake --build build --config Release --target Jerislink
+      - name: Install Inno Setup 6.7.1
+        run: choco install innosetup --version 6.7.1 -y --no-progress
+      - name: Compile installer (unsigned)
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          & $iscc "/DMyAppVersion=$env:VERSION" Jerislink.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+      - name: Collect artifacts and check file metadata
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = 'build\Release\Jerislink.exe'
+          $setup = "dist\Jerislink-$env:VERSION-windows-x64-setup.exe"
+          foreach ($f in @($exe, $setup)) {
+            # Inno Setup pads its version strings with spaces, so compare trimmed values.
+            $vi = (Get-Item $f).VersionInfo
+            $name = "$($vi.ProductName)".Trim()
+            $ver = "$($vi.ProductVersion)".Trim()
+            Write-Host "$f ProductName=$name ProductVersion=$ver"
+            if ($name -ne 'JerisLink') { throw "$f ProductName is '$name', expected 'JerisLink'" }
+            if ($ver -ne $env:VERSION) { throw "$f ProductVersion is '$ver', expected '$env:VERSION'" }
+          }
+          $portable = Join-Path $env:RUNNER_TEMP 'portable'
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          Copy-Item $exe (Join-Path $portable 'Jerislink.exe')
+          Copy-Item 'README-Windows.txt' (Join-Path $portable 'README.txt')
+          Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $out "Jerislink-$env:VERSION-windows-x64-portable.zip")
+          Copy-Item $setup $out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-windows
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build mac host apps (unsigned, ad-hoc)
+        working-directory: personal/mac-host
+        env:
+          JERISLINK_ALLOW_ADHOC: '1'
+        run: ./Deploy/build-apps.sh "$RUNNER_TEMP/JerisLink-$VERSION-macos"
+      - name: Package
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          rm -f "$RUNNER_TEMP/JerisLink-$VERSION-macos/JerisLinkInputHelper"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/JerisLink-$VERSION-macos" \
+            "$RUNNER_TEMP/dist/JerisLink-$VERSION-macos-$(uname -m)-unsigned.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-macos
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create draft release
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "JerisLink v$VERSION" \
+            --notes "See CHANGELOG.md for changes. Windows binaries are unsigned until SignPath code signing is active (see CODE_SIGNING_POLICY.md). macOS builds are unsigned (ad-hoc)."

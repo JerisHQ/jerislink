@@ -6,6 +6,14 @@ JerisLink is a low-latency remote desktop that streams a macOS host to a Windows
 
 Copyright 2026 jeris.org. Licensed under the [Apache License 2.0](LICENSE).
 
+**[Code signing policy](CODE_SIGNING_POLICY.md)** · [Download](#download) · [Security](SECURITY.md)
+
+## Download
+
+Release builds are published on [GitHub Releases](https://github.com/JerisHQ/jerislink/releases). They are built by the [release workflow](.github/workflows/release.yml) on GitHub-hosted runners from a tagged commit. Windows binaries are unsigned until SignPath code signing is active (see the [code signing policy](CODE_SIGNING_POLICY.md)); macOS builds are unsigned (ad-hoc).
+
+The version number lives in one place: the [`VERSION`](VERSION) file. The Windows file metadata (ProductName "JerisLink", ProductVersion) and the installer version are generated from it.
+
 ## Repository layout
 
 | Folder | What it is |
@@ -73,7 +81,7 @@ See [SECURITY.md](SECURITY.md) for how to report a vulnerability and for the kno
 
 ## Code signing
 
-Windows release binaries are planned to be signed through the SignPath Foundation; see [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md). macOS builds from CI are unsigned (ad-hoc).
+Windows release binaries are planned to be signed through the SignPath Foundation; see [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md). Releases are built by `.github/workflows/release.yml`. macOS builds from CI are unsigned (ad-hoc).
 
 ## Contributing
 

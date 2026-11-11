@@ -23,6 +23,12 @@ cp "$HERE/JerisLinkInputHelper-Info.plist" "$OUT/JerisLink Input Helper.app/Cont
 cp Brand/JerisLink.icns "$OUT/JerisLink Host.app/Contents/Resources/JerisLink.icns"
 cp Brand/JerisLink.icns "$OUT/JerisLink Input Helper.app/Contents/Resources/JerisLink.icns"
 
+# Single source of the version: VERSION at the repository root.
+VERSION="$(head -n 1 "$ROOT/../../VERSION" | tr -d '[:space:]')"
+for app in 'JerisLink Host' 'JerisLink Input Helper'; do
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$OUT/$app.app/Contents/Info.plist"
+done
+
 unlock_signing_keychain() {
     [[ -r "$SIGN_KEYCHAIN_PASSWORD_FILE" ]] || return 1
     local keychain_password

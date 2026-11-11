@@ -1,4 +1,4 @@
-Jerislink 0.0.9.5 - Windows x64
+JerisLink - Windows x64 (version: see VERSION, or the file properties of Jerislink.exe)
 
 Purpose
 -------

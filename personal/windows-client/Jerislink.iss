@@ -1,5 +1,13 @@
 #define MyAppName "Jerislink"
-#define MyAppVersion "0.0.9.5"
+; The version comes from the VERSION file at the repository root.
+; CI may override it with: ISCC /DMyAppVersion=x.y.z Jerislink.iss
+#ifndef MyAppVersion
+  #define VersionFile FileOpen(AddBackslash(SourcePath) + "..\..\VERSION")
+  #define MyAppVersion Trim(FileRead(VersionFile))
+  #expr FileClose(VersionFile)
+  #undef VersionFile
+#endif
+#define MyProductName "JerisLink"
 #define MyAppPublisher "Jeris"
 #define MyAppExeName "Jerislink.exe"
 
@@ -20,6 +28,14 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#MyAppExeName}
 WizardStyle=modern
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoProductName={#MyProductName}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductTextVersion={#MyAppVersion}
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyProductName} Setup
+VersionInfoCopyright=Copyright 2026 jeris.org
 
 [Files]
 Source: "build\Release\Jerislink.exe"; DestDir: "{app}"; Flags: ignoreversion

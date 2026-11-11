@@ -3,15 +3,16 @@ setlocal
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
+set /p VERSION=<"%ROOT%..\..\VERSION"
 set "PAYLOAD=%ROOT%setup_payload"
 set "DIST=%ROOT%dist"
-set "SETUP=%DIST%\Jerislink-0.0.9.5-windows-x64-setup.exe"
-set "LOG=%ROOT%build-v0.0.9.5.log"
+set "SETUP=%DIST%\Jerislink-%VERSION%-windows-x64-setup.exe"
+set "LOG=%ROOT%build-v%VERSION%.log"
 
 if not exist "%PAYLOAD%" mkdir "%PAYLOAD%"
 if not exist "%DIST%" mkdir "%DIST%"
 
->"%LOG%" echo Jerislink v0.0.9.5 build log
+>"%LOG%" echo Jerislink v%VERSION% build log
 >>"%LOG%" echo Started: %DATE% %TIME%
 >>"%LOG%" echo.
 
