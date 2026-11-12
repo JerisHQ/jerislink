@@ -296,7 +296,7 @@ struct JerisLinkHostMain {
             defer { mouseUDP?.stop() }
 
             let deadline = Date().addingTimeInterval(o.durationSeconds)
-            let keyframeGate = KeyframeRequestGate(minimumInterval: 0.5)
+            let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
             var sessionIndex = 0
             while Date() < deadline {
                 sessionIndex += 1
@@ -391,7 +391,9 @@ struct JerisLinkHostMain {
     }
 }
 
-/// Rate limit for viewer keyframe requests (any thread).
+/// Rate limit for viewer keyframe requests (any thread). 150 ms coalesces
+/// the viewer's 100 ms re-requests for one loss into one IDR, but still
+/// answers a new loss almost at once, like the pre-bundle host (no gate).
 final class KeyframeRequestGate: @unchecked Sendable {
     private let lock = NSLock()
     private let minimumInterval: TimeInterval
