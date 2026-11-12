@@ -42,6 +42,9 @@ struct PersistedVideoSettings: Equatable {
     var bitrateMbps = 25
     var fps: Int32 = 60
     var keepDisplayAwake = false
+    /// udpPaceMbps: missing = auto (UDPPacing.autoMbps), 0 = off, 1...1000 = Mbps.
+    var udpPaceMbps: Int?
+    var udpPaceBurstKB = UDPPacing.defaultBurstKB
 
     /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
     /// BetterDisplay 4K virtual screen stops delivering frames after the first
@@ -55,6 +58,13 @@ struct PersistedVideoSettings: Equatable {
         if let bitrate = Self.int(dict["bitrateMbps"]), (4...100).contains(bitrate) { bitrateMbps = bitrate }
         if let fps = Self.int(dict["fps"]), fps == 30 || fps == 60 { self.fps = Int32(fps) }
         keepDisplayAwake = Self.bool(dict["keepDisplayAwake"]) ?? false
+        if let pace = Self.int(dict["udpPaceMbps"]), (0...1000).contains(pace) { udpPaceMbps = pace }
+        if let burst = Self.int(dict["udpPaceBurstKB"]), (2...1024).contains(burst) { udpPaceBurstKB = burst }
+    }
+
+    var pacing: UDPPacing {
+        UDPPacing(mbps: udpPaceMbps ?? UDPPacing.autoMbps(bitrateMbps: bitrateMbps),
+                  burstBytes: udpPaceBurstKB * 1024)
     }
 
     static func load(from url: URL) -> PersistedVideoSettings {
@@ -66,7 +76,7 @@ struct PersistedVideoSettings: Equatable {
     }
 
     var summary: String {
-        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake)"
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary)"
     }
 
     private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }

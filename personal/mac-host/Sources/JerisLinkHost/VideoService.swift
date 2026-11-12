@@ -132,6 +132,8 @@ enum VideoService {
             o.controlClientIP = clientIP
             o.clientPort = 38402
             o.packetBytes = 1200
+            o.udpPaceMbps = settings.pacing.mbps
+            o.udpPaceBurstKB = settings.udpPaceBurstKB
             o.mouseUDPPort = 38412
             o.controlServerEnabled = false
             o.captureCursor = false
