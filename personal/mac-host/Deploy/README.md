@@ -101,7 +101,14 @@ Migration from the old layout (two apps, three hand-installed LaunchAgents, zsh 
 - keeps `network.conf` and `video-settings.plist`,
 - copies the new app to `~/Applications/JerisLink.app` and registers its agents.
 
-After migration the apps have new paths and a new parent app, so check the Screen Recording and Accessibility entries once (steps 2-5 above).
+TCC matches an app by bundle identifier and designated requirement (which includes the signing certificate), so approvals carry over only if the new app is signed with the same certificate as the installed one. Compare before migrating:
+
+```sh
+codesign -d -r- ~/Applications/"JerisLink Host.app"
+codesign -d -r- ~/Applications/JerisLink.app
+```
+
+Whatever the result, check the Screen Recording, Accessibility and Login Items entries once after migration (steps 2-5 above): the app path, name and parent process all change.
 
 ## Host baseline
 
