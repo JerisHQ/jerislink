@@ -84,7 +84,7 @@ TCC stores the designated requirement, which includes the signing certificate. A
 - local identity -> Developer ID,
 - a new or lost private key for the same certificate name.
 
-Rebuilds with the same certificate and bundle identifiers keep their approvals. Compare before deploying:
+Rebuilds with the same certificate and bundle identifiers keep their approvals. A Mac whose current apps are Developer ID signed stays on the same identity only with a Developer ID build from the same team; installing a local-identity or ad-hoc build there needs re-approval. Compare before deploying:
 
 ```sh
 codesign -d -r- JerisLink.app
