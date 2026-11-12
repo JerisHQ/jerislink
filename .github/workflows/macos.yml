@@ -13,6 +13,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build mac host (unsigned)
+      - name: Build JerisLink.app (ad-hoc signed)
         working-directory: personal/mac-host
-        run: swift build -c release
+        env:
+          JERISLINK_ALLOW_ADHOC: '1'
+        run: ./Deploy/build-apps.sh "$RUNNER_TEMP/build"
+      - name: Verify bundle layout, signature and both executables
+        working-directory: personal/mac-host
+        run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"

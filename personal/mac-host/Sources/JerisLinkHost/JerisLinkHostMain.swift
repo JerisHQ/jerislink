@@ -29,6 +29,11 @@ struct Options {
     var requestPostEventAccess = false
     var requestScreenCaptureAccess = false
     var captureCursor = true
+    var service: String?
+    var showVersion = false
+    var registerAgents = false
+    var unregisterAgents = false
+    var showAgentStatus = false
 
     static func parse() -> Options {
         var o = Options()
@@ -58,6 +63,26 @@ struct Options {
             }
             if key == "--request-screen-capture-access" {
                 o.requestScreenCaptureAccess = true
+                i += 1
+                continue
+            }
+            if key == "--version" {
+                o.showVersion = true
+                i += 1
+                continue
+            }
+            if key == "--register" {
+                o.registerAgents = true
+                i += 1
+                continue
+            }
+            if key == "--unregister" {
+                o.unregisterAgents = true
+                i += 1
+                continue
+            }
+            if key == "--status" {
+                o.showAgentStatus = true
                 i += 1
                 continue
             }
@@ -105,6 +130,7 @@ struct Options {
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--control-client-ip": o.controlClientIP = value
+            case "--service": o.service = value
             default: break
             }
             i += 2
@@ -120,7 +146,38 @@ struct Options {
 @main
 struct JerisLinkHostMain {
     static func main() async {
-        let o = Options.parse()
+        var o = Options.parse()
+        let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        if o.showVersion {
+            print("JerisLink Host v\(hostVersion)")
+            return
+        }
+        if o.registerAgents || o.unregisterAgents {
+            let errors = o.registerAgents ? JerisLinkAgents.registerAll() : JerisLinkAgents.unregisterAll()
+            JerisLinkAgents.statusLines().forEach { print($0) }
+            if o.registerAgents && JerisLinkAgents.needsUserApproval {
+                print("Allow JerisLink in System Settings > General > Login Items & Extensions.")
+            }
+            errors.forEach { fputs("Error: \($0)\n", stderr) }
+            exit(errors.isEmpty ? 0 : 1)
+        }
+        if o.showAgentStatus {
+            JerisLinkAgents.statusLines().forEach { print($0) }
+            return
+        }
+        // Opened from Finder or at login as JerisLink.app with no arguments.
+        if CommandLine.arguments.count == 1,
+           Bundle.main.bundleIdentifier == JerisLinkAgents.launcherBundleIdentifier {
+            await MainActor.run { JerisLinkLauncher.run() }
+            return
+        }
+        if let service = o.service {
+            guard service == "video" else {
+                fputs("Fatal: unknown --service \(service) (expected video)\n", stderr)
+                exit(2)
+            }
+            o = await VideoService.resolveOptions(base: o)
+        }
         if o.requestPostEventAccess {
             let before = CGPreflightPostEventAccess()
             print("PostEvent permission before request: \(before)")
@@ -166,7 +223,6 @@ struct JerisLinkHostMain {
         }
         let autoResolution = o.width == nil
         let outputURL = URL(fileURLWithPath: o.outputPath).standardizedFileURL
-        let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         print("JerisLink Host v\(hostVersion)")
         print("Output: \(outputURL.path)")
         if autoResolution {
