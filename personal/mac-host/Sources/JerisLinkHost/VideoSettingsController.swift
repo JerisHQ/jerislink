@@ -40,13 +40,39 @@ final class VideoSettingsController: @unchecked Sendable {
     private let fileURL: URL
     private let hostExecutablePattern: String
 
-    init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let support = home
+    static var defaultFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
-        self.fileURL = support.appendingPathComponent("video-settings.plist")
-        self.hostExecutablePattern =
-            "^" + home.path + "/Applications/JerisLink Host.app/Contents/MacOS/JerisLinkHost --duration 86400( |$)"
+            .appendingPathComponent("video-settings.plist")
+    }
+
+    init() {
+        self.fileURL = Self.defaultFileURL
+        // Fallback for a video host started by hand from this executable.
+        let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        self.hostExecutablePattern = "^" + Self.extendedRegexEscaped(executable) + " --duration 86400( |$)"
+    }
+
+    static func extendedRegexEscaped(_ text: String) -> String {
+        var out = ""
+        for ch in text {
+            if "\\.[]()*+?{}|^$".contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// Codec and bitrate persisted by the control service; h264 / 25 Mbps by default.
+    static func readPersisted(from url: URL = defaultFileURL) -> (codec: String, bitrateMbps: Int) {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = object as? [String: Any],
+              let codec = dict["codec"] as? String,
+              let bitrate = dict["bitrateMbps"] as? Int
+        else {
+            return ("h264", 25)
+        }
+        return (codec, bitrate)
     }
 
     func apply(request payload: [UInt8]) -> VideoSettingsAck {
@@ -139,15 +165,7 @@ final class VideoSettingsController: @unchecked Sendable {
     }
 
     private func readCurrent() -> (codec: String, bitrateMbps: Int) {
-        guard let data = try? Data(contentsOf: fileURL),
-              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-              let dict = object as? [String: Any],
-              let codec = dict["codec"] as? String,
-              let bitrate = dict["bitrateMbps"] as? Int
-        else {
-            return ("h264", 25)
-        }
-        return (codec, bitrate)
+        Self.readPersisted(from: fileURL)
     }
 
     private func persist(codec: String, bitrateMbps: Int) throws {
@@ -170,7 +188,23 @@ final class VideoSettingsController: @unchecked Sendable {
         print("Video settings persisted codec=\(codec) bitrate_mbps=\(bitrateMbps)")
     }
 
+    /// Restarts the video host so it picks up the new settings. The video host
+    /// normally runs as the launchd agent org.jeris.jerislink.agent.video, so
+    /// `launchctl kickstart -k` stops it and launchd starts it again at once.
+    /// A video host started by hand is stopped with pkill instead.
     private func requestVideoRestart() {
+        let kickstart = Process()
+        kickstart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        kickstart.arguments = ["kickstart", "-k", "gui/\(getuid())/\(JerisLinkAgents.videoLabel)"]
+        kickstart.standardOutput = FileHandle.nullDevice
+        kickstart.standardError = FileHandle.nullDevice
+        if (try? kickstart.run()) != nil {
+            kickstart.waitUntilExit()
+            if kickstart.terminationStatus == 0 {
+                print("Video settings restarted the video agent before ACK")
+                return
+            }
+        }
         let pattern = hostExecutablePattern
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")

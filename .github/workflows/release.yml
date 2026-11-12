@@ -90,19 +90,90 @@ jobs:
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      # Developer ID signing and notarization run only when all four required
+      # secrets are set. Until then this job builds the unsigned (ad-hoc) zip.
+      # See personal/mac-host/Deploy/SIGNING.md for what each secret holds.
+      MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+      MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+      MACOS_NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build mac host apps (unsigned, ad-hoc)
+      - id: mode
+        name: Choose signing mode
+        shell: bash
+        run: |
+          if [[ -n "$MACOS_DEVELOPER_ID_P12_BASE64" && -n "$MACOS_DEVELOPER_ID_P12_PASSWORD" \
+                && -n "$MACOS_NOTARY_KEY_P8_BASE64" && -n "$MACOS_NOTARY_KEY_ID" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Developer ID signing and notarization: on"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::macOS signing secrets are not set; building the unsigned (ad-hoc) zip"
+          fi
+      - name: Import Developer ID certificate into a temporary keychain
+        if: steps.mode.outputs.signed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/jerislink-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$MACOS_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" \
+            -P "$MACOS_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "::error::No 'Developer ID Application' identity in MACOS_DEVELOPER_ID_P12_BASE64"
+            exit 1
+          fi
+          echo "Signing identity: $identity"
+          printf '%s' "$MACOS_NOTARY_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          chmod 600 "$RUNNER_TEMP/notary-key.p8"
+          {
+            echo "JERISLINK_DEVELOPER_ID=$identity"
+            echo "JERISLINK_SIGN_KEYCHAIN=$keychain"
+            echo "JERISLINK_NOTARY_KEY_PATH=$RUNNER_TEMP/notary-key.p8"
+          } >> "$GITHUB_ENV"
+      - name: Build JerisLink.app
         working-directory: personal/mac-host
         env:
-          JERISLINK_ALLOW_ADHOC: '1'
-        run: ./Deploy/build-apps.sh "$RUNNER_TEMP/JerisLink-$VERSION-macos"
-      - name: Package
+          JERISLINK_ALLOW_ADHOC: ${{ steps.mode.outputs.signed == 'true' && '0' || '1' }}
+        run: ./Deploy/build-apps.sh "$RUNNER_TEMP/build"
+      - name: Verify bundle
+        working-directory: personal/mac-host
+        run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"
+      - name: Notarize, staple and package (Developer ID)
+        if: steps.mode.outputs.signed == 'true'
+        working-directory: personal/mac-host
+        env:
+          JERISLINK_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          JERISLINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          app="$RUNNER_TEMP/build/JerisLink.app"
+          ./Deploy/notarize.sh "$app" "$RUNNER_TEMP/dist/JerisLink-$VERSION-macos-$(uname -m).zip"
+          codesign -dv --verbose=2 "$app"
+          spctl -a -vv -t exec "$app"
+          xcrun stapler validate "$app"
+      - name: Package (unsigned)
+        if: steps.mode.outputs.signed != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/dist"
-          rm -f "$RUNNER_TEMP/JerisLink-$VERSION-macos/JerisLinkInputHelper"
-          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/JerisLink-$VERSION-macos" \
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/build/JerisLink.app" \
             "$RUNNER_TEMP/dist/JerisLink-$VERSION-macos-$(uname -m)-unsigned.zip"
+      - name: Remove signing material
+        if: always()
+        run: |
+          if [[ -n "${JERISLINK_SIGN_KEYCHAIN:-}" ]]; then security delete-keychain "$JERISLINK_SIGN_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/developer-id.p12"
       - uses: actions/upload-artifact@v4
         with:
           name: jerislink-macos
@@ -133,4 +204,4 @@ jobs:
             --verify-tag \
             --draft \
             --title "JerisLink v$VERSION" \
-            --notes "See CHANGELOG.md for changes. Windows binaries are unsigned until SignPath code signing is active (see CODE_SIGNING_POLICY.md). macOS builds are unsigned (ad-hoc)."
+            --notes "See CHANGELOG.md for changes. Windows binaries are unsigned until SignPath code signing is active (see CODE_SIGNING_POLICY.md). macOS: JerisLink-<version>-macos-<arch>.zip is Developer ID signed and notarized; a file ending in -unsigned.zip is ad-hoc signed."

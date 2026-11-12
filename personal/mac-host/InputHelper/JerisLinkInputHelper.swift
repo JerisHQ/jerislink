@@ -284,6 +284,12 @@ final class InputHelper {
     }
 }
 
+if CommandLine.arguments.contains("--version") {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    print("JerisLink Input Helper v\(version)")
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--release-modifiers") {
     let modifiers: [CGKeyCode] = [59, 58, 55, 56]
     let allowed = CGPreflightPostEventAccess()
@@ -312,6 +318,12 @@ if CommandLine.arguments.contains("--request-post-event-access") {
     try? line.write(to: dir.appendingPathComponent("input-helper-request.txt"), atomically: true, encoding: .utf8)
     print(line, terminator: "")
     exit(result ? 0 : 4)
+}
+
+// The helper is its own launchd agent, so this request is attributed to the
+// helper's code identity (Accessibility), not to JerisLink.app.
+if !CGPreflightPostEventAccess() {
+    _ = CGRequestPostEventAccess()
 }
 
 do {
