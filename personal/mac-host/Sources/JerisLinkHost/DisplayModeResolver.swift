@@ -12,6 +12,28 @@ struct ActiveDisplayMode: Equatable {
 }
 
 enum DisplayModeResolver {
+    /// Default ceiling for the encoded stream: 3840x2160 pixels of area.
+    /// HEVC level 5.1 allows at most 8,912,896 luma samples per picture; a
+    /// larger frame such as 4544x2556 (BetterDisplay 2272x1278 HiDPI) dropped
+    /// the M4 hardware encoder to about 5 fps on jenny-mac01 (macOS 27.2).
+    static let defaultMaxEncodePixels = 3840 * 2160
+
+    /// The encoded size for a native framebuffer: unchanged when it fits in
+    /// `maxPixels`, otherwise scaled down with the aspect ratio kept. Sizes are
+    /// even, as the 4:2:0 encoders need. `maxPixels <= 0` means no ceiling.
+    static func streamSize(width: Int, height: Int, maxPixels: Int) -> (width: Int, height: Int) {
+        guard maxPixels > 0, width > 0, height > 0, width * height > maxPixels else {
+            return (width & ~1, height & ~1)
+        }
+        let scale = (Double(maxPixels) / Double(width * height)).squareRoot()
+        var w = Int((Double(width) * scale).rounded()) & ~1
+        var h = Int((Double(height) * scale).rounded()) & ~1
+        while w * h > maxPixels {
+            if w * height >= h * width { w -= 2 } else { h -= 2 }
+        }
+        return (max(w, 2), max(h, 2))
+    }
+
     static func currentMainDisplay() throws -> ActiveDisplayMode {
         let displayID = CGMainDisplayID()
         guard let mode = CGDisplayCopyDisplayMode(displayID) else {
