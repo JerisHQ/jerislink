@@ -31,6 +31,7 @@ struct Options {
     var captureCursor = true
     var service: String?
     var showVersion = false
+    var showVideoConfig = false
     var registerAgents = false
     var unregisterAgents = false
     var showAgentStatus = false
@@ -68,6 +69,11 @@ struct Options {
             }
             if key == "--version" {
                 o.showVersion = true
+                i += 1
+                continue
+            }
+            if key == "--video-config" {
+                o.showVideoConfig = true
                 i += 1
                 continue
             }
@@ -150,6 +156,12 @@ struct JerisLinkHostMain {
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         if o.showVersion {
             print("JerisLink Host v\(hostVersion)")
+            return
+        }
+        if o.showVideoConfig {
+            // What `--service video` will use, read from video-settings.plist.
+            print("video-settings: \(VideoSettingsController.defaultFileURL.path)")
+            print(PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL).summary)
             return
         }
         if o.registerAgents || o.unregisterAgents {

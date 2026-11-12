@@ -1,12 +1,13 @@
 import Darwin
 import Foundation
+import IOKit.pwr_mgt
 
 /// `--service video`: the video host as a launchd agent.
 ///
 /// Replaces the old video-watchdog.zsh. It reads the network addresses from
 /// network.conf (or the environment), waits until this Mac's address is up on a
-/// local interface (Tailscale running), reads the persisted codec/bitrate, and
-/// then runs the normal 24-hour video session. launchd (KeepAlive) restarts it
+/// local interface (Tailscale running), reads codec, bitrate, fps and
+/// keepDisplayAwake from video-settings.plist, and then runs the normal 24-hour video session. launchd (KeepAlive) restarts it
 /// when it exits, crashes, or is restarted by the control service.
 enum VideoService {
     static var supportDirectory: URL {
@@ -105,20 +106,24 @@ enum VideoService {
                 continue
             }
 
-            let persisted = VideoSettingsController.readPersisted()
-            let codec: VideoCodec = persisted.codec == "hevc" ? .hevc : .h264
-            let bitrate = (4...100).contains(persisted.bitrateMbps) ? persisted.bitrateMbps : 25
-            log("starting video bind=\(bindIP) client=\(clientIP) codec=\(codec.rawValue) bitrate=\(bitrate) Mbps")
+            let settings = PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL)
+            let codec: VideoCodec = settings.codec == "hevc" ? .hevc : .h264
+            log("starting video bind=\(bindIP) client=\(clientIP) \(settings.summary)")
+            if settings.keepDisplayAwake {
+                log(DisplayAwake.hold()
+                    ? "display sleep prevention held for this video service"
+                    : "keepDisplayAwake: could not create the display sleep assertion")
+            }
 
             var o = base
             o.durationSeconds = 86400
-            o.fps = 60
-            o.bitrateMbps = bitrate
+            o.fps = settings.fps
+            o.bitrateMbps = settings.bitrateMbps
             o.codec = codec
             o.colorRange = "full"
             o.keyframeInterval = 60
             o.h264Profile = "constrained-high"
-            o.captureQueueDepth = 2
+            o.captureQueueDepth = settings.captureQueueDepth
             o.bindIP = bindIP
             o.clientIP = clientIP
             o.controlClientIP = clientIP
@@ -130,5 +135,26 @@ enum VideoService {
             o.outputPath = "/dev/null"
             return o
         }
+    }
+}
+
+/// keepDisplayAwake: what the old watchdog did with `caffeinate -u -t 3` and
+/// `caffeinate -d -w <host pid>`. Headless or virtual displays can drop out of
+/// ScreenCaptureKit after idle display sleep. The assertion lives as long as
+/// this process; launchd starts a new one with a fresh assertion.
+enum DisplayAwake {
+    nonisolated(unsafe) private static var assertionID: IOPMAssertionID = 0
+
+    static func hold() -> Bool {
+        let reason = "JerisLink video streaming (keepDisplayAwake)" as CFString
+        var activity: IOPMAssertionID = 0
+        _ = IOPMAssertionDeclareUserActivity(reason, kIOPMUserActiveLocal, &activity)
+        if assertionID != 0 { return true }
+        return IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason,
+            &assertionID
+        ) == kIOReturnSuccess
     }
 }
