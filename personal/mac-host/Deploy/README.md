@@ -25,7 +25,7 @@ The app registers its agents itself with `SMAppService` (macOS 13+; the app requ
 | `org.jeris.jerislink.agent.control` | `JerisLinkHost --control-only --bind-ip 127.0.0.1 --control-port 38411 --control-client-ip 127.0.0.1 --control-inject` | `org.jeris.jerislink.control` |
 | `org.jeris.jerislink.agent.video` | `JerisLinkHost --service video` | `video-watchdog.zsh` + `org.jeris.jerislink.video-watchdog` |
 
-`JerisLinkHost --service video` does what the video watchdog did: it reads `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `~/Library/Application Support/JerisLink/network.conf` (or the environment), waits until the bind address is up on a local interface, reads the persisted codec/bitrate from `video-settings.plist`, and runs the video host. When the control service changes codec or bitrate it restarts the video agent with `launchctl kickstart -k`.
+`JerisLinkHost --service video` does what the video watchdog did: it reads `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `~/Library/Application Support/JerisLink/network.conf` (or the environment), waits until the bind address is up on a local interface, reads codec, bitrate, `fps` (30 or 60) and `keepDisplayAwake` from `video-settings.plist`, and runs the video host. At 60 fps it uses ScreenCaptureKit queue depth 5, at 30 fps depth 2. With `keepDisplayAwake` true it holds a display-sleep assertion while it runs. `JerisLinkHost --video-config` prints what it will use. When the control service changes codec or bitrate it restarts the video agent with `launchctl kickstart -k`.
 
 Host commands:
 
@@ -117,6 +117,7 @@ Whatever the result, check the Screen Recording, Accessibility and Login Items e
 - H.264 or HEVC, 4:2:0 Full Range; H.264 / 25 Mbps is the default
 - client-selected codec/bitrate are persisted in `video-settings.plist` and read each time the video agent starts
 - keyframe interval 60 with on-demand IDR recovery
-- ScreenCaptureKit queue depth 2
+- ScreenCaptureKit queue depth 5 at 60 fps, 2 at 30 fps (`fps` in `video-settings.plist`, default 60)
+- `keepDisplayAwake` in `video-settings.plist` keeps the display from idle sleep while the video agent runs
 - captured macOS cursor hidden; Windows renders the local cursor
 - TCP control/helper sockets suppress SIGPIPE
