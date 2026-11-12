@@ -30,6 +30,8 @@ struct Options {
     var requestScreenCaptureAccess = false
     var captureCursor = true
     var service: String?
+    /// Diagnostics: capture this display instead of the main display while it exists.
+    var displayID: UInt32?
     var showVersion = false
     var showVideoConfig = false
     var registerAgents = false
@@ -137,6 +139,8 @@ struct Options {
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--control-client-ip": o.controlClientIP = value
             case "--service": o.service = value
+            case "--display-id":
+                if let parsed = UInt32(value), parsed > 0 { o.displayID = parsed }
             default: break
             }
             i += 2
@@ -287,11 +291,11 @@ struct JerisLinkHostMain {
             var sessionIndex = 0
             while Date() < deadline {
                 sessionIndex += 1
-                let displayMode = try DisplayModeResolver.currentMainDisplay()
-                let targetWidth = o.width ?? Int32(displayMode.pixelWidth)
-                let targetHeight = o.height ?? Int32(displayMode.pixelHeight)
+                let target = try await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID)
+                let targetWidth = o.width ?? Int32(target.pixelWidth)
+                let targetHeight = o.height ?? Int32(target.pixelHeight)
 
-                print("Capture session \(sessionIndex): display=\(displayMode.displayID) logical=\(displayMode.logicalWidth)x\(displayMode.logicalHeight) framebuffer=\(displayMode.pixelWidth)x\(displayMode.pixelHeight) target=\(targetWidth)x\(targetHeight) refresh=\(String(format: "%.2f", displayMode.refreshRate))Hz")
+                print("Capture session \(sessionIndex): \(target.summary) target=\(targetWidth)x\(targetHeight) refresh=\(String(format: "%.2f", target.refreshRate))Hz")
 
                 let encoder: any FrameEncoder
                 switch o.codec {
@@ -315,21 +319,36 @@ struct JerisLinkHostMain {
                 mouseUDP?.setKeyframeRequestHandler {
                     encoder.requestKeyframe()
                 }
-                try await capture.start(displayID: displayMode.displayID,
+                if sessionIndex > 1 {
+                    // Restart after a display change: the viewer keeps the same
+                    // UDP stream, so make it resync on the new size at once.
+                    encoder.requestKeyframe()
+                }
+                try await capture.start(display: target.display,
                                         targetWidth: Int(targetWidth), targetHeight: Int(targetHeight), fps: o.fps,
                                         fullRange: o.colorRange == "full", showsCursor: o.captureCursor,
                                         queueDepth: o.captureQueueDepth)
                 print("Capture started. Move windows around to create motion.")
 
-                var changedMode: ActiveDisplayMode?
+                // Watch for display changes: a display added or removed, the main
+                // display changing, or a resolution change. The CoreGraphics layout
+                // is cheap and stays current, so poll it every 500 ms and look up
+                // ScreenCaptureKit again when it changes; also re-check
+                // ScreenCaptureKit every 5 s, since a display mode that appeared
+                // after start is not visible through CoreGraphics here.
+                var changedTarget: CaptureTarget?
+                var layout = DisplayLayoutFingerprint.current()
+                var ticks = 0
                 while Date() < deadline {
                     try await Task.sleep(for: .milliseconds(500))
-                    if autoResolution,
-                       let currentMode = try? DisplayModeResolver.currentMainDisplay(),
-                       (currentMode.displayID != displayMode.displayID ||
-                        currentMode.pixelWidth != displayMode.pixelWidth ||
-                        currentMode.pixelHeight != displayMode.pixelHeight) {
-                        changedMode = currentMode
+                    ticks += 1
+                    let currentLayout = DisplayLayoutFingerprint.current()
+                    guard currentLayout != layout || ticks % 10 == 0 else { continue }
+                    layout = currentLayout
+                    guard let current = try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) else { continue }
+                    if current.displayID != target.displayID ||
+                        (autoResolution && !current.sameCapture(as: target)) {
+                        changedTarget = current
                         break
                     }
                 }
@@ -337,8 +356,8 @@ struct JerisLinkHostMain {
                 await capture.stop()
                 print("Capture session \(sessionIndex) complete: \(encoder.statsLine())")
 
-                if let changedMode {
-                    print("Display mode changed: \(displayMode.pixelWidth)x\(displayMode.pixelHeight) -> \(changedMode.pixelWidth)x\(changedMode.pixelHeight); restarting capture at native framebuffer size")
+                if let changedTarget {
+                    print("Display changed: \(target.summary) -> \(changedTarget.summary); restarting capture at native framebuffer size")
                     continue
                 }
                 break
