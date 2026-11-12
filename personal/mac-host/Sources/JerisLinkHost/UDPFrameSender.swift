@@ -7,6 +7,12 @@ final class UDPFrameSender {
     private let packetBytes: Int
     private let headerBytes = 20
     private let lock = NSLock()
+    /// Pacing rate for each frame's packets in bits/s; 0 keeps the old
+    /// 50us-per-8-packets smoothing. A path with a short queue (a relay, a
+    /// congested link) drops much of a 270-packet IDR sent in ~1 ms.
+    private let paceBitsPerSecond: Double
+    private var paceWaitNanos: UInt64 = 0
+    private var maxFrameSendNanos: UInt64 = 0
 
     private var sentFrames: UInt64 = 0
     private var sentPackets: UInt64 = 0
@@ -16,7 +22,9 @@ final class UDPFrameSender {
     private var maxFrameBytes: UInt64 = 0
     private var keyFrames: UInt64 = 0
 
-    init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int) throws {
+    init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int,
+         paceMbps: Int = 0) throws {
+        self.paceBitsPerSecond = Double(max(0, paceMbps)) * 1_000_000
         guard packetBytes > headerBytes + 64 && packetBytes <= 1400 else {
             throw NSError(domain: "JerisLink.UDP", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "packetBytes must be between 85 and 1400"])
@@ -58,7 +66,7 @@ final class UDPFrameSender {
                           userInfo: [NSLocalizedDescriptionKey: "Invalid client IP: \(clientIP)"])
         }
 
-        print("UDP sender: \(bindIP) -> \(clientIP):\(clientPort), packetBytes=\(packetBytes)")
+        print("UDP sender: \(bindIP) -> \(clientIP):\(clientPort), packetBytes=\(packetBytes), pace=\(paceMbps > 0 ? "\(paceMbps) Mbps" : "off")")
     }
 
     deinit {
@@ -82,6 +90,9 @@ final class UDPFrameSender {
         lock.unlock()
 
         var frameHadError = false
+        let frameStartNanos = DispatchTime.now().uptimeNanoseconds
+        var frameBytesSent = 0
+        var frameWaitNanos: UInt64 = 0
         for packetIndex in 0..<packetCount {
             let start = packetIndex * payloadCapacity
             let end = min(start + payloadCapacity, data.count)
@@ -118,13 +129,30 @@ final class UDPFrameSender {
             }
             lock.unlock()
 
-            // Smooth very large IDR/key frames so dozens of UDP datagrams are not
-            // emitted in one tight burst. 50us every 8 packets adds sub-ms pacing
-            // for normal frames and only a few ms for unusually large frames.
-            if packetCount > 24 && packetIndex % 8 == 7 {
+            frameBytesSent += packet.count
+            if paceBitsPerSecond > 0 {
+                // Keep this frame at or under the pace rate. Sleep only when at
+                // least 2 ms ahead: macOS sleeps overshoot by several ms, so a
+                // small frame (under ~20 KB at 80 Mbps) goes out without a wait,
+                // and the due time is from the frame start so overshoot is
+                // absorbed by the following packets.
+                let dueNanos = frameStartNanos
+                    + UInt64(Double(frameBytesSent) * 8 / paceBitsPerSecond * 1_000_000_000)
+                let now = DispatchTime.now().uptimeNanoseconds
+                if dueNanos > now + 2_000_000 {
+                    usleep(UInt32((dueNanos - now) / 1000))
+                    frameWaitNanos &+= dueNanos - now
+                }
+            } else if packetCount > 24 && packetIndex % 8 == 7 {
+                // Old behaviour: 50us every 8 packets for large frames.
                 usleep(50)
             }
         }
+        let frameSendNanos = DispatchTime.now().uptimeNanoseconds &- frameStartNanos
+        lock.lock()
+        paceWaitNanos &+= frameWaitNanos
+        maxFrameSendNanos = max(maxFrameSendNanos, frameSendNanos)
+        lock.unlock()
 
         if !frameHadError {
             lock.lock(); sentFrames &+= 1; lock.unlock()
@@ -133,7 +161,7 @@ final class UDPFrameSender {
 
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
-        return "udp_frames=\(sentFrames) udp_packets=\(sentPackets) udp_bytes=\(sentBytes) udp_errors=\(sendErrors) keyframes=\(keyFrames) max_packets_per_frame=\(maxPacketsPerFrame) max_frame_bytes=\(maxFrameBytes)"
+        return "udp_frames=\(sentFrames) udp_packets=\(sentPackets) udp_bytes=\(sentBytes) udp_errors=\(sendErrors) keyframes=\(keyFrames) max_packets_per_frame=\(maxPacketsPerFrame) max_frame_bytes=\(maxFrameBytes) pace_wait_total_ms=\(paceWaitNanos / 1_000_000) max_frame_send_ms=\(String(format: "%.2f", Double(maxFrameSendNanos) / 1_000_000))"
     }
 
     private static func posixError(_ operation: String) -> NSError {

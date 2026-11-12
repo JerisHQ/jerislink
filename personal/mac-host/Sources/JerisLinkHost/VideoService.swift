@@ -129,6 +129,10 @@ enum VideoService {
             o.controlClientIP = clientIP
             o.clientPort = 38402
             o.packetBytes = 1200
+            // Per-frame pacing (80 Mbps unless the plist says otherwise): a 4K
+            // IDR is ~270 packets and a short-queue path drops much of a 1 ms burst.
+            // 80 Mbps would send a 320 KB IDR in ~32 ms, a 30 KB P-frame in ~3 ms.
+            o.udpPaceMbps = settings.udpPaceMbps
             o.mouseUDPPort = 38412
             o.controlServerEnabled = false
             o.captureCursor = false

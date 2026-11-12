@@ -20,6 +20,8 @@ struct Options {
     var clientIP: String?
     var clientPort: UInt16 = 38401
     var packetBytes: Int = 1200
+    /// Per-frame UDP pacing rate in Mbps; 0 = off (old 50us/8-packet smoothing).
+    var udpPaceMbps: Int = 0
     var controlPort: UInt16 = 38400
     var mouseUDPPort: UInt16?
     var controlClientIP: String?
@@ -137,6 +139,8 @@ struct Options {
             case "--client-ip": o.clientIP = value
             case "--client-port": o.clientPort = UInt16(value) ?? o.clientPort
             case "--packet-bytes": o.packetBytes = Int(value) ?? o.packetBytes
+            case "--udp-pace-mbps":
+                if let parsed = Int(value), parsed >= 0 { o.udpPaceMbps = parsed }
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--control-client-ip": o.controlClientIP = value
@@ -278,7 +282,8 @@ struct JerisLinkHostMain {
             var mouseUDP: MouseMoveUDPServer?
             if let bindIP = o.bindIP, let clientIP = o.clientIP {
                 sender = try UDPFrameSender(bindIP: bindIP, clientIP: clientIP,
-                                            clientPort: o.clientPort, packetBytes: o.packetBytes)
+                                            clientPort: o.clientPort, packetBytes: o.packetBytes,
+                                            paceMbps: o.udpPaceMbps)
                 if let mouseUDPPort = o.mouseUDPPort {
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
