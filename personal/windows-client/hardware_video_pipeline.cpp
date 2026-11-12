@@ -1,4 +1,5 @@
 #include "hardware_video_pipeline.hpp"
+#include "source_rect.hpp"
 
 #include <d3d10_1.h>
 #include <d3d11.h>
@@ -69,6 +70,8 @@ struct HardwareVideoPipeline::Impl {
     UINT processorInputH = 0;
     UINT swapW = 0;
     UINT swapH = 0;
+    UINT32 activeSourceX = 0;
+    UINT32 activeSourceY = 0;
     UINT32 activeSourceW = 0;
     UINT32 activeSourceH = 0;
     UINT inputNominalRange = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
@@ -333,11 +336,14 @@ struct HardwareVideoPipeline::Impl {
         const float black[4] = {0.f, 0.f, 0.f, 1.f};
         context->ClearRenderTargetView(renderTarget.Get(), black);
 
+        UINT32 sourceX = std::min<UINT32>(activeSourceX, td.Width - 1);
+        UINT32 sourceY = std::min<UINT32>(activeSourceY, td.Height - 1);
         UINT32 sourceW = activeSourceW ? activeSourceW : width;
         UINT32 sourceH = activeSourceH ? activeSourceH : height;
-        sourceW = std::min<UINT32>(sourceW, td.Width);
-        sourceH = std::min<UINT32>(sourceH, td.Height);
-        RECT sourceRect{0, 0, static_cast<LONG>(sourceW), static_cast<LONG>(sourceH)};
+        sourceW = std::min<UINT32>(sourceW, td.Width - sourceX);
+        sourceH = std::min<UINT32>(sourceH, td.Height - sourceY);
+        RECT sourceRect{static_cast<LONG>(sourceX), static_cast<LONG>(sourceY),
+                        static_cast<LONG>(sourceX + sourceW), static_cast<LONG>(sourceY + sourceH)};
         RECT targetRect{0, 0, static_cast<LONG>(swapW), static_cast<LONG>(swapH)};
         const double srcAspect = static_cast<double>(sourceW) / std::max<UINT32>(1, sourceH);
         if (static_cast<double>(swapW) / std::max<UINT>(1, swapH) > srcAspect) {
@@ -451,8 +457,6 @@ struct HardwareVideoPipeline::Impl {
         UINT32 mtW = 0, mtH = 0;
         (void)MFGetAttributeSize(chosen.Get(), MF_MT_FRAME_SIZE, &mtW, &mtH);
 
-        UINT32 displayW = mtW;
-        UINT32 displayH = mtH;
         MFVideoArea aperture{};
         UINT32 apertureBytes = 0;
         auto readAperture = [&](const GUID& key) -> bool {
@@ -464,8 +468,7 @@ struct HardwareVideoPipeline::Impl {
                 &apertureBytes);
             if (FAILED(apertureHr) || apertureBytes != sizeof(aperture)) return false;
             if (aperture.Area.cx <= 0 || aperture.Area.cy <= 0) return false;
-            displayW = static_cast<UINT32>(aperture.Area.cx);
-            displayH = static_cast<UINT32>(aperture.Area.cy);
+            if (aperture.OffsetX.value < 0 || aperture.OffsetY.value < 0) return false;
             return true;
         };
 
@@ -474,27 +477,30 @@ struct HardwareVideoPipeline::Impl {
             readAperture(MF_MT_GEOMETRIC_APERTURE) ||
             readAperture(MF_MT_PAN_SCAN_APERTURE);
 
-        if (!haveAperture && mtW && mtH && width && height) {
-            // Media Foundation commonly exposes an aligned NV12 surface height
-            // (for example 990 -> 992 or 1800 -> 1808). When explicit display
-            // aperture metadata is absent, preserve the stream's original
-            // display aspect and trim only a small alignment tail.
-            const double baseAspect = static_cast<double>(width) / height;
-            const UINT32 inferredH = static_cast<UINT32>(
-                std::llround(static_cast<double>(mtW) / baseAspect));
-            if (inferredH > 0 && inferredH <= mtH && (mtH - inferredH) <= 16) {
-                displayW = mtW;
-                displayH = inferredH;
-            }
-        }
+        // width/height are the host framebuffer size from the VIDEO_CONFIG
+        // ACK. The host encodes a 16-aligned frame with the picture centred
+        // in it, so crop to that picture instead of scaling the bars in.
+        const JerisSourceRect picked = jerisPickSourceRect(
+            mtW, mtH, haveAperture,
+            haveAperture ? static_cast<uint32_t>(aperture.OffsetX.value) : 0,
+            haveAperture ? static_cast<uint32_t>(aperture.OffsetY.value) : 0,
+            haveAperture ? static_cast<uint32_t>(aperture.Area.cx) : 0,
+            haveAperture ? static_cast<uint32_t>(aperture.Area.cy) : 0,
+            width, height);
 
-        if (displayW && displayH &&
-            (displayW != activeSourceW || displayH != activeSourceH)) {
-            activeSourceW = displayW;
-            activeSourceH = displayH;
+        if (picked.w && picked.h &&
+            (picked.x != activeSourceX || picked.y != activeSourceY ||
+             picked.w != activeSourceW || picked.h != activeSourceH)) {
+            activeSourceX = picked.x;
+            activeSourceY = picked.y;
+            activeSourceW = picked.w;
+            activeSourceH = picked.h;
             std::ostringstream sourceOs;
             sourceOs << "present.source_active=" << activeSourceW << "x" << activeSourceH
-                     << " surface=" << mtW << "x" << mtH;
+                     << " offset=" << activeSourceX << "," << activeSourceY
+                     << " surface=" << mtW << "x" << mtH
+                     << " aperture=" << (haveAperture ? "yes" : "no")
+                     << " remote=" << width << "x" << height;
             log(sourceOs.str());
         }
         std::ostringstream os;
