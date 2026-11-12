@@ -117,11 +117,28 @@ extension DisplayModeResolver {
                           userInfo: [NSLocalizedDescriptionKey: "No captureable display found"])
         }
 
-        let info = SCShareableContent.info(for: SCContentFilter(display: display, excludingWindows: []))
-        let scale = Double(info.pointPixelScale) > 0 ? Double(info.pointPixelScale) : 1
+        // Prefer the real mode. CoreGraphics caches modes per process, so a
+        // display that appeared or changed after launch can report no mode (or
+        // a stale one) here; a fresh process always reads the current one.
+        var mode = ProbedDisplayMode(CGDisplayCopyDisplayMode(display.displayID))
+        if mode?.matches(display) != true {
+            mode = probeModeInFreshProcess(display.displayID)
+        }
+        let rawWidth: Double
+        let rawHeight: Double
+        if let mode, mode.matches(display) {
+            rawWidth = Double(mode.pixelWidth)
+            rawHeight = Double(mode.pixelHeight)
+        } else {
+            let info = SCShareableContent.info(for: SCContentFilter(display: display, excludingWindows: []))
+            let fallbackScale = Double(info.pointPixelScale) > 0 ? Double(info.pointPixelScale) : 1
+            rawWidth = Double(display.width) * fallbackScale
+            rawHeight = Double(display.height) * fallbackScale
+        }
         // Even sizes keep 4:2:0 encoders happy.
-        let pixelWidth = Int((Double(display.width) * scale).rounded()) & ~1
-        let pixelHeight = Int((Double(display.height) * scale).rounded()) & ~1
+        let pixelWidth = Int(rawWidth.rounded()) & ~1
+        let pixelHeight = Int(rawHeight.rounded()) & ~1
+        let scale = display.width > 0 ? rawWidth / Double(display.width) : 1
         guard pixelWidth > 0, pixelHeight > 0,
               pixelWidth <= Int(UInt16.max), pixelHeight <= Int(UInt16.max)
         else {
@@ -135,7 +152,72 @@ extension DisplayModeResolver {
             pixelWidth: pixelWidth,
             pixelHeight: pixelHeight,
             scale: scale,
-            refreshRate: CGDisplayCopyDisplayMode(display.displayID)?.refreshRate ?? 0
+            refreshRate: mode?.refreshRate ?? 0
         )
+    }
+
+    static let probeModeFlag = "--probe-display-mode"
+
+    /// Child side of `probeModeInFreshProcess`: print the current mode and exit.
+    static func runModeProbe(_ argument: String) -> Never {
+        guard let id = CGDirectDisplayID(argument),
+              let mode = ProbedDisplayMode(CGDisplayCopyDisplayMode(id))
+        else { exit(1) }
+        print("\(mode.pixelWidth) \(mode.pixelHeight) \(mode.logicalWidth) \(mode.logicalHeight) \(mode.refreshRate)")
+        exit(0)
+    }
+
+    static func probeModeInFreshProcess(_ id: CGDirectDisplayID) -> ProbedDisplayMode? {
+        guard let executable = Bundle.main.executableURL else { return nil }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = executable
+        process.arguments = [probeModeFlag, String(id)]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            if process.isRunning { process.terminate() }
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8)
+        else { return nil }
+        let parts = text.split(whereSeparator: { $0 == " " || $0 == "\n" })
+        guard parts.count == 5,
+              let pw = Int(parts[0]), let ph = Int(parts[1]),
+              let lw = Int(parts[2]), let lh = Int(parts[3]),
+              let refresh = Double(parts[4])
+        else { return nil }
+        return ProbedDisplayMode(pixelWidth: pw, pixelHeight: ph,
+                                 logicalWidth: lw, logicalHeight: lh, refreshRate: refresh)
+    }
+}
+
+struct ProbedDisplayMode {
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let logicalWidth: Int
+    let logicalHeight: Int
+    let refreshRate: Double
+
+    init(pixelWidth: Int, pixelHeight: Int, logicalWidth: Int, logicalHeight: Int, refreshRate: Double) {
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.logicalWidth = logicalWidth
+        self.logicalHeight = logicalHeight
+        self.refreshRate = refreshRate
+    }
+
+    init?(_ mode: CGDisplayMode?) {
+        guard let mode, mode.pixelWidth > 0, mode.pixelHeight > 0 else { return nil }
+        self.init(pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight,
+                  logicalWidth: mode.width, logicalHeight: mode.height, refreshRate: mode.refreshRate)
+    }
+
+    /// A cached mode is only trusted when it agrees with ScreenCaptureKit's point size.
+    func matches(_ display: SCDisplay) -> Bool {
+        logicalWidth == display.width && logicalHeight == display.height
     }
 }
