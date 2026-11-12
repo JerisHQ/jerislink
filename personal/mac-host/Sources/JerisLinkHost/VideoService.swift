@@ -4,9 +4,9 @@ import IOKit.pwr_mgt
 
 /// `--service video`: the video host as a launchd agent.
 ///
-/// Replaces the old video-watchdog.zsh. It reads the network addresses from
-/// network.conf (or the environment), waits until this Mac's address is up on a
-/// local interface (Tailscale running), reads codec, bitrate, fps and
+/// Replaces the old video-watchdog.zsh. It takes its addresses from the listen
+/// endpoint (ListenConfig: listen.plist, else network.conf or the environment),
+/// waits until that address is up on this Mac, reads codec, bitrate, fps and
 /// keepDisplayAwake from video-settings.plist, and then runs the normal 24-hour video session. launchd (KeepAlive) restarts it
 /// when it exits, crashes, or is restarted by the control service.
 enum VideoService {
@@ -56,90 +56,53 @@ enum VideoService {
         return (pick("JERISLINK_BIND_IP"), pick("JERISLINK_CLIENT_IP"))
     }
 
-    static func localIPv4Addresses() -> Set<String> {
-        var result = Set<String>()
-        var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0, let first = head else { return result }
-        defer { freeifaddrs(head) }
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let entry = cursor {
-            if let addr = entry.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) {
-                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                    var address = sin.pointee.sin_addr
-                    _ = inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN))
-                }
-                result.insert(String(cString: buffer))
-            }
-            cursor = entry.pointee.ifa_next
-        }
-        return result
-    }
-
     static func log(_ message: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
         print("\(stamp) video-service: \(message)")
         fflush(stdout)
     }
 
-    /// Blocks until the service is configured and the bind address is up, then
-    /// returns the production video options.
+    /// Blocks until the listen endpoint is ready (ListenConfig: listen.plist,
+    /// else network.conf), then returns the production video options. Video,
+    /// mouse UDP and the control service all use this same endpoint.
     static func resolveOptions(base: Options) async -> Options {
-        var loggedNotConfigured = false
-        var loggedWaiting = false
-        while true {
-            let (bindIP, clientIP) = loadAddresses()
-            guard let bindIP, let clientIP else {
-                if !loggedNotConfigured {
-                    log("not configured: set JERISLINK_BIND_IP and JERISLINK_CLIENT_IP in \(networkConfURL.path)")
-                    loggedNotConfigured = true
-                }
-                try? await Task.sleep(for: .seconds(5))
-                continue
-            }
-            guard localIPv4Addresses().contains(bindIP) else {
-                if !loggedWaiting {
-                    log("waiting for \(bindIP) on a local interface (Tailscale running) before starting video")
-                    loggedWaiting = true
-                }
-                try? await Task.sleep(for: .seconds(1))
-                continue
-            }
-
-            let settings = PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL)
-            let codec: VideoCodec = settings.codec == "hevc" ? .hevc : .h264
-            log("starting video bind=\(bindIP) client=\(clientIP) \(settings.summary)")
-            if settings.keepDisplayAwake {
-                log(DisplayAwake.hold()
-                    ? "display sleep prevention held for this video service"
-                    : "keepDisplayAwake: could not create the display sleep assertion")
-            }
-
-            var o = base
-            o.durationSeconds = 86400
-            o.fps = settings.fps
-            o.bitrateMbps = settings.bitrateMbps
-            o.codec = codec
-            o.colorRange = "full"
-            // 10 s at 60 fps: periodic IDRs cost 36-85 ms each at 4K. Loss
-            // recovery uses viewer keyframe requests, and a new viewer gets a
-            // forced IDR (MouseMoveUDPServer new session).
-            o.keyframeInterval = 600
-            o.h264Profile = "constrained-high"
-            o.captureQueueDepth = settings.captureQueueDepth
-            o.bindIP = bindIP
-            o.clientIP = clientIP
-            o.controlClientIP = clientIP
-            o.clientPort = 38402
-            o.packetBytes = 1200
-            o.udpPaceMbps = settings.pacing.mbps
-            o.udpPaceBurstKB = settings.udpPaceBurstKB
-            o.mouseUDPPort = 38412
-            o.controlServerEnabled = false
-            o.captureCursor = false
-            o.outputPath = "/dev/null"
-            return o
+        let endpoint = await ListenConfig.waitForEndpoint(log: log)
+        let bindIP = endpoint.bindIP
+        let clientIP = endpoint.clientIP
+        ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
+        let settings = PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL)
+        let codec: VideoCodec = settings.codec == "hevc" ? .hevc : .h264
+        log("starting video \(endpoint.summary) \(settings.summary)")
+        if settings.keepDisplayAwake {
+            log(DisplayAwake.hold()
+                ? "display sleep prevention held for this video service"
+                : "keepDisplayAwake: could not create the display sleep assertion")
         }
+
+        var o = base
+        o.durationSeconds = 86400
+        o.fps = settings.fps
+        o.bitrateMbps = settings.bitrateMbps
+        o.codec = codec
+        o.colorRange = "full"
+        // 10 s at 60 fps: periodic IDRs cost 36-85 ms each at 4K. Loss
+        // recovery uses viewer keyframe requests, and a new viewer gets a
+        // forced IDR (MouseMoveUDPServer new session).
+        o.keyframeInterval = 600
+        o.h264Profile = "constrained-high"
+        o.captureQueueDepth = settings.captureQueueDepth
+        o.bindIP = bindIP
+        o.clientIP = clientIP
+        o.controlClientIP = clientIP
+        o.clientPort = 38402
+        o.packetBytes = 1200
+        o.udpPaceMbps = settings.pacing.mbps
+        o.udpPaceBurstKB = settings.udpPaceBurstKB
+        o.mouseUDPPort = 38412
+        o.controlServerEnabled = false
+        o.captureCursor = false
+        o.outputPath = "/dev/null"
+        return o
     }
 }
 

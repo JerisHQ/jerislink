@@ -24,6 +24,9 @@ struct Options {
     var udpPaceMbps: Int = 0
     var udpPaceBurstKB: Int = UDPPacing.defaultBurstKB
     var controlPort: UInt16 = 38400
+    /// `--service control`: loopback listener for the video service's mouse
+    /// relay (MouseMoveUDPServer -> 127.0.0.1:38411). 0 = off.
+    var relayPort: UInt16 = 38411
     var mouseUDPPort: UInt16?
     var controlClientIP: String?
     var controlInject = false
@@ -146,6 +149,7 @@ struct Options {
                 if let parsed = Int(value), parsed > 0 { o.udpPaceBurstKB = parsed }
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
+            case "--relay-port": o.relayPort = UInt16(value) ?? o.relayPort
             case "--control-client-ip": o.controlClientIP = value
             case "--service": o.service = value
             case "--display-id":
@@ -172,7 +176,9 @@ struct JerisLinkHostMain {
             DisplayModeResolver.runModeProbe(rawArgs[2])
         }
         if rawArgs.count == 2, rawArgs[1] == "--self-test" {
-            exit(ControlPeerSelfTest.run())
+            let peer = ControlPeerSelfTest.run()
+            let listen = ListenConfigSelfTest.run()
+            exit(peer == 0 && listen == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -206,11 +212,15 @@ struct JerisLinkHostMain {
             return
         }
         if let service = o.service {
-            guard service == "video" else {
-                fputs("Fatal: unknown --service \(service) (expected video)\n", stderr)
+            switch service {
+            case "video":
+                o = await VideoService.resolveOptions(base: o)
+            case "control":
+                await ControlService.run(o)
+            default:
+                fputs("Fatal: unknown --service \(service) (expected video or control)\n", stderr)
                 exit(2)
             }
-            o = await VideoService.resolveOptions(base: o)
         }
         if o.requestPostEventAccess {
             let before = CGPreflightPostEventAccess()

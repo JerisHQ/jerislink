@@ -30,11 +30,16 @@ final class ControlServer: @unchecked Sendable {
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
     private let settingsClientIP: () -> String?
+    /// Read PROXY headers from loopback peers (legacy `tailscale serve`
+    /// forward). Off for `--service control`, whose sockets see real peers.
+    private let acceptProxy: Bool
     private static let maxClipboardBytes = 60 * 1024
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
-         settingsClientIP: @escaping () -> String? = { VideoService.loadAddresses().clientIP }) {
+         settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
+         acceptProxy: Bool = true) {
         self.bindIP = bindIP
+        self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
         self.port = port
         self.injectRequested = inject
@@ -141,7 +146,7 @@ final class ControlServer: @unchecked Sendable {
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             if let allowedClientIP, peerIP != allowedClientIP {
                 rejectedClients += 1
-                print("Control reject client \(peerIP), expected \(allowedClientIP)")
+                print("Control reject peer=\(peerIP) expected=\(allowedClientIP) on \(bindIP):\(port); connection closed")
                 Darwin.close(c)
                 continue
             }
@@ -169,7 +174,7 @@ final class ControlServer: @unchecked Sendable {
         var peer = ControlPeer(ip: tcpPeerIP, verified: !ControlPeer.isLoopback(tcpPeerIP))
         // Only a local forwarder (tailscale serve --proxy-protocol) may name
         // another address; a remote client cannot claim one.
-        if ControlPeer.isLoopback(tcpPeerIP) {
+        if acceptProxy && ControlPeer.isLoopback(tcpPeerIP) {
             switch ProxyProtocol.parse(first: pending, read: { self.recvExact(fd, count: $0) }) {
             case .notProxy:
                 break

@@ -9,13 +9,8 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>JerisLinkHost</string>
-		<string>--control-only</string>
-		<string>--bind-ip</string>
-		<string>127.0.0.1</string>
-		<string>--control-port</string>
-		<string>38411</string>
-		<string>--control-client-ip</string>
-		<string>127.0.0.1</string>
+		<string>--service</string>
+		<string>control</string>
 		<string>--control-inject</string>
 	</array>
 	<key>AssociatedBundleIdentifiers</key>
