@@ -258,6 +258,9 @@ struct ConnectionInfoState {
     std::string backend = "pending";
     std::string decoder = "pending";
     std::string adapter;
+    // Empty while video is flowing; otherwise a short state such as
+    // "Waiting for host video" that the title and CPU canvas show.
+    std::wstring status;
 };
 
 static ConnectionInfoState gConnectionInfo;
@@ -688,6 +691,7 @@ static void updateViewerTitle(HWND hwnd) {
     std::wostringstream title;
     title << L"JerisLink \u2014 " << codecDisplayName(gConnectionInfo.effectiveCodec)
           << L" \u00b7 " << gConnectionInfo.effectiveBitrateMbps << L" Mbps";
+    if (!gConnectionInfo.status.empty()) title << L" \u2014 " << gConnectionInfo.status;
     SetWindowTextW(hwnd, title.str().c_str());
 }
 
@@ -745,6 +749,9 @@ struct Options {
     std::string lossRecovery = "strict";
     int idleTimeoutMs = 8000;
     int startupTimeoutMs = 180000;
+    // Old behaviour: quit when no video arrives for the idle/startup timeout.
+    // By default the viewer now stays open and waits for the host instead.
+    bool exitOnIdle = false;
     UINT32 width = 3712;
     UINT32 height = 2088;
     bool widthExplicit = false;
@@ -779,6 +786,10 @@ static std::optional<Options> parseArgs(int argc, char** argv) {
         }
         if (k == "--start-maximized") {
             o.startMaximized = true;
+            continue;
+        }
+        if (k == "--exit-on-idle") {
+            o.exitOnIdle = true;
             continue;
         }
         if (i + 1 >= argc) return std::nullopt;
@@ -873,6 +884,10 @@ struct FrameAssembly {
 // frames it separates.
 struct VideoCommand {
     bool reset = false;
+    // The host switched codec: rebuild the decoder for `codec` before the
+    // frames that follow.
+    bool codecChange = false;
+    JerisVideoCodec codec = JerisVideoCodec::H264;
     uint64_t fid = 0;
     std::vector<uint8_t> data;
     bool discontinuity = false;
@@ -907,6 +922,18 @@ public:
         SetEvent(event_);
     }
 
+    void pushCodecChange(JerisVideoCodec codec) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            VideoCommand c;
+            c.codecChange = true;
+            c.codec = codec;
+            queue_.push_back(std::move(c));
+            maxDepth_ = std::max(maxDepth_, queue_.size());
+        }
+        SetEvent(event_);
+    }
+
     // Returns false if the queue was full: the backlog and this frame are
     // dropped and replaced by a single reset. A keyframe is still accepted
     // after the reset, since it can start a clean decode.
@@ -915,7 +942,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (queue_.size() >= kMaxCommands) {
+                // Keep the newest codec change: the frames after it are in
+                // the new codec and the decoder must be rebuilt first.
+                std::optional<VideoCommand> codecChange;
+                for (auto& c : queue_) {
+                    if (c.codecChange) codecChange = std::move(c);
+                }
                 queue_.clear();
+                if (codecChange) queue_.push_back(std::move(*codecChange));
                 VideoCommand r;
                 r.reset = true;
                 queue_.push_back(std::move(r));
@@ -1352,6 +1386,22 @@ public:
         if (gCpuPresenter == this) gCpuPresenter = nullptr;
     }
 
+    UINT32 sourceWidth() const { return srcW_; }
+    UINT32 sourceHeight() const { return srcH_; }
+
+    // The host restarted at another size. Reallocate the conversion buffer;
+    // the next frame paints at the new size.
+    void resizeSource(UINT32 width, UINT32 height) {
+        if (!width || !height || (width == srcW_ && height == srcH_)) return;
+        srcW_ = width;
+        srcH_ = height;
+        bgra_.assign(static_cast<size_t>(srcW_) * srcH_ * 4, 0);
+        bmi_.bmiHeader.biWidth = static_cast<LONG>(srcW_);
+        bmi_.bmiHeader.biHeight = -static_cast<LONG>(srcH_);
+        hasFrame_ = false;
+        logLine("cpu.source_resized size=" + std::to_string(srcW_) + "x" + std::to_string(srcH_));
+    }
+
     void setLayout(UINT32 stride, UINT32 storageHeight) {
         stride_ = stride ? stride : srcW_;
         storageHeight_ = storageHeight ? storageHeight : srcH_;
@@ -1381,7 +1431,7 @@ public:
             return;
         }
         const size_t required = static_cast<size_t>(stride_) * storageHeight_ * 3 / 2;
-        if (!data || curLen < required) {
+        if (!data || curLen < required || stride_ < srcW_ || storageHeight_ < srcH_) {
             buffer->Unlock();
             ++bufferDrops_;
             return;
@@ -1575,6 +1625,15 @@ static void paintCpuFrame(HWND hwnd) {
             GetClientRect(hwnd, &r);
             FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         }
+        if (!gHardwarePresenterActive && !gConnectionInfo.status.empty()) {
+            RECT r{};
+            GetClientRect(hwnd, &r);
+            r.top += 24;
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(235, 235, 235));
+            DrawTextW(dc, gConnectionInfo.status.c_str(), -1, &r,
+                      DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        }
         EndPaint(hwnd, &ps);
     }
 }
@@ -1727,6 +1786,29 @@ private:
         }
         UINT32 mtW = 0, mtH = 0;
         (void)MFGetAttributeSize(chosen.Get(), MF_MT_FRAME_SIZE, &mtW, &mtH);
+        // The host encodes a 16-aligned frame and the viewer crops to the
+        // real picture, so 1920x1088 still shows 1920x1080. Anything else
+        // means the host restarted at another size: show the new size.
+        const UINT32 shownW = presenter_.sourceWidth();
+        const UINT32 shownH = presenter_.sourceHeight();
+        if (mtW && mtH && (mtW < shownW || mtH < shownH ||
+                           mtW >= shownW + 16 || mtH >= shownH + 16)) {
+            UINT32 newW = mtW, newH = mtH;
+            MFVideoArea area{};
+            if (SUCCEEDED(chosen->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE,
+                                          reinterpret_cast<UINT8*>(&area), sizeof(area), nullptr)) &&
+                area.Area.cx > 0 && area.Area.cy > 0 &&
+                static_cast<UINT32>(area.Area.cx) <= mtW && static_cast<UINT32>(area.Area.cy) <= mtH) {
+                newW = static_cast<UINT32>(area.Area.cx);
+                newH = static_cast<UINT32>(area.Area.cy);
+            }
+            presenter_.resizeSource(newW, newH);
+            gRemoteWidth = newW;
+            gRemoteHeight = newH;
+            gConnectionInfo.remoteWidth = newW;
+            gConnectionInfo.remoteHeight = newH;
+            logLine("input.remote_size=" + std::to_string(newW) + "x" + std::to_string(newH));
+        }
         presenter_.setLayout(strideValue, mtH ? mtH : height_);
         std::ostringstream os;
         os << "decoder.output=NV12 " << mtW << "x" << mtH << " stride=" << strideValue;
@@ -1970,6 +2052,28 @@ private:
     double hardwarePresentMaxSaved_ = 0.0;
 };
 
+// Which codec an Annex B access unit is in, judged from its parameter sets.
+// The host repeats them in front of every keyframe. nullopt if none is found.
+static std::optional<JerisVideoCodec> sniffAnnexBCodec(const std::vector<uint8_t>& au) {
+    for (size_t i = 0; i + 3 < au.size(); ++i) {
+        if (au[i] != 0 || au[i + 1] != 0) continue;
+        size_t p = 0;
+        if (au[i + 2] == 1) p = i + 3;
+        else if (au[i + 2] == 0 && i + 3 < au.size() && au[i + 3] == 1) p = i + 4;
+        else continue;
+        if (p + 1 >= au.size()) break;
+        const uint8_t b0 = au[p];
+        const uint8_t b1 = au[p + 1];
+        // HEVC VPS/SPS/PPS (types 32-34), layer 0, temporal id 0.
+        if ((b0 == 0x40 || b0 == 0x42 || b0 == 0x44) && b1 == 0x01) return JerisVideoCodec::HEVC;
+        // H.264 SPS/PPS (types 7-8) with nal_ref_idc set.
+        const uint8_t type = b0 & 0x1f;
+        if ((b0 & 0x80) == 0 && (b0 & 0x60) != 0 && (type == 7 || type == 8)) return JerisVideoCodec::H264;
+        i = p;
+    }
+    return std::nullopt;
+}
+
 static int appMain(int argc, char** argv) {
     std::remove(kLogPath.c_str());
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
@@ -2206,6 +2310,14 @@ static int appMain(int argc, char** argv) {
         std::atomic<bool> rxStop{false};
         std::atomic<bool> rxDone{false};
         std::string rxError;
+        // Set by the window thread after it rebuilt the decoder; the receive
+        // thread then waits for the next keyframe.
+        std::atomic<bool> rxNeedKeyframe{false};
+        // 0 = video flowing, 1 = waiting for the host (nothing received for
+        // the idle/startup timeout). Shown in the title by the window thread.
+        std::atomic<int> rxWaiting{1};
+        uint64_t idleEvents = 0, streamResumes = 0, codecChanges = 0, rxSocketErrors = 0;
+        const JerisVideoCodec startCodec = jerisVideoCodecFromString(effectiveCodec);
         if (strictLossRecovery) {
             video->resetForNewStream();
             logLine("loss.strict_wait_for_keyframe reason=startup");
@@ -2222,6 +2334,39 @@ static int appMain(int argc, char** argv) {
                 auto start = std::chrono::steady_clock::now();
                 auto lastPacket = start;
                 bool gotAny = false;
+                bool idle = false;
+                JerisVideoCodec streamCodec = startCodec;
+                auto lastIdleKeyframeRequest = start;
+                // Returns true when the viewer should quit (only with
+                // --exit-on-idle). Otherwise it marks the stream idle once and
+                // keeps waiting for the host.
+                auto checkIdle = [&](std::chrono::steady_clock::time_point now) {
+                    const auto base = gotAny ? lastPacket : start;
+                    const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
+                    const auto quietMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count();
+                    if (gotAny && quietMs >= o.idleTimeoutMs && !idle) {
+                        idle = true;
+                        ++idleEvents;
+                        rxWaiting = 1;
+                        logLine("stream.idle quiet_ms=" + std::to_string(quietMs) +
+                                (o.exitOnIdle ? " action=exit" : " action=wait"));
+                    }
+                    if (o.exitOnIdle && quietMs >= timeoutMs) return true;
+                    if (idle && gMouseMoveUdp &&
+                        now - lastIdleKeyframeRequest >= std::chrono::seconds(2)) {
+                        lastIdleKeyframeRequest = now;
+                        gMouseMoveUdp->requestKeyframe();
+                    }
+                    return false;
+                };
+                auto socketError = [&](const char* what, int code) {
+                    ++rxSocketErrors;
+                    if (rxSocketErrors <= 5 || rxSocketErrors % 100 == 0) {
+                        logLine(std::string("rx.socket_error op=") + what + " wsa=" +
+                                std::to_string(code) + " count=" + std::to_string(rxSocketErrors));
+                    }
+                    Sleep(100);
+                };
 
                 while (!rxStop && !gWindowClosed) {
                     // Wait with select() and only then read. A recvfrom that
@@ -2234,12 +2379,13 @@ static int appMain(int argc, char** argv) {
                     FD_SET(s, &readable);
                     timeval waitTime{0, 50 * 1000};
                     const int ready = select(0, &readable, nullptr, nullptr, &waitTime);
-                    if (ready == SOCKET_ERROR) throw std::runtime_error("select failed");
+                    if (ready == SOCKET_ERROR) {
+                        socketError("select", WSAGetLastError());
+                        if (checkIdle(std::chrono::steady_clock::now())) break;
+                        continue;
+                    }
                     if (ready == 0) {
-                        auto idleNow = std::chrono::steady_clock::now();
-                        auto base = gotAny ? lastPacket : start;
-                        const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
-                        if (std::chrono::duration_cast<std::chrono::milliseconds>(idleNow - base).count() >= timeoutMs) break;
+                        if (checkIdle(std::chrono::steady_clock::now())) break;
                         continue;
                     }
 
@@ -2249,26 +2395,48 @@ static int appMain(int argc, char** argv) {
                     auto now = std::chrono::steady_clock::now();
                     if (n == SOCKET_ERROR) {
                         int e = WSAGetLastError();
-                        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
-                            auto base = gotAny ? lastPacket : start;
-                            const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
-                            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
-                            continue;
-                        }
-                        throw std::runtime_error("recvfrom failed");
+                        // Timeouts are normal. Anything else (for example a
+                        // reset after a network change) is logged and the
+                        // viewer keeps listening instead of quitting.
+                        if (e != WSAETIMEDOUT && e != WSAEWOULDBLOCK) socketError("recvfrom", e);
+                        if (checkIdle(now)) break;
+                        continue;
                     }
                     const auto packetGapMs = gotAny
                         ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
                         : 0;
+                    if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
                     gotAny = true;
                     lastPacket = now;
-                    if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
                     ++packets;
                     if (n < 20 || std::memcmp(buf.data(), "MR02", 4) || buf[4] != 1) { ++bad; continue; }
                     uint8_t flags = buf[5];
                     uint64_t fid = be64(buf.data()+6);
                     uint16_t idx = be16(buf.data()+14), cnt = be16(buf.data()+16), len = be16(buf.data()+18);
                     if (!cnt || idx >= cnt || len != static_cast<uint16_t>(n-20)) { ++bad; continue; }
+
+                    if (idle) {
+                        // Video is back after a pause or a host restart. Start
+                        // clean: whatever frame ids came before do not apply.
+                        idle = false;
+                        ++streamResumes;
+                        logLine("stream.resumed fid=" + std::to_string(fid) +
+                                " key=" + std::to_string(flags & 0x01));
+                        assembling.clear();
+                        newestFrameSeen = 0;
+                        lastSubmitted = 0;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        rxQueue.pushReset();
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                    }
+                    if (rxNeedKeyframe.exchange(false)) {
+                        assembling.clear();
+                        lastSubmitted = 0;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                    }
 
                     const bool frameWentBackward = newestFrameSeen > 0 && fid + 2 < newestFrameSeen;
                     const bool farBackward = newestFrameSeen > fid + 120;
@@ -2351,6 +2519,18 @@ static int appMain(int argc, char** argv) {
                     }
                     bool discontinuity = forceDiscontinuity || (lastSubmitted && fid != lastSubmitted + 1);
                     assembling.erase(it);
+                    if (keyFrame) {
+                        const auto sniffed = sniffAnnexBCodec(frame);
+                        if (sniffed && *sniffed != streamCodec) {
+                            ++codecChanges;
+                            logLine(std::string("stream.codec_change from=") +
+                                    jerisVideoCodecName(streamCodec) + " to=" +
+                                    jerisVideoCodecName(*sniffed) + " fid=" + std::to_string(fid));
+                            streamCodec = *sniffed;
+                            rxQueue.pushCodecChange(streamCodec);
+                            discontinuity = true;
+                        }
+                    }
                     if (!rxQueue.pushFrame(fid, std::move(frame), discontinuity, keyFrame)) {
                         // The window thread fell behind by a full queue. The
                         // backlog was replaced by a reset; resync on a keyframe.
@@ -2364,6 +2544,7 @@ static int appMain(int argc, char** argv) {
                         continue;
                     }
                     lastSubmitted = fid;
+                    rxWaiting = 0;
                     if (waitingForKeyframe) {
                         waitingForKeyframe = false;
                         logLine("stream.keyframe_reacquired fid=" + std::to_string(fid));
@@ -2388,6 +2569,74 @@ static int appMain(int argc, char** argv) {
         double queueWaitTotalMs = 0.0, queueWaitMaxMs = 0.0;
         uint64_t queueWaitSamples = 0;
         const HANDLE rxEvent = rxQueue.event();
+
+        // Decoder state that survives rebuilds, so the summary still counts
+        // everything this run decoded.
+        uint64_t retiredDecoded = 0, retiredPresented = 0, videoRebuilds = 0, videoRebuildFailures = 0;
+        uint64_t decoderErrors = 0, codecRequests = 0;
+        std::string videoCodec = effectiveCodec;
+        auto lastRebuildAttempt = std::chrono::steady_clock::time_point{};
+        auto lastCodecRequest = std::chrono::steady_clock::time_point{};
+        int shownWaiting = -1;
+        auto setStatus = [&](const std::wstring& status) {
+            if (gConnectionInfo.status == status) return;
+            gConnectionInfo.status = status;
+            updateViewerTitle(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        };
+        // Tear the decoder down and build a new one for `codecName`. On
+        // failure the viewer keeps running without a decoder and tries again
+        // on a later keyframe.
+        auto rebuildVideo = [&](const std::string& codecName, const std::string& reason,
+                                bool resyncOnKeyframe) {
+            lastRebuildAttempt = std::chrono::steady_clock::now();
+            logLine("video.rebuild reason=" + reason + " codec=" + codecName);
+            if (video) {
+                retiredDecoded += video->decodedFrames();
+                retiredPresented += video->presented();
+                video.reset();
+            }
+            videoCodec = codecName;
+            // After a codec change the keyframe that starts the new codec is
+            // already queued right behind this command, so no resync is needed.
+            if (resyncOnKeyframe) rxNeedKeyframe = true;
+            try {
+                video = std::make_unique<VideoPipeline>(
+                    hwnd, gRemoteWidth, gRemoteHeight, o.fps, o.videoBackend, codecName);
+                ++videoRebuilds;
+                gConnectionInfo.effectiveCodec = codecName;
+                gConnectionInfo.backend = video->activeBackend();
+                gConnectionInfo.decoder = video->decoderName();
+                gConnectionInfo.adapter = video->adapterName();
+                updateViewerTitle(hwnd);
+                logLine("video.rebuild_ok backend=" + video->activeBackend());
+                return true;
+            } catch (const std::exception& e) {
+                ++videoRebuildFailures;
+                video.reset();
+                logLine(std::string("video.rebuild_failed reason=") + e.what());
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return false;
+            }
+        };
+        // The host is sending a codec this PC cannot decode. Ask it (at most
+        // every 15 s) for one this PC can; the host only obeys its configured
+        // viewer, so another viewer's request is ignored there.
+        auto requestDecodableCodec = [&]() {
+            const auto now = std::chrono::steady_clock::now();
+            if (!control || now - lastCodecRequest < std::chrono::seconds(15)) return;
+            lastCodecRequest = now;
+            ++codecRequests;
+            logLine("video.codec_request codec=h264 reason=cannot_decode_" + videoCodec);
+            try {
+                const auto cfg = control->negotiateVideo("h264", true, false, o.bitrateMbps);
+                logLine(std::string("video.codec_request_result negotiated=") +
+                        (cfg.negotiated ? "yes" : "no") + " codec=" + cfg.codec);
+            } catch (const std::exception& e) {
+                logLine(std::string("video.codec_request_failed reason=") + e.what());
+            }
+        };
+
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
                 uint8_t cursorShape = gRemoteCursorShape;
@@ -2400,15 +2649,54 @@ static int appMain(int argc, char** argv) {
 
             rxQueue.takeAll(pending);
             for (auto& c : pending) {
-                if (c.reset) { video->resetForNewStream(); continue; }
-                const double waitMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - c.queuedAt).count();
-                queueWaitTotalMs += waitMs;
-                queueWaitMaxMs = std::max(queueWaitMaxMs, waitMs);
-                ++queueWaitSamples;
-                video->submit(c.fid, c.data, c.discontinuity, c.keyFrame);
+                try {
+                    if (c.codecChange) {
+                        const std::string name = jerisVideoCodecName(c.codec);
+                        setStatus(L"Switching codec");
+                        if (!rebuildVideo(name, "codec_change", false) && c.codec == JerisVideoCodec::HEVC) {
+                            setStatus(L"Host sends HEVC, which this PC cannot decode");
+                            requestDecodableCodec();
+                        }
+                        continue;
+                    }
+                    if (!video) {
+                        // No decoder (a rebuild failed). Retry on a keyframe,
+                        // at most every 5 s.
+                        if (c.reset || !c.keyFrame ||
+                            std::chrono::steady_clock::now() - lastRebuildAttempt < std::chrono::seconds(5)) {
+                            continue;
+                        }
+                        if (!rebuildVideo(videoCodec, "retry", false)) {
+                            if (videoCodec == "hevc") requestDecodableCodec();
+                            continue;
+                        }
+                        c.discontinuity = true;
+                    }
+                    if (c.reset) { video->resetForNewStream(); continue; }
+                    const double waitMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - c.queuedAt).count();
+                    queueWaitTotalMs += waitMs;
+                    queueWaitMaxMs = std::max(queueWaitMaxMs, waitMs);
+                    ++queueWaitSamples;
+                    video->submit(c.fid, c.data, c.discontinuity, c.keyFrame);
+                } catch (const std::exception& e) {
+                    // A bad or unexpected stream (a codec or size the decoder
+                    // was not built for) must not end the session. Rebuild and
+                    // resync on the next keyframe.
+                    ++decoderErrors;
+                    logLine(std::string("video.decoder_error reason=") + e.what());
+                    setStatus(L"Reconnecting video");
+                    rebuildVideo(videoCodec, "decoder_error", true);
+                }
             }
             pending.clear();
+            const int waiting = rxWaiting.load();
+            if (waiting != shownWaiting) {
+                shownWaiting = waiting;
+                logLine(waiting ? "viewer.state=waiting" : "viewer.state=streaming");
+            }
+            if (waiting) setStatus(L"Waiting for host video");
+            else if (video) setStatus(L"");
             if (rxDone && rxQueue.empty()) break;
 
             // Sleep until a frame is queued, any window input arrives, or 16 ms
@@ -2422,28 +2710,34 @@ static int appMain(int argc, char** argv) {
             closesocket(s);
             throw std::runtime_error(rxError);
         }
-        video->finish();
+        if (video) {
+            try {
+                video->finish();
+            } catch (const std::exception& e) {
+                logLine(std::string("video.finish_failed reason=") + e.what());
+            }
+        }
         closesocket(s);
         pumpMessages();
 
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
                 << " complete_frames=" << complete
-                << " decoded_frames=" << video->decodedFrames()
-                << " presented_frames=" << video->presented()
-                << " present_busy_drops=" << video->busyDrops()
-                << " present_avg_ms=" << video->avgPresentMs()
-                << " present_max_ms=" << video->maxPresentMs()
-                << " non_dxgi_drops=" << video->nonDxgiDrops()
+                << " decoded_frames=" << (retiredDecoded + (video ? video->decodedFrames() : 0))
+                << " presented_frames=" << (retiredPresented + (video ? video->presented() : 0))
+                << " present_busy_drops=" << (video ? video->busyDrops() : 0)
+                << " present_avg_ms=" << (video ? video->avgPresentMs() : 0.0)
+                << " present_max_ms=" << (video ? video->maxPresentMs() : 0.0)
+                << " non_dxgi_drops=" << (video ? video->nonDxgiDrops() : 0)
                 << " stale_incomplete_dropped=" << incompleteDropped
                 << " strict_recovery_events=" << strictRecoveryEvents
                 << " late_frames_dropped=" << lateFramesDropped
                 << " recovery_wait_packet_drops=" << recoveryWaitPacketDrops
-                << " stream_changes=" << video->streamChanges()
-                << " backpressure=" << video->inputBackpressure()
-                << " video_backend=" << video->activeBackend()
-                << " gpu_fallbacks=" << video->fallbackCount()
-                << " gpu_keyframe_wait_drops=" << video->keyframeWaitDrops()
+                << " stream_changes=" << (video ? video->streamChanges() : 0)
+                << " backpressure=" << (video ? video->inputBackpressure() : 0)
+                << " video_backend=" << (video ? video->activeBackend() : std::string("none"))
+                << " gpu_fallbacks=" << (video ? video->fallbackCount() : 0)
+                << " gpu_keyframe_wait_drops=" << (video ? video->keyframeWaitDrops() : 0)
                 << " control_events=" << (control ? control->sentEvents() : 0)
                 << " control_failures=" << (control ? control->failures() : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
@@ -2463,6 +2757,14 @@ static int appMain(int argc, char** argv) {
                 << " rx_queue_wait_max_ms=" << queueWaitMaxMs
                 << " rx_queue_max_depth=" << rxQueue.maxDepth()
                 << " rx_queue_overflows=" << queueOverflows
+                << " idle_events=" << idleEvents
+                << " stream_resumes=" << streamResumes
+                << " codec_changes=" << codecChanges
+                << " video_rebuilds=" << videoRebuilds
+                << " video_rebuild_failures=" << videoRebuildFailures
+                << " decoder_errors=" << decoderErrors
+                << " codec_requests=" << codecRequests
+                << " rx_socket_errors=" << rxSocketErrors
                 << " bad=" << bad << " rejected=" << rejected;
         logLine(summary.str());
         gControl = nullptr;
