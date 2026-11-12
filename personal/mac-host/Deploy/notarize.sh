@@ -29,10 +29,10 @@ trap 'rm -rf "$tmp"' EXIT
     --wait --timeout 30m --output-format json > "$tmp/result.json"
 cat "$tmp/result.json"
 echo
-status="$(/usr/bin/plutil -extract status raw -o - "$tmp/result.json")"
+notary_status="$(/usr/bin/plutil -extract status raw -o - "$tmp/result.json")"
 submission="$(/usr/bin/plutil -extract id raw -o - "$tmp/result.json")"
-if [[ "$status" != "Accepted" ]]; then
-    print -u2 -- "ERROR: notarization status '$status' for submission $submission"
+if [[ "$notary_status" != "Accepted" ]]; then
+    print -u2 -- "ERROR: notarization status '$notary_status' for submission $submission"
     /usr/bin/xcrun notarytool log "$submission" "${AUTH[@]}" || true
     exit 1
 fi
