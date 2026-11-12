@@ -28,7 +28,7 @@ The version number lives in one place: the [`VERSION`](VERSION) file. The Window
 ## Requirements
 
 - Tailscale running on both machines, in the same tailnet. A direct peer path gives the lowest latency.
-- macOS host: a recent macOS with ScreenCaptureKit; Xcode command line tools (Swift 6).
+- macOS host: macOS 14 or later; Xcode command line tools (Swift 6).
 - Windows viewer: Windows 10/11 x64 with a hardware H.264 (and optionally HEVC) decoder; Visual Studio 2022 with C++ and CMake 3.20+ to build; Inno Setup 6 for the installer.
 - Support: Go (see `support/go.mod` for the version).
 
@@ -39,11 +39,12 @@ macOS host:
 ```sh
 cd personal/mac-host
 swift build -c release
-# Disposable dev build without a signing identity:
+# Disposable dev build of JerisLink.app without a signing identity:
 JERISLINK_ALLOW_ADHOC=1 ./Deploy/build-apps.sh
+./Deploy/verify-bundle.sh .dist/JerisLink.app
 ```
 
-For a stable local identity (keeps macOS privacy permissions across upgrades), see `personal/mac-host/Deploy/SIGNING.md`.
+Install, background services and macOS permissions: `personal/mac-host/Deploy/README.md`. Signing (stable local identity, Developer ID, notarization): `personal/mac-host/Deploy/SIGNING.md`.
 
 Windows viewer (Developer Command Prompt for VS 2022):
 
@@ -69,7 +70,7 @@ JerisLink does not ship with any built-in addresses. Set your own Tailscale IPv4
 |---|---|---|
 | Windows viewer | `--source-ip` flag or `JERISLINK_SOURCE_IP` env var | The Mac host's Tailscale IPv4 (required) |
 | Windows viewer | `--bind-ip` (optional) | Local Tailscale IPv4; auto-detected from the Tailscale CGNAT range if not set |
-| macOS host watchdog / A/B tool | `JERISLINK_BIND_IP`, `JERISLINK_CLIENT_IP` in `~/Library/Application Support/JerisLink/network.conf` (or env) | This Mac's and the Windows viewer's Tailscale IPv4 |
+| macOS host video service / A/B tool | `JERISLINK_BIND_IP`, `JERISLINK_CLIENT_IP` in `~/Library/Application Support/JerisLink/network.conf` (or env) | This Mac's and the Windows viewer's Tailscale IPv4 |
 | Support macOS build | `JERISLINK_CORE_ROOT` (optional) | Path to `personal/mac-host`; defaults to the copy in this repo |
 | Support Windows helper | `JERISLINK_SUPPORT_HOME` (optional) | Install folder; defaults to `%LOCALAPPDATA%\JerisLink Support` |
 
