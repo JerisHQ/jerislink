@@ -171,6 +171,9 @@ struct JerisLinkHostMain {
         if rawArgs.count == 3, rawArgs[1] == DisplayModeResolver.probeModeFlag {
             DisplayModeResolver.runModeProbe(rawArgs[2])
         }
+        if rawArgs.count == 2, rawArgs[1] == "--self-test" {
+            exit(ControlPeerSelfTest.run())
+        }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         if o.showVersion {
