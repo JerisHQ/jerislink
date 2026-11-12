@@ -25,6 +25,10 @@ final class HEVCEncoder: FrameEncoder {
     private var encodedFrames: UInt64 = 0
     private var latencySumMS: Double = 0
     private var latencyMaxMS: Double = 0
+    private var callbackLatencySumMS: Double = 0
+    private var callbackLatencyMaxMS: Double = 0
+    private var sendLatencySumMS: Double = 0
+    private var sendLatencyMaxMS: Double = 0
     private let statsLock = NSLock()
     private let keyframeRequestLock = NSLock()
     private var forceKeyframePending = false
@@ -169,7 +173,13 @@ final class HEVCEncoder: FrameEncoder {
         statsLock.lock()
         defer { statsLock.unlock() }
         guard encodedFrames > 0 else { return "codec=hevc encoded=0" }
-        let base = String(format: "codec=hevc encoded=%llu avg_encode=%.2fms max_encode=%.2fms", encodedFrames, latencySumMS / Double(encodedFrames), latencyMaxMS)
+        // avg_encode runs from submit to the end of the UDP send (as before);
+        // callback_avg is the hardware encoder alone, udp_send_avg the send.
+        let n = Double(encodedFrames)
+        let base = String(format: "codec=hevc encoded=%llu avg_encode=%.2fms max_encode=%.2fms callback_avg=%.2fms callback_max=%.2fms udp_send_avg=%.2fms udp_send_max=%.2fms",
+                          encodedFrames, latencySumMS / n, latencyMaxMS,
+                          callbackLatencySumMS / n, callbackLatencyMaxMS,
+                          sendLatencySumMS / n, sendLatencyMaxMS)
         if let udpSender { return base + " " + udpSender.statsLine() }
         return base
     }
@@ -192,6 +202,7 @@ final class HEVCEncoder: FrameEncoder {
         infoFlags: VTEncodeInfoFlags,
         sampleBuffer: CMSampleBuffer?
     ) {
+        let callbackNanos = DispatchTime.now().uptimeNanoseconds
         let context: HEVCFrameContext? = sourceFrameRefCon.map {
             Unmanaged<HEVCFrameContext>.fromOpaque($0).takeRetainedValue()
         }
@@ -219,14 +230,21 @@ final class HEVCEncoder: FrameEncoder {
         }
         writer.write(data: encoded.data)
         if let context {
+            let sendStartNanos = DispatchTime.now().uptimeNanoseconds
             udpSender?.send(frameID: context.frameID, data: encoded.data, keyFrame: encoded.keyFrame)
             let now = DispatchTime.now().uptimeNanoseconds
             let latencyMS = Double(now - context.submitNanos) / 1_000_000.0
+            let callbackLatencyMS = Double(callbackNanos &- context.submitNanos) / 1_000_000.0
+            let sendLatencyMS = Double(now - sendStartNanos) / 1_000_000.0
 
             statsLock.lock()
             encodedFrames &+= 1
             latencySumMS += latencyMS
             latencyMaxMS = max(latencyMaxMS, latencyMS)
+            callbackLatencySumMS += callbackLatencyMS
+            callbackLatencyMaxMS = max(callbackLatencyMaxMS, callbackLatencyMS)
+            sendLatencySumMS += sendLatencyMS
+            sendLatencyMaxMS = max(sendLatencyMaxMS, sendLatencyMS)
             let shouldPrint = encodedFrames % 120 == 0
             statsLock.unlock()
 
