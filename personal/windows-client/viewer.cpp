@@ -25,17 +25,21 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -108,6 +112,7 @@ public:
 
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
+        std::lock_guard<std::mutex> lock(sendMutex_);
         const uint32_t seq = ++sequence_;
         uint8_t p[14]{
             'M','R','M','1', 1, 0x24,
@@ -123,6 +128,8 @@ public:
 
     bool requestKeyframe() {
         if (s_ == INVALID_SOCKET) return false;
+        // Called from both the window thread and the receive thread.
+        std::lock_guard<std::mutex> lock(sendMutex_);
         const auto now = std::chrono::steady_clock::now();
         if (haveKeyframeRequestTime_ &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - lastKeyframeRequest_).count() < 100) {
@@ -195,6 +202,7 @@ public:
 private:
     SOCKET s_ = INVALID_SOCKET;
     sockaddr_in remote_{};
+    std::mutex sendMutex_;
     uint32_t sequence_ = 0;
     uint64_t sent_ = 0;
     uint64_t dropped_ = 0;
@@ -210,7 +218,7 @@ private:
     uint64_t cursorRxStale_ = 0;
 };
 
-static bool gWindowClosed = false;
+static std::atomic<bool> gWindowClosed{false};
 static ControlChannel* gControl = nullptr;
 static MouseMoveUdpChannel* gMouseMoveUdp = nullptr;
 static double gScrollScale = 1.0 / 3.0;
@@ -455,6 +463,8 @@ static void releaseRemoteModifiers() {
 }
 
 static void logLine(const std::string& s) {
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> lock(logMutex);
     std::ofstream f(kLogPath, std::ios::app);
     f << s << "\n";
     f.flush();
@@ -855,6 +865,99 @@ struct FrameAssembly {
         for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
         return out;
     }
+};
+
+// One unit of work the receive thread hands to the window thread: either a
+// complete Annex-B frame to decode, or a decoder reset (stream restart or
+// loss recovery). Order is preserved, so a reset always lands between the
+// frames it separates.
+struct VideoCommand {
+    bool reset = false;
+    uint64_t fid = 0;
+    std::vector<uint8_t> data;
+    bool discontinuity = false;
+    bool keyFrame = false;
+    std::chrono::steady_clock::time_point queuedAt{};
+};
+
+class VideoCommandQueue {
+public:
+    // About half a second at 60 fps. Past this the decoder is not keeping up;
+    // the backlog is dropped and the stream resyncs on a keyframe.
+    static constexpr size_t kMaxCommands = 32;
+
+    VideoCommandQueue() : event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+        if (!event_) throw std::runtime_error("rx queue event failed");
+    }
+    ~VideoCommandQueue() { CloseHandle(event_); }
+    VideoCommandQueue(const VideoCommandQueue&) = delete;
+    VideoCommandQueue& operator=(const VideoCommandQueue&) = delete;
+
+    HANDLE event() const { return event_; }
+    void wake() { SetEvent(event_); }
+
+    void pushReset() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            VideoCommand c;
+            c.reset = true;
+            queue_.push_back(std::move(c));
+            maxDepth_ = std::max(maxDepth_, queue_.size());
+        }
+        SetEvent(event_);
+    }
+
+    // Returns false if the queue was full: the backlog and this frame are
+    // dropped and replaced by a single reset. A keyframe is still accepted
+    // after the reset, since it can start a clean decode.
+    bool pushFrame(uint64_t fid, std::vector<uint8_t>&& data, bool discontinuity, bool keyFrame) {
+        bool accepted = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.size() >= kMaxCommands) {
+                queue_.clear();
+                VideoCommand r;
+                r.reset = true;
+                queue_.push_back(std::move(r));
+                if (!keyFrame) accepted = false;
+                discontinuity = true;
+            }
+            if (accepted) {
+                VideoCommand c;
+                c.fid = fid;
+                c.data = std::move(data);
+                c.discontinuity = discontinuity;
+                c.keyFrame = keyFrame;
+                c.queuedAt = std::chrono::steady_clock::now();
+                queue_.push_back(std::move(c));
+            }
+            maxDepth_ = std::max(maxDepth_, queue_.size());
+        }
+        SetEvent(event_);
+        return accepted;
+    }
+
+    // Moves everything queued into out (which must be empty).
+    void takeAll(std::deque<VideoCommand>& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        out.swap(queue_);
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    size_t maxDepth() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return maxDepth_;
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<VideoCommand> queue_;
+    size_t maxDepth_ = 0;
+    HANDLE event_ = nullptr;
 };
 
 static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2090,22 +2193,182 @@ static int appMain(int argc, char** argv) {
         const bool strictLossRecovery = o.lossRecovery == "strict";
         logLine("loss.recovery=" + o.lossRecovery);
 
-        std::unordered_map<uint64_t, FrameAssembly> assembling;
+        // The receive thread owns recvfrom, MR02 parsing, frame assembly and
+        // loss handling. It never touches the decoder: finished frames and
+        // stream resets go to this (window) thread through rxQueue, which
+        // pumps messages, decodes and presents. A slow decode or present no
+        // longer delays packet reads, and window events no longer wait for a
+        // 16 ms recvfrom timeout.
         uint64_t packets = 0, complete = 0, incompleteDropped = 0, bad = 0, rejected = 0;
-        uint64_t newestFrameSeen = 0, lastSubmitted = 0, streamRestarts = 0;
         uint64_t strictRecoveryEvents = 0, lateFramesDropped = 0, recoveryWaitPacketDrops = 0;
-        bool waitingForKeyframe = strictLossRecovery;
-        bool forceDiscontinuity = strictLossRecovery;
+        uint64_t queueOverflows = 0;
+        VideoCommandQueue rxQueue;
+        std::atomic<bool> rxStop{false};
+        std::atomic<bool> rxDone{false};
+        std::string rxError;
         if (strictLossRecovery) {
             video->resetForNewStream();
             logLine("loss.strict_wait_for_keyframe reason=startup");
             if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
         }
-        std::vector<uint8_t> buf(2048);
-        auto start = std::chrono::steady_clock::now();
-        auto lastPacket = start;
-        bool gotAny = false;
 
+        std::thread rxThread([&] {
+            try {
+                std::unordered_map<uint64_t, FrameAssembly> assembling;
+                uint64_t newestFrameSeen = 0, lastSubmitted = 0;
+                bool waitingForKeyframe = strictLossRecovery;
+                bool forceDiscontinuity = strictLossRecovery;
+                std::vector<uint8_t> buf(2048);
+                auto start = std::chrono::steady_clock::now();
+                auto lastPacket = start;
+                bool gotAny = false;
+
+                while (!rxStop && !gWindowClosed) {
+                    sockaddr_in peer{}; int plen = sizeof(peer);
+                    int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
+                                     reinterpret_cast<sockaddr*>(&peer), &plen);
+                    auto now = std::chrono::steady_clock::now();
+                    if (n == SOCKET_ERROR) {
+                        int e = WSAGetLastError();
+                        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
+                            auto base = gotAny ? lastPacket : start;
+                            const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
+                            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
+                            continue;
+                        }
+                        throw std::runtime_error("recvfrom failed");
+                    }
+                    const auto packetGapMs = gotAny
+                        ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
+                        : 0;
+                    gotAny = true;
+                    lastPacket = now;
+                    if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
+                    ++packets;
+                    if (n < 20 || std::memcmp(buf.data(), "MR02", 4) || buf[4] != 1) { ++bad; continue; }
+                    uint8_t flags = buf[5];
+                    uint64_t fid = be64(buf.data()+6);
+                    uint16_t idx = be16(buf.data()+14), cnt = be16(buf.data()+16), len = be16(buf.data()+18);
+                    if (!cnt || idx >= cnt || len != static_cast<uint16_t>(n-20)) { ++bad; continue; }
+
+                    const bool frameWentBackward = newestFrameSeen > 0 && fid + 2 < newestFrameSeen;
+                    const bool farBackward = newestFrameSeen > fid + 120;
+                    const bool earlyRestart = frameWentBackward && fid <= 5;
+                    const bool gapRestart = frameWentBackward && packetGapMs >= 250;
+                    if (frameWentBackward && (farBackward || earlyRestart || gapRestart)) {
+                        std::ostringstream restart;
+                        restart << "stream.restart_detected old_newest=" << newestFrameSeen
+                                << " new_fid=" << fid
+                                << " gap_ms=" << packetGapMs
+                                << " key=" << ((flags & 0x01) ? 1 : 0);
+                        logLine(restart.str());
+                        assembling.clear();
+                        newestFrameSeen = fid;
+                        lastSubmitted = 0;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        rxQueue.pushReset();
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                    }
+
+                    newestFrameSeen = std::max(newestFrameSeen, fid);
+                    if (waitingForKeyframe && (flags & 0x01) == 0) {
+                        ++recoveryWaitPacketDrops;
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                        continue;
+                    }
+                    bool staleLossDetected = false;
+                    for (auto it = assembling.begin(); it != assembling.end();) {
+                        if (it->first + 2 < newestFrameSeen) {
+                            ++incompleteDropped;
+                            staleLossDetected = true;
+                            it = assembling.erase(it);
+                        }
+                        else ++it;
+                    }
+                    if (strictLossRecovery && staleLossDetected) {
+                        ++strictRecoveryEvents;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        lastSubmitted = 0;
+                        assembling.clear();
+                        rxQueue.pushReset();
+                        logLine("loss.strict_wait_for_keyframe reason=stale_incomplete newest=" +
+                                std::to_string(newestFrameSeen));
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                        if ((flags & 0x01) == 0) {
+                            ++recoveryWaitPacketDrops;
+                            continue;
+                        }
+                    }
+                    auto it = assembling.find(fid);
+                    if (it == assembling.end()) it = assembling.emplace(fid, FrameAssembly(cnt)).first;
+                    if (it->second.packetCount != cnt) { ++bad; assembling.erase(it); continue; }
+                    it->second.add(idx, buf.data()+20, len, (flags & 0x01) != 0);
+                    if (!it->second.complete()) continue;
+
+                    auto frame = it->second.join();
+                    const bool keyFrame = it->second.keyFrame;
+                    if (strictLossRecovery && lastSubmitted && fid <= lastSubmitted) {
+                        ++lateFramesDropped;
+                        logLine("loss.strict_drop_late fid=" + std::to_string(fid) +
+                                " last=" + std::to_string(lastSubmitted));
+                        assembling.erase(it);
+                        continue;
+                    }
+                    if (strictLossRecovery && lastSubmitted && fid > lastSubmitted + 1) {
+                        ++strictRecoveryEvents;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        lastSubmitted = 0;
+                        rxQueue.pushReset();
+                        logLine("loss.strict_wait_for_keyframe reason=frame_gap fid=" +
+                                std::to_string(fid));
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                        if (!keyFrame) {
+                            assembling.clear();
+                            continue;
+                        }
+                    }
+                    bool discontinuity = forceDiscontinuity || (lastSubmitted && fid != lastSubmitted + 1);
+                    assembling.erase(it);
+                    if (!rxQueue.pushFrame(fid, std::move(frame), discontinuity, keyFrame)) {
+                        // The window thread fell behind by a full queue. The
+                        // backlog was replaced by a reset; resync on a keyframe.
+                        ++queueOverflows;
+                        waitingForKeyframe = true;
+                        forceDiscontinuity = true;
+                        lastSubmitted = 0;
+                        assembling.clear();
+                        logLine("rx.queue_overflow fid=" + std::to_string(fid));
+                        if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+                        continue;
+                    }
+                    lastSubmitted = fid;
+                    if (waitingForKeyframe) {
+                        waitingForKeyframe = false;
+                        logLine("stream.keyframe_reacquired fid=" + std::to_string(fid));
+                    }
+                    forceDiscontinuity = false;
+                    ++complete;
+                }
+            } catch (const std::exception& e) {
+                rxError = e.what();
+            }
+            rxDone = true;
+            rxQueue.wake();
+        });
+        struct RxThreadJoin {
+            std::atomic<bool>& stop;
+            std::thread& thread;
+            ~RxThreadJoin() { stop = true; if (thread.joinable()) thread.join(); }
+        } rxThreadJoin{rxStop, rxThread};
+        logLine("rx.thread=started queue_max=" + std::to_string(VideoCommandQueue::kMaxCommands));
+
+        std::deque<VideoCommand> pending;
+        double queueWaitTotalMs = 0.0, queueWaitMaxMs = 0.0;
+        uint64_t queueWaitSamples = 0;
+        const HANDLE rxEvent = rxQueue.event();
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
                 uint8_t cursorShape = gRemoteCursorShape;
@@ -2116,126 +2379,30 @@ static int appMain(int argc, char** argv) {
             pumpMessages();
             if (gWindowClosed) break;
 
-            sockaddr_in peer{}; int plen = sizeof(peer);
-            int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
-                             reinterpret_cast<sockaddr*>(&peer), &plen);
-            auto now = std::chrono::steady_clock::now();
-            if (n == SOCKET_ERROR) {
-                int e = WSAGetLastError();
-                if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
-                    auto base = gotAny ? lastPacket : start;
-                    const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
-                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
-                    continue;
-                }
-                closesocket(s);
-                throw std::runtime_error("recvfrom failed");
+            rxQueue.takeAll(pending);
+            for (auto& c : pending) {
+                if (c.reset) { video->resetForNewStream(); continue; }
+                const double waitMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - c.queuedAt).count();
+                queueWaitTotalMs += waitMs;
+                queueWaitMaxMs = std::max(queueWaitMaxMs, waitMs);
+                ++queueWaitSamples;
+                video->submit(c.fid, c.data, c.discontinuity, c.keyFrame);
             }
-            const auto packetGapMs = gotAny
-                ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
-                : 0;
-            gotAny = true;
-            lastPacket = now;
-            if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
-            ++packets;
-            if (n < 20 || std::memcmp(buf.data(), "MR02", 4) || buf[4] != 1) { ++bad; continue; }
-            uint8_t flags = buf[5];
-            uint64_t fid = be64(buf.data()+6);
-            uint16_t idx = be16(buf.data()+14), cnt = be16(buf.data()+16), len = be16(buf.data()+18);
-            if (!cnt || idx >= cnt || len != static_cast<uint16_t>(n-20)) { ++bad; continue; }
+            pending.clear();
+            if (rxDone && rxQueue.empty()) break;
 
-            const bool frameWentBackward = newestFrameSeen > 0 && fid + 2 < newestFrameSeen;
-            const bool farBackward = newestFrameSeen > fid + 120;
-            const bool earlyRestart = frameWentBackward && fid <= 5;
-            const bool gapRestart = frameWentBackward && packetGapMs >= 250;
-            if (frameWentBackward && (farBackward || earlyRestart || gapRestart)) {
-                std::ostringstream restart;
-                restart << "stream.restart_detected old_newest=" << newestFrameSeen
-                        << " new_fid=" << fid
-                        << " gap_ms=" << packetGapMs
-                        << " key=" << ((flags & 0x01) ? 1 : 0);
-                logLine(restart.str());
-                assembling.clear();
-                newestFrameSeen = fid;
-                lastSubmitted = 0;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                video->resetForNewStream();
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                ++streamRestarts;
-            }
-
-            newestFrameSeen = std::max(newestFrameSeen, fid);
-            if (waitingForKeyframe && (flags & 0x01) == 0) {
-                ++recoveryWaitPacketDrops;
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                continue;
-            }
-            bool staleLossDetected = false;
-            for (auto it = assembling.begin(); it != assembling.end();) {
-                if (it->first + 2 < newestFrameSeen) {
-                    ++incompleteDropped;
-                    staleLossDetected = true;
-                    it = assembling.erase(it);
-                }
-                else ++it;
-            }
-            if (strictLossRecovery && staleLossDetected) {
-                ++strictRecoveryEvents;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                lastSubmitted = 0;
-                assembling.clear();
-                video->resetForNewStream();
-                logLine("loss.strict_wait_for_keyframe reason=stale_incomplete newest=" +
-                        std::to_string(newestFrameSeen));
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                if ((flags & 0x01) == 0) {
-                    ++recoveryWaitPacketDrops;
-                    continue;
-                }
-            }
-            auto it = assembling.find(fid);
-            if (it == assembling.end()) it = assembling.emplace(fid, FrameAssembly(cnt)).first;
-            if (it->second.packetCount != cnt) { ++bad; assembling.erase(it); continue; }
-            it->second.add(idx, buf.data()+20, len, (flags & 0x01) != 0);
-            if (!it->second.complete()) continue;
-
-            auto frame = it->second.join();
-            const bool keyFrame = it->second.keyFrame;
-            if (strictLossRecovery && lastSubmitted && fid <= lastSubmitted) {
-                ++lateFramesDropped;
-                logLine("loss.strict_drop_late fid=" + std::to_string(fid) +
-                        " last=" + std::to_string(lastSubmitted));
-                assembling.erase(it);
-                continue;
-            }
-            if (strictLossRecovery && lastSubmitted && fid > lastSubmitted + 1) {
-                ++strictRecoveryEvents;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                lastSubmitted = 0;
-                video->resetForNewStream();
-                logLine("loss.strict_wait_for_keyframe reason=frame_gap fid=" +
-                        std::to_string(fid));
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                if (!keyFrame) {
-                    assembling.clear();
-                    continue;
-                }
-            }
-            bool discontinuity = forceDiscontinuity || (lastSubmitted && fid != lastSubmitted + 1);
-            video->submit(fid, frame, discontinuity, keyFrame);
-            lastSubmitted = fid;
-            if (waitingForKeyframe) {
-                waitingForKeyframe = false;
-                logLine("stream.keyframe_reacquired fid=" + std::to_string(fid));
-            }
-            forceDiscontinuity = false;
-            ++complete;
-            assembling.erase(it);
+            // Sleep until a frame is queued, any window input arrives, or 16 ms
+            // pass (cursor shape poll), whichever comes first.
+            MsgWaitForMultipleObjectsEx(1, &rxEvent, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
 
+        rxStop = true;
+        if (rxThread.joinable()) rxThread.join();
+        if (!rxError.empty()) {
+            closesocket(s);
+            throw std::runtime_error(rxError);
+        }
         video->finish();
         closesocket(s);
         pumpMessages();
@@ -2272,6 +2439,11 @@ static int appMain(int argc, char** argv) {
                 << " clipboard_rx=" << (clipboard ? clipboard->received() : 0)
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
                 << " clipboard_oversize=" << (clipboard ? clipboard->skippedOversize() : 0)
+                << " rx_thread=1"
+                << " rx_queue_wait_avg_ms=" << (queueWaitSamples ? queueWaitTotalMs / double(queueWaitSamples) : 0.0)
+                << " rx_queue_wait_max_ms=" << queueWaitMaxMs
+                << " rx_queue_max_depth=" << rxQueue.maxDepth()
+                << " rx_queue_overflows=" << queueOverflows
                 << " bad=" << bad << " rejected=" << rejected;
         logLine(summary.str());
         gControl = nullptr;
