@@ -2224,6 +2224,25 @@ static int appMain(int argc, char** argv) {
                 bool gotAny = false;
 
                 while (!rxStop && !gWindowClosed) {
+                    // Wait with select() and only then read. A recvfrom that
+                    // times out via SO_RCVTIMEO cancels the pending receive,
+                    // and Windows documents the socket state as undefined
+                    // after that; with frames every 16.7 ms and a 16 ms
+                    // timeout the expiry lands right on packet arrival.
+                    fd_set readable;
+                    FD_ZERO(&readable);
+                    FD_SET(s, &readable);
+                    timeval waitTime{0, 50 * 1000};
+                    const int ready = select(0, &readable, nullptr, nullptr, &waitTime);
+                    if (ready == SOCKET_ERROR) throw std::runtime_error("select failed");
+                    if (ready == 0) {
+                        auto idleNow = std::chrono::steady_clock::now();
+                        auto base = gotAny ? lastPacket : start;
+                        const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
+                        if (std::chrono::duration_cast<std::chrono::milliseconds>(idleNow - base).count() >= timeoutMs) break;
+                        continue;
+                    }
+
                     sockaddr_in peer{}; int plen = sizeof(peer);
                     int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                                      reinterpret_cast<sockaddr*>(&peer), &plen);
