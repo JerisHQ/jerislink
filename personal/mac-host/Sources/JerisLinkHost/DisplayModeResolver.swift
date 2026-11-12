@@ -21,7 +21,47 @@ enum DisplayModeResolver {
     /// The encoded size for a native framebuffer: unchanged when it fits in
     /// `maxPixels`, otherwise scaled down with the aspect ratio kept. Sizes are
     /// even, as the 4:2:0 encoders need. `maxPixels <= 0` means no ceiling.
+    /// Encoded size: native, or scaled down to maxPixels, then aligned to a
+    /// multiple of 16 in both directions (see align16).
     static func streamSize(width: Int, height: Int, maxPixels: Int) -> (width: Int, height: Int) {
+        let even = evenStreamSize(width: width, height: height, maxPixels: maxPixels)
+        guard width > 0, height > 0 else { return even }
+        return align16(width: even.width, height: even.height,
+                       sourceWidth: width, sourceHeight: height, maxPixels: maxPixels)
+    }
+
+    /// VideoToolbox HEVC on Apple silicon is several times slower when the
+    /// height is not a multiple of 16 (bench: 3840x2164 p95 74 ms vs
+    /// 3840x2160 34 ms; old host 3904x2196 163 ms vs 3840x2160 20 ms).
+    /// Picks the 16-aligned size next to (width, height) whose aspect ratio is
+    /// closest to the source, within maxPixels; ties go to the larger area.
+    /// ScreenCaptureKit keeps the aspect ratio, so a few rows or columns of
+    /// border appear instead of stretching.
+    static func align16(width: Int, height: Int, sourceWidth: Int, sourceHeight: Int,
+                        maxPixels: Int) -> (width: Int, height: Int) {
+        func down(_ v: Int) -> Int { max(16, v / 16 * 16) }
+        func up(_ v: Int) -> Int { max(16, (v + 15) / 16 * 16) }
+        let target = Double(sourceWidth) / Double(sourceHeight)
+        var best: (width: Int, height: Int)?
+        var bestError = Double.infinity
+        for w in Set([down(width), up(width)]) {
+            for h in Set([down(height), up(height)]) {
+                if maxPixels > 0 && w * h > maxPixels { continue }
+                let error = abs(Double(w) / Double(h) - target) / target
+                if let current = best {
+                    if error < bestError - 1e-9 ||
+                        (abs(error - bestError) <= 1e-9 && w * h > current.width * current.height) {
+                        best = (w, h); bestError = error
+                    }
+                } else {
+                    best = (w, h); bestError = error
+                }
+            }
+        }
+        return best ?? (down(width), down(height))
+    }
+
+    static func evenStreamSize(width: Int, height: Int, maxPixels: Int) -> (width: Int, height: Int) {
         guard maxPixels > 0, width > 0, height > 0, width * height > maxPixels else {
             return (width & ~1, height & ~1)
         }

@@ -30,6 +30,9 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = targetHeight
         config.minimumFrameInterval = CMTime(value: 1, timescale: fps)
         config.queueDepth = queueDepth
+        // The encoded size is 16-aligned and may differ from the display's
+        // aspect ratio by a few pixels: add a border, never stretch.
+        config.preservesAspectRatio = true
         config.pixelFormat = fullRange
             ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange

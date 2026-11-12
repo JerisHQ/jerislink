@@ -336,6 +336,13 @@ struct JerisLinkHostMain {
                     // request per 500 ms instead of an IDR every few frames.
                     if keyframeGate.allow() { encoder.requestKeyframe() }
                 }
+                mouseUDP?.setNewSessionHandler {
+                    // A viewer connected or reconnected: send it an IDR now
+                    // instead of waiting up to 10 s for the periodic one.
+                    print("video.viewer_new_session forcing keyframe")
+                    encoder.requestKeyframe()
+                    keyframeGate.markForced()
+                }
                 if sessionIndex > 1 {
                     // Restart after a display change: the viewer keeps the same
                     // UDP stream, so make it resync on the new size at once.

@@ -29,6 +29,20 @@ final class HEVCEncoder: FrameEncoder {
     private var callbackLatencyMaxMS: Double = 0
     private var sendLatencySumMS: Double = 0
     private var sendLatencyMaxMS: Double = 0
+    // Encode time (submit -> VT callback) split by frame type.
+    private var idrFrames: UInt64 = 0
+    private var idrEncodeSumMS: Double = 0
+    private var idrEncodeMaxMS: Double = 0
+    private var pFrames: UInt64 = 0
+    private var pEncodeSumMS: Double = 0
+    private var pEncodeMaxMS: Double = 0
+    // Frames VT rate control dropped (.frameDropped) and encode errors;
+    // before these were returned without a trace.
+    private var vtDroppedFrames: UInt64 = 0
+    private var encodeErrors: UInt64 = 0
+    // Delivered fps: frames sent over the time since the last stats line.
+    private var fpsWindowStartNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var fpsWindowStartFrames: UInt64 = 0
     private let statsLock = NSLock()
     private let keyframeRequestLock = NSLock()
     private var forceKeyframePending = false
@@ -127,9 +141,12 @@ final class HEVCEncoder: FrameEncoder {
         if forceKeyframe { forceKeyframePending = false }
         keyframeRequestLock.unlock()
 
+        statsLock.lock()
         frameID &+= 1
+        let submittedID = frameID
+        statsLock.unlock()
         let context = HEVCFrameContext(
-            frameID: frameID,
+            frameID: submittedID,
             submitNanos: DispatchTime.now().uptimeNanoseconds,
             forcedKeyframeRequested: forceKeyframe
         )
@@ -172,16 +189,30 @@ final class HEVCEncoder: FrameEncoder {
     func statsLine() -> String {
         statsLock.lock()
         defer { statsLock.unlock() }
-        guard encodedFrames > 0 else { return "codec=hevc encoded=0" }
+        guard encodedFrames > 0 else {
+            return "codec=hevc encoded=0 vt_dropped=\(vtDroppedFrames) encode_errors=\(encodeErrors)"
+        }
         // avg_encode runs from submit to the end of the UDP send (as before);
         // callback_avg is the hardware encoder alone, udp_send_avg the send.
+        // fps is frames actually sent per second since the previous stats line;
+        // vt_dropped counts frames VT rate control dropped (cumulative);
+        // idr_*/p_* split the hardware encode time by frame type (cumulative).
         let n = Double(encodedFrames)
+        let now = DispatchTime.now().uptimeNanoseconds
+        let windowSeconds = Double(now &- fpsWindowStartNanos) / 1_000_000_000.0
+        let fps = windowSeconds > 0 ? Double(encodedFrames &- fpsWindowStartFrames) / windowSeconds : 0
+        fpsWindowStartNanos = now
+        fpsWindowStartFrames = encodedFrames
         let base = String(format: "codec=hevc encoded=%llu avg_encode=%.2fms max_encode=%.2fms callback_avg=%.2fms callback_max=%.2fms udp_send_avg=%.2fms udp_send_max=%.2fms",
                           encodedFrames, latencySumMS / n, latencyMaxMS,
                           callbackLatencySumMS / n, callbackLatencyMaxMS,
                           sendLatencySumMS / n, sendLatencyMaxMS)
-        if let udpSender { return base + " " + udpSender.statsLine() }
-        return base
+        let metrics = String(format: " fps=%.1f submitted=%llu vt_dropped=%llu encode_errors=%llu idr=%llu idr_avg=%.2fms idr_max=%.2fms p=%llu p_avg=%.2fms p_max=%.2fms",
+                             fps, frameID, vtDroppedFrames, encodeErrors,
+                             idrFrames, idrFrames > 0 ? idrEncodeSumMS / Double(idrFrames) : 0, idrEncodeMaxMS,
+                             pFrames, pFrames > 0 ? pEncodeSumMS / Double(pFrames) : 0, pEncodeMaxMS)
+        if let udpSender { return base + metrics + " " + udpSender.statsLine() }
+        return base + metrics
     }
 
     private func setProperty(_ key: CFString, _ value: CFTypeRef) throws {
@@ -212,6 +243,15 @@ final class HEVCEncoder: FrameEncoder {
               let sampleBuffer,
               CMSampleBufferDataIsReady(sampleBuffer)
         else {
+            statsLock.lock()
+            if status != noErr { encodeErrors &+= 1 } else { vtDroppedFrames &+= 1 }
+            statsLock.unlock()
+            // A forced keyframe that VT dropped must not be lost: ask again.
+            if let context, context.forcedKeyframeRequested {
+                keyframeRequestLock.lock()
+                forceKeyframePending = true
+                keyframeRequestLock.unlock()
+            }
             return
         }
 
@@ -245,6 +285,15 @@ final class HEVCEncoder: FrameEncoder {
             callbackLatencyMaxMS = max(callbackLatencyMaxMS, callbackLatencyMS)
             sendLatencySumMS += sendLatencyMS
             sendLatencyMaxMS = max(sendLatencyMaxMS, sendLatencyMS)
+            if encoded.keyFrame {
+                idrFrames &+= 1
+                idrEncodeSumMS += callbackLatencyMS
+                idrEncodeMaxMS = max(idrEncodeMaxMS, callbackLatencyMS)
+            } else {
+                pFrames &+= 1
+                pEncodeSumMS += callbackLatencyMS
+                pEncodeMaxMS = max(pEncodeMaxMS, callbackLatencyMS)
+            }
             let shouldPrint = encodedFrames % 120 == 0
             statsLock.unlock()
 

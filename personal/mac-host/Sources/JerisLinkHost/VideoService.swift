@@ -121,7 +121,10 @@ enum VideoService {
             o.bitrateMbps = settings.bitrateMbps
             o.codec = codec
             o.colorRange = "full"
-            o.keyframeInterval = 60
+            // 10 s at 60 fps: periodic IDRs cost 36-85 ms each at 4K. Loss
+            // recovery uses viewer keyframe requests, and a new viewer gets a
+            // forced IDR (MouseMoveUDPServer new session).
+            o.keyframeInterval = 600
             o.h264Profile = "constrained-high"
             o.captureQueueDepth = settings.captureQueueDepth
             o.bindIP = bindIP
