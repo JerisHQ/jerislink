@@ -35,18 +35,90 @@ struct VideoSettingsAck {
     }
 }
 
+/// Everything the video service reads from video-settings.plist. Each key falls
+/// back to its default on its own, as the old video-watchdog.zsh did.
+struct PersistedVideoSettings: Equatable {
+    var codec = "h264"
+    var bitrateMbps = 25
+    var fps: Int32 = 60
+    var keepDisplayAwake = false
+
+    /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
+    /// BetterDisplay 4K virtual screen stops delivering frames after the first
+    /// few (macOS 27.2). 30 fps keeps the low-latency depth 2.
+    var captureQueueDepth: Int { fps == 60 ? 5 : 2 }
+
+    init() {}
+
+    init(dictionary dict: [String: Any]) {
+        if let codec = dict["codec"] as? String, codec == "h264" || codec == "hevc" { self.codec = codec }
+        if let bitrate = Self.int(dict["bitrateMbps"]), (4...100).contains(bitrate) { bitrateMbps = bitrate }
+        if let fps = Self.int(dict["fps"]), fps == 30 || fps == 60 { self.fps = Int32(fps) }
+        keepDisplayAwake = Self.bool(dict["keepDisplayAwake"]) ?? false
+    }
+
+    static func load(from url: URL) -> PersistedVideoSettings {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = object as? [String: Any]
+        else { return PersistedVideoSettings() }
+        return PersistedVideoSettings(dictionary: dict)
+    }
+
+    var summary: String {
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake)"
+    }
+
+    private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
+
+    private static func int(_ value: Any?) -> Int? {
+        if let n = value as? NSNumber, !isBool(n) { return n.intValue }
+        if let s = value as? String { return Int(s.trimmingCharacters(in: .whitespaces)) }
+        return nil
+    }
+
+    /// `<true/>`, `1`, "true" or "1" mean true, like the old watchdog.
+    private static func bool(_ value: Any?) -> Bool? {
+        if let n = value as? NSNumber { return isBool(n) ? n.boolValue : n.intValue == 1 }
+        if let s = value as? String { return s == "true" || s == "1" }
+        return nil
+    }
+}
+
 final class VideoSettingsController: @unchecked Sendable {
     private let lock = NSLock()
     private let fileURL: URL
     private let hostExecutablePattern: String
 
-    init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let support = home
+    static var defaultFileURL: URL {
+        if let path = ProcessInfo.processInfo.environment["JERISLINK_VIDEO_SETTINGS"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
-        self.fileURL = support.appendingPathComponent("video-settings.plist")
-        self.hostExecutablePattern =
-            "^" + home.path + "/Applications/JerisLink Host.app/Contents/MacOS/JerisLinkHost --duration 86400( |$)"
+            .appendingPathComponent("video-settings.plist")
+    }
+
+    init() {
+        self.fileURL = Self.defaultFileURL
+        // Fallback for a video host started by hand from this executable.
+        let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        self.hostExecutablePattern = "^" + Self.extendedRegexEscaped(executable) + " --duration 86400( |$)"
+    }
+
+    static func extendedRegexEscaped(_ text: String) -> String {
+        var out = ""
+        for ch in text {
+            if "\\.[]()*+?{}|^$".contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// Codec and bitrate persisted by the control service; h264 / 25 Mbps by default.
+    static func readPersisted(from url: URL = defaultFileURL) -> (codec: String, bitrateMbps: Int) {
+        let settings = PersistedVideoSettings.load(from: url)
+        return (settings.codec, settings.bitrateMbps)
     }
 
     func apply(request payload: [UInt8]) -> VideoSettingsAck {
@@ -139,15 +211,7 @@ final class VideoSettingsController: @unchecked Sendable {
     }
 
     private func readCurrent() -> (codec: String, bitrateMbps: Int) {
-        guard let data = try? Data(contentsOf: fileURL),
-              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-              let dict = object as? [String: Any],
-              let codec = dict["codec"] as? String,
-              let bitrate = dict["bitrateMbps"] as? Int
-        else {
-            return ("h264", 25)
-        }
-        return (codec, bitrate)
+        Self.readPersisted(from: fileURL)
     }
 
     private func persist(codec: String, bitrateMbps: Int) throws {
@@ -156,11 +220,15 @@ final class VideoSettingsController: @unchecked Sendable {
             at: directory,
             withIntermediateDirectories: true
         )
-        let object: [String: Any] = [
-            "version": 1,
-            "codec": codec,
-            "bitrateMbps": bitrateMbps
-        ]
+        // Keep keys this controller does not own (fps, keepDisplayAwake).
+        var object: [String: Any] = [:]
+        if let data = try? Data(contentsOf: fileURL),
+           let existing = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+            object = existing
+        }
+        object["version"] = 1
+        object["codec"] = codec
+        object["bitrateMbps"] = bitrateMbps
         let data = try PropertyListSerialization.data(
             fromPropertyList: object,
             format: .xml,
@@ -170,7 +238,23 @@ final class VideoSettingsController: @unchecked Sendable {
         print("Video settings persisted codec=\(codec) bitrate_mbps=\(bitrateMbps)")
     }
 
+    /// Restarts the video host so it picks up the new settings. The video host
+    /// normally runs as the launchd agent org.jeris.jerislink.agent.video, so
+    /// `launchctl kickstart -k` stops it and launchd starts it again at once.
+    /// A video host started by hand is stopped with pkill instead.
     private func requestVideoRestart() {
+        let kickstart = Process()
+        kickstart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        kickstart.arguments = ["kickstart", "-k", "gui/\(getuid())/\(JerisLinkAgents.videoLabel)"]
+        kickstart.standardOutput = FileHandle.nullDevice
+        kickstart.standardError = FileHandle.nullDevice
+        if (try? kickstart.run()) != nil {
+            kickstart.waitUntilExit()
+            if kickstart.terminationStatus == 0 {
+                print("Video settings restarted the video agent before ACK")
+                return
+            }
+        }
         let pattern = hostExecutablePattern
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")

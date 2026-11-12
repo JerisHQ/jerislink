@@ -1,0 +1,207 @@
+name: release
+
+# Builds the release artifacts on GitHub-hosted runners.
+# On a tag push (v*) it also creates a DRAFT GitHub release with the artifacts.
+# workflow_dispatch only builds and uploads artifacts; it never creates a release.
+# The tag must match the VERSION file (e.g. VERSION 0.1.0 -> tag v0.1.0).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read VERSION and check the tag
+        shell: bash
+        run: |
+          version="$(head -n 1 VERSION | tr -d '[:space:]')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must be MAJOR.MINOR.PATCH, got '$version'"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: personal/windows-client
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build viewer (Release x64, unsigned)
+        run: cmake --build build --config Release --target Jerislink
+      - name: Install Inno Setup 6.7.1
+        run: choco install innosetup --version 6.7.1 -y --no-progress
+      - name: Compile installer (unsigned)
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          & $iscc "/DMyAppVersion=$env:VERSION" Jerislink.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+      - name: Collect artifacts and check file metadata
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = 'build\Release\Jerislink.exe'
+          $setup = "dist\Jerislink-$env:VERSION-windows-x64-setup.exe"
+          foreach ($f in @($exe, $setup)) {
+            # Inno Setup pads its version strings with spaces, so compare trimmed values.
+            $vi = (Get-Item $f).VersionInfo
+            $name = "$($vi.ProductName)".Trim()
+            $ver = "$($vi.ProductVersion)".Trim()
+            Write-Host "$f ProductName=$name ProductVersion=$ver"
+            if ($name -ne 'JerisLink') { throw "$f ProductName is '$name', expected 'JerisLink'" }
+            if ($ver -ne $env:VERSION) { throw "$f ProductVersion is '$ver', expected '$env:VERSION'" }
+          }
+          $portable = Join-Path $env:RUNNER_TEMP 'portable'
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          Copy-Item $exe (Join-Path $portable 'Jerislink.exe')
+          Copy-Item 'README-Windows.txt' (Join-Path $portable 'README.txt')
+          Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $out "Jerislink-$env:VERSION-windows-x64-portable.zip")
+          Copy-Item $setup $out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-windows
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Developer ID signing and notarization run only when all four required
+      # secrets are set. Until then this job builds the unsigned (ad-hoc) zip.
+      # See personal/mac-host/Deploy/SIGNING.md for what each secret holds.
+      MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+      MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+      MACOS_NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: mode
+        name: Choose signing mode
+        shell: bash
+        run: |
+          if [[ -n "$MACOS_DEVELOPER_ID_P12_BASE64" && -n "$MACOS_DEVELOPER_ID_P12_PASSWORD" \
+                && -n "$MACOS_NOTARY_KEY_P8_BASE64" && -n "$MACOS_NOTARY_KEY_ID" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Developer ID signing and notarization: on"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::macOS signing secrets are not set; building the unsigned (ad-hoc) zip"
+          fi
+      - name: Import Developer ID certificate into a temporary keychain
+        if: steps.mode.outputs.signed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/jerislink-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$MACOS_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" \
+            -P "$MACOS_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "::error::No 'Developer ID Application' identity in MACOS_DEVELOPER_ID_P12_BASE64"
+            exit 1
+          fi
+          echo "Signing identity: $identity"
+          printf '%s' "$MACOS_NOTARY_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          chmod 600 "$RUNNER_TEMP/notary-key.p8"
+          {
+            echo "JERISLINK_DEVELOPER_ID=$identity"
+            echo "JERISLINK_SIGN_KEYCHAIN=$keychain"
+            echo "JERISLINK_NOTARY_KEY_PATH=$RUNNER_TEMP/notary-key.p8"
+          } >> "$GITHUB_ENV"
+      - name: Build JerisLink.app
+        working-directory: personal/mac-host
+        env:
+          JERISLINK_ALLOW_ADHOC: ${{ steps.mode.outputs.signed == 'true' && '0' || '1' }}
+        run: ./Deploy/build-apps.sh "$RUNNER_TEMP/build"
+      - name: Verify bundle
+        working-directory: personal/mac-host
+        run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"
+      - name: Notarize, staple and package (Developer ID)
+        if: steps.mode.outputs.signed == 'true'
+        working-directory: personal/mac-host
+        env:
+          JERISLINK_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          JERISLINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          app="$RUNNER_TEMP/build/JerisLink.app"
+          ./Deploy/notarize.sh "$app" "$RUNNER_TEMP/dist/JerisLink-$VERSION-macos-$(uname -m).zip"
+          codesign -dv --verbose=2 "$app"
+          spctl -a -vv -t exec "$app"
+          xcrun stapler validate "$app"
+      - name: Package (unsigned)
+        if: steps.mode.outputs.signed != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/build/JerisLink.app" \
+            "$RUNNER_TEMP/dist/JerisLink-$VERSION-macos-$(uname -m)-unsigned.zip"
+      - name: Remove signing material
+        if: always()
+        run: |
+          if [[ -n "${JERISLINK_SIGN_KEYCHAIN:-}" ]]; then security delete-keychain "$JERISLINK_SIGN_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/developer-id.p12"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-macos
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create draft release
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "JerisLink v$VERSION" \
+            --notes "See CHANGELOG.md for changes. Windows binaries are unsigned until SignPath code signing is active (see CODE_SIGNING_POLICY.md). macOS: JerisLink-<version>-macos-<arch>.zip is Developer ID signed and notarized; a file ending in -unsigned.zip is ad-hoc signed."

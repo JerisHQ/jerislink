@@ -8,6 +8,7 @@
 #include <string>
 
 #include "resource.h"
+#include "version.h"
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -89,7 +90,7 @@ static bool registerUninstaller(const fs::path& installDir, std::wstring& error)
     DWORD one = 1;
     bool ok = true;
     ok = setRegString(key, L"DisplayName", L"Jerislink") && ok;
-    ok = setRegString(key, L"DisplayVersion", L"0.0.9.5") && ok;
+    ok = setRegString(key, L"DisplayVersion", JERISLINK_VERSION_WSTR) && ok;
     ok = setRegString(key, L"Publisher", L"Jeris") && ok;
     ok = setRegString(key, L"InstallLocation", installDir.wstring()) && ok;
     ok = setRegString(key, L"DisplayIcon", exe.wstring()) && ok;
@@ -218,7 +219,7 @@ static LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         SendMessageW(icon, STM_SETICON, reinterpret_cast<WPARAM>(iconBig), 0);
         makeLabel(hwnd, L"Jerislink", 112, 28, 330, 36, gTitleFont);
         makeLabel(hwnd, L"Remote access over your Tailscale network", 112, 66, 350, 24, gBodyFont);
-        makeLabel(hwnd, L"Version 0.0.9.5", 32, 114, 220, 24, gBodyFont);
+        makeLabel(hwnd, L"Version " JERISLINK_VERSION_WSTR, 32, 114, 220, 24, gBodyFont);
 
         gDesktopCheck = CreateWindowExW(0, L"BUTTON", L"Create a desktop shortcut",
                                         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,

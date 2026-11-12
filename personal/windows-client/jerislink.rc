@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 IDI_JERISLINK ICON "jerislink.ico"
 
@@ -19,8 +20,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,0,9,5
- PRODUCTVERSION 0,0,9,5
+ FILEVERSION JERISLINK_VERSION_MAJOR,JERISLINK_VERSION_MINOR,JERISLINK_VERSION_PATCH,0
+ PRODUCTVERSION JERISLINK_VERSION_MAJOR,JERISLINK_VERSION_MINOR,JERISLINK_VERSION_PATCH,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -33,12 +34,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Jeris\0"
             VALUE "FileDescription", "JerisLink Remote Viewer\0"
-            VALUE "FileVersion", "0.0.9.5\0"
+            VALUE "FileVersion", JERISLINK_VERSION_STR
             VALUE "InternalName", "Jerislink\0"
-            VALUE "LegalCopyright", "Copyright (c) 2026 Jeris\0"
+            VALUE "LegalCopyright", "Copyright 2026 jeris.org"
             VALUE "OriginalFilename", "Jerislink.exe\0"
-            VALUE "ProductName", "JerisLink\0"
-            VALUE "ProductVersion", "0.0.9.5\0"
+            VALUE "ProductName", JERISLINK_PRODUCT_NAME
+            VALUE "ProductVersion", JERISLINK_VERSION_STR
         END
     END
     BLOCK "VarFileInfo"

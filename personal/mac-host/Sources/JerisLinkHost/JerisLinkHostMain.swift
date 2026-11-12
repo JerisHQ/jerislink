@@ -29,6 +29,16 @@ struct Options {
     var requestPostEventAccess = false
     var requestScreenCaptureAccess = false
     var captureCursor = true
+    var service: String?
+    /// Diagnostics: capture this display instead of the main display while it exists.
+    var displayID: UInt32?
+    /// Ceiling on the encoded area when the size follows the display; 0 = none.
+    var maxEncodePixels: Int = DisplayModeResolver.defaultMaxEncodePixels
+    var showVersion = false
+    var showVideoConfig = false
+    var registerAgents = false
+    var unregisterAgents = false
+    var showAgentStatus = false
 
     static func parse() -> Options {
         var o = Options()
@@ -58,6 +68,31 @@ struct Options {
             }
             if key == "--request-screen-capture-access" {
                 o.requestScreenCaptureAccess = true
+                i += 1
+                continue
+            }
+            if key == "--version" {
+                o.showVersion = true
+                i += 1
+                continue
+            }
+            if key == "--video-config" {
+                o.showVideoConfig = true
+                i += 1
+                continue
+            }
+            if key == "--register" {
+                o.registerAgents = true
+                i += 1
+                continue
+            }
+            if key == "--unregister" {
+                o.unregisterAgents = true
+                i += 1
+                continue
+            }
+            if key == "--status" {
+                o.showAgentStatus = true
                 i += 1
                 continue
             }
@@ -105,6 +140,11 @@ struct Options {
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--control-client-ip": o.controlClientIP = value
+            case "--service": o.service = value
+            case "--display-id":
+                if let parsed = UInt32(value), parsed > 0 { o.displayID = parsed }
+            case "--max-encode-pixels":
+                if let parsed = Int(value), parsed >= 0 { o.maxEncodePixels = parsed }
             default: break
             }
             i += 2
@@ -120,7 +160,48 @@ struct Options {
 @main
 struct JerisLinkHostMain {
     static func main() async {
-        let o = Options.parse()
+        let rawArgs = CommandLine.arguments
+        if rawArgs.count == 3, rawArgs[1] == DisplayModeResolver.probeModeFlag {
+            DisplayModeResolver.runModeProbe(rawArgs[2])
+        }
+        var o = Options.parse()
+        let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        if o.showVersion {
+            print("JerisLink Host v\(hostVersion)")
+            return
+        }
+        if o.showVideoConfig {
+            // What `--service video` will use, read from video-settings.plist.
+            print("video-settings: \(VideoSettingsController.defaultFileURL.path)")
+            print(PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL).summary)
+            return
+        }
+        if o.registerAgents || o.unregisterAgents {
+            let errors = o.registerAgents ? JerisLinkAgents.registerAll() : JerisLinkAgents.unregisterAll()
+            JerisLinkAgents.statusLines().forEach { print($0) }
+            if o.registerAgents && JerisLinkAgents.needsUserApproval {
+                print("Allow JerisLink in System Settings > General > Login Items & Extensions.")
+            }
+            errors.forEach { fputs("Error: \($0)\n", stderr) }
+            exit(errors.isEmpty ? 0 : 1)
+        }
+        if o.showAgentStatus {
+            JerisLinkAgents.statusLines().forEach { print($0) }
+            return
+        }
+        // Opened from Finder or at login as JerisLink.app with no arguments.
+        if CommandLine.arguments.count == 1,
+           Bundle.main.bundleIdentifier == JerisLinkAgents.launcherBundleIdentifier {
+            await MainActor.run { JerisLinkLauncher.run() }
+            return
+        }
+        if let service = o.service {
+            guard service == "video" else {
+                fputs("Fatal: unknown --service \(service) (expected video)\n", stderr)
+                exit(2)
+            }
+            o = await VideoService.resolveOptions(base: o)
+        }
         if o.requestPostEventAccess {
             let before = CGPreflightPostEventAccess()
             print("PostEvent permission before request: \(before)")
@@ -166,10 +247,10 @@ struct JerisLinkHostMain {
         }
         let autoResolution = o.width == nil
         let outputURL = URL(fileURLWithPath: o.outputPath).standardizedFileURL
-        print("JerisLink Host v0.0.9.4")
+        print("JerisLink Host v\(hostVersion)")
         print("Output: \(outputURL.path)")
         if autoResolution {
-            print("Resolution: auto-native framebuffer")
+            print("Resolution: auto-native framebuffer, encoded area <= \(o.maxEncodePixels > 0 ? String(o.maxEncodePixels) : "unlimited") px")
         } else {
             print("Resolution override: \(o.width!)x\(o.height!)")
         }
@@ -215,14 +296,20 @@ struct JerisLinkHostMain {
             defer { mouseUDP?.stop() }
 
             let deadline = Date().addingTimeInterval(o.durationSeconds)
+            let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
             var sessionIndex = 0
             while Date() < deadline {
                 sessionIndex += 1
-                let displayMode = try DisplayModeResolver.currentMainDisplay()
-                let targetWidth = o.width ?? Int32(displayMode.pixelWidth)
-                let targetHeight = o.height ?? Int32(displayMode.pixelHeight)
+                let target = try await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID)
+                // Capture follows the native framebuffer; ScreenCaptureKit scales
+                // it down to the encoded size when it is over the ceiling.
+                let stream = DisplayModeResolver.streamSize(width: target.pixelWidth, height: target.pixelHeight,
+                                                            maxPixels: o.maxEncodePixels)
+                let targetWidth = o.width ?? Int32(stream.width)
+                let targetHeight = o.height ?? Int32(stream.height)
+                let capped = autoResolution && (stream.width != target.pixelWidth || stream.height != target.pixelHeight)
 
-                print("Capture session \(sessionIndex): display=\(displayMode.displayID) logical=\(displayMode.logicalWidth)x\(displayMode.logicalHeight) framebuffer=\(displayMode.pixelWidth)x\(displayMode.pixelHeight) target=\(targetWidth)x\(targetHeight) refresh=\(String(format: "%.2f", displayMode.refreshRate))Hz")
+                print("Capture session \(sessionIndex): \(target.summary) target=\(targetWidth)x\(targetHeight)\(capped ? " (capped from \(target.pixelWidth)x\(target.pixelHeight))" : "") refresh=\(String(format: "%.2f", target.refreshRate))Hz")
 
                 let encoder: any FrameEncoder
                 switch o.codec {
@@ -244,32 +331,52 @@ struct JerisLinkHostMain {
 
                 let capture = ScreenCaptureHost(encoder: encoder)
                 mouseUDP?.setKeyframeRequestHandler {
-                    encoder.requestKeyframe()
+                    // The viewer asks again every ~100 ms while it waits, and each
+                    // forced IDR is ~250 UDP packets at 4K, so forward at most one
+                    // request per 500 ms instead of an IDR every few frames.
+                    if keyframeGate.allow() { encoder.requestKeyframe() }
                 }
-                try await capture.start(displayID: displayMode.displayID,
+                if sessionIndex > 1 {
+                    // Restart after a display change: the viewer keeps the same
+                    // UDP stream, so make it resync on the new size at once.
+                    encoder.requestKeyframe()
+                    keyframeGate.markForced()
+                }
+                let sessionStart = Date()
+                try await capture.start(display: target.display,
                                         targetWidth: Int(targetWidth), targetHeight: Int(targetHeight), fps: o.fps,
                                         fullRange: o.colorRange == "full", showsCursor: o.captureCursor,
                                         queueDepth: o.captureQueueDepth)
                 print("Capture started. Move windows around to create motion.")
 
-                var changedMode: ActiveDisplayMode?
+                // Watch for display changes: a display added or removed, the main
+                // display changing, or a resolution change. The CoreGraphics layout
+                // is cheap and stays current, so poll it every 500 ms and look up
+                // ScreenCaptureKit again when it changes; also re-check
+                // ScreenCaptureKit every 5 s, since a display mode that appeared
+                // after start is not visible through CoreGraphics here.
+                var changedTarget: CaptureTarget?
+                var layout = DisplayLayoutFingerprint.current()
+                var ticks = 0
                 while Date() < deadline {
                     try await Task.sleep(for: .milliseconds(500))
-                    if autoResolution,
-                       let currentMode = try? DisplayModeResolver.currentMainDisplay(),
-                       (currentMode.displayID != displayMode.displayID ||
-                        currentMode.pixelWidth != displayMode.pixelWidth ||
-                        currentMode.pixelHeight != displayMode.pixelHeight) {
-                        changedMode = currentMode
+                    ticks += 1
+                    let currentLayout = DisplayLayoutFingerprint.current()
+                    guard currentLayout != layout || ticks % 10 == 0 else { continue }
+                    layout = currentLayout
+                    guard let current = try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) else { continue }
+                    if current.displayID != target.displayID ||
+                        (autoResolution && !current.sameCapture(as: target)) {
+                        changedTarget = current
                         break
                     }
                 }
 
                 await capture.stop()
-                print("Capture session \(sessionIndex) complete: \(encoder.statsLine())")
+                print("Capture session \(sessionIndex) complete: \(encoder.statsLine()) seconds=\(String(format: "%.1f", Date().timeIntervalSince(sessionStart))) \(keyframeGate.statsLine())")
 
-                if let changedMode {
-                    print("Display mode changed: \(displayMode.pixelWidth)x\(displayMode.pixelHeight) -> \(changedMode.pixelWidth)x\(changedMode.pixelHeight); restarting capture at native framebuffer size")
+                if let changedTarget {
+                    print("Display changed: \(target.summary) -> \(changedTarget.summary); restarting capture at native framebuffer size")
                     continue
                 }
                 break
@@ -281,5 +388,40 @@ struct JerisLinkHostMain {
             fputs("Fatal: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
+    }
+}
+
+/// Rate limit for viewer keyframe requests (any thread). 150 ms coalesces
+/// the viewer's 100 ms re-requests for one loss into one IDR, but still
+/// answers a new loss almost at once, like the pre-bundle host (no gate).
+final class KeyframeRequestGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let minimumInterval: TimeInterval
+    private var lastForced: Date?
+    private var forwarded: UInt64 = 0
+    private var suppressed: UInt64 = 0
+
+    init(minimumInterval: TimeInterval) { self.minimumInterval = minimumInterval }
+
+    /// True when a forced keyframe may be sent now; records it if so.
+    func allow(now: Date = Date()) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let lastForced, now.timeIntervalSince(lastForced) < minimumInterval {
+            suppressed &+= 1
+            return false
+        }
+        lastForced = now
+        forwarded &+= 1
+        return true
+    }
+
+    /// A keyframe forced by the host itself (capture restart) counts too.
+    func markForced(now: Date = Date()) {
+        lock.lock(); lastForced = now; lock.unlock()
+    }
+
+    func statsLine() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return "keyframe_requests_forwarded=\(forwarded) keyframe_requests_suppressed=\(suppressed)"
     }
 }

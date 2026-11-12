@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.jeris.jerislink.agent.video</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/JerisLinkHost</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>JerisLinkHost</string>
+		<string>--service</string>
+		<string>video</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>org.jeris.jerislink.host</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
+	<key>StandardOutPath</key>
+	<string>/tmp/jerislink-host.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/jerislink-host.err</string>
+</dict>
+</plist>

@@ -4,6 +4,7 @@ param(
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
+$version = (Get-Content (Join-Path $here "..\..\VERSION") -TotalCount 1).Trim()
 
 $cmake = (Get-Command cmake -ErrorAction Stop).Source
 & $cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -20,7 +21,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Copy-Item $exe (Join-Path $outDir "Jerislink.exe") -Force
 Copy-Item (Join-Path $here "README-Windows.txt") (Join-Path $outDir "README.txt") -Force
 
-$zip = Join-Path $here "dist\Jerislink-0.0.9.5-windows-x64-portable.zip"
+$zip = Join-Path $here "dist\Jerislink-$version-windows-x64-portable.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $outDir "*") -DestinationPath $zip
 
