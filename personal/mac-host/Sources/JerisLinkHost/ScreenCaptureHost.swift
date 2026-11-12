@@ -14,22 +14,11 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
         self.encoder = encoder
     }
 
-    func start(displayID: CGDirectDisplayID,
+    /// `display` comes from `DisplayModeResolver.captureTarget`, so the capture
+    /// size and the captured display always come from the same lookup.
+    func start(display: SCDisplay,
                targetWidth: Int, targetHeight: Int, fps: Int32,
                fullRange: Bool, showsCursor: Bool = true, queueDepth: Int = 3) async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false,
-            onScreenWindowsOnly: true
-        )
-
-        guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else {
-            throw NSError(
-                domain: "JerisLink.ScreenCapture",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No captureable display found"]
-            )
-        }
-
         let filter = SCContentFilter(
             display: display,
             excludingApplications: [],
