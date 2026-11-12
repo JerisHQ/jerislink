@@ -156,6 +156,10 @@ struct Options {
 @main
 struct JerisLinkHostMain {
     static func main() async {
+        let rawArgs = CommandLine.arguments
+        if rawArgs.count == 3, rawArgs[1] == DisplayModeResolver.probeModeFlag {
+            DisplayModeResolver.runModeProbe(rawArgs[2])
+        }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         if o.showVersion {
