@@ -1614,6 +1614,60 @@ static void testPresentLatencyCap() {
     CHECK(p.counters().latencyTimeouts == 1);
 }
 
+static void testPresentLatencyMultiCycle() {
+    // The loop waits on the latency object itself (MsgWaitForMultipleObjects)
+    // and calls onLatencySignalled() when it fires. Each new frame must start
+    // its own wait: a start time left over from the previous frame would make
+    // the next wait look older than the cap and skip the gate at once.
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    sc.latencySignalled = false;
+    // Idle gaps longer than the cap (IME popup, cursor blink), then 60 fps.
+    double t = 0.0;
+    for (int f = 1; f <= 13; ++f) {
+        t += (f <= 4) ? 100.0 : 1000.0 / 60.0;
+        sc.now = t;
+        sc.newest = f;
+        p.onDecoded();
+        CHECK(sc.screen.size() == static_cast<size_t>(f - 1));   // not presented by a timeout
+        CHECK(p.waitingForLatency());
+        sc.now = t + 4.0;
+        p.service();
+        CHECK(sc.screen.size() == static_cast<size_t>(f - 1));
+        p.onLatencySignalled();
+        CHECK(sc.screen.size() == static_cast<size_t>(f) && sc.screen.back() == f);
+    }
+    CHECK(p.counters().latencyTimeouts == 0);
+    CHECK(p.counters().presented == 13);
+    // The cap still works after many cycles: a wait that never fires times
+    // out once, measured from this frame's own start.
+    t += 100.0;
+    sc.now = t;
+    sc.newest = 14;
+    p.onDecoded();
+    sc.now = t + LatestFramePresenter::kLatencyWaitCapMs - 1;
+    p.service();
+    CHECK(sc.screen.size() == 13);
+    sc.now = t + LatestFramePresenter::kLatencyWaitCapMs + 1;
+    p.service();
+    CHECK(sc.screen.size() == 14 && sc.screen.back() == 14);
+    CHECK(p.counters().latencyTimeouts == 1);
+    // A wait cut short by clear() (stream reset) must not leak into the next one.
+    t += 100.0;
+    sc.now = t;
+    sc.newest = 15;
+    p.onDecoded();
+    CHECK(p.waitingForLatency());
+    p.clear();
+    sc.now = t + 200.0;
+    sc.newest = 16;
+    p.onDecoded();
+    CHECK(sc.screen.size() == 14);
+    CHECK(p.counters().latencyTimeouts == 1);
+    p.onLatencySignalled();
+    CHECK(sc.screen.back() == 16);
+}
+
 static void testPresentRepaint() {
     FakeSwapChain sc;
     LatestFramePresenter p(sc.ops());
@@ -1758,6 +1812,7 @@ int main() {
     testPresentLatestFrameWins();
     testPresentLatencyGate();
     testPresentLatencyCap();
+    testPresentLatencyMultiCycle();
     testPresentRepaint();
     testPresentLoopOldVsNew();
     runSimulation();

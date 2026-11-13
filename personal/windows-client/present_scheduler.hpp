@@ -78,6 +78,7 @@ public:
     // The caller waited on the latency object itself and it was signalled.
     void onLatencySignalled() {
         latencyAcquired_ = true;
+        waitStartMs_ = -1.0;  // this wait is over; the next one starts fresh
         service();
     }
 
@@ -88,6 +89,7 @@ public:
         pendingIsRepaint_ = false;
         rendered_ = false;
         haveFrame_ = false;
+        waitStartMs_ = -1.0;
     }
 
     // Try to put the pending frame on screen. Never blocks.
@@ -125,6 +127,7 @@ public:
         pendingIsRepaint_ = false;
         rendered_ = false;  // FLIP_DISCARD: back buffer content is undefined now
         latencyAcquired_ = false;
+        waitStartMs_ = -1.0;  // every present path starts the next wait clean
         return false;
     }
 
