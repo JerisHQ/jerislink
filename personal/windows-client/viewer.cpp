@@ -22,6 +22,7 @@
 #include "resource.h"
 #include "viewer_options.hpp"
 #include "video_receiver.hpp"
+#include "abr.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -173,6 +174,19 @@ public:
     }
 
     // Smoothed RTT from 0x44 echoes (EWMA 1/8), 0 until the first echo.
+    // MRM1 0x42 receiver report (ABR), only when the host set ACK flag 0x40.
+    bool sendReceiverReport(const jl::ReceiverReport& r) {
+        if (s_ == INVALID_SOCKET) return false;
+        const auto p = jl::encodeReceiverReport(++sequence_, r);
+        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
+                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        if (n == static_cast<int>(p.size())) { ++reportSent_; return true; }
+        ++reportDrops_;
+        return false;
+    }
+    uint64_t reportSent() const { return reportSent_; }
+    uint64_t reportDrops() const { return reportDrops_; }
+
     double rttMs() const { return rttEwmaMs_; }
     double rttMaxMs() const { return rttMaxMs_; }
     double rttLastMs() const { return rttLastMs_; }
@@ -266,6 +280,8 @@ private:
     }
     uint64_t nackSent_ = 0;
     uint64_t nackDrops_ = 0;
+    uint64_t reportSent_ = 0;
+    uint64_t reportDrops_ = 0;
     uint64_t pingSent_ = 0;
     uint64_t pongRx_ = 0;
     double rttEwmaMs_ = 0.0;
@@ -1956,6 +1972,7 @@ static int appMain(int argc, char** argv) {
     std::string effectiveCodec = "h264";
     uint16_t effectiveBitrateMbps = 25;
     bool hostSupportsNack = false;
+    bool hostSupportsAbr = false;
     gRemoteWidth = o.width;
     gRemoteHeight = o.height;
     gScrollScale = o.scrollScale;
@@ -2016,6 +2033,7 @@ static int appMain(int argc, char** argv) {
                 if (videoConfig.negotiated) {
                     effectiveCodec = videoConfig.codec;
                     hostSupportsNack = videoConfig.hostSupportsNack;
+                    hostSupportsAbr = videoConfig.hostSupportsAbr;
                     effectiveBitrateMbps = videoConfig.bitrateMbps;
                     if (!o.widthExplicit &&
                         videoConfig.remoteWidth > 0 && videoConfig.remoteHeight > 0) {
@@ -2031,6 +2049,7 @@ static int appMain(int argc, char** argv) {
                         << " host_hevc=" << (videoConfig.hostSupportsHevc ? "yes" : "no")
                         << " fallback=" << (videoConfig.codecFallback ? "yes" : "no")
                         << " host_nack=" << (videoConfig.hostSupportsNack ? "yes" : "no")
+                        << " host_abr=" << (videoConfig.hostSupportsAbr ? "yes" : "no")
                         << " remote_size=" << videoConfig.remoteWidth << "x"
                         << videoConfig.remoteHeight;
                     logLine(cfg.str());
@@ -2165,7 +2184,12 @@ static int appMain(int argc, char** argv) {
         logLine(std::string("loss.nack=") + (nackEnabled ? "on" : "off") +
                 " requested=" + o.nack +
                 " host_nack=" + (hostSupportsNack ? "yes" : "no"));
-        if (nackEnabled) {
+        // ABR: the host only adapts when it set ACK flag 0x40 and gets 0x42 reports.
+        const bool abrEnabled = o.abr == "on" && hostSupportsAbr && mouseMoveUdp;
+        logLine(std::string("abr=") + (abrEnabled ? "on" : "off") +
+                " requested=" + o.abr +
+                " host_abr=" + (hostSupportsAbr ? "yes" : "no"));
+        if (nackEnabled || abrEnabled) {
             // Wake up often enough for the 2 ms reorder grace and 40 ms hold.
             DWORD nackTimeout = 5;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&nackTimeout), sizeof(nackTimeout));
@@ -2209,6 +2233,11 @@ static int appMain(int argc, char** argv) {
         jl::PresentedFpsSampler presentedFps;
         // Receiver loss counters at the previous stats line (window deltas).
         uint64_t prevLossExpected = 0, prevLossRaw = 0, prevLossAfter = 0;
+        // ABR: arrival-delay slope and the loss deltas of each 250 ms report.
+        jl::ArrivalSlope arrivalSlope(o.fps > 0 ? 1000.0 / o.fps : 1000.0 / 60);
+        auto lastReport = start;
+        uint64_t repLossExpected = 0, repLossRaw = 0, repLossAfter = 0;
+        double lastSlopeMs = 0.0;
 
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
@@ -2226,6 +2255,26 @@ static int appMain(int argc, char** argv) {
             if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
+            }
+            if (abrEnabled && now - lastReport >= std::chrono::milliseconds(250)) {
+                const auto& st = receiver.stats();
+                const auto w = arrivalSlope.take();
+                jl::ReceiverReport r;
+                r.slopeValid = w.valid;
+                r.slope01Ms = w.valid ? jl::abrSlopeTo01Ms(w.slopeMs) : 0;
+                if (w.valid) lastSlopeMs = w.slopeMs;
+                r.windowMs = uint16_t(std::min<long long>(65535,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReport).count()));
+                const auto clamp32 = [](uint64_t v) { return uint32_t(std::min<uint64_t>(v, 0xFFFFFFFFull)); };
+                r.expected = clamp32(st.lossExpected - repLossExpected);
+                r.lostRaw = clamp32(st.lossRaw - repLossRaw);
+                r.lostAfterNack = clamp32(st.lossAfterNack - repLossAfter);
+                r.rttMs = uint16_t(std::min(65535.0, mouseMoveUdp->rttMs() + 0.5));
+                mouseMoveUdp->sendReceiverReport(r);
+                repLossExpected = st.lossExpected;
+                repLossRaw = st.lossRaw;
+                repLossAfter = st.lossAfterNack;
+                lastReport = now;
             }
             if (now - lastStats >= std::chrono::seconds(5)) {
                 const auto& st = receiver.stats();
@@ -2250,7 +2299,9 @@ static int appMain(int argc, char** argv) {
                      << std::setprecision(3)
                      << " loss_raw_pct=" << wloss.rawPct
                      << " loss_after_nack_pct=" << wloss.afterNackPct
-                     << " held_frames=" << receiver.heldFrames();
+                     << " held_frames=" << receiver.heldFrames()
+                     << " abr_reports_tx=" << (mouseMoveUdp ? mouseMoveUdp->reportSent() : 0)
+                     << " delay_slope_ms=" << lastSlopeMs;
                 logLine(line.str());
                 decodeWindowMs.clear();
                 presentedFps.clearWindow();
@@ -2282,6 +2333,9 @@ static int appMain(int argc, char** argv) {
             gotAny = true;
             lastPacket = now;
             if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
+            if (abrEnabled && n >= 20 && std::memcmp(buf.data(), "MR02", 4) == 0) {
+                arrivalSlope.onPacket(jl::receiverBe64(buf.data() + 6), (buf[5] & 0x04) != 0, msSince(now));
+            }
             receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
             receiver.tick(msSince(now));
         }
@@ -2312,6 +2366,10 @@ static int appMain(int argc, char** argv) {
                 << " recovery_wait_packet_drops=" << rst.recoveryWaitPacketDrops
                 << " stream_restarts=" << rst.streamRestarts
                 << " nack=" << (receiver.nackActive() ? "on" : "off")
+                << " abr=" << (abrEnabled ? "on" : "off")
+                << " abr_reports_tx=" << (mouseMoveUdp ? mouseMoveUdp->reportSent() : 0)
+                << " abr_report_drops=" << (mouseMoveUdp ? mouseMoveUdp->reportDrops() : 0)
+                << " abr_slope_skipped=" << arrivalSlope.skipped()
                 << " nack_tx=" << rst.nackTx
                 << " nack_send_drops=" << (mouseMoveUdp ? mouseMoveUdp->nackDrops() : 0)
                 << " nack_packets_requested=" << rst.nackPacketsRequested

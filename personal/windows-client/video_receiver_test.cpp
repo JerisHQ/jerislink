@@ -6,8 +6,13 @@
 //    the real VideoReceiver over a lossy link. Each scenario runs once with
 //    NACK and once without, with the same loss pattern seed, and compares
 //    the number of forced IDRs.
+// 3. ABR v1: report layout, arrival slope, controller rules, and the same
+//    simulation with a bottleneck link (drop-tail queue, capacity that drops
+//    for a while) run with ABR off and on.
+#include "abr.hpp"
 #include "video_receiver.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -627,6 +632,18 @@ struct SimConfig {
     double oneWayMs;
     double seconds;
     uint32_t seed;
+    // Bottleneck after the host pacer (0 = none): capacity in Mbps, drop-tail
+    // queue of queueMs at that capacity. From congestFrom to congestTo
+    // seconds the capacity is congestMbps instead.
+    double capMbps = 0;
+    double queueMs = 0;
+    double congestFrom = 0, congestTo = 0, congestMbps = 0;
+};
+
+// Host model knobs for the ABR runs (design 2.2).
+struct AbrSimOptions {
+    bool paceFollows = true;   // pace = UDPPacing.autoMbps(ABR bitrate), else fixed 72 Mbps
+    int idrCapFrames = 3;      // DataRateLimits: IDR at most N x the average frame (0 = off)
 };
 
 struct SimResult {
@@ -636,11 +653,18 @@ struct SimResult {
     double repairP50 = 0, repairP95 = 0;
     double lossRawPct = 0;
     double lossAfterNackPct = 0;
+    // ABR
+    uint64_t abrDown = 0, abrUp = 0, abrReports = 0, queueDrops = 0;
+    uint32_t minKbps = 0;
+    double recoverS = -2;       // congestTo -> bitrate back at the ceiling (-1 never, -2 n/a)
+    double delayP95 = 0;        // encode -> frame submitted at the viewer, ms
+    std::vector<std::pair<double, uint32_t>> trace;  // (s, kbps) at each change
 };
 
 class Sim {
 public:
-    Sim(SimConfig c, bool nack) : c_(c), nack_(nack), rng_(c.seed) {}
+    Sim(SimConfig c, bool nack, bool abr = false, AbrSimOptions o = {})
+        : c_(c), nack_(nack), abr_(abr), o_(o), rng_(c.seed), slope_(1000.0 / 60), ctl_(18000) {}
 
     SimResult run() {
         ReceiverConfig rc;
@@ -658,11 +682,16 @@ public:
         rx_ = std::make_unique<VideoReceiver>(rc, h);
         rx_->setRttMs(2 * c_.oneWayMs);
         rx_->start();
+        r_.minKbps = ctl_.current();
+        r_.trace.push_back({0, ctl_.current()});
 
         const double frameMs = 1000.0 / 60.0;
         const uint64_t frames = uint64_t(c_.seconds * 60.0);
         for (uint64_t f = 1; f <= frames; ++f) at(f * frameMs, [this, f] { hostEncode(f); });
         for (double t = 0; t < c_.seconds * 1000.0 + 500; t += 2.0) at(t, [this, t] { rx_->tick(t); });
+        if (abr_)
+            for (double t = kReceiverReportIntervalMs; t < c_.seconds * 1000.0; t += kReceiverReportIntervalMs)
+                at(t, [this] { viewerReport(); });
         while (!q_.empty()) {
             Ev e = q_.top();
             q_.pop();
@@ -679,6 +708,22 @@ public:
         const ReceiverLoss loss = receiverLoss(st.lossExpected, st.lossRaw, st.lossAfterNack);
         r_.lossRawPct = loss.rawPct;
         r_.lossAfterNackPct = loss.afterNackPct;
+        r_.abrDown = ctl_.downs();
+        r_.abrUp = ctl_.ups();
+        if (!delays_.empty()) {
+            std::sort(delays_.begin(), delays_.end());
+            r_.delayP95 = delays_[std::min(delays_.size() - 1, delays_.size() * 95 / 100)];
+        }
+        if (abr_ && c_.congestTo > 0) {
+            r_.recoverS = -1;
+            // First time at or after congestTo that the bitrate is back at the ceiling.
+            const auto& tr = r_.trace;
+            for (size_t i = 0; i < tr.size(); ++i) {
+                const bool atCeiling = tr[i].second == ctl_.ceiling();
+                const double until = i + 1 < tr.size() ? tr[i + 1].first : 1e18;
+                if (atCeiling && until > c_.congestTo) { r_.recoverS = std::max(0.0, tr[i].first - c_.congestTo); break; }
+            }
+        }
         return r_;
     }
 
@@ -700,17 +745,35 @@ private:
         return u(rng_) < c_.lossRate;
     }
 
-    // host -> viewer video packet, paced at 72 Mbps (0.156 ms per 1400 B)
+    double capacityAt(double ms) const {
+        if (c_.congestTo > 0 && ms >= c_.congestFrom * 1000 && ms < c_.congestTo * 1000) return c_.congestMbps;
+        return c_.capMbps;
+    }
+
+    // host -> viewer video packet, paced at 72 Mbps (0.156 ms per 1400 B),
+    // then through the bottleneck (if any): drop-tail when the packet would
+    // wait more than queueMs.
     void sendVideo(uint64_t fid, uint16_t idx, uint16_t cnt, bool key, bool retransmit) {
-        const double paceMs = 1400.0 * 8 / 72e6 * 1000.0;
+        // UDPPacing.autoMbps: 4x bitrate, 40..400 Mbps (18 Mbps -> 72).
+        const double paceMbps = (abr_ && o_.paceFollows) ? std::clamp(ctl_.current() * 4 / 1000.0, 40.0, 400.0) : 72.0;
+        const double paceMs = 1400.0 * 8 / (paceMbps * 1e6) * 1000.0;
         linkFreeMs_ = std::max(linkFreeMs_, now_) + paceMs;
+        double out = linkFreeMs_;
+        const double cap = capacityAt(out);
+        if (cap > 0) {
+            const double start = std::max(bottleFreeMs_, out);
+            if (start - out > c_.queueMs) { ++r_.queueDrops; ++r_.lostVideoPackets; return; }
+            bottleFreeMs_ = start + 1400.0 * 8 / (cap * 1e6) * 1000.0;
+            out = bottleFreeMs_;
+        }
         if (linkLoses()) { ++r_.lostVideoPackets; return; }
-        const double arrive = linkFreeMs_ + c_.oneWayMs;
+        const double arrive = out + c_.oneWayMs;
         auto p = packet(fid, idx, cnt, key, retransmit);
-        at(arrive, [this, p, arrive] {
+        at(arrive, [this, p, arrive, fid, retransmit] {
             const long long gap = haveLast_ ? (long long)(arrive - lastArrive_) : 0;
             haveLast_ = true;
             lastArrive_ = arrive;
+            slope_.onPacket(fid, retransmit, arrive);
             rx_->onPacket(p.data(), p.size(), arrive, gap);
         });
     }
@@ -725,10 +788,20 @@ private:
         if (key && fid != 1) ++r_.periodicIdr;
         if (!key && forceKeyPending_) { key = true; ++r_.forcedIdr; }
         forceKeyPending_ = false;
-        const uint16_t cnt = key ? 250 : 28;  // 4K IDR / 18 Mbps P frame
+        // 4K IDR 250 packets / P frame 28 packets at 18 Mbps; both scale with
+        // the ABR bitrate (the encoder targets an average, so this is a model).
+        const uint32_t kbps = ctl_.current();
+        const uint16_t pCnt = uint16_t(std::max<uint32_t>(4, (kbps * 1000 / 8 / 60 + 1379) / 1380));
+        uint16_t cnt = key ? uint16_t(std::max<uint32_t>(60, 250 * kbps / 18000)) : pCnt;
+        if (key && abr_ && o_.idrCapFrames > 0) cnt = std::min<uint16_t>(cnt, uint16_t(pCnt * o_.idrCapFrames));
+        encodedAt_[fid] = now_;
         cache_[fid] = {cnt, key, now_};
         evict();
         for (uint16_t i = 0; i < cnt; ++i) sendVideo(fid, i, cnt, key, false);
+        // Host send queue: frames handed to the pacer whose last packet has not left.
+        while (!pacerFrames_.empty() && pacerFrames_.front() <= now_) pacerFrames_.pop_front();
+        pacerFrames_.push_back(linkFreeMs_);
+        queueMax_ = std::max<int>(queueMax_, int(pacerFrames_.size()));
     }
 
     void evict() {
@@ -753,7 +826,7 @@ private:
         auto it = cache_.find(fid);
         if (it == cache_.end()) { ++r_.hostMiss; hostKeyframeRequest(); return; }  // D2-B
         // 20% of 18 Mbps in any 100 ms (sliding, same as RetransmitBudget)
-        const double budgetBytes = 18e6 / 8 * 0.2 * 0.1;
+        const double budgetBytes = ctl_.current() * 1e3 / 8 * 0.2 * 0.1;
         while (!budget_.empty() && now_ - budget_.front().first >= 100) {
             budgetUsed_ -= budget_.front().second;
             budget_.pop_front();
@@ -764,7 +837,7 @@ private:
             for (uint32_t i = r.start; i < end; ++i) idx.push_back(uint16_t(i));
         }
         const double need = double(idx.size()) * 1400;
-        if (budgetUsed_ + need > budgetBytes) { ++r_.overBudget; return; }
+        if (budgetUsed_ + need > budgetBytes) { ++r_.overBudget; ++overBudgetTotal_; return; }
         budgetUsed_ += need;
         budget_.push_back({now_, need});
         for (uint16_t i : idx) { sendVideo(fid, i, it->second.count, it->second.key, true); ++r_.resent; }
@@ -777,7 +850,49 @@ private:
         sendUp([this] { hostKeyframeRequest(); });
     }
 
+    // Viewer, every 250 ms: loss deltas (finalized frames) and the slope.
+    void viewerReport() {
+        const auto& st = rx_->stats();
+        ReceiverReport rep;
+        rep.windowMs = uint16_t(kReceiverReportIntervalMs);
+        rep.expected = uint32_t(st.lossExpected - prevExp_);
+        rep.lostRaw = uint32_t(st.lossRaw - prevRaw_);
+        rep.lostAfterNack = uint32_t(st.lossAfterNack - prevAfter_);
+        prevExp_ = st.lossExpected; prevRaw_ = st.lossRaw; prevAfter_ = st.lossAfterNack;
+        const auto w = slope_.take();
+        rep.slopeValid = w.valid;
+        rep.slope01Ms = abrSlopeTo01Ms(w.slopeMs);
+        rep.rttMs = uint16_t(2 * c_.oneWayMs);
+        CHECK(encodeReceiverReport(++seq_, rep).size() == kReceiverReportBytes);
+        sendUp([this, rep] { hostReport(rep); });
+    }
+
+    void hostReport(const ReceiverReport& rep) {
+        ++r_.abrReports;
+        AbrInput in;
+        in.nowMs = uint64_t(now_);
+        in.expected = rep.expected;
+        in.lostRaw = rep.lostRaw;
+        in.lostAfterNack = rep.lostAfterNack;
+        in.slopeValid = rep.slopeValid;
+        in.slope01Ms = rep.slope01Ms;
+        in.overBudgetDelta = overBudgetTotal_ - overBudgetSeen_;
+        overBudgetSeen_ = overBudgetTotal_;
+        while (!pacerFrames_.empty() && pacerFrames_.front() <= now_) pacerFrames_.pop_front();
+        in.queueMax = queueMax_;
+        queueMax_ = int(pacerFrames_.size());
+        AbrChange ch;
+        if (ctl_.onReport(in, ch)) {
+            r_.trace.push_back({now_ / 1000.0, ch.toKbps});
+            r_.minKbps = std::min(r_.minKbps, ch.toKbps);
+        }
+    }
+
     void onSubmit(uint64_t fid, bool disc, bool key) {
+        if (auto it = encodedAt_.find(fid); it != encodedAt_.end()) {
+            delays_.push_back(float(now_ - it->second));
+            encodedAt_.erase(encodedAt_.begin(), std::next(it));
+        }
         // Decoder model: a frame decodes cleanly if it is a keyframe after a
         // discontinuity, or the direct successor of a cleanly decoded frame.
         bool ok;
@@ -791,7 +906,18 @@ private:
 
     SimConfig c_;
     bool nack_;
+    bool abr_;
+    AbrSimOptions o_;
     std::mt19937 rng_;
+    ArrivalSlope slope_;
+    AbrController ctl_;
+    std::deque<double> pacerFrames_;
+    int queueMax_ = 0;
+    double bottleFreeMs_ = 0;
+    uint64_t overBudgetTotal_ = 0, overBudgetSeen_ = 0;
+    uint64_t prevExp_ = 0, prevRaw_ = 0, prevAfter_ = 0;
+    std::map<uint64_t, double> encodedAt_;
+    std::vector<float> delays_;
     std::priority_queue<Ev> q_;
     uint64_t order_ = 0;
     double now_ = 0;
@@ -852,6 +978,171 @@ static void runSimulation() {
     }
 }
 
+// ---------------------------------------------------------------- ABR v1
+
+static void testReceiverReportEncoding() {
+    ReceiverReport r;
+    r.slopeValid = true;
+    r.windowMs = 250;
+    r.expected = 0x01020304;
+    r.lostRaw = 7;
+    r.lostAfterNack = 2;
+    r.slope01Ms = -123;
+    r.rttMs = 61;
+    const auto p = encodeReceiverReport(0x0A0B0C0D, r);
+    const std::vector<uint8_t> want{'M', 'R', 'M', '1', 1, 0x42, 0x0A, 0x0B, 0x0C, 0x0D, 0x01, 0x00, 0xFA,
+                                    0x01, 0x02, 0x03, 0x04, 0, 0, 0, 7, 0, 0, 0, 2, 0xFF, 0x85, 0x00, 61};
+    CHECK(p == want);
+    CHECK(p.size() == kReceiverReportBytes);
+    CHECK(abrSlopeTo01Ms(1.26) == 13);
+    CHECK(abrSlopeTo01Ms(-1.26) == -13);
+    CHECK(abrSlopeTo01Ms(1e9) == 32767);
+}
+
+static void testArrivalSlope() {
+    const double T = 1000.0 / 60;
+    {   // steady arrivals: slope 0
+        ArrivalSlope a(T);
+        for (int f = 1; f <= 16; ++f) a.onPacket(f, false, 100 + f * T);
+        const auto w = a.take();
+        CHECK(w.valid && w.samples == 15 && std::fabs(w.slopeMs) < 1e-6);
+    }
+    {   // each frame 1 ms later than the last: +1 ms per frame = 15 ms per 250 ms
+        ArrivalSlope a(T);
+        for (int f = 1; f <= 16; ++f) a.onPacket(f, false, 100 + f * (T + 1));
+        const auto w = a.take();
+        CHECK(w.valid && std::fabs(w.slopeMs - 15.0) < 1e-6);
+    }
+    {   // later packets of the same frame, retransmits and skipped captures do not count
+        ArrivalSlope a(T);
+        double t = 100;
+        for (int f = 1; f <= 10; ++f) {
+            t += (f == 5) ? 2 * T : T;          // frame 5: capture skipped one interval
+            a.onPacket(f, false, t);
+            a.onPacket(f, false, t + 3);        // second packet of the frame
+            a.onPacket(f - 1, true, t + 4);     // late retransmit of the previous frame
+        }
+        const auto w = a.take();
+        CHECK(w.valid && w.samples == 8 && std::fabs(w.slopeMs) < 1e-6);
+        CHECK(a.skipped() == 1);
+    }
+    {   // too few samples: unknown; the window resets after take()
+        ArrivalSlope a(T);
+        for (int f = 1; f <= 5; ++f) a.onPacket(f, false, f * T * 3);
+        CHECK(!a.take().valid);
+        CHECK(a.take().samples == 0);
+    }
+}
+
+// Golden trace, ceiling 18000 kbps. AbrSelfTest.swift runs the same inputs
+// and must produce the same bitrates.
+struct AbrGolden { AbrInput in; uint32_t kbps; };
+static const AbrGolden kAbrGolden[] = {
+    {{250, 400, 0, 0, true, 0, 0, 0}, 18000},        // clean, at ceiling
+    {{500, 400, 12, 12, true, 0, 0, 0}, 14400},      // 3% after NACK: x0.8
+    {{750, 400, 12, 12, true, 0, 0, 0}, 14400},      // within 500 ms: hold
+    {{1000, 400, 50, 50, true, 0, 0, 0}, 7200},      // 12.5%: heavy x0.5
+    {{1250, 400, 0, 0, true, 0, 0, 3}, 7200},        // send queue 3, within 500 ms
+    {{1500, 400, 0, 0, true, 0, 0, 3}, 6000},        // x0.8 -> 5760, floor 6000
+    {{1750, 400, 0, 0, true, 50, 0, 0}, 6000},       // slope +5 ms once: hold
+    {{2000, 400, 0, 0, true, 50, 0, 0}, 6000},       // twice: delay, already at floor
+    {{2250, 400, 0, 0, true, 0, 0, 0}, 6000},        // clear starts
+    {{5250, 400, 0, 0, true, 0, 0, 0}, 6900},        // clear 3 s: +5% of ceiling
+    {{5750, 400, 0, 0, true, 0, 0, 0}, 6900},        // within 1 s of the last step
+    {{6250, 400, 0, 0, true, 0, 0, 0}, 7800},
+    {{6500, 400, 0, 0, true, 0, 1, 0}, 7800},        // NACK over budget once: hold
+    {{6750, 400, 0, 0, true, 0, 1, 0}, 6000},        // twice: heavy x0.5 -> floor
+    {{7000, 400, 24, 0, true, 0, 0, 0}, 6000},       // raw 6%, within 500 ms
+    {{7250, 20, 10, 10, false, 0, 0, 0}, 6000},      // under 30 expected: loss unknown, clear
+    {{10250, 400, 0, 0, false, 0, 0, 0}, 6900},
+};
+
+static void testAbrControllerGolden() {
+    AbrController c(18000);
+    CHECK(c.current() == 18000 && c.floor() == 6000);
+    for (const auto& g : kAbrGolden) {
+        AbrChange ch;
+        const uint32_t before = c.current();
+        const bool changed = c.onReport(g.in, ch);
+        CHECK(c.current() == g.kbps);
+        CHECK(changed == (before != g.kbps));
+        if (changed) CHECK(ch.fromKbps == before && ch.toKbps == g.kbps && !ch.reason.empty());
+    }
+    CHECK(c.downs() == 4 && c.ups() == 3);
+    c.reset();
+    CHECK(c.current() == 18000);
+    AbrController low(4000);  // ceiling below 6 Mbps: floor = ceiling, never changes
+    AbrChange ch;
+    CHECK(!low.onReport({500, 400, 100, 100, true, 0, 0, 0}, ch) && low.current() == 4000);
+}
+
+static void printAbrRow(const char* name, bool abr, const SimResult& r) {
+    std::printf("%-22s %-4s %7llu %7llu %7llu %6llu %6llu %7u %8.1fms %8llu %s\n", name, abr ? "on" : "off",
+                (unsigned long long)r.forcedIdr, (unsigned long long)r.framesShown, (unsigned long long)r.corrupt,
+                (unsigned long long)r.abrDown, (unsigned long long)r.abrUp, r.minKbps, r.delayP95,
+                (unsigned long long)r.queueDrops,
+                r.recoverS == -1 ? "never" : r.recoverS < 0 ? "-" : (std::to_string(r.recoverS).substr(0, 4) + "s").c_str());
+}
+
+static void printTrace(const char* name, const SimResult& r) {
+    std::printf("  %s bitrate trace (s:kbps):", name);
+    size_t n = 0;
+    for (auto& [t, k] : r.trace) {
+        if (n++ % 10 == 0) std::printf("\n   ");
+        std::printf(" %.2f:%u", t, k);
+    }
+    std::printf("\n");
+}
+
+static void runAbrSimulation() {
+    SimConfig loss[] = {
+        {"direct_0.1pct", 0.001, 0, 0, 5, 60, 11},
+        {"direct_1pct", 0.01, 0, 0, 5, 60, 13},
+        {"direct_burst4", 0.0005, 0.0005, 4, 5, 60, 14},
+        {"derp_0.5pct_rtt60", 0.005, 0, 0, 30, 60, 15},
+    };
+    SimConfig congest[] = {
+        // 100 Mbps link with a 50 ms drop-tail queue; 10..30 s it drops to 10 Mbps.
+        {"congest_10mbps_q50", 0.0005, 0, 0, 5, 60, 21, 100, 50, 10, 30, 10},
+        // Same with a deep (200 ms) router queue.
+        {"congest_10mbps_q200", 0.0005, 0, 0, 5, 60, 24, 100, 200, 10, 30, 10},
+        // Same over a relay: RTT 60 ms, 8 Mbps for 20 s.
+        {"congest_8mbps_rtt60", 0.0005, 0, 0, 30, 60, 22, 100, 80, 10, 30, 8},
+        // Short dip: 12 Mbps for 5 s.
+        {"dip_12mbps_5s", 0.0005, 0, 0, 5, 40, 23, 100, 50, 10, 15, 12},
+    };
+    std::printf("\nABR simulation (NACK on in both), 60 fps, 18 Mbps ceiling, 6 Mbps floor\n");
+    std::printf("%-22s %-4s %7s %7s %7s %6s %6s %7s %10s %8s %s\n", "scenario", "abr", "forced", "shown", "corrupt",
+                "down", "up", "min_kbps", "delay_p95", "q_drops", "recover");
+    for (const auto& s : loss) {
+        SimResult off = Sim(s, true, false).run();
+        SimResult on = Sim(s, true, true).run();
+        printAbrRow(s.name, false, off);
+        printAbrRow(s.name, true, on);
+        CHECK(on.corrupt == 0);
+        CHECK(on.abrReports > 200);
+        // Random loss that NACK repairs is not congestion: the bitrate stays up.
+        if (s.oneWayMs * 2 < 40) CHECK(on.abrDown == 0 && on.minKbps == 18000);
+        CHECK(on.forcedIdr <= off.forcedIdr + 2);
+    }
+    for (const auto& s : congest) {
+        SimResult off = Sim(s, true, false).run();
+        SimResult on = Sim(s, true, true).run();
+        printAbrRow(s.name, false, off);
+        printAbrRow(s.name, true, on);
+        printTrace(s.name, on);
+        CHECK(off.corrupt == 0);
+        CHECK(on.corrupt == 0);
+        CHECK(on.abrDown >= 1);
+        CHECK(on.minKbps < 18000);
+        // ABR must cut forced IDRs and show more frames while the link is short.
+        CHECK(on.forcedIdr * 2 <= off.forcedIdr);
+        CHECK(on.framesShown > off.framesShown);
+        // And climb back to the ceiling once the link is clear again.
+        CHECK(on.recoverS >= 0 && on.recoverS <= 25);
+    }
+}
+
 int main() {
     testStrictWithoutNack();
     testSingleHoleRepaired();
@@ -871,7 +1162,11 @@ int main() {
     testPauseDeadlineWhileWaiting();
     testPacketLossAllModes();
     testPresentedFps();
+    testReceiverReportEncoding();
+    testArrivalSlope();
+    testAbrControllerGolden();
     runSimulation();
+    runAbrSimulation();
     if (gFailures) {
         std::printf("\n%d check(s) failed\n", gFailures);
         return 1;

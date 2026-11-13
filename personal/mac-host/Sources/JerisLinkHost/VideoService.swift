@@ -99,6 +99,8 @@ enum VideoService {
         o.udpPaceMbps = settings.pacing.mbps
         o.udpPaceBurstKB = settings.udpPaceBurstKB
         o.nackEnabled = settings.nack
+        o.abrEnabled = settings.abr
+        o.udpPaceAuto = settings.udpPaceMbps == nil
         o.mouseUDPPort = 38412
         o.controlServerEnabled = false
         o.captureCursor = false
