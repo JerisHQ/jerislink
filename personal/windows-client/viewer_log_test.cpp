@@ -12,6 +12,7 @@
 #include <vector>
 
 static int gPass = 0, gFail = 0;
+static const std::string EOL = jl::kLogEol;
 static void expect(bool ok, const std::string& what) {
     if (ok) ++gPass; else ++gFail;
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
@@ -55,7 +56,7 @@ static void testOrderAndContents(const std::string& d) {
     }
     const std::string sess = readAll(s), hist = readAll(h);
     std::string want;
-    for (int i = 0; i < 1000; ++i) want += lineN(i) + "\n";
+    for (int i = 0; i < 1000; ++i) want += lineN(i) + EOL;
     expect(sess == want, "session log: truncated at start, 1000 lines in order");
     expect(hist == "earlier run\n" + want, "history log: appended after earlier run, in order");
 }
@@ -78,7 +79,7 @@ static void testHistoryRotation(const std::string& d) {
     expect(hs <= cap, "history stays <= cap");
     expect(os <= cap, "history.old <= cap");
     const std::string tail = readAll(h);
-    expect(tail.size() > 0 && tail.substr(tail.size() - lineN(19999).size() - 1) == lineN(19999) + "\n",
+    expect(tail.size() > 0 && tail.substr(tail.size() - lineN(19999).size() - 2) == lineN(19999) + EOL,
            "newest line is at the end of history");
     expect(readAll(h).find(lineN(0)) == std::string::npos && readAll(h + ".old").find(lineN(0)) == std::string::npos,
            "oldest lines dropped (only one .old kept)");
@@ -110,7 +111,7 @@ static void testLegacyOversized(const std::string& d) {
            ".old ends with the newest legacy line");
     expect(old.compare(0, 11, "stats.line ") == 0, ".old starts at a full line");
     expect(hist.find("log.history_trimmed old_bytes=" + std::to_string(before)) == 0 &&
-               hist.find("viewer.start pid=1\n") != std::string::npos,
+               hist.find("viewer.start pid=1" + EOL) != std::string::npos,
            "new history starts with a trim note, then the new lines");
     expect(readAll(s).find("log.history_trimmed") == 0, "session log records the trim too");
 }
@@ -123,7 +124,7 @@ static void testUnderCapUntouched(const std::string& d) {
         log.start(s, h);
         log.line("next");
     }  // destructor drains
-    expect(readAll(h) == "keep me\nnext\n", "history under cap: kept, appended; destructor drains");
+    expect(readAll(h) == "keep me\nnext" + EOL, "history under cap: kept, appended; destructor drains");
     expect(!exists(h + ".old"), "no .old created when under cap");
 }
 
@@ -140,7 +141,7 @@ static void testSessionCap(const std::string& d) {
     const std::string sess = readAll(s);
     expect(sess.size() <= cap, "session log stays <= cap");
     expect(sess.find("log.truncated cap_bytes=") == 0, "session log restarts with a truncated note");
-    expect(sess.find(lineN(4999) + "\n") != std::string::npos, "newest line kept in session log");
+    expect(sess.find(lineN(4999) + EOL) != std::string::npos, "newest line kept in session log");
     expect(countLines(readAll(h)) == 5000, "history unaffected by session cap");
 }
 

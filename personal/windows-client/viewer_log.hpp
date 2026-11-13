@@ -13,6 +13,8 @@
 //   before this change grew without a limit) is rotated the same way, but
 //   only its newest cap bytes are kept in .old, cut at a line start.
 //
+// Lines end in CRLF, as the old std::ofstream (text mode) wrote them.
+//
 // Header-only so viewer_log_test.cpp runs the same code.
 #pragma once
 
@@ -27,6 +29,8 @@
 #include <vector>
 
 namespace jl {
+
+constexpr const char* kLogEol = "\r\n";
 
 class LogFile {
 public:
@@ -118,7 +122,7 @@ private:
         h_ = openHandle(CREATE_ALWAYS);
         size_ = 0;
         ++rotations_;
-        const std::string note = why + " cap_bytes=" + std::to_string(cap_) + "\n";
+        const std::string note = why + " cap_bytes=" + std::to_string(cap_) + kLogEol;
         DWORD wrote = 0;
         if (h_ != INVALID_HANDLE_VALUE &&
             WriteFile(h_, note.data(), static_cast<DWORD>(note.size()), &wrote, nullptr)) size_ = wrote;
@@ -202,7 +206,7 @@ public:
         thread_ = std::thread([this] { run(); });
     }
 
-    // Queues one line (a newline is added). Cheap: no file I/O here.
+    // Queues one line (CRLF is added). Cheap: no file I/O here.
     void line(const std::string& s) {
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -242,7 +246,7 @@ private:
         history_.open();
         if (history_.legacyTrimmedFrom()) {
             const std::string note = "log.history_trimmed old_bytes=" +
-                                     std::to_string(history_.legacyTrimmedFrom()) + "\n";
+                                     std::to_string(history_.legacyTrimmedFrom()) + kLogEol;
             session_.write(note);
             history_.write(note);
         }
@@ -258,7 +262,7 @@ private:
             std::string chunk;
             for (auto& s : batch) {
                 chunk.append(s);
-                chunk.push_back('\n');
+                chunk.append(kLogEol);
                 // Write in pieces so a cap check happens at least every 8 KB.
                 if (chunk.size() >= kChunk) {
                     session_.write(chunk);
