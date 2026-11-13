@@ -52,3 +52,7 @@ add_executable(JerislinkOptionsTest viewer_options_test.cpp)
 
 # Console unit test for the MR02 receive / NACK logic (video_receiver.hpp).
 add_executable(JerislinkReceiverTest video_receiver_test.cpp)
+
+# Console test for the async, size-capped viewer logger (viewer_log.hpp).
+add_executable(JerislinkLogTest viewer_log_test.cpp)
+target_compile_definitions(JerislinkLogTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

@@ -23,6 +23,7 @@
 #include "viewer_options.hpp"
 #include "video_receiver.hpp"
 #include "abr.hpp"
+#include "viewer_log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -67,6 +68,9 @@ static std::string tempLogPath(const char* filename) {
 }
 static const std::string kLogPath = tempLogPath("jerislink-viewer.log");
 static const std::string kHistoryLogPath = tempLogPath("jerislink-viewer-history.log");
+// Both logs are written by one background thread through handles kept
+// open for the run; each is capped at 10 MB (history keeps one .old).
+static jl::ViewerLog gLog;
 extern "C" const char* __asan_default_options() {
     return "log_path=shader-asan:abort_on_error=1";
 }
@@ -537,12 +541,7 @@ static void releaseRemoteModifiers() {
 }
 
 static void logLine(const std::string& s) {
-    std::ofstream f(kLogPath, std::ios::app);
-    f << s << "\n";
-    f.flush();
-    std::ofstream h(kHistoryLogPath, std::ios::app);
-    h << s << "\n";
-    h.flush();
+    gLog.line(s);
 }
 
 static void check(HRESULT hr, const char* what) {
@@ -1960,7 +1959,7 @@ static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
 }
 
 static int appMain(int argc, char** argv) {
-    std::remove(kLogPath.c_str());
+    gLog.start(kLogPath, kHistoryLogPath);
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
     auto request = resolveLaunchFromSystem(argc, argv);
 
@@ -2593,5 +2592,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     LocalFree(wideArgv);
-    return appMain(argc, argv.data());
+    const int rc = appMain(argc, argv.data());
+    gLog.stop();  // write out every queued line before the process exits
+    return rc;
 }
