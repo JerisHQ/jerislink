@@ -25,3 +25,46 @@ jobs:
         with:
           name: jerislink-windows-unsigned
           path: personal/windows-client/build/Release/Jerislink.exe
+      - name: Build launch-config unit test
+        run: cmake --build build --config Release --target JerislinkOptionsTest
+      - name: Launch-config unit test
+        run: build\Release\JerislinkOptionsTest.exe
+      - name: Saved settings drive a launch without connection arguments
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $key = 'HKCU:\Software\Jeris\Jerislink'
+          $exe = (Resolve-Path build\Release\Jerislink.exe).Path
+          $out = Join-Path $env:RUNNER_TEMP 'jerislink-config.txt'
+          function Invoke-PrintConfig([string[]]$extra) {
+            Remove-Item $out -ErrorAction SilentlyContinue
+            $p = Start-Process $exe -ArgumentList ($extra + @('--print-config', $out)) -PassThru
+            if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'Jerislink.exe did not exit (dialog shown?)' }
+            $text = Get-Content $out -Raw
+            Write-Host "args: $extra exit: $($p.ExitCode)"; Write-Host $text
+            return @{ Exit = $p.ExitCode; Text = $text }
+          }
+          function Assert-Has($r, [string[]]$lines) {
+            foreach ($l in $lines) { if ($r.Text -notmatch "(?m)^$([regex]::Escape($l))\r?$") { throw "missing '$l'" } }
+          }
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name HostIp -Value '100.64.0.25' -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $key -Name BindIp -Value '100.64.0.16' -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $key -Name VideoCodec -Value 2 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $key -Name VideoBitrateMbps -Value 18 -PropertyType DWord -Force | Out-Null
+
+          # Only the diagnostic flag: everything comes from the saved settings.
+          $r = Invoke-PrintConfig @()
+          if ($r.Exit -ne 0) { throw "exit $($r.Exit)" }
+          Assert-Has $r @('status=ok', 'host=100.64.0.25', 'host_source=saved', 'bind=100.64.0.16', 'bind_source=saved', 'codec=hevc', 'bitrate_mbps=18')
+
+          # Command-line arguments still win over saved settings.
+          $r = Invoke-PrintConfig @('--source-ip', '100.64.0.99', '--codec', 'h264', '--bitrate-mbps', '30')
+          Assert-Has $r @('status=ok', 'host=100.64.0.99', 'host_source=cli', 'codec=h264', 'bitrate_mbps=30')
+
+          # No saved host: the viewer asks for setup (exit 3, no dialog with --print-config).
+          Remove-ItemProperty -Path $key -Name HostIp
+          $r = Invoke-PrintConfig @()
+          if ($r.Exit -ne 3) { throw "expected exit 3, got $($r.Exit)" }
+          Assert-Has $r @('status=needs-setup')
+          Remove-Item -Path $key -Recurse -Force

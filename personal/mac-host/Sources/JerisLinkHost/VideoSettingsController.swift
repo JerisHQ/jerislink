@@ -42,6 +42,9 @@ struct PersistedVideoSettings: Equatable {
     var bitrateMbps = 25
     var fps: Int32 = 60
     var keepDisplayAwake = false
+    /// udpPaceMbps: missing = auto (UDPPacing.autoMbps), 0 = off, 1...1000 = Mbps.
+    var udpPaceMbps: Int?
+    var udpPaceBurstKB = UDPPacing.defaultBurstKB
 
     /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
     /// BetterDisplay 4K virtual screen stops delivering frames after the first
@@ -55,6 +58,13 @@ struct PersistedVideoSettings: Equatable {
         if let bitrate = Self.int(dict["bitrateMbps"]), (4...100).contains(bitrate) { bitrateMbps = bitrate }
         if let fps = Self.int(dict["fps"]), fps == 30 || fps == 60 { self.fps = Int32(fps) }
         keepDisplayAwake = Self.bool(dict["keepDisplayAwake"]) ?? false
+        if let pace = Self.int(dict["udpPaceMbps"]), (0...1000).contains(pace) { udpPaceMbps = pace }
+        if let burst = Self.int(dict["udpPaceBurstKB"]), (2...1024).contains(burst) { udpPaceBurstKB = burst }
+    }
+
+    var pacing: UDPPacing {
+        UDPPacing(mbps: udpPaceMbps ?? UDPPacing.autoMbps(bitrateMbps: bitrateMbps),
+                  burstBytes: udpPaceBurstKB * 1024)
     }
 
     static func load(from url: URL) -> PersistedVideoSettings {
@@ -66,7 +76,7 @@ struct PersistedVideoSettings: Equatable {
     }
 
     var summary: String {
-        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake)"
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary)"
     }
 
     private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
@@ -89,6 +99,7 @@ final class VideoSettingsController: @unchecked Sendable {
     private let lock = NSLock()
     private let fileURL: URL
     private let hostExecutablePattern: String
+    private let restartOverride: (() -> Void)?
 
     static var defaultFileURL: URL {
         if let path = ProcessInfo.processInfo.environment["JERISLINK_VIDEO_SETTINGS"], !path.isEmpty {
@@ -99,11 +110,38 @@ final class VideoSettingsController: @unchecked Sendable {
             .appendingPathComponent("video-settings.plist")
     }
 
-    init() {
-        self.fileURL = Self.defaultFileURL
+    /// `restart` replaces the launchd restart (self-test). Setting
+    /// JERISLINK_NO_VIDEO_RESTART=1 logs instead of restarting (private test hosts).
+    init(fileURL: URL = VideoSettingsController.defaultFileURL, restart: (() -> Void)? = nil) {
+        self.fileURL = fileURL
+        self.restartOverride = restart
         // Fallback for a video host started by hand from this executable.
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
         self.hostExecutablePattern = "^" + Self.extendedRegexEscaped(executable) + " --duration 86400( |$)"
+    }
+
+    /// ACK for a request that was not applied (not the configured viewer): the
+    /// current persisted settings, status 0, flag 0x10 = ignored. Nothing is
+    /// written and nothing restarts.
+    func currentAck(ignored: Bool) -> VideoSettingsAck {
+        let current: (codec: String, bitrateMbps: Int)
+        lock.lock()
+        current = readCurrent()
+        lock.unlock()
+        let displayMode = try? DisplayModeResolver.currentMainDisplay()
+        let framebufferWidth = UInt16(displayMode?.pixelWidth ?? 0)
+        let framebufferHeight = UInt16(displayMode?.pixelHeight ?? 0)
+        var flags: UInt8 = 0x02 // host HEVC
+        if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
+        if ignored { flags |= 0x10 }
+        return VideoSettingsAck(
+            status: 0,
+            codec: current.codec == "hevc" ? 2 : 1,
+            flags: flags,
+            bitrateMbps: UInt16(current.bitrateMbps),
+            framebufferWidth: framebufferWidth,
+            framebufferHeight: framebufferHeight
+        )
     }
 
     static func extendedRegexEscaped(_ text: String) -> String {
@@ -194,6 +232,8 @@ final class VideoSettingsController: @unchecked Sendable {
 
             if changed {
                 requestVideoRestart()
+            } else {
+                print("Video settings unchanged codec=\(codecName) bitrate_mbps=\(selectedBitrate); no restart")
             }
 
             return VideoSettingsAck(
@@ -243,6 +283,14 @@ final class VideoSettingsController: @unchecked Sendable {
     /// `launchctl kickstart -k` stops it and launchd starts it again at once.
     /// A video host started by hand is stopped with pkill instead.
     private func requestVideoRestart() {
+        if let restartOverride {
+            restartOverride()
+            return
+        }
+        if ProcessInfo.processInfo.environment["JERISLINK_NO_VIDEO_RESTART"] == "1" {
+            print("Video settings restart skipped (JERISLINK_NO_VIDEO_RESTART=1)")
+            return
+        }
         let kickstart = Process()
         kickstart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         kickstart.arguments = ["kickstart", "-k", "gui/\(getuid())/\(JerisLinkAgents.videoLabel)"]
