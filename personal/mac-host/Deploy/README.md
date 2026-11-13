@@ -52,7 +52,7 @@ Video, mouse UDP and control all use one endpoint, so the screen and the input a
 ```xml
 <dict>
   <key>mode</key><string>tailnet</string>
-  <key>clientIP</key><string>100.64.0.16</string>
+  <key>clientIP</key><string>100.64.0.20</string>
 </dict>
 ```
 

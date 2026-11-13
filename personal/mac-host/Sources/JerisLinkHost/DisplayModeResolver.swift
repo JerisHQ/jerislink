@@ -15,7 +15,7 @@ enum DisplayModeResolver {
     /// Default ceiling for the encoded stream: 3840x2160 pixels of area.
     /// HEVC level 5.1 allows at most 8,912,896 luma samples per picture; a
     /// larger frame such as 4544x2556 (BetterDisplay 2272x1278 HiDPI) dropped
-    /// the M4 hardware encoder to about 5 fps on jenny-mac01 (macOS 27.2).
+    /// the M4 hardware encoder to about 5 fps on example-mac (macOS 27.2).
     static let defaultMaxEncodePixels = 3840 * 2160
 
     /// The encoded size for a native framebuffer: unchanged when it fits in

@@ -186,8 +186,8 @@ enum ControlPeerSelfTest {
         expect(parse(Array("PROXY UNKNOWN\r\n".utf8)) == .proxy(source: nil), "v1 UNKNOWN")
         expect(parse(Array("PROXY TCP4 bogus 127.0.0.1 1 2\r\n".utf8)) == .invalid("v1 address"), "v1 bad address rejected")
         let v2Inet = ProxyProtocol.v2Signature + [0x21, 0x11, 0x00, 0x0c,
-                                                  100, 64, 0, 16, 127, 0, 0, 1, 0xc8, 0x00, 0x95, 0xdb]
-        expect(parse(v2Inet) == .proxy(source: "100.64.0.16"), "v2 TCP4 source")
+                                                  100, 64, 0, 20, 127, 0, 0, 1, 0xc8, 0x00, 0x95, 0xdb]
+        expect(parse(v2Inet) == .proxy(source: "100.64.0.20"), "v2 TCP4 source")
         var mapped = [UInt8](repeating: 0, count: 10) + [0xff, 0xff, 100, 64, 0, 6]
         mapped += [UInt8](repeating: 0, count: 15) + [1] + [0, 1, 0, 2]
         let v2Mapped = ProxyProtocol.v2Signature + [0x21, 0x21, 0x00, 0x24] + mapped
@@ -196,7 +196,7 @@ enum ControlPeerSelfTest {
         expect(parse(ProxyProtocol.v2Signature + [0x21, 0x11, 0x00, 0x0c, 1, 2]) == .invalid("v2 body truncated"),
                "v2 truncated body rejected")
 
-        let client = "100.64.0.16"
+        let client = "100.64.0.20"
         expect(SettingsAuthority.check(peer: ControlPeer(ip: client, verified: true), clientIP: client) == .allow,
                "configured client may change settings")
         expect(SettingsAuthority.check(peer: ControlPeer(ip: "100.64.0.6", verified: true), clientIP: client)
