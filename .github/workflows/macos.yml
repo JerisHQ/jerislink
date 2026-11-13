@@ -23,3 +23,5 @@ jobs:
         run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"
       - name: Host self-test (control peer, settings policy)
         run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/MacOS/JerisLinkHost" --self-test'
+      - name: Input helper self-test (status throttle, display bounds cache)
+        run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/Helpers/JerisLink Input Helper.app/Contents/MacOS/JerisLinkInputHelper" --self-test'

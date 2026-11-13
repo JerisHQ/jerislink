@@ -89,10 +89,256 @@ enum ControlServiceSelfTest {
         }
         expect(helper.maxConcurrentConnections == 1, "control e2e: one helper connection for both listeners")
 
-        direct?.close()
+        // F3 session lifecycle: one SESSION_START before a viewer connection's
+        // first key or mouse message, one SESSION_END when it closes. Nothing
+        // per event; nothing for relay, clipboard or ping-only connections.
+        let start = InputHelperClient.sessionStartType
+        let end = InputHelperClient.sessionEndType
+        expect(helper.count(type: start) == 1, "control e2e: one SESSION_START for the viewer, none for the relay clients")
+        if let s = helper.firstIndex(type: start),
+           let k = helper.firstIndex(of: .init(type: 0x10, payload: [1, 0, 0])) {
+            expect(s < k, "control e2e: SESSION_START reaches the helper before the viewer's first event")
+        } else {
+            expect(false, "control e2e: SESSION_START reaches the helper before the viewer's first event")
+        }
+        let marker = FakeInputHelper.Event(type: 0x24, payload: [0x00, 0x07, 0x00, 0x09])
+        for _ in 0..<50 { _ = direct?.send(type: 0x24, payload: marker.payload) }
+        let markerDeadline = Date().addingTimeInterval(5)
+        while Date() < markerDeadline, !helper.received(marker) { usleep(20_000) }
+        expect(helper.received(marker) && helper.count(type: start) == 1 && helper.count(type: end) == 0,
+               "control e2e: no lifecycle message per event (50 events)")
+
+        let clipboard = MRC1Client(port: directPort)
+        _ = clipboard?.send(type: 0x30, payload: [])                 // CLIPBOARD_HELLO
+        let pingOnly = MRC1Client(port: directPort)
+        _ = pingOnly?.send(type: 0x01, payload: [1, 2, 3, 4])        // PING
+        usleep(300_000)
+        clipboard?.close()
+        pingOnly?.close()
         relayKey?.close()
         relayMouse.closeConnection()
+        usleep(500_000)
+        expect(clipboard != nil && pingOnly != nil && helper.count(type: start) == 1 && helper.count(type: end) == 0,
+               "control e2e: clipboard, ping-only and relay connections send no SESSION_START/END")
+
+        direct?.close()
+        let endDeadline = Date().addingTimeInterval(5)
+        while Date() < endDeadline, helper.count(type: end) < 1 { usleep(20_000) }
+        usleep(200_000)
+        expect(helper.count(type: end) == 1 && helper.count(type: start) == 1,
+               "control e2e: viewer disconnect sends exactly one SESSION_END")
+        expect(helper.maxConcurrentConnections == 1, "control e2e: still one helper connection (no reconnect per session)")
+        let ev = helper.snapshot()
+        let startIDs = ev.filter { $0.type == start }.map(\.payload)
+        let endIDs = ev.filter { $0.type == end }.map(\.payload)
+        expect(startIDs.count == 1 && startIDs[0].count == 4 && startIDs == endIDs,
+               "control e2e: SESSION_START and SESSION_END carry the same 4-byte session id")
+
+        failures += interleavedReconnect(expect)
+        failures += helperRecovers(expect)
+        failures += eofMonitor(expect)
+        failures += recoveryWindow(expect)
         return failures == 0 ? 0 : 1
+    }
+
+    private static func wait(until cond: () -> Bool, seconds: Double = 5) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !cond() { usleep(20_000) }
+    }
+
+    /// Round 4 (a): A START, MRI1 drop, B START + Shift + drag, A END. After
+    /// the reconnect the client re-announces A before B's START, and A's END
+    /// carries A's id, so the helper (id set) keeps B's state. Once A has
+    /// ended, the next reconnect re-announces only B. Returns 0: failures are
+    /// counted by `expect`.
+    private static func interleavedReconnect(_ expect: (Bool, String) -> Void) -> Int {
+        guard let fake = FakeInputHelper.start() else {
+            expect(false, "reconnect: fake input helper listens"); return 0
+        }
+        defer { fake.stop() }
+        let start = InputHelperClient.sessionStartType
+        let end = InputHelperClient.sessionEndType
+        let idA = InputHelperClient.sessionIDBytes(101)
+        let idB = InputHelperClient.sessionIDBytes(102)
+        let client = InputHelperClient(port: fake.port)
+        expect(client.sendSessionStart(id: 101), "reconnect: A SESSION_START delivered")
+        wait { fake.snapshot().count == 1 }
+        fake.dropCurrentConnection()
+        fake.waitIdle()
+        wait { !client.isConnected }
+        expect(client.sendSessionStart(id: 102), "reconnect: B SESSION_START delivered after the MRI1 drop")
+        _ = client.sendKey(cgCode: 56, down: true)
+        _ = client.sendMouseButton(button: 0, down: true)
+        expect(client.sendSessionEnd(id: 101), "reconnect: A SESSION_END delivered")
+        wait { fake.snapshot().count >= 6 }
+        let want: [FakeInputHelper.Event] = [
+            .init(type: start, payload: idA),                 // before the drop
+            .init(type: start, payload: idA),                 // re-announced on reconnect
+            .init(type: start, payload: idB),
+            .init(type: 0x10, payload: [1, 0, 56]),
+            .init(type: 0x21, payload: [0, 1]),
+            .init(type: end, payload: idA),
+        ]
+        let got = fake.snapshot()
+        expect(got == want, "reconnect: helper sees A, re-announced A, B, B's Shift and drag, then A's END (got \(got.map { "\($0.type):\($0.payload)" }))")
+        expect(fake.connections == 2, "reconnect: exactly one reconnect after the drop (got \(fake.connections))")
+
+        fake.dropCurrentConnection()
+        fake.waitIdle()
+        wait { !client.isConnected }
+        _ = client.sendKey(cgCode: 56, down: false)
+        wait { fake.snapshot().count >= 8 }
+        let tail = Array(fake.snapshot().dropFirst(6))
+        expect(tail == [.init(type: start, payload: idB), .init(type: 0x10, payload: [0, 0, 56])],
+               "reconnect: after A ended, a reconnect re-announces only B, before the next event")
+        _ = client.sendSessionEnd(id: 102)
+        client.closeConnection()
+        return 0
+    }
+
+    /// Round 4 (b): the helper is not running at the viewer's first input and
+    /// comes up later. START is retried on the next input message, reaches
+    /// the helper once before that event, and END follows at close.
+    private static func helperRecovers(_ expect: (Bool, String) -> Void) -> Int {
+        guard let helperPort = freeLoopbackPort(), let directPort = freeLoopbackPort(),
+              let relayPort = freeLoopbackPort(), Set([helperPort, directPort, relayPort]).count == 3 else {
+            expect(false, "recovery: free loopback ports"); return 0
+        }
+        let started = DispatchSemaphore(value: 0)
+        let result = StartResult()
+        Thread.detachNewThread {
+            do {
+                result.servers = try ControlService.startServers(bindIP: ListenConfig.loopbackIP, clientIP: ListenConfig.loopbackIP,
+                                                                 port: directPort, relayPort: relayPort, inject: true,
+                                                                 helper: InputHelperClient(port: helperPort))
+            } catch {
+                result.error = error
+            }
+            started.signal()
+        }
+        guard started.wait(timeout: .now() + 10) == .success, result.error == nil, result.servers.count == 2 else {
+            expect(false, "recovery: listeners start with the helper down"); return 0
+        }
+        let servers = result.servers
+        defer { servers.forEach { $0.stop() } }
+
+        let viewer = MRC1Client(port: directPort)
+        expect(viewer != nil, "recovery: viewer connects while the helper is down")
+        _ = viewer?.send(type: 0x10, payload: [1, 0, 65])            // first input: helper down
+        usleep(300_000)
+        guard let fake = FakeInputHelper.start(port: helperPort) else {
+            expect(false, "recovery: helper comes up on its port"); return 0
+        }
+        defer { fake.stop() }
+        _ = viewer?.send(type: 0x10, payload: [0, 0, 65])            // next input: START retried
+        let marker = FakeInputHelper.Event(type: 0x24, payload: [0x00, 0x05, 0x00, 0x06])
+        for _ in 0..<10 { _ = viewer?.send(type: 0x24, payload: marker.payload) }
+        wait { fake.received(marker) }
+        viewer?.close()
+        wait { fake.count(type: InputHelperClient.sessionEndType) >= 1 }
+        usleep(200_000)
+        let ev = fake.snapshot()
+        let starts = ev.filter { $0.type == InputHelperClient.sessionStartType }
+        let ends = ev.filter { $0.type == InputHelperClient.sessionEndType }
+        expect(ev.first?.type == InputHelperClient.sessionStartType && starts.count == 1,
+               "recovery: START retried once the helper is up, first on the wire, sent once (got \(starts.count))")
+        expect(ev.contains(.init(type: 0x10, payload: [0, 0, 0])) && fake.received(marker),
+               "recovery: events after the helper came up are delivered")
+        expect(ends.count == 1 && ends.map(\.payload) == starts.map(\.payload),
+               "recovery: one SESSION_END with the started id at close")
+        return 0
+    }
+
+    /// Round 5: helper EOF is found by the socket monitor, not by a check per
+    /// event. 50 events do not wake the monitor; killing the helper does, and
+    /// the next event reconnects, re-announces the live session and arrives.
+    private static func eofMonitor(_ expect: (Bool, String) -> Void) -> Int {
+        guard let port = freeLoopbackPort(), let fake = FakeInputHelper.start(port: port) else {
+            expect(false, "eof monitor: fake input helper listens"); return 0
+        }
+        let start = InputHelperClient.sessionStartType
+        let id = InputHelperClient.sessionIDBytes(201)
+        let client = InputHelperClient(port: port)
+        _ = client.sendSessionStart(id: 201)
+        _ = client.sendKey(cgCode: 0, down: true)
+        wait { fake.snapshot().count == 2 }
+        let wakeupsBefore = client.eofMonitorWakeups
+        for _ in 0..<50 { _ = client.sendMouseMoveNormalized(nx: 7, ny: 9) }
+        wait { fake.snapshot().count == 52 }
+        usleep(100_000)
+        expect(fake.snapshot().count == 52 && client.eofMonitorWakeups == wakeupsBefore,
+               "eof monitor: 50 events delivered, monitor not woken by events (wakeups \(wakeupsBefore) -> \(client.eofMonitorWakeups))")
+
+        fake.dropCurrentConnection()     // helper dies
+        fake.waitIdle()
+        fake.stop()
+        wait { !client.isConnected }
+        expect(!client.isConnected, "eof monitor: helper EOF detected without sending anything")
+        guard let restarted = FakeInputHelper.start(port: port) else {
+            expect(false, "eof monitor: helper restarts on its port"); return 0
+        }
+        defer { restarted.stop() }
+        _ = client.sendKey(cgCode: 0, down: false)
+        wait { restarted.snapshot().count >= 2 }
+        let got = restarted.snapshot()
+        expect(got == [.init(type: start, payload: id), .init(type: 0x10, payload: [0, 0, 0])],
+               "eof monitor: first event after the helper restart re-sends START and is delivered (got \(got.map { "\($0.type):\($0.payload)" }))")
+        _ = client.sendSessionEnd(id: 201)
+        client.closeConnection()
+        return 0
+    }
+
+    /// Round 5: the helper comes up between a failed SESSION_START and the
+    /// send of that input message. The message must be dropped (no input
+    /// outside a session the helper knows), the next one starts the session.
+    private static func recoveryWindow(_ expect: (Bool, String) -> Void) -> Int {
+        guard let helperPort = freeLoopbackPort(), let directPort = freeLoopbackPort(),
+              let relayPort = freeLoopbackPort(), Set([helperPort, directPort, relayPort]).count == 3 else {
+            expect(false, "window: free loopback ports"); return 0
+        }
+        let box = FakeBox()
+        let client = InputHelperClient(port: helperPort)
+        client.afterFailedSessionStart = {
+            if box.fake == nil { box.fake = FakeInputHelper.start(port: helperPort) }
+        }
+        let started = DispatchSemaphore(value: 0)
+        let result = StartResult()
+        Thread.detachNewThread {
+            do {
+                result.servers = try ControlService.startServers(bindIP: ListenConfig.loopbackIP, clientIP: ListenConfig.loopbackIP,
+                                                                 port: directPort, relayPort: relayPort, inject: true,
+                                                                 helper: client)
+            } catch {
+                result.error = error
+            }
+            started.signal()
+        }
+        guard started.wait(timeout: .now() + 10) == .success, result.error == nil, result.servers.count == 2 else {
+            expect(false, "window: listeners start with the helper down"); return 0
+        }
+        let servers = result.servers
+        defer { servers.forEach { $0.stop() }; box.fake?.stop() }
+
+        let viewer = MRC1Client(port: directPort)
+        _ = viewer?.send(type: 0x10, payload: [1, 0, 65])            // START fails, helper comes up
+        wait { box.fake != nil }
+        usleep(300_000)
+        guard let fake = box.fake else {
+            expect(false, "window: helper came up after the failed START"); return 0
+        }
+        expect(fake.snapshot().isEmpty, "window: input whose START failed is not delivered (got \(fake.snapshot().map { "\($0.type):\($0.payload)" }))")
+        _ = viewer?.send(type: 0x10, payload: [0, 0, 65])            // next input: START, then key
+        wait { fake.snapshot().count >= 2 }
+        viewer?.close()
+        wait { fake.count(type: InputHelperClient.sessionEndType) >= 1 }
+        usleep(200_000)
+        let ev = fake.snapshot()
+        let ok = ev.count == 3 && ev[0].type == InputHelperClient.sessionStartType
+            && ev[1] == .init(type: 0x10, payload: [0, 0, 0])
+            && ev[2].type == InputHelperClient.sessionEndType && ev[2].payload == ev[0].payload
+        expect(ok, "window: helper sees START, then the key, then END with the same id (got \(ev.map { "\($0.type):\($0.payload)" }))")
+        client.closeConnection()
+        return 0
     }
 
     private static func freeLoopbackPort() -> UInt16? {
@@ -167,6 +413,8 @@ private final class FakeInputHelper: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [Event] = []
     private var active = 0
+    private var accepted = 0
+    private var current: Int32 = -1
     private(set) var maxConcurrentConnections = 0
     private var stopping = false
 
@@ -175,10 +423,12 @@ private final class FakeInputHelper: @unchecked Sendable {
         self.port = port
     }
 
-    static func start() -> FakeInputHelper? {
+    static func start(port: UInt16 = 0) -> FakeInputHelper? {
         let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return nil }
-        var addr = ControlServiceSelfTest.loopbackAddress(port: 0)
+        var yes: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = ControlServiceSelfTest.loopbackAddress(port: port)
         let rc = withUnsafePointer(to: &addr) { p in
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
@@ -203,6 +453,38 @@ private final class FakeInputHelper: @unchecked Sendable {
         return events.contains(event)
     }
 
+    func count(type: UInt8) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return events.filter { $0.type == type }.count
+    }
+
+    func firstIndex(of event: Event) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return events.firstIndex(of: event)
+    }
+
+    func firstIndex(type: UInt8) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return events.firstIndex { $0.type == type }
+    }
+
+    func snapshot() -> [Event] {
+        lock.lock(); defer { lock.unlock() }
+        return events
+    }
+
+    /// Connections accepted so far.
+    var connections: Int {
+        lock.lock(); defer { lock.unlock() }
+        return accepted
+    }
+
+    /// Close the connection being served, as a helper restart would.
+    func dropCurrentConnection() {
+        lock.lock(); let c = current; lock.unlock()
+        if c >= 0 { Darwin.shutdown(c, SHUT_RDWR) }
+    }
+
     /// Wait until no client is being served (after the root-cause probe).
     func waitIdle() {
         for _ in 0..<250 {
@@ -222,9 +504,12 @@ private final class FakeInputHelper: @unchecked Sendable {
             }
             lock.lock()
             active += 1
+            accepted += 1
+            current = c
             maxConcurrentConnections = max(maxConcurrentConnections, active)
             lock.unlock()
             serve(c)
+            lock.lock(); current = -1; lock.unlock()
             Darwin.close(c)
             lock.lock(); active -= 1; lock.unlock()
         }
@@ -255,6 +540,10 @@ private final class FakeInputHelper: @unchecked Sendable {
         }
         return out
     }
+}
+
+private final class FakeBox: @unchecked Sendable {
+    var fake: FakeInputHelper?
 }
 
 private final class StartResult: @unchecked Sendable {

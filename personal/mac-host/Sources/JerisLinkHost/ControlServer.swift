@@ -33,13 +33,20 @@ final class ControlServer: @unchecked Sendable {
     /// Read PROXY headers from loopback peers (legacy `tailscale serve`
     /// forward). Off for `--service control`, whose sockets see real peers.
     private let acceptProxy: Bool
+    /// Tell the input helper when a viewer input session starts and ends
+    /// (MRI1 SESSION_START / SESSION_END). On for viewer-facing listeners;
+    /// off for the loopback relay, whose client is the long-lived video
+    /// service.
+    private let announceInputSessions: Bool
     private static let maxClipboardBytes = 60 * 1024
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
          acceptProxy: Bool = true,
-         inputHelper: InputHelperClient? = nil) {
+         inputHelper: InputHelperClient? = nil,
+         announceInputSessions: Bool = true) {
         self.bindIP = bindIP
+        self.announceInputSessions = announceInputSessions
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -192,6 +199,17 @@ final class ControlServer: @unchecked Sendable {
                 return
             }
         }
+        // A connection is an input session only once it sends its first key
+        // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
+        // are. One bool test per message, one helper message per session edge.
+        // A START that did not reach the helper (helper down) is retried on
+        // the next input message, and the input message that failed it is
+        // dropped: input reaches the helper only inside a session it knows.
+        // END is sent only for a started session. The relay listener has no
+        // lifecycle and forwards as before.
+        let sessionID = Self.sessionIDs.next()
+        var sessionStarted = false
+        defer { if sessionStarted { endInputSession(sessionID) } }
         var firstHeader: [UInt8]? = pending
         while true {
             let next: [UInt8]?
@@ -206,6 +224,10 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
+            if !sessionStarted && announceInputSessions && Self.isInputMessage(type) {
+                sessionStarted = startInputSession(sessionID)
+                if !sessionStarted { continue }
+            }
 
             switch type {
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
@@ -274,6 +296,39 @@ final class ControlServer: @unchecked Sendable {
             }
         }
     }
+
+    private static func isInputMessage(_ type: UInt8) -> Bool {
+        switch type {
+        case 0x10, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25: return true
+        default: return false
+        }
+    }
+
+    /// Returns true when SESSION_START reached the helper, so SESSION_END is
+    /// sent only for a session the helper knows about.
+    private func startInputSession(_ id: UInt32) -> Bool {
+        guard announceInputSessions, injectRequested, let helper = inputHelper else { return false }
+        return helper.sendSessionStart(id: id)
+    }
+
+    private func endInputSession(_ id: UInt32) {
+        guard let helper = inputHelper else { return }
+        _ = helper.sendSessionEnd(id: id)
+    }
+
+    /// Input session ids, unique per process (shared by every listener, as
+    /// is the one helper connection). 0 is never used.
+    private final class SessionIDCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var last: UInt32 = 0
+        func next() -> UInt32 {
+            lock.lock(); defer { lock.unlock() }
+            last &+= 1
+            if last == 0 { last = 1 }
+            return last
+        }
+    }
+    private static let sessionIDs = SessionIDCounter()
 
     private struct ClipboardSnapshot {
         let changeCount: Int

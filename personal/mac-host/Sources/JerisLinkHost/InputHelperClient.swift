@@ -9,6 +9,18 @@ import Darwin
 /// `ControlService`); a second connection would sit in the helper's backlog and
 /// its events would never be posted. All calls are serialised by `lock`, and
 /// socket timeouts keep a busy or wedged helper from blocking a caller forever.
+///
+/// Helper EOF is detected off the event path: a dispatch read source watches
+/// the MRI1 socket. The helper never sends unsolicited data, so the socket only
+/// turns readable outside `ping()` when the helper closed it (or sent junk).
+/// The source then closes the socket under `lock`, and the next send
+/// reconnects and re-announces live sessions. Sending an event costs one
+/// send(), nothing else. `ping()` holds `lock` for its whole round trip, so the
+/// source cannot steal its reply; if the source fires for a reply, it waits
+/// for the lock, finds nothing to read and leaves the socket alone.
+/// Residual risk: if the helper dies after the source last ran and before a
+/// send, that one packet goes into the dead socket and is lost; the next send
+/// fails and reconnects.
 final class InputHelperClient: @unchecked Sendable {
     static let defaultPort: UInt16 = 38410
     private static let ioTimeoutSeconds = 2
@@ -17,6 +29,20 @@ final class InputHelperClient: @unchecked Sendable {
     private let port: UInt16
     private let lock = NSLock()
     private var fd: Int32 = -1
+    /// Viewer input sessions this host has started (SESSION_START delivered)
+    /// and not yet ended. Re-announced on every new MRI1 connection, so a
+    /// helper that restarted or dropped the socket learns the live sessions
+    /// again before the next event.
+    private var announcedSessions: [UInt32] = []
+    /// EOF monitor for the current socket; nil while disconnected.
+    private var monitor: DispatchSourceRead?
+    private var monitorGeneration: UInt64 = 0
+    private let monitorQueue = DispatchQueue(label: "jerislink.input-helper.eof")
+    /// Times the EOF monitor ran (self-test: must not grow with events).
+    private var monitorWakeups = 0
+    /// Self-test hook: runs after a SESSION_START that did not reach the
+    /// helper, before `sendSessionStart` returns. Nil in production.
+    var afterFailedSessionStart: (() -> Void)?
 
     /// `port` nil: JERISLINK_INPUT_HELPER_PORT, else 38410.
     init(port: UInt16? = nil) {
@@ -40,13 +66,58 @@ final class InputHelperClient: @unchecked Sendable {
     /// Send one packet, reconnecting once if the connection dropped.
     private func deliver(_ bytes: [UInt8]) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        return deliverLocked(bytes)
+    }
+
+    private func deliverLocked(_ bytes: [UInt8]) -> Bool {
         if sendAll(bytes) { return true }
         closeLocked()
         return sendAll(bytes)
     }
 
     private func closeLocked() {
-        if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR); Darwin.close(fd); fd = -1 }
+        guard fd >= 0 else { return }
+        Darwin.shutdown(fd, SHUT_RDWR)
+        if let monitor {
+            // The cancel handler closes the fd, after the source is done with it.
+            monitor.cancel()
+            self.monitor = nil
+        } else {
+            Darwin.close(fd)
+        }
+        fd = -1
+    }
+
+    private func startMonitorLocked(_ s: Int32) {
+        monitorGeneration &+= 1
+        let generation = monitorGeneration
+        let source = DispatchSource.makeReadSource(fileDescriptor: s, queue: monitorQueue)
+        source.setEventHandler { [weak self] in self?.monitorFired(fd: s, generation: generation) }
+        source.setCancelHandler { Darwin.close(s) }
+        monitor = source
+        source.resume()
+    }
+
+    private func monitorFired(fd s: Int32, generation: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        guard fd == s, generation == monitorGeneration else { return }
+        monitorWakeups += 1
+        var buf = [UInt8](repeating: 0, count: 256)
+        let n = buf.withUnsafeMutableBytes { Darwin.recv(s, $0.baseAddress!, $0.count, MSG_DONTWAIT) }
+        if n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { closeLocked() }
+        // n > 0: unsolicited bytes; the helper sends none, drop them.
+    }
+
+    /// Self-test only.
+    var isConnected: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fd >= 0
+    }
+
+    /// Self-test only.
+    var eofMonitorWakeups: Int {
+        lock.lock(); defer { lock.unlock() }
+        return monitorWakeups
     }
 
     private func ensureConnected() -> Bool {
@@ -70,6 +141,12 @@ final class InputHelperClient: @unchecked Sendable {
         }
         guard rc == 0 else { Darwin.close(s); return false }
         fd = s
+        startMonitorLocked(s)
+        // A new MRI1 connection starts with an empty session set in the
+        // helper: re-announce every live session before anything else.
+        for id in announcedSessions {
+            guard writeAll(packet(type: Self.sessionStartType, payload: Self.sessionIDBytes(id))) else { return false }
+        }
         return true
     }
 
@@ -80,6 +157,11 @@ final class InputHelperClient: @unchecked Sendable {
 
     private func sendAll(_ bytes: [UInt8]) -> Bool {
         guard ensureConnected() else { return false }
+        return writeAll(bytes)
+    }
+
+    /// Write on the current socket; closes it on failure.
+    private func writeAll(_ bytes: [UInt8]) -> Bool {
         var off = 0
         while off < bytes.count {
             let n = bytes.withUnsafeBytes { raw in
@@ -112,6 +194,36 @@ final class InputHelperClient: @unchecked Sendable {
         guard h[0] == 0x4d, h[1] == 0x52, h[2] == 0x49, h[3] == 0x31, h[4] == 1, h[5] == 0x02,
               let p = recvExact(len) else { return false }
         return p == payload
+    }
+
+    /// MRI1 SESSION_START (0x50) and SESSION_END (0x51), payload: a 4-byte
+    /// big-endian session id. Sent once per viewer input session by
+    /// `ControlServer`, never per event. The helper keeps a set of live ids,
+    /// checks post-event access on a new START and ignores an END for an id it
+    /// does not know (a session from before a helper restart).
+    static let sessionStartType: UInt8 = 0x50
+    static let sessionEndType: UInt8 = 0x51
+
+    static func sessionIDBytes(_ id: UInt32) -> [UInt8] {
+        [UInt8(id >> 24), UInt8((id >> 16) & 0xff), UInt8((id >> 8) & 0xff), UInt8(id & 0xff)]
+    }
+
+    /// True when START reached the helper; only then is the session announced
+    /// again after a reconnect.
+    func sendSessionStart(id: UInt32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard deliverLocked(packet(type: Self.sessionStartType, payload: Self.sessionIDBytes(id))) else {
+            afterFailedSessionStart?()
+            return false
+        }
+        if !announcedSessions.contains(id) { announcedSessions.append(id) }
+        return true
+    }
+
+    func sendSessionEnd(id: UInt32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        announcedSessions.removeAll { $0 == id }
+        return deliverLocked(packet(type: Self.sessionEndType, payload: Self.sessionIDBytes(id)))
     }
 
     func sendKey(cgCode: UInt16, down: Bool) -> Bool {
