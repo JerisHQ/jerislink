@@ -16,6 +16,11 @@
 //   reorder grace. Retransmits (flag 0x04) never look like a stream restart.
 //   While RTT + grace does not fit inside holdMs (e.g. DERP) a repair cannot
 //   arrive in time, so NACK pauses and the strict path runs, as with NACK off.
+//   Frames already held when NACK pauses keep their deadline: they are
+//   settled on the NACK path (no new NACKs) before the strict path takes over.
+// - All modes: frames never go backwards within one stream (a submitted
+//   watermark survives recovery; only a real restart resets it), and packet
+//   loss is counted per (frame id, index), de-duplicated (PacketLossCounter).
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -73,6 +78,12 @@ struct ReceiverStats {
     uint64_t keyframeJumps = 0;       // complete keyframe ended a hold early
     uint64_t heldFramesMax = 0;
     std::vector<float> repairMs;      // first NACK -> frame complete, capped
+    // Packet loss in every mode (off, paused, on), from PacketLossCounter.
+    // Counted when a frame is finalized (32 frames behind the newest).
+    uint64_t lossExpected = 0;        // packets the host sent as originals
+    uint64_t lossRaw = 0;             // of those, never arrived as an original
+    uint64_t lossAfterNack = 0;       // never arrived at all, nor repaired in time
+    uint64_t lossWholeFrames = 0;     // frames with no packet at all (size estimated)
 };
 
 inline uint16_t receiverBe16(const uint8_t* p) {
@@ -92,22 +103,109 @@ inline double receiverPercentile(std::vector<float> v, double p) {
     return v[std::min(i, v.size() - 1)];
 }
 
-// Loss in percent of the packets the host meant to deliver, NACK mode only:
-// raw = holes NACKed, afterNack = holes that were never filled in time.
-// Denominator: accepted original packets + holes (a whole lost frame counts
-// as one hole, so a lost IDR is undercounted).
+// Loss in percent of the packets the host sent (PacketLossCounter totals):
+// raw = never arrived as an original, afterNack = still missing after repair.
 struct ReceiverLoss {
     double rawPct = 0, afterNackPct = 0;
 };
-inline ReceiverLoss receiverLoss(uint64_t holes, uint64_t recovered, uint64_t originals) {
+inline ReceiverLoss receiverLoss(uint64_t expected, uint64_t lostRaw, uint64_t lostAfterNack) {
     ReceiverLoss l;
-    const double total = double(originals + holes);
-    if (total <= 0) return l;
-    const uint64_t left = holes > recovered ? holes - recovered : 0;
-    l.rawPct = 100.0 * double(holes) / total;
-    l.afterNackPct = 100.0 * double(left) / total;
+    if (expected == 0) return l;
+    l.rawPct = 100.0 * double(lostRaw) / double(expected);
+    l.afterNackPct = 100.0 * double(lostAfterNack) / double(expected);
     return l;
 }
+
+// Packet loss by sequence number, independent of the receive mode. MR02 has
+// no packet counter, so the sequence is (frame id, index): frame ids are
+// consecutive and each packet carries the frame's packet count. Duplicates
+// are ignored. A frame is finalized once it is kFinalizeLag frames behind the
+// newest one (well past the 40 ms hold); packets that come later count as
+// lost. A frame with no packet at all is counted with the mean size of the
+// frames seen so far (an estimate, also counted in wholeFrames).
+class PacketLossCounter {
+public:
+    static constexpr uint64_t kFinalizeLag = 32;
+
+    // A packet without flag 0x04.
+    void original(uint64_t fid, uint16_t idx, uint16_t cnt) { mark(fid, idx, cnt, true); }
+    // A retransmit the receiver accepted while the frame was still wanted.
+    void repaired(uint64_t fid, uint16_t idx, uint16_t cnt) { mark(fid, idx, cnt, false); }
+    // Stream restart: count what is open, then start over.
+    void restart() {
+        finalizeUpTo(newest_);
+        frames_.clear();
+        started_ = false;
+        newest_ = finalized_ = 0;
+    }
+    // End of session: count the frames still inside the lag.
+    void flush() { finalizeUpTo(newest_); }
+
+    uint64_t expected = 0, lostRaw = 0, lostAfterNack = 0, wholeFrames = 0;
+
+private:
+    struct F {
+        uint16_t count = 0;
+        uint32_t orig = 0, any = 0;
+        std::vector<uint8_t> bits;  // 1 = original, 2 = repaired
+    };
+
+    void mark(uint64_t fid, uint16_t idx, uint16_t cnt, bool orig) {
+        if (!cnt || idx >= cnt) return;
+        if (!started_) {
+            if (!orig) return;  // a stray repair cannot start the count
+            started_ = true;
+            finalized_ = fid ? fid - 1 : 0;
+            newest_ = fid;
+        }
+        if (fid <= finalized_) return;  // too late, already counted as lost
+        F& f = frames_[fid];
+        if (f.count == 0) { f.count = cnt; f.bits.assign(cnt, 0); }
+        if (f.count != cnt) return;
+        uint8_t& b = f.bits[idx];
+        if (orig) {
+            if (!(b & 1)) { if (!b) ++f.any; b |= 1; ++f.orig; }
+        } else if (!b) {
+            b = 2;
+            ++f.any;
+        }
+        if (fid > newest_) newest_ = fid;
+        if (newest_ > kFinalizeLag) finalizeUpTo(newest_ - kFinalizeLag);
+    }
+
+    void missingFrames(uint64_t n) {
+        if (!n) return;
+        const uint64_t est = seenFrames_ ? std::max<uint64_t>(1, (seenPackets_ + seenFrames_ / 2) / seenFrames_) : 1;
+        expected += n * est;
+        lostRaw += n * est;
+        lostAfterNack += n * est;
+        wholeFrames += n;
+    }
+
+    void finalizeUpTo(uint64_t t) {
+        while (!frames_.empty() && frames_.begin()->first <= t) {
+            auto it = frames_.begin();
+            missingFrames(it->first - finalized_ - 1);
+            const F& f = it->second;
+            expected += f.count;
+            lostRaw += f.count - f.orig;
+            lostAfterNack += f.count - f.any;
+            seenPackets_ += f.count;
+            ++seenFrames_;
+            finalized_ = it->first;
+            frames_.erase(it);
+        }
+        if (t > finalized_) {
+            missingFrames(t - finalized_);
+            finalized_ = t;
+        }
+    }
+
+    std::map<uint64_t, F> frames_;
+    bool started_ = false;
+    uint64_t newest_ = 0, finalized_ = 0;
+    uint64_t seenPackets_ = 0, seenFrames_ = 0;
+};
 
 // Presented frames per second, one sample per >= 1 s of wall time. The
 // window holds the samples since clearWindow() (the 5 s stats line); the
@@ -160,12 +258,17 @@ public:
         if (fit == nackPaused_) {
             nackPaused_ = !fit;
             if (nackPaused_) ++st_.nackPausedRtt;
+            // Frames held behind a hole keep their 40 ms deadline after the
+            // switch; they are settled on the NACK path (no new NACKs).
+            settling_ = nackPaused_ && holdingHole();
             log(std::string(nackPaused_ ? "loss.nack_paused" : "loss.nack_resumed") +
                 " rtt_ms=" + std::to_string(int(rttMs())) + " hold_ms=" + std::to_string(int(cfg_.holdMs)));
         }
         return fit;
     }
     size_t heldFrames() const { return assembling_.size(); }
+    // End of session: count loss for the frames that are not finalized yet.
+    void flushLoss() { loss_.flush(); syncLoss(); }
 
     // Same as the old start of the receive loop.
     void start() {
@@ -194,6 +297,7 @@ public:
         // signal a restart.
         const bool retransmit = (flags & 0x04) != 0;
         if (!retransmit) ++st_.originalPackets;
+        else ++st_.retransmitRx;
         const bool frameWentBackward = !retransmit && newest_ > 0 && fid + 2 < newest_;
         const bool farBackward = newest_ > fid + 120;
         const bool earlyRestart = frameWentBackward && fid <= 5;
@@ -208,6 +312,10 @@ public:
             assembling_.clear();
             newest_ = fid;
             lastSubmitted_ = 0;
+            submittedMax_ = 0;
+            settling_ = false;
+            loss_.restart();
+            syncLoss();
             carried_.clear();
             waiting_ = true;
             forceDisc_ = true;
@@ -216,16 +324,35 @@ public:
             ++st_.streamRestarts;
         }
 
-        if (cfg_.nack && !nackUsable()) onPacketStrict(flags, fid, idx, cnt, buf + 20, len);
-        else if (cfg_.nack) onPacketNack(flags, fid, idx, cnt, buf + 20, len, nowMs);
-        else onPacketStrict(flags, fid, idx, cnt, buf + 20, len);
+        if (!retransmit) { loss_.original(fid, idx, cnt); syncLoss(); }
+        // A copy of a frame already shown in this stream is never used again,
+        // in any mode: recovery must not move the stream backwards.
+        if (retransmit && submittedMax_ && fid <= submittedMax_) {
+            ++st_.latePacketsIgnored;
+            return;
+        }
+
+        if (cfg_.nack) {
+            const bool usable = nackUsable();
+            if (usable || settling_) {
+                onPacketNack(flags, fid, idx, cnt, buf + 20, len, nowMs);
+                if (!usable) updateSettling();
+            } else {
+                onPacketStrict(flags, fid, idx, cnt, buf + 20, len);
+            }
+        } else {
+            onPacketStrict(flags, fid, idx, cnt, buf + 20, len);
+        }
     }
 
     // Timers (NACK retry, hold deadline). Call often: on every packet and on
     // every receive timeout.
     void tick(double nowMs) {
-        if (!cfg_.nack || !nackUsable()) return;
+        if (!cfg_.nack) return;
+        const bool usable = nackUsable();
+        if (!usable && !settling_) return;
         service(nowMs);
+        if (!usable) updateSettling();
     }
 
 private:
@@ -244,6 +371,7 @@ private:
         double firstNackMs = -1;
         int nackAttempts = 0;      // NACK messages sent for this frame (D: max 2)
         bool wholeRequested = false;  // placeholder was asked for as a whole frame
+        bool expired = false;      // deadline already missed: no NACK, no repair
 
         void init(uint16_t cnt) {
             count = cnt;
@@ -278,6 +406,27 @@ private:
     void submit(uint64_t fid, const Frame& f, bool disc) {
         if (h_.submit) h_.submit(fid, f.join(), disc, f.key);
         ++st_.complete;
+        submittedMax_ = std::max(submittedMax_, fid);
+    }
+    void syncLoss() {
+        st_.lossExpected = loss_.expected;
+        st_.lossRaw = loss_.lostRaw;
+        st_.lossAfterNack = loss_.lostAfterNack;
+        st_.lossWholeFrames = loss_.wholeFrames;
+    }
+    // A frame is held behind a known hole (NACK state that needs settling).
+    bool holdingHole() const {
+        for (const auto& e : assembling_)
+            if (!e.second.complete() && !e.second.expired && e.second.holeMs >= 0) return true;
+        return false;
+    }
+    // While NACK is paused, held frames are settled on the NACK path until
+    // no hole is held any more or recovery took over (then strict waits).
+    void updateSettling() {
+        if (settling_ && (waiting_ || !holdingHole())) {
+            settling_ = false;
+            log("loss.nack_settled waiting=" + std::string(waiting_ ? "1" : "0"));
+        }
     }
 
     // ---- legacy / strict: the pre-NACK loop body, unchanged ----
@@ -318,7 +467,10 @@ private:
             it->second.init(cnt);
         }
         if (it->second.count != cnt) { ++st_.bad; assembling_.erase(it); return; }
-        it->second.add(idx, payload, len, (flags & 0x01) != 0);
+        if (it->second.add(idx, payload, len, (flags & 0x01) != 0) && (flags & 0x04)) {
+            loss_.repaired(fid, idx, cnt);
+            syncLoss();
+        }
         if (!it->second.complete()) return;
 
         const bool keyFrame = it->second.key;
@@ -356,7 +508,7 @@ private:
     void onPacketNack(uint8_t flags, uint64_t fid, uint16_t idx, uint16_t cnt,
                       const uint8_t* payload, uint16_t len, double now) {
         const bool key = (flags & 0x01) != 0;
-        if (flags & 0x04) ++st_.retransmitRx;
+        const bool retransmit = (flags & 0x04) != 0;
         // Deadlines first: a hole that is already past holdMs must fall back
         // to a keyframe even if this very packet would have closed it.
         // After a fallback this packet is handled like any packet that arrives
@@ -371,7 +523,7 @@ private:
             service(now);
             return;
         }
-        if (lastSubmitted_ && fid <= lastSubmitted_) {
+        if (submittedMax_ && fid <= submittedMax_) {
             ++st_.latePacketsIgnored;
             return;
         }
@@ -379,7 +531,7 @@ private:
         if (!waiting_ && fid > prevNewest + 1) {
             const uint64_t from = std::max(prevNewest, lastSubmitted_) + 1;
             if (fid - from > cfg_.maxHeldFrames) {
-                enterRecovery("frame_gap fid=" + std::to_string(fid), false);
+                enterRecovery("frame_gap fid=" + std::to_string(fid), false, now);
                 ++st_.heldCapMiss;
                 if (!key) { ++st_.recoveryWaitPacketDrops; return; }
             } else {
@@ -401,13 +553,20 @@ private:
             ++st_.bad;
             return;
         }
+        // A frame whose deadline already passed takes no repair (it may still
+        // complete from its own original packets, e.g. a long IDR tail).
+        if (fr.expired && retransmit) {
+            ++st_.latePacketsIgnored;
+            return;
+        }
         if (!fr.add(idx, payload, len, key)) {
             ++st_.duplicatePackets;
             return;
         }
-        if (fr.requested[idx]) ++st_.holesRecovered;
+        if (retransmit) { loss_.repaired(fid, idx, cnt); syncLoss(); }
+        if (fr.requested[idx] && !fr.expired) ++st_.holesRecovered;
         fr.lastPacketMs = now;
-        if (fr.complete()) {
+        if (fr.complete() && !fr.expired) {
             if (fr.wholeRequested) ++st_.holesRecovered;
             if (fr.firstNackMs >= 0) {
                 ++st_.framesRepaired;
@@ -423,8 +582,9 @@ private:
     void drain() {
         for (;;) {
             if (waiting_) {
-                auto it = std::find_if(assembling_.begin(), assembling_.end(),
-                                       [](const auto& e) { return e.second.complete() && e.second.key; });
+                auto it = std::find_if(assembling_.begin(), assembling_.end(), [&](const auto& e) {
+                    return e.first > submittedMax_ && e.second.complete() && e.second.key;
+                });
                 if (it == assembling_.end()) return;
                 const uint64_t fid = it->first;
                 submit(fid, it->second, true);
@@ -466,17 +626,18 @@ private:
     // keyframes after dropUpTo are kept; they end the wait.
     void pruneCarried() {
         for (auto it = carried_.begin(); it != carried_.end();) {
-            const bool done = lastSubmitted_ && it->first <= lastSubmitted_;
+            const bool done = submittedMax_ && it->first <= submittedMax_;
             if (done || it->first + 240 < newest_) it = carried_.erase(it); else ++it;
         }
     }
 
-    void enterRecovery(const std::string& reason, bool countMiss, uint64_t dropUpTo = 0) {
+    void enterRecovery(const std::string& reason, bool countMiss, double now, uint64_t dropUpTo = 0) {
         if (countMiss) ++st_.nackDeadlineMiss;
         // A keyframe given up here may be assembled again from its tail (a long
-        // IDR is often still on the wire). Keep what was already received and
-        // NACKed, so a rebuild neither asks for those packets again nor counts
-        // its holes twice.
+        // IDR is often still on the wire). Keep everything: what was received,
+        // what was NACKed, the attempt count and the original deadline, so a
+        // rebuild neither asks again past the 2-attempt cap or the deadline nor
+        // counts its holes twice. Past its deadline it takes no repair.
         pruneCarried();
         ++st_.strictRecoveryEvents;
         for (auto it = assembling_.begin(); it != assembling_.end();) {
@@ -484,16 +645,14 @@ private:
             if (!it->second.complete()) ++st_.incompleteDropped;
             if (it->second.count && it->second.key && !it->second.complete()) {
                 Frame kept = std::move(it->second);
-                kept.holeMs = kept.lastNackMs = kept.firstNackMs = -1;
-                kept.nackAttempts = 0;
-                std::fill(kept.missSinceMs.begin(), kept.missSinceMs.end(), -1.0);
+                if (kept.holeMs >= 0 && now - kept.holeMs > cfg_.holdMs) kept.expired = true;
                 carried_[it->first] = std::move(kept);
             }
             it = assembling_.erase(it);
         }
         waiting_ = true;
         forceDisc_ = true;
-        lastSubmitted_ = 0;
+        lastSubmitted_ = 0;  // submittedMax_ stays: same stream
         reset();
         log("loss.strict_wait_for_keyframe reason=" + reason);
         requestKeyframe();
@@ -502,12 +661,12 @@ private:
     void service(double now) {
         if (assembling_.size() > cfg_.maxHeldFrames && !waiting_) {
             ++st_.heldCapMiss;
-            enterRecovery("nack_held_cap held=" + std::to_string(assembling_.size()), false);
+            enterRecovery("nack_held_cap held=" + std::to_string(assembling_.size()), false, now);
             drain();
             return;
         }
         if (expireDeadlines(now)) return;
-        sendNacks(now);
+        if (!nackPaused_) sendNacks(now);
     }
 
     // Marks newly visible holes and enforces holdMs (D1-A) from the moment a
@@ -515,10 +674,10 @@ private:
     bool expireDeadlines(double now) {
         for (auto& e : assembling_) {
             Frame& fr = e.second;
-            if (fr.complete()) continue;
+            if (fr.complete() || fr.expired) continue;
             markHoles(e.first, fr, now);
             if (fr.holeMs >= 0 && now - fr.holeMs > cfg_.holdMs) {
-                enterRecovery("nack_deadline fid=" + std::to_string(e.first), true, e.first);
+                enterRecovery("nack_deadline fid=" + std::to_string(e.first), true, now, e.first);
                 drain();
                 return true;
             }
@@ -552,7 +711,7 @@ private:
         for (auto& e : assembling_) {
             const uint64_t fid = e.first;
             Frame& fr = e.second;
-            if (fr.complete()) continue;
+            if (fr.complete() || fr.expired) continue;
             if (fr.nackAttempts >= cfg_.maxNackAttempts) continue;
             if (fr.nackAttempts > 0 && now - fr.lastNackMs < retryMs) continue;
 
@@ -622,9 +781,12 @@ private:
     ReceiverStats st_;
     std::map<uint64_t, Frame> assembling_;
     uint64_t newest_ = 0, lastSubmitted_ = 0;
+    uint64_t submittedMax_ = 0;  // highest frame submitted in this stream
     bool waiting_ = false, forceDisc_ = false;
     double rttMs_ = 0;
     bool nackPaused_ = false;
+    bool settling_ = false;      // NACK paused, held frames still on their deadline
+    PacketLossCounter loss_;
     std::map<uint64_t, Frame> carried_;  // keyframes dropped by a fallback, for a rebuild
 };
 

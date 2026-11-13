@@ -2208,7 +2208,7 @@ static int appMain(int argc, char** argv) {
         };
         jl::PresentedFpsSampler presentedFps;
         // Receiver loss counters at the previous stats line (window deltas).
-        uint64_t prevHoles = 0, prevRecovered = 0, prevOriginals = 0;
+        uint64_t prevLossExpected = 0, prevLossRaw = 0, prevLossAfter = 0;
 
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
@@ -2229,9 +2229,9 @@ static int appMain(int argc, char** argv) {
             }
             if (now - lastStats >= std::chrono::seconds(5)) {
                 const auto& st = receiver.stats();
-                const jl::ReceiverLoss wloss = jl::receiverLoss(st.lostPacketsRaw - prevHoles,
-                                                                st.holesRecovered - prevRecovered,
-                                                                st.originalPackets - prevOriginals);
+                const jl::ReceiverLoss wloss = jl::receiverLoss(st.lossExpected - prevLossExpected,
+                                                                st.lossRaw - prevLossRaw,
+                                                                st.lossAfterNack - prevLossAfter);
                 std::ostringstream line;
                 line << std::fixed << std::setprecision(1)
                      << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
@@ -2254,9 +2254,9 @@ static int appMain(int argc, char** argv) {
                 logLine(line.str());
                 decodeWindowMs.clear();
                 presentedFps.clearWindow();
-                prevHoles = st.lostPacketsRaw;
-                prevRecovered = st.holesRecovered;
-                prevOriginals = st.originalPackets;
+                prevLossExpected = st.lossExpected;
+                prevLossRaw = st.lossRaw;
+                prevLossAfter = st.lossAfterNack;
                 lastStats = now;
             }
 
@@ -2290,8 +2290,9 @@ static int appMain(int argc, char** argv) {
         closesocket(s);
         pumpMessages();
 
+        receiver.flushLoss();
         const auto& rst = receiver.stats();
-        const jl::ReceiverLoss loss = jl::receiverLoss(rst.lostPacketsRaw, rst.holesRecovered, rst.originalPackets);
+        const jl::ReceiverLoss loss = jl::receiverLoss(rst.lossExpected, rst.lossRaw, rst.lossAfterNack);
         const uint64_t packets = rst.packets, complete = rst.complete, bad = rst.bad;
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
@@ -2317,6 +2318,8 @@ static int appMain(int argc, char** argv) {
                 << " nack_whole_frames=" << rst.nackWholeFrames
                 << " lost_packets_raw=" << rst.lostPacketsRaw
                 << " original_packets=" << rst.originalPackets
+                << " loss_expected_packets=" << rst.lossExpected
+                << " loss_whole_frames=" << rst.lossWholeFrames
                 << " loss_raw_pct=" << loss.rawPct
                 << " loss_after_nack_pct=" << loss.afterNackPct
                 << " nack_paused_rtt=" << rst.nackPausedRtt

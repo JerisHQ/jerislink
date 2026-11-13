@@ -307,10 +307,12 @@ static void testPresentedFps() {
     CHECK(s.window().size() == 1 && std::fabs(s.window()[0] - 60.f) < 1e-3f && s.session().size() == 3);
 }
 
-static void testRebuiltFrameNotDoubleCounted() {
-    // A long IDR with an early hole misses the deadline while its tail is still
-    // on the wire. The tail assembles the frame again; the hole it already
-    // NACKed must not count as a second lost packet.
+static void testRebuiltFrameKeepsQuotaAndDeadline() {
+    // Second review item 2. A long IDR with an early hole misses the deadline
+    // while its tail is still on the wire. The tail assembles the frame again;
+    // the rebuild keeps the original deadline and attempt count, so it sends no
+    // more NACKs (it used to send 2 more: 4 in total), takes no late repair,
+    // and its hole does not count twice.
     Recorder rec;
     VideoReceiver r(nackConfig(), rec.hooks());
     r.start();
@@ -328,20 +330,181 @@ static void testRebuiltFrameNotDoubleCounted() {
         auto p = packet(1, i, 10, true);
         r.onPacket(p.data(), p.size(), 42, 0);
     }
-    r.tick(42.5);
-    r.tick(45);
-    CHECK(rec.nacks.size() == 2);
+    for (double t = 42.5; t < 120; t += 0.5) r.tick(t);
+    CHECK(rec.nacks.size() == 1);  // hard cap: no new attempt, past deadline anyway
+    CHECK(r.stats().nackDeadlineMiss == 1);  // the miss is not counted again
     CHECK(r.stats().lostPacketsRaw == 1);
     auto p = packet(1, 2, 10, true, true);
-    r.onPacket(p.data(), p.size(), 50, 0);
-    CHECK(r.stats().holesRecovered == 1);
-    CHECK(!rec.subs.empty() && rec.subs.back().fid == 1);
-    auto l = receiverLoss(r.stats().lostPacketsRaw, r.stats().holesRecovered, r.stats().originalPackets);
-    CHECK(l.afterNackPct == 0);
+    r.onPacket(p.data(), p.size(), 120, 0);  // repair long after the deadline
+    CHECK(r.stats().holesRecovered == 0 && r.stats().framesRepaired == 0);
+    CHECK(rec.subs.empty());
+    feed(r, 2, 3, true, 130);  // the requested fresh keyframe
+    CHECK(rec.subs.size() == 1 && rec.subs[0].fid == 2 && rec.subs[0].disc);
+
+    // Attempts are capped per frame even when the rebuild is still in time:
+    // two NACKs, deadline miss, rebuild, and never a third NACK for that frame.
+    Recorder rec2;
+    VideoReceiver r2(nackConfig(), rec2.hooks());
+    r2.start();
+    for (uint16_t i = 0; i < 5; ++i)
+        if (i != 2) { auto q = packet(1, i, 10, true); r2.onPacket(q.data(), q.size(), 0, 0); }
+    for (double t = 0.5; t <= 41; t += 0.5) r2.tick(t);
+    CHECK(rec2.nacks.size() == 2);
+    for (uint16_t i = 5; i < 10; ++i) { auto q = packet(1, i, 10, true); r2.onPacket(q.data(), q.size(), 41.5, 0); }
+    for (double t = 42; t < 200; t += 0.5) r2.tick(t);
+    size_t forFrame1 = 0;
+    for (auto& n : rec2.nacks) if (n.first == 1) ++forFrame1;
+    CHECK(forFrame1 == 2);
+    CHECK(r2.stats().nackDeadlineMiss == 1);
+}
+
+// Second review item 1: recovery keeps the submitted watermark of the stream.
+// Frame 11 was shown; after a deadline fallback an old keyframe-10 copy must
+// not be shown again (the stream would go backwards).
+static void testRecoveryNeverGoesBackwards() {
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    feed(r, 1, 2, true, 0);
+    for (uint64_t f = 2; f <= 9; ++f) feed(r, f, 2, false, double(f));
+    feed(r, 10, 4, true, 10);
+    feed(r, 11, 2, false, 11);
+    CHECK(rec.subs.size() == 11 && rec.subs.back().fid == 11);
+    feed(r, 12, 4, false, 12, {1});
+    r.tick(12 + 41);
+    CHECK(r.stats().nackDeadlineMiss == 1);
+    for (uint16_t i = 0; i < 4; ++i) {  // e.g. an over-wide NACK range resent all of frame 10
+        auto p = packet(10, i, 4, true, true);
+        r.onPacket(p.data(), p.size(), 60, 0);
+    }
+    CHECK(rec.subs.size() == 11 && rec.subs.back().fid == 11);
+    CHECK(r.stats().streamRestarts == 0);
+    feed(r, 13, 3, true, 70);
+    CHECK(rec.subs.size() == 12 && rec.subs.back().fid == 13 && rec.subs.back().disc);
+
+    // Same on the strict path (NACK paused at RTT 60 ms): a retransmit from an
+    // earlier NACK arriving during the wait is not shown either.
+    Recorder rec2;
+    VideoReceiver r2(nackConfig(), rec2.hooks());
+    r2.setRttMs(60);
+    r2.start();
+    feed(r2, 1, 2, true, 0);
+    feed(r2, 2, 2, false, 16);
+    feed(r2, 3, 3, false, 33, {1});
+    feed(r2, 4, 2, false, 50);  // frame gap -> strict wait
+    CHECK(r2.stats().strictRecoveryEvents == 1);
+    for (uint16_t i = 0; i < 2; ++i) {
+        auto p = packet(1, i, 2, true, true);
+        r2.onPacket(p.data(), p.size(), 60, 0);
+    }
+    CHECK(rec2.subs.size() == 2 && rec2.subs.back().fid == 2);
+    // A real host restart still resets the watermark.
+    auto fresh = packet(1, 0, 1, true);
+    r2.onPacket(fresh.data(), fresh.size(), 400, 300);
+    CHECK(r2.stats().streamRestarts == 1);
+    CHECK(rec2.subs.size() == 3 && rec2.subs.back().fid == 1);
+}
+
+// Second review item 3: frames already held when RTT rises and NACK pauses
+// keep the 40 ms deadline, and the miss is counted.
+static void testPauseKeepsHeldDeadline() {
+    auto setup = [](Recorder& rec, VideoReceiver& r) {
+        r.start();
+        feed(r, 1, 2, true, 0);
+        feed(r, 2, 4, false, 16, {1});  // hole at 16 ms
+        r.tick(18.5);                   // NACK sent
+        feed(r, 3, 2, false, 33);       // held
+        CHECK(rec.nacks.size() == 1 && rec.subs.size() == 1);
+        r.setRttMs(60);                 // NACK cannot fit any more
+    };
+    {   // repair 44 ms after the hole: too late
+        Recorder rec;
+        VideoReceiver r(nackConfig(), rec.hooks());
+        setup(rec, r);
+        auto p = packet(2, 1, 4, false, true);
+        r.onPacket(p.data(), p.size(), 16 + 44, 0);
+        CHECK(r.stats().nackPausedRtt == 1);
+        CHECK(r.stats().nackDeadlineMiss == 1);
+        CHECK(r.stats().framesRepaired == 0);
+        CHECK(rec.subs.size() == 1);
+        CHECK(rec.keyframeRequests >= 2);
+    }
+    {   // no packet at all: the timer alone enforces it
+        Recorder rec;
+        VideoReceiver r(nackConfig(), rec.hooks());
+        setup(rec, r);
+        r.tick(40);
+        CHECK(r.stats().nackDeadlineMiss == 0);
+        r.tick(16 + 41);
+        CHECK(r.stats().nackDeadlineMiss == 1);
+        CHECK(rec.nacks.size() == 1);  // no new NACK while paused
+    }
+    {   // repair inside the hold: frames 2 and 3 go out, then strict as usual
+        Recorder rec;
+        VideoReceiver r(nackConfig(), rec.hooks());
+        setup(rec, r);
+        auto p = packet(2, 1, 4, false, true);
+        r.onPacket(p.data(), p.size(), 16 + 30, 0);
+        CHECK(rec.subs.size() == 3 && rec.subs.back().fid == 3 && !rec.subs.back().disc);
+        CHECK(r.stats().nackDeadlineMiss == 0 && r.stats().framesRepaired == 1);
+        feed(r, 4, 3, false, 50, {1});
+        feed(r, 5, 2, false, 66);  // strict: frame gap -> keyframe at once
+        CHECK(rec.nacks.size() == 1);
+        CHECK(r.stats().strictRecoveryEvents == 1);
+    }
+}
+
+// Second review item 4: loss is counted by (frame, index), de-duplicated, in
+// every mode. 1 of 4 packets lost per frame is 25%, with every other packet
+// arriving twice.
+static void testPacketLossAllModes() {
+    auto run = [](ReceiverConfig c, double rtt) {
+        Recorder rec;
+        VideoReceiver r(c, rec.hooks());
+        if (rtt > 0) r.setRttMs(rtt);
+        r.start();
+        for (uint64_t f = 1; f <= 100; ++f) {
+            for (int dup = 0; dup < 2; ++dup)
+                for (uint16_t i = 0; i < 4; ++i) {
+                    if (i == 1) continue;
+                    auto p = packet(f, i, 4, f % 50 == 1);
+                    r.onPacket(p.data(), p.size(), double(f) * 16, 0);
+                }
+        }
+        r.flushLoss();
+        return r.stats();
+    };
+    ReceiverConfig off;  // strict, NACK off
+    for (const ReceiverStats& st : {run(off, 0), run(nackConfig(), 60)}) {
+        const ReceiverLoss l = receiverLoss(st.lossExpected, st.lossRaw, st.lossAfterNack);
+        CHECK(st.lossExpected == 400);
+        CHECK(std::fabs(l.rawPct - 25.0) < 1e-9);
+        CHECK(std::fabs(l.afterNackPct - 25.0) < 1e-9);
+    }
+    // NACK on: the repaired packet counts as raw loss but not as loss left.
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    feed(r, 1, 4, true, 0);
+    feed(r, 2, 4, false, 16, {1});
+    r.tick(18.5);
+    auto p = packet(2, 1, 4, false, true);
+    r.onPacket(p.data(), p.size(), 25, 0);
+    r.onPacket(p.data(), p.size(), 26, 0);  // duplicate repair
+    feed(r, 3, 4, false, 33);
+    r.flushLoss();
+    CHECK(r.stats().lossExpected == 12 && r.stats().lossRaw == 1 && r.stats().lossAfterNack == 0);
+    // A frame with no packet at all counts with the mean frame size.
+    PacketLossCounter c;
+    for (uint64_t f = 1; f <= 40; ++f)
+        if (f != 5) for (uint16_t i = 0; i < 4; ++i) c.original(f, i, 4);
+    CHECK(c.wholeFrames == 1 && c.expected == 8 * 4 && c.lostRaw == 4);  // finalized up to frame 8
+    c.flush();
+    CHECK(c.expected == 160 && c.lostRaw == 4 && c.lostAfterNack == 4);
 }
 
 static void testLossPercent() {
-    auto l = receiverLoss(10, 8, 990);
+    auto l = receiverLoss(1000, 10, 2);
     CHECK(std::fabs(l.rawPct - 1.0) < 1e-9 && std::fabs(l.afterNackPct - 0.2) < 1e-9);
     CHECK(receiverLoss(0, 0, 0).rawPct == 0);
 }
@@ -404,7 +567,8 @@ public:
         r_.deadlineMiss = st.nackDeadlineMiss;
         r_.repairP50 = receiverPercentile(st.repairMs, 50);
         r_.repairP95 = receiverPercentile(st.repairMs, 95);
-        const ReceiverLoss loss = receiverLoss(st.lostPacketsRaw, st.holesRecovered, st.originalPackets);
+        rx_->flushLoss();
+        const ReceiverLoss loss = receiverLoss(st.lossExpected, st.lossRaw, st.lossAfterNack);
         r_.lossRawPct = loss.rawPct;
         r_.lossAfterNackPct = loss.afterNackPct;
         return r_;
@@ -592,7 +756,10 @@ int main() {
     testDeadlineEnforcedBeforeRepair();
     testLossPercent();
     testHighRttSkipsHold();
-    testRebuiltFrameNotDoubleCounted();
+    testRebuiltFrameKeepsQuotaAndDeadline();
+    testRecoveryNeverGoesBackwards();
+    testPauseKeepsHeldDeadline();
+    testPacketLossAllModes();
     testPresentedFps();
     runSimulation();
     if (gFailures) {
