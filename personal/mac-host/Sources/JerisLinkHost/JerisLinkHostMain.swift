@@ -178,7 +178,8 @@ struct JerisLinkHostMain {
         if rawArgs.count == 2, rawArgs[1] == "--self-test" {
             let peer = ControlPeerSelfTest.run()
             let listen = ListenConfigSelfTest.run()
-            exit(peer == 0 && listen == 0 ? 0 : 1)
+            let control = ControlServiceSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"

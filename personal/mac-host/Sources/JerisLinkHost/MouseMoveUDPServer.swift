@@ -66,10 +66,14 @@ private final class CursorShapeDetector {
     }
 }
 
-private final class LocalControlMouseClient {
+/// The video service's mouse relay into the control service's loopback
+/// listener (127.0.0.1:38411). Internal so the control self-test drives it.
+final class LocalControlMouseClient {
     private let host = "127.0.0.1"
-    private let port: UInt16 = 38411
+    private let port: UInt16
     private var fd: Int32 = -1
+
+    init(port: UInt16 = 38411) { self.port = port }
 
     deinit { closeConnection() }
 

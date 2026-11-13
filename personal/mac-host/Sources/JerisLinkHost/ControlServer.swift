@@ -37,8 +37,10 @@ final class ControlServer: @unchecked Sendable {
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
-         acceptProxy: Bool = true) {
+         acceptProxy: Bool = true,
+         inputHelper: InputHelperClient? = nil) {
         self.bindIP = bindIP
+        self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -89,7 +91,9 @@ final class ControlServer: @unchecked Sendable {
             // Keep the client object even when the Helper is not reachable yet.
             // InputHelperClient reconnects lazily on send, which removes the
             // boot-order dependency where the Host had to start after the app.
-            let helper = InputHelperClient()
+            // A caller running several servers passes one shared client: the
+            // helper serves a single connection at a time.
+            let helper = inputHelper ?? InputHelperClient()
             inputHelper = helper
             helperOK = helper.ping()
         }
