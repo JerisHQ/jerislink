@@ -10,6 +10,7 @@
 //    simulation with a bottleneck link (drop-tail queue, capacity that drops
 //    for a while) run with ABR off and on.
 #include "abr.hpp"
+#include "present_scheduler.hpp"
 #include "video_receiver.hpp"
 
 #include <algorithm>
@@ -1500,6 +1501,230 @@ static void runAbrSimulation() {
     }
 }
 
+// ---- Present scheduling (present_scheduler.hpp) ----------------------------
+// A fake swap chain stands in for DXGI: Present() can be told to return
+// "busy" (DXGI_ERROR_WAS_STILL_DRAWING) and the latency object can be held
+// unsignalled. The screen records which decoded frame each present showed.
+
+struct FakeSwapChain {
+    int newest = 0;            // frame id the decoder produced last
+    int backBuffer = 0;        // frame id drawn into the back buffer
+    std::vector<int> screen;   // frame ids in present order
+    int busyLeft = 0;          // the next N Present() calls return Busy
+    bool latencySignalled = true;
+    int latencyAsks = 0;
+    int renders = 0;
+    double now = 0.0;
+
+    PresentOps ops() {
+        PresentOps o;
+        o.latencyReady = [this] { ++latencyAsks; return latencySignalled; };
+        o.render = [this] { ++renders; backBuffer = newest; };
+        o.present = [this] {
+            if (busyLeft > 0) { --busyLeft; return PresentResult::Busy; }
+            screen.push_back(backBuffer);
+            return PresentResult::Ok;
+        };
+        o.nowMs = [this] { return now; };
+        return o;
+    }
+};
+
+static void testPresentStillDrawingKeepsFrame() {
+    // Old viewer: WAS_STILL_DRAWING dropped the frame for good. Here the
+    // same frame must reach the screen on the next loop pass.
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    sc.newest = 1;
+    sc.busyLeft = 1;
+    p.onDecoded();
+    CHECK(sc.screen.empty());
+    CHECK(p.pending());
+    CHECK(p.service() == false);       // next loop pass
+    CHECK(sc.screen.size() == 1 && sc.screen.back() == 1);
+    CHECK(sc.renders == 1);            // drawn once, presented on retry
+    CHECK(p.counters().presented == 1);
+    CHECK(p.counters().busyDrops == 0);
+    CHECK(p.counters().busyRetries == 1);
+    CHECK(!p.pending());
+    CHECK(p.service() == false);       // nothing pending: no extra present
+    CHECK(sc.screen.size() == 1);
+}
+
+static void testPresentLatestFrameWins() {
+    // Frames 1..3 arrive while the swap chain stays busy: only 3 is shown,
+    // 1 and 2 count as busy drops, nothing queues up.
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    sc.busyLeft = 1000;
+    for (int f = 1; f <= 3; ++f) { sc.newest = f; p.onDecoded(); }
+    CHECK(sc.screen.empty());
+    CHECK(p.counters().busyDrops == 2);
+    sc.busyLeft = 0;
+    p.service();
+    CHECK(sc.screen.size() == 1 && sc.screen.back() == 3);
+    CHECK(p.counters().decoded == 3);
+    CHECK(p.counters().presented == 1);
+    CHECK(p.counters().presented + p.counters().busyDrops == p.counters().decoded);
+}
+
+static void testPresentLatencyGate() {
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    sc.latencySignalled = false;
+    sc.newest = 1;
+    p.onDecoded();
+    CHECK(sc.renders == 0);            // no draw into a buffer still in use
+    CHECK(sc.screen.empty());
+    CHECK(p.waitingForLatency());
+    sc.now = 10.0;
+    p.service();
+    CHECK(sc.screen.empty());
+    // The loop waited on the latency object and it fired.
+    p.onLatencySignalled();
+    CHECK(sc.screen.size() == 1 && sc.screen.back() == 1);
+    // A busy Present() after the slot was taken must not ask for the slot again.
+    sc.latencySignalled = true;
+    sc.newest = 2;
+    sc.busyLeft = 2;
+    const int asksBefore = sc.latencyAsks;
+    p.onDecoded();
+    p.service();
+    CHECK(sc.latencyAsks == asksBefore + 1);
+    CHECK(sc.screen.size() == 1);
+    p.service();
+    CHECK(sc.screen.size() == 2 && sc.screen.back() == 2);
+    CHECK(sc.latencyAsks == asksBefore + 1);
+}
+
+static void testPresentLatencyCap() {
+    // An object that never fires (occluded window, driver quirk) must not
+    // freeze the picture: after the cap the frame is presented anyway.
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    sc.latencySignalled = false;
+    sc.newest = 7;
+    p.onDecoded();
+    sc.now = LatestFramePresenter::kLatencyWaitCapMs - 1;
+    p.service();
+    CHECK(sc.screen.empty());
+    sc.now = LatestFramePresenter::kLatencyWaitCapMs + 1;
+    p.service();
+    CHECK(sc.screen.size() == 1 && sc.screen.back() == 7);
+    CHECK(p.counters().latencyTimeouts == 1);
+}
+
+static void testPresentRepaint() {
+    FakeSwapChain sc;
+    LatestFramePresenter p(sc.ops());
+    p.onRepaint();                     // nothing decoded yet: nothing to draw
+    CHECK(sc.renders == 0 && sc.screen.empty());
+    sc.newest = 1;
+    p.onDecoded();
+    CHECK(sc.screen.size() == 1);
+    p.onRepaint();                     // WM_PAINT draws the last frame again
+    CHECK(sc.screen.size() == 2 && sc.screen.back() == 1);
+    CHECK(sc.renders == 2);
+    CHECK(p.counters().presented == 1);
+    CHECK(p.counters().repaints == 1);
+    // A pending repaint replaced by a new frame is not a busy drop.
+    sc.busyLeft = 1;
+    p.onRepaint();
+    sc.newest = 2;
+    p.onDecoded();
+    CHECK(p.counters().busyDrops == 0);
+    CHECK(sc.screen.back() == 2);
+    CHECK(p.counters().presented == 2);
+    // Resize lost the back buffer while a frame was pending: draw it again.
+    sc.busyLeft = 1;
+    sc.newest = 3;
+    p.onDecoded();
+    p.onBuffersLost();
+    const int r = sc.renders;
+    p.service();
+    CHECK(sc.renders == r + 1);
+    CHECK(sc.screen.back() == 3);
+}
+
+// Loop-level model of the reported laptop case: decoded frames arrive at ~57 fps, the
+// receive loop runs every 1 ms, and a presented buffer stays in use until the
+// second vsync after it (DWM composition), so a present in that window is
+// "still drawing". Old policy drops on busy; the new one retries next pass.
+struct PresentLoopResult {
+    uint64_t decoded = 0, presented = 0, busyDrops = 0;
+    int lastShown = 0;
+    double idleFrameShownMs = -1.0;    // when the lone frame after idle reached the screen
+};
+
+static PresentLoopResult runPresentLoop(bool newPolicy, double fps, int frames, bool idleFrame) {
+    const double vsync = 1000.0 / 60.0;
+    double busyUntil = -1.0;
+    double now = 0.0;
+    int newest = 0, back = 0;
+    PresentLoopResult res;
+    PresentOps ops;
+    ops.render = [&] { back = newest; };
+    ops.present = [&] {
+        if (now < busyUntil) return PresentResult::Busy;
+        busyUntil = (std::floor(now / vsync) + 2.0) * vsync;
+        res.lastShown = back;
+        if (back == frames + 1 && res.idleFrameShownMs < 0) res.idleFrameShownMs = now;
+        return PresentResult::Ok;
+    };
+    ops.nowMs = [&] { return now; };
+    LatestFramePresenter p(ops);
+    uint64_t oldPresented = 0, oldDrops = 0;
+    int next = 1;
+    const double idleAt = frames * (1000.0 / fps) + 500.0;
+    for (int ms = 0; ms < static_cast<int>(idleAt) + 200; ++ms) {
+        now = ms;
+        const bool lone = idleFrame && next == frames + 1 && now >= idleAt;
+        if ((next <= frames && now >= (next - 1) * (1000.0 / fps)) || lone) {
+            newest = next++;
+            if (lone) busyUntil = now + 5.0;   // the frame lands while the last flip is still in use
+            if (newPolicy) {
+                p.onDecoded();
+            } else {
+                back = newest;
+                if (ops.present() == PresentResult::Busy) ++oldDrops; else ++oldPresented;
+            }
+            ++res.decoded;
+        } else if (newPolicy) {
+            p.service();
+        }
+    }
+    if (newPolicy) {
+        res.presented = p.counters().presented;
+        res.busyDrops = p.counters().busyDrops;
+    } else {
+        res.presented = oldPresented;
+        res.busyDrops = oldDrops;
+    }
+    return res;
+}
+
+static void testPresentLoopOldVsNew() {
+    const PresentLoopResult oldR = runPresentLoop(false, 57.0, 570, true);
+    const PresentLoopResult newR = runPresentLoop(true, 57.0, 570, true);
+    std::printf("present loop 57 fps: old presented=%llu busy_drops=%llu | new presented=%llu busy_drops=%llu\n",
+                static_cast<unsigned long long>(oldR.presented), static_cast<unsigned long long>(oldR.busyDrops),
+                static_cast<unsigned long long>(newR.presented), static_cast<unsigned long long>(newR.busyDrops));
+    CHECK(oldR.decoded == newR.decoded);
+    CHECK(oldR.presented + oldR.busyDrops == oldR.decoded);
+    CHECK(newR.presented + newR.busyDrops == newR.decoded);
+    // Old policy: the lone frame after idle (IME popup) hit a busy present
+    // and never reached the screen.
+    CHECK(oldR.idleFrameShownMs < 0);
+    CHECK(oldR.lastShown != 571);
+    // New policy: it is shown once the buffer frees, within two vsyncs.
+    CHECK(newR.lastShown == 571);
+    CHECK(newR.idleFrameShownMs >= 0);
+    // The display can show at most 30 frames/s in this model (a buffer is
+    // held for two vsyncs); the new loop must use every slot it gets.
+    CHECK(newR.presented > oldR.presented);
+    CHECK(newR.presented * 100 >= newR.decoded * 45);
+}
+
 int main() {
     testStrictWithoutNack();
     testSingleHoleRepaired();
@@ -1529,6 +1754,12 @@ int main() {
     testAbrUnknownSlopeNeverClear();
     testSlopeDriftBound();
     testCaptureRestartCadence();
+    testPresentStillDrawingKeepsFrame();
+    testPresentLatestFrameWins();
+    testPresentLatencyGate();
+    testPresentLatencyCap();
+    testPresentRepaint();
+    testPresentLoopOldVsNew();
     runSimulation();
     runAbrSimulation();
     if (gFailures) {

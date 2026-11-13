@@ -35,7 +35,7 @@ struct Options {
     std::string videoBackend = "auto";
     std::string codec = "h264";
     uint16_t bitrateMbps = 25;
-    std::string presentMode = "nowait";
+    std::string presentMode = "waitable";  // "nowait": no frame-latency object (both keep busy frames)
     std::string lossRecovery = "strict";
     std::string nack = "on";  // on: use NACK when the host supports it (strict only)
     std::string abr = "on";   // on: send MRM1 0x42 receiver reports when the host supports ABR
