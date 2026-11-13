@@ -193,6 +193,8 @@ final class UDPFrameSender: @unchecked Sendable {
     private var nackOverBudget: UInt64 = 0
     // ABR window: send queue max since the last abrWindow() call (lock).
     private var abrWindowQueueMax = 0
+    // Send-cadence slope since the last abrWindow() call (lock).
+    private var sendSlope: ArrivalSlope
     private var abrPaceMbps = 0
     private var statsSuffix: (() -> String)?
 
@@ -201,7 +203,8 @@ final class UDPFrameSender: @unchecked Sendable {
     private let maxQueuedBeforeFlush = 4
 
     init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int,
-         pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20) throws {
+         pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20,
+         nominalFps: Int = 60) throws {
         guard packetBytes > headerBytes + 64 && packetBytes <= 1400 else {
             throw NSError(domain: "JerisLink.UDP", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "packetBytes must be between 85 and 1400"])
@@ -215,6 +218,7 @@ final class UDPFrameSender: @unchecked Sendable {
         self.lastRefillNanos = DispatchTime.now().uptimeNanoseconds
         self.retransmitEnabled = retransmit
         self.budget = RetransmitBudget(videoBitrateMbps: videoBitrateMbps)
+        self.sendSlope = ArrivalSlope(nominalFrameMs: 1000.0 / Double(max(1, nominalFps)))
 
         socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard socketFD >= 0 else {
@@ -269,6 +273,7 @@ final class UDPFrameSender: @unchecked Sendable {
         }
 
         lock.lock()
+        sendSlope.onFrame(frameID, nowMs: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000)
         maxPacketsPerFrame = max(maxPacketsPerFrame, UInt64(packetCount))
         maxFrameBytes = max(maxFrameBytes, UInt64(data.count))
         if keyFrame { keyFrames &+= 1 }
@@ -386,13 +391,14 @@ final class UDPFrameSender: @unchecked Sendable {
     }
 
     /// ABR input for one receiver report: the most frames queued at the pacer
-    /// since the previous call (then reset to the current depth), and the
-    /// cumulative NACK over-budget count.
-    func abrWindow() -> (queueMax: Int, overBudgetTotal: UInt64) {
+    /// since the previous call (then reset to the current depth), the
+    /// cumulative NACK over-budget count, and the send-cadence slope since
+    /// the previous call (frames as the encoder handed them over).
+    func abrWindow() -> (queueMax: Int, overBudgetTotal: UInt64, sendSlope: ArrivalSlope.Window) {
         lock.lock(); defer { lock.unlock() }
         let q = abrWindowQueueMax
         abrWindowQueueMax = queuedFrames
-        return (q, nackOverBudget)
+        return (q, nackOverBudget, sendSlope.take())
     }
 
     /// ABR changed the encoder bitrate: the NACK budget follows it, and so

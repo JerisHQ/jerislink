@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -122,6 +124,63 @@ private:
     double sum_ = 0;
     int n_ = 0;
     uint64_t skipped_ = 0;
+};
+
+// Host send-cadence compensation (host only, no wire change). The viewer
+// measures arrival gaps against the nominal 1000/fps, so a host that hands
+// frames to the sender slower than that (encode or capture bound: ~50 fps
+// with a 60 fps setting) reads as delay growing by 15 x (gap - T) per 250 ms
+// while no queue grows. The host runs the same ArrivalSlope over the times
+// the encoder hands it frames and subtracts its own slope. When the host
+// window has too few in-range gaps (e.g. a 30 fps cadence) the viewer slope
+// is left out as unknown; loss, send queue and NACK budget still apply.
+struct SlopeEstimate { bool valid = false; int slope01Ms = 0; };
+inline SlopeEstimate compensateSlope(bool viewerValid, int viewer01Ms, const ArrivalSlope::Window& host) {
+    if (!viewerValid || !host.valid) return {};
+    return {true, viewer01Ms - int(abrSlopeTo01Ms(host.slopeMs))};
+}
+
+// Host-side delay signal for the controller: compensateSlope, then a jitter
+// gate. Over a relay (DERP) the compensated slope still moves by ~8 ms from
+// one 250 ms window to the next, twice the 4 ms delay threshold, and would
+// never stay under the 1 ms "clear" limit. The noise is the median |change|
+// between consecutive compensated slopes over the last 16 reports (4 s); a
+// slope within 2x that noise is reported as unknown, which neither steps
+// down for delay nor blocks a step up. A queue that keeps growing changes
+// the slope little from one report to the next, so it stays visible; direct
+// paths have almost no noise and behave as before. Swift: AbrController.swift
+// SlopeFilter, same rules and test vectors.
+class SlopeFilter {
+public:
+    static constexpr size_t kHistory = 16;
+    static constexpr size_t kMinDiffs = 4;
+
+    SlopeEstimate onReport(bool viewerValid, int viewer01Ms, const ArrivalSlope::Window& host) {
+        SlopeEstimate e = compensateSlope(viewerValid, viewer01Ms, host);
+        if (!e.valid) { haveLast_ = false; return e; }
+        if (haveLast_) {
+            diffs_.push_back(std::abs(e.slope01Ms - last_));
+            if (diffs_.size() > kHistory) diffs_.pop_front();
+        }
+        haveLast_ = true;
+        last_ = e.slope01Ms;
+        const int n = noise01Ms();
+        if (n > 0 && std::abs(e.slope01Ms) <= 2 * n) e.valid = false;
+        return e;
+    }
+    // Median |change| between consecutive compensated slopes (0.1 ms), 0 until 4 changes.
+    int noise01Ms() const {
+        if (diffs_.size() < kMinDiffs) return 0;
+        std::vector<int> d(diffs_.begin(), diffs_.end());
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        return d[d.size() / 2];
+    }
+    void reset() { diffs_.clear(); haveLast_ = false; last_ = 0; }
+
+private:
+    std::deque<int> diffs_;
+    bool haveLast_ = false;
+    int last_ = 0;
 };
 
 // Host controller, design 2.2 (D5 A: bitrate only). Integer kbps; the Swift

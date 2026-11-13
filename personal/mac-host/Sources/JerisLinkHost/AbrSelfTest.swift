@@ -131,6 +131,75 @@ enum AbrSelfTest {
         expect(host.reset() == AbrChange(fromKbps: 9000, toKbps: 18000, reason: "new_session") && host.reset() == nil,
                "abr host: new session resets to the ceiling once")
 
+        // Send-cadence compensation (testSlopeCompensation in C++): a 51 fps
+        // host against 60 fps reads as +44 ms per 250 ms at the viewer; the
+        // host's own slope cancels it and a real queue stays.
+        let T = 1000.0 / 60, gap = 1000.0 / 51
+        var hs = ArrivalSlope(nominalFrameMs: T), vs = ArrivalSlope(nominalFrameMs: T)
+        for f in 1...14 { hs.onFrame(UInt64(f), nowMs: Double(f) * gap); vs.onFrame(UInt64(f), nowMs: 30 + Double(f) * gap) }
+        let hw = hs.take(), vw = vs.take()
+        let e1 = SlopeFilter.compensate(viewerValid: true, viewer01Ms: abrSlopeTo01Ms(vw.slopeMs), host: hw)
+        expect(vw.valid && vw.slopeMs > 40 && hw.valid && e1.valid && abs(e1.slope01Ms) <= 1,
+               "slope: encode-bound cadence cancelled")
+        for f in 1...14 {
+            hs.onFrame(UInt64(100 + f), nowMs: 1000 + Double(f) * gap)
+            vs.onFrame(UInt64(100 + f), nowMs: 1030 + Double(f) * (gap + 1))
+        }
+        let e2 = SlopeFilter.compensate(viewerValid: true, viewer01Ms: abrSlopeTo01Ms(vs.take().slopeMs), host: hs.take())
+        expect(e2.valid && abs(e2.slope01Ms - 150) <= 1, "slope: queue growth survives compensation")
+        var slow = ArrivalSlope(nominalFrameMs: T)
+        for f in 1...8 { slow.onFrame(UInt64(f), nowMs: Double(f) * 33.3) }
+        expect(!SlopeFilter.compensate(viewerValid: true, viewer01Ms: 400, host: slow.take()).valid,
+               "slope: host window unknown -> unknown")
+
+        // Jitter gate (testSlopeFilter in C++, same vectors).
+        let flat = ArrivalSlope.Window(valid: true, slopeMs: 0, samples: 14)
+        var f = SlopeFilter()
+        var firstFour = true, gated = true
+        for i in 0..<12 {
+            let e = f.onReport(viewerValid: true, viewer01Ms: i % 2 == 1 ? -80 : 80, host: flat)
+            if i < 4 { firstFour = firstFour && e.valid } else { gated = gated && !e.valid }
+        }
+        expect(firstFour && gated && f.noise01Ms == 160, "slope gate: +-8 ms relay jitter -> unknown")
+        var firstValid = -1, lastOk = false
+        for i in 0..<16 {
+            let e = f.onReport(viewerValid: true, viewer01Ms: 150, host: flat)
+            if e.valid && firstValid < 0 { firstValid = i }
+            if i == 15 { lastOk = e.valid && e.slope01Ms == 150 }
+        }
+        expect(lastOk && firstValid >= 0 && firstValid <= 9, "slope gate: steady +15 ms queue growth passes")
+        var direct = SlopeFilter(), directOk = true
+        for i in 0..<10 {
+            let e = direct.onReport(viewerValid: true, viewer01Ms: i < 5 ? 0 : 50, host: flat)
+            directOk = directOk && e == SlopeFilter.Estimate(valid: true, slope01Ms: i < 5 ? 0 : 50)
+        }
+        expect(directOk, "slope gate: no noise, nothing gated")
+        var g = SlopeFilter()
+        let g1 = g.onReport(viewerValid: true, viewer01Ms: 30, host: flat)
+        let g2 = g.onReport(viewerValid: false, viewer01Ms: 0, host: flat)
+        let g3 = g.onReport(viewerValid: true, viewer01Ms: 30, host: ArrivalSlope.Window())
+        let g4 = g.onReport(viewerValid: true, viewer01Ms: 500, host: flat)
+        expect(g1.valid && !g2.valid && !g3.valid && g4.valid && g.noise01Ms == 0,
+               "slope gate: unknown side -> unknown, no change measured across it")
+
+        // AbrHost with the send slope: the 51 fps cadence bias never steps down.
+        let comp = AbrHost(enabled: true, ceilingMbps: 18)
+        var biased = ReceiverReport()
+        biased.expected = 400; biased.slopeValid = true; biased.slope01Ms = Int16(abrSlopeTo01Ms(vw.slopeMs))
+        let hostWindow = ArrivalSlope.Window(valid: true, slopeMs: hw.slopeMs, samples: 14)
+        var compDown = false
+        for k in 1...8 {
+            compDown = compDown || comp.onReport(biased, overBudgetTotal: 0, queueMax: 0, sendSlope: hostWindow,
+                                                 nowNanos: t0 + UInt64(k) * 250_000_000) != nil
+        }
+        let v1 = AbrHost(enabled: true, ceilingMbps: 18)
+        var v1Down: AbrChange?
+        for k in 1...2 { v1Down = v1.onReport(biased, overBudgetTotal: 0, queueMax: 0, nowNanos: t0 + UInt64(k) * 250_000_000) }
+        expect(!compDown && comp.currentKbps == 18000 && v1Down?.reason == "delay",
+               "abr host: send slope cancels the cadence bias (v1 steps down on it)")
+        expect(comp.statsFields().contains(" abr_slope_host=") && comp.statsFields().contains(" abr_slope_eff=")
+               && !v1.statsFields().contains("abr_slope_host"), "abr host: slope stats fields")
+
         // NACK budget follows the bitrate: 20% of bitrate per 100 ms.
         var budget = RetransmitBudget(videoBitrateMbps: 20)
         budget.setVideoBitrate(kbps: 8000)

@@ -143,6 +143,100 @@ struct AbrController {
     }
 }
 
+/// Send-cadence slope: the viewer's ArrivalSlope (windows-client/abr.hpp)
+/// run over the times the encoder hands frames to the sender. Same rules:
+/// consecutive frame ids, gaps outside [0.25 T, 1.75 T] left out, mean excess
+/// scaled to 250 ms, under 6 samples = unknown.
+struct ArrivalSlope {
+    struct Window: Equatable { var valid = false; var slopeMs = 0.0; var samples = 0 }
+    static let reportIntervalMs = 250.0
+    let t: Double
+    private var have = false
+    private var last: UInt64 = 0
+    private var at = 0.0
+    private var sum = 0.0
+    private var n = 0
+
+    init(nominalFrameMs: Double) { t = nominalFrameMs > 0 ? nominalFrameMs : 1000.0 / 60 }
+
+    mutating func onFrame(_ fid: UInt64, nowMs: Double) {
+        if have && fid <= last {
+            if fid &+ 2 < last && last - fid > 120 { last = fid; at = nowMs }  // restart
+            return
+        }
+        if have && fid == last &+ 1 {
+            let gap = nowMs - at
+            if gap >= 0.25 * t && gap <= 1.75 * t { sum += gap - t; n += 1 }
+        }
+        have = true
+        last = fid
+        at = nowMs
+    }
+
+    mutating func take() -> Window {
+        var w = Window()
+        w.samples = n
+        w.valid = n >= 6
+        if w.valid { w.slopeMs = sum / Double(n) * (Self.reportIntervalMs / t) }
+        sum = 0
+        n = 0
+        return w
+    }
+}
+
+/// Same rounding as abrSlopeTo01Ms in abr.hpp.
+func abrSlopeTo01Ms(_ ms: Double) -> Int {
+    let v = min(max(ms * 10, -32767), 32767)
+    return Int(v < 0 ? v - 0.5 : v + 0.5)
+}
+
+/// Host delay signal (abr.hpp SlopeFilter, same rules and test vectors).
+/// 1. Compensation: the viewer measures gaps against 1000/fps, so a host
+///    that encodes slower (~50 fps at a 60 fps setting) reads as delay
+///    growing 15 x (gap - T) per 250 ms with no queue at all. The host's own
+///    send-cadence slope is subtracted; either side unknown = unknown.
+/// 2. Jitter gate: over a relay (DERP) the compensated slope moves ~8 ms from
+///    one report to the next, twice the 4 ms delay threshold. Noise is the
+///    median |change| between consecutive compensated slopes over the last
+///    16 reports; a slope within 2x the noise is reported as unknown (no
+///    delay step-down, no blocked step-up). A growing queue changes little
+///    report to report and stays visible; with no noise nothing is gated.
+struct SlopeFilter {
+    struct Estimate: Equatable { var valid = false; var slope01Ms = 0 }
+    static let history = 16
+    static let minDiffs = 4
+    private var diffs: [Int] = []
+    private var haveLast = false
+    private var last = 0
+
+    static func compensate(viewerValid: Bool, viewer01Ms: Int, host: ArrivalSlope.Window) -> Estimate {
+        guard viewerValid, host.valid else { return Estimate() }
+        return Estimate(valid: true, slope01Ms: viewer01Ms - abrSlopeTo01Ms(host.slopeMs))
+    }
+
+    mutating func onReport(viewerValid: Bool, viewer01Ms: Int, host: ArrivalSlope.Window) -> Estimate {
+        var e = Self.compensate(viewerValid: viewerValid, viewer01Ms: viewer01Ms, host: host)
+        guard e.valid else { haveLast = false; return e }
+        if haveLast {
+            diffs.append(abs(e.slope01Ms - last))
+            if diffs.count > Self.history { diffs.removeFirst() }
+        }
+        haveLast = true
+        last = e.slope01Ms
+        let n = noise01Ms
+        if n > 0 && abs(e.slope01Ms) <= 2 * n { e.valid = false }
+        return e
+    }
+
+    /// Median |change| (0.1 ms), 0 until 4 changes. Same element as nth_element(size / 2).
+    var noise01Ms: Int {
+        guard diffs.count >= Self.minDiffs else { return 0 }
+        return diffs.sorted()[diffs.count / 2]
+    }
+
+    mutating func reset() { diffs.removeAll(); haveLast = false; last = 0 }
+}
+
 /// Host-side ABR state for one video service run (any thread). Reports come
 /// in on the mouse UDP queue; the encoder applies a new bitrate before its
 /// next frame, the sender updates the NACK budget and (auto pace) the pace.
@@ -157,6 +251,9 @@ final class AbrHost: @unchecked Sendable {
     private let start = DispatchTime.now().uptimeNanoseconds
     private var lastSlope01Ms = 0
     private var lastLossAfterBp: UInt64 = 0
+    private var slopeFilter = SlopeFilter()
+    private var lastHostSlope01Ms: Int?
+    private var lastEffective: SlopeFilter.Estimate?
 
     init(enabled: Bool, ceilingMbps: Int) {
         self.enabled = enabled
@@ -171,12 +268,16 @@ final class AbrHost: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let from = controller.currentKbps
         controller.reset()
+        slopeFilter.reset()
         return from == controller.currentKbps ? nil : AbrChange(fromKbps: from, toKbps: controller.currentKbps, reason: "new_session")
     }
 
     /// One 0x42 report plus the sender's window counters. MouseMoveUDPServer
-    /// already drops old or duplicate MRM1 sequence numbers.
+    /// already drops old or duplicate MRM1 sequence numbers. sendSlope: the
+    /// sender's send-cadence window since the last report; nil uses the
+    /// viewer slope as is (ABR v1).
     func onReport(_ r: ReceiverReport, overBudgetTotal: UInt64, queueMax: Int,
+                  sendSlope: ArrivalSlope.Window? = nil,
                   nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds) -> AbrChange? {
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return nil }
@@ -188,6 +289,13 @@ final class AbrHost: @unchecked Sendable {
         i.lostAfterNack = r.lostAfterNack
         i.slopeValid = r.slopeValid
         i.slope01Ms = Int(r.slope01Ms)
+        if let sendSlope {
+            let e = slopeFilter.onReport(viewerValid: r.slopeValid, viewer01Ms: Int(r.slope01Ms), host: sendSlope)
+            i.slopeValid = e.valid
+            i.slope01Ms = e.slope01Ms
+            lastHostSlope01Ms = sendSlope.valid ? abrSlopeTo01Ms(sendSlope.slopeMs) : nil
+            lastEffective = e
+        }
         i.overBudgetDelta = overBudgetTotal &- lastOverBudget
         lastOverBudget = overBudgetTotal
         i.queueMax = queueMax
@@ -202,5 +310,14 @@ final class AbrHost: @unchecked Sendable {
         return "abr=on abr_bitrate=\(controller.currentKbps)kbps abr_down=\(controller.downs) abr_up=\(controller.ups) "
             + "abr_reports=\(reports) abr_slope=\(String(format: "%.1f", Double(lastSlope01Ms) / 10))ms "
             + "abr_loss_after_nack=\(String(format: "%.2f", Double(lastLossAfterBp) / 100))%"
+            + slopeFields()
+    }
+
+    /// Host slope, effective slope ("na" = unknown or gated) and jitter noise.
+    private func slopeFields() -> String {
+        guard let e = lastEffective else { return "" }
+        func ms(_ v: Int?) -> String { v.map { String(format: "%.1fms", Double($0) / 10) } ?? "na" }
+        return " abr_slope_host=\(ms(lastHostSlope01Ms)) abr_slope_eff=\(ms(e.valid ? e.slope01Ms : nil))"
+            + " abr_slope_noise=\(ms(slopeFilter.noise01Ms))"
     }
 }
