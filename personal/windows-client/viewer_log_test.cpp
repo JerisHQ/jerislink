@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <thread>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -233,20 +235,38 @@ static void testTwoWritersSeparateHandles(const std::string& d) {
 }
 
 // Two viewer processes (this exe, --writer mode) writing the same history at
-// the same time through ViewerLog.
+// the same time through ViewerLog. Each writer checks the cap after every
+// write while it still holds the lock; the parent samples both sizes for
+// the whole run.
 static int writerMain(int argc, char** argv) {
     if (argc < 6) return 2;
     const std::string sess = argv[2], hist = argv[3], tag = argv[4];
     const int n = std::atoi(argv[5]);
+    const uint64_t cap = 64 * 1024;
+    uint64_t checks = 0, overCap = 0, maxHist = 0, maxOld = 0;
     jl::ViewerLog log;
-    log.start(sess, hist, 1ull << 30, 64 * 1024);
+    log.setHistoryTestHook([&](const char* stage) {
+        if (std::strcmp(stage, "written") != 0) return;
+        const uint64_t hs = sizeOf(hist), os = sizeOf(hist + ".old");
+        ++checks;
+        maxHist = std::max(maxHist, hs);
+        maxOld = std::max(maxOld, os);
+        if (hs > cap || os > cap) ++overCap;
+    });
+    log.start(sess, hist, 1ull << 30, cap);
     for (int i = 0; i < n; ++i) {
         log.line(tag + " " + lineN(i));
         if (i % 200 == 0) Sleep(0);
     }
     log.stop();
-    std::printf("writer %s rotations=%llu reopens=%llu\n", tag.c_str(),
-                (unsigned long long)log.historyRotations(), (unsigned long long)log.historyReopens());
+    std::printf("writer %s rotations=%llu reopens=%llu checks=%llu over_cap=%llu max_history=%llu max_old=%llu "
+                "lock_failures=%llu dropped=%llu\n",
+                tag.c_str(), (unsigned long long)log.historyRotations(), (unsigned long long)log.historyReopens(),
+                (unsigned long long)checks, (unsigned long long)overCap, (unsigned long long)maxHist,
+                (unsigned long long)maxOld, (unsigned long long)log.historyLockFailures(),
+                (unsigned long long)log.historyDroppedChunks());
+    if (overCap) return 3;
+    if (checks == 0 || log.historyLockFailures() || log.historyDroppedChunks()) return 4;
     return 0;
 }
 
@@ -275,21 +295,34 @@ static void testTwoWriterProcesses(const std::string& d) {
     expect(p1 && p2, "two writer processes started");
     if (!p1 || !p2) return;
     HANDLE both[2] = {p1, p2};
-    const DWORD w = WaitForMultipleObjects(2, both, TRUE, 120000);
+    // Sample both files for the whole run, not just at the end.
+    uint64_t samples = 0, maxHist = 0, maxOld = 0;
+    DWORD w = WAIT_TIMEOUT;
+    const ULONGLONG deadline = GetTickCount64() + 120000;
+    while (w == WAIT_TIMEOUT && GetTickCount64() < deadline) {
+        maxHist = std::max(maxHist, sizeOf(h));
+        maxOld = std::max(maxOld, sizeOf(h + ".old"));
+        ++samples;
+        w = WaitForMultipleObjects(2, both, TRUE, 0);
+        if (w == WAIT_TIMEOUT) Sleep(0);
+    }
     DWORD e1 = 1, e2 = 1;
     GetExitCodeProcess(p1, &e1);
     GetExitCodeProcess(p2, &e2);
     CloseHandle(p1);
     CloseHandle(p2);
-    expect(w != WAIT_TIMEOUT && e1 == 0 && e2 == 0, "both writer processes finished");
+    std::printf("  writer exit codes: P1=%lu P2=%lu (3 = a writer saw a file over the cap)\n", e1, e2);
+    expect(w != WAIT_TIMEOUT && e1 == 0 && e2 == 0,
+           "both writer processes finished; each checked history and .old <= cap after every write it made");
     const std::string hist = readAll(h), old = readAll(h + ".old");
-    std::printf("  two processes, cap=%llu: history=%llu old=%llu\n", (unsigned long long)cap,
-                (unsigned long long)hist.size(), (unsigned long long)old.size());
-    // Without the lock a writer can append one batch (<= 8 KB + one line)
-    // between its size check and its write.
-    const uint64_t slack = jl::ViewerLog::kChunk + 256;
-    expect(hist.size() <= cap + slack, "two processes: history <= cap (+ one batch)");
-    expect(old.size() <= cap + slack, "two processes: .old <= cap (+ one batch)");
+    std::printf("  two processes, cap=%llu: %llu samples during the run, max history=%llu max old=%llu | "
+                "final history=%llu old=%llu\n",
+                (unsigned long long)cap, (unsigned long long)samples, (unsigned long long)maxHist,
+                (unsigned long long)maxOld, (unsigned long long)hist.size(), (unsigned long long)old.size());
+    expect(samples >= 100, "two processes: sizes sampled throughout the run");
+    expect(maxHist <= cap, "two processes: history <= cap at every sample");
+    expect(maxOld <= cap, "two processes: .old <= cap at every sample");
+    expect(hist.size() <= cap && old.size() <= cap, "two processes: final history and .old <= cap");
     bool whole = true;
     for (const std::string* f : {&hist, &old}) {
         size_t pos = 0;
@@ -309,6 +342,197 @@ static void testTwoWriterProcesses(const std::string& d) {
     expect(hist.find("P1 " + lineN(n - 1) + EOL) != std::string::npos ||
                hist.find("P2 " + lineN(n - 1) + EOL) != std::string::npos,
            "two processes: newest line is in the current history");
+}
+
+// Reads with full sharing, so it never blocks a rotation by the writer.
+static std::string readShared(const std::string& p) {
+    HANDLE f = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    std::string out;
+    char buf[65536];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) out.append(buf, got);
+    CloseHandle(f);
+    return out;
+}
+static size_t countOf(const std::string& hay, const std::string& needle) {
+    size_t n = 0;
+    for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1)) ++n;
+    return n;
+}
+
+// The race from review: writer B checks the cap, then writer A rotates the
+// file, then B writes. B's write lands in the renamed file (.old), and if .old
+// is replaced again the batch is lost. A test hook stops B between its check
+// and its write and lets A try to rotate right there.
+struct GapResult {
+    bool aRotatedInGap = false;   // A finished its rotation while B was between check and write
+    bool bLandedAtPath = false;   // right after B's write, B's batch is at the end of the file at the path
+    size_t bCount = 0;            // copies of B's batch in history + .old at the end
+    bool aInHistory = false;
+    uint64_t history = 0, old = 0;
+};
+static GapResult runGap(const std::string& h, bool coordinated) {
+    const uint64_t cap = 4096;
+    DeleteFileA(h.c_str());
+    DeleteFileA((h + ".old").c_str());
+    std::string pre;
+    for (int i = 0; pre.size() + 100 < cap - 100; ++i) pre += "pre " + lineN(i) + EOL;  // ~cap - 200
+    writeAll(h, pre);
+    const std::string bData = "B gap marker" + EOL;                   // fits: no rotation for B
+    const std::string aData = "A rotating " + std::string(400, 'a') + EOL;  // over the cap: A rotates
+    jl::LogFile a, b;
+    a.configure(h, cap, true, false);
+    b.configure(h, cap, true, false);
+    a.setCoordinated(coordinated);
+    b.setCoordinated(coordinated);
+    a.open();
+    b.open();
+    HANDLE checked = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    HANDLE aDone = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    GapResult r;
+    b.setTestHook([&](const char* stage) {
+        if (std::strcmp(stage, "checked") == 0) {
+            SetEvent(checked);
+            // Uncoordinated, A rotates now. Coordinated, A must wait for
+            // our lock: 500 ms without A finishing shows it is blocked.
+            r.aRotatedInGap = WaitForSingleObject(aDone, coordinated ? 500 : 5000) == WAIT_OBJECT_0;
+        } else {
+            const std::string at = readShared(h);
+            r.bLandedAtPath = at.size() >= bData.size() && at.compare(at.size() - bData.size(), bData.size(), bData) == 0;
+        }
+    });
+    std::thread tb([&] { b.write(bData); });
+    WaitForSingleObject(checked, 5000);
+    a.write(aData);
+    SetEvent(aDone);
+    tb.join();
+    a.close();
+    b.close();
+    CloseHandle(checked);
+    CloseHandle(aDone);
+    const std::string hist = readAll(h), old = readAll(h + ".old");
+    r.bCount = countOf(hist, bData) + countOf(old, bData);
+    r.aInHistory = hist.find(aData) != std::string::npos;
+    r.history = hist.size();
+    r.old = old.size();
+    return r;
+}
+
+static void testCheckWriteGap(const std::string& d) {
+    const GapResult before = runGap(d + "gap-before-history.log", false);
+    const GapResult after = runGap(d + "gap-after-history.log", true);
+    std::printf("  check/write gap: before aRotatedInGap=%d bAtPath=%d | after aRotatedInGap=%d bAtPath=%d "
+                "bCopies=%zu history=%llu old=%llu\n",
+                before.aRotatedInGap, before.bLandedAtPath, after.aRotatedInGap, after.bLandedAtPath, after.bCount,
+                (unsigned long long)after.history, (unsigned long long)after.old);
+    expect(before.aRotatedInGap && !before.bLandedAtPath,
+           "gap, without the lock: A rotates between B's check and write, B's batch goes to the renamed file "
+           "(the race this test catches)");
+    expect(!after.aRotatedInGap, "gap, with the lock: A cannot rotate between B's check and B's write");
+    expect(after.bLandedAtPath, "gap, with the lock: B's batch lands in the file at the path, not in .old");
+    expect(after.bCount == 1, "gap, with the lock: B's batch is kept exactly once (not lost)");
+    expect(after.aInHistory, "gap, with the lock: A rotated after B and wrote to the new history");
+    expect(after.history <= 4096 && after.old <= 4096, "gap, with the lock: history and .old <= cap");
+}
+
+// Holds a log file's named mutex on another thread, like a stuck viewer.
+struct LockHolder {
+    HANDLE held = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    std::thread t;
+    explicit LockHolder(const std::string& path) {
+        const std::string name = jl::LogFile::mutexName(path);
+        t = std::thread([this, name] {
+            HANDLE m = CreateMutexA(nullptr, FALSE, name.c_str());
+            WaitForSingleObject(m, INFINITE);
+            SetEvent(held);
+            WaitForSingleObject(release, INFINITE);
+            ReleaseMutex(m);
+            CloseHandle(m);
+        });
+        WaitForSingleObject(held, 5000);
+    }
+    void let() {
+        SetEvent(release);
+        if (t.joinable()) t.join();
+    }
+    ~LockHolder() {
+        let();
+        CloseHandle(held);
+        CloseHandle(release);
+    }
+};
+
+static void testLockTimeoutDefers(const std::string& d) {
+    const std::string h = d + "locked-history.log";
+    const uint64_t cap = 1024;
+    DeleteFileA(h.c_str());
+    DeleteFileA((h + ".old").c_str());
+    jl::LogFile w;
+    w.configure(h, cap, true, false);
+    w.setLockTimeoutMs(50);
+    w.open();
+    w.write("first" + EOL);
+    std::string fill;
+    for (int i = 0; fill.size() + 100 < cap - 60; ++i) fill += lineN(i) + EOL;
+    w.write(fill);  // just under the cap: the next lines need a rotation
+    const std::string beforeLock = readShared(h);
+    std::string later;
+    {
+        LockHolder holder(h);
+        bool anyWritten = false;
+        for (int i = 0; i < 5; ++i) {
+            const std::string l = "deferred " + lineN(i) + EOL;
+            later += l;
+            anyWritten |= w.write(l);
+        }
+        expect(!anyWritten, "lock timeout: write() reports the data as not written");
+        expect(readShared(h) == beforeLock, "lock timeout: history unchanged while another viewer holds the lock");
+        expect(!exists(h + ".old"), "lock timeout: no rotation without the lock (no .old)");
+        expect(w.pendingBytes() == later.size(), "lock timeout: the batches stay pending");
+        expect(w.lockFailures() == 5, "lock timeout: each failed try is counted");
+        holder.let();
+        expect(w.flushPending(), "lock free again: pending data written on the next try");
+    }
+    w.close();
+    const std::string hist = readAll(h), old = readAll(h + ".old");
+    std::printf("  lock timeout: history=%llu old=%llu\n", (unsigned long long)hist.size(), (unsigned long long)old.size());
+    const std::string note = "log.lock_timeout failures=5 dropped_chunks=0 dropped_bytes=0" + EOL;
+    expect(exists(h + ".old") && old.compare(0, beforeLock.size(), beforeLock) == 0,
+           "lock free again: the rotation happens then, under the lock");
+    expect(countOf(hist + old, note) == 1, "lock free again: one note with the failure count");
+    expect(hist == later || hist == note + later, "lock free again: every deferred line written, in order");
+    expect(hist.size() <= cap && old.size() <= cap, "lock timeout: history and .old <= cap");
+}
+
+static void testLockTimeoutOverflow(const std::string& d) {
+    const std::string h = d + "overflow-history.log";
+    DeleteFileA(h.c_str());
+    DeleteFileA((h + ".old").c_str());
+    jl::LogFile w;
+    w.configure(h, 64 * 1024, true, false);
+    w.setLockTimeoutMs(20);
+    w.setPendingCap(1000);
+    w.open();
+    std::vector<std::string> chunks;
+    {
+        LockHolder holder(h);
+        for (int i = 0; i < 10; ++i) {
+            chunks.push_back("chunk" + std::to_string(i) + " " + std::string(291, 'x') + EOL);  // 300 bytes
+            w.write(chunks.back());
+        }
+        expect(sizeOf(h) == 0, "pending over its cap: still nothing written without the lock");
+        expect(w.pendingBytes() <= 1000, "pending stays within its own cap");
+        expect(w.droppedChunks() == 7 && w.droppedBytes() == 2100, "pending over its cap: oldest 7 chunks dropped and counted");
+        holder.let();
+        w.flushPending();
+    }
+    w.close();
+    const std::string hist = readAll(h);
+    expect(hist == "log.lock_timeout failures=10 dropped_chunks=7 dropped_bytes=2100" + EOL + chunks[7] + chunks[8] + chunks[9],
+           "pending over its cap: note reports the drops, newest 3 chunks kept in order");
 }
 
 static double pct(std::vector<double> v, double p) {
@@ -363,6 +587,9 @@ int main(int argc, char** argv) {
     testSessionCap(d);
     testOpenSharing(d);
     testTwoWritersSeparateHandles(d);
+    testCheckWriteGap(d);
+    testLockTimeoutDefers(d);
+    testLockTimeoutOverflow(d);
     testTwoWriterProcesses(d);
     testCallerCost(d);
     std::printf("%d PASS, %d FAIL\n", gPass, gFail);
