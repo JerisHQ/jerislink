@@ -202,9 +202,11 @@ final class ControlServer: @unchecked Sendable {
         // A connection is an input session only once it sends its first key
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
         // are. One bool test per message, one helper message per session edge.
-        var inputSeen = false
+        // A START that did not reach the helper (helper down) is retried on
+        // the next input message; END is sent only for a started session.
+        let sessionID = Self.sessionIDs.next()
         var sessionStarted = false
-        defer { if sessionStarted { endInputSession() } }
+        defer { if sessionStarted { endInputSession(sessionID) } }
         var firstHeader: [UInt8]? = pending
         while true {
             let next: [UInt8]?
@@ -219,9 +221,8 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
-            if !inputSeen && Self.isInputMessage(type) {
-                inputSeen = true
-                sessionStarted = startInputSession()
+            if !sessionStarted && Self.isInputMessage(type) {
+                sessionStarted = startInputSession(sessionID)
             }
 
             switch type {
@@ -301,15 +302,29 @@ final class ControlServer: @unchecked Sendable {
 
     /// Returns true when SESSION_START reached the helper, so SESSION_END is
     /// sent only for a session the helper knows about.
-    private func startInputSession() -> Bool {
+    private func startInputSession(_ id: UInt32) -> Bool {
         guard announceInputSessions, injectRequested, let helper = inputHelper else { return false }
-        return helper.sendSessionStart()
+        return helper.sendSessionStart(id: id)
     }
 
-    private func endInputSession() {
+    private func endInputSession(_ id: UInt32) {
         guard let helper = inputHelper else { return }
-        _ = helper.sendSessionEnd()
+        _ = helper.sendSessionEnd(id: id)
     }
+
+    /// Input session ids, unique per process (shared by every listener, as
+    /// is the one helper connection). 0 is never used.
+    private final class SessionIDCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var last: UInt32 = 0
+        func next() -> UInt32 {
+            lock.lock(); defer { lock.unlock() }
+            last &+= 1
+            if last == 0 { last = 1 }
+            return last
+        }
+    }
+    private static let sessionIDs = SessionIDCounter()
 
     private struct ClipboardSnapshot {
         let changeCount: Int

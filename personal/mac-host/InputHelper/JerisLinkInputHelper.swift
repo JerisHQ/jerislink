@@ -57,10 +57,12 @@ private let statusDirURL: URL = {
     return dir
 }()
 
-/// MRI1 session lifecycle (loopback only, empty payload). The control
-/// service sends SESSION_START once when a viewer connection sends its first
-/// key or mouse message, and SESSION_END when that connection closes. Never
-/// per event. Older control services never send them.
+/// MRI1 session lifecycle (loopback only). Payload: a 4-byte big-endian
+/// session id. The control service sends SESSION_START once when a viewer
+/// connection sends its first key or mouse message, SESSION_END when that
+/// connection closes, and START again for every live session after it
+/// reconnects to the helper. Never per event. Older control services never
+/// send them.
 enum MRI1Session {
     static let start: UInt8 = 0x50
     static let end: UInt8 = 0x51
@@ -86,7 +88,9 @@ final class InputHelper {
     private var statusThrottle = StatusThrottle()
     private var displayBounds = DisplayBoundsCache()
     /// Viewer input sessions announced with SESSION_START and not yet ended.
-    private(set) var activeSessions = 0
+    /// A set of ids, not a counter: an END for a session from before a socket
+    /// drop must not end a session that started after it.
+    private(set) var activeSessions: Set<UInt32> = []
     /// `clientConnected=true` or `clientClosed=true`, kept on every status
     /// line until the next lifecycle message.
     private var lifecycleNote = ""
@@ -130,7 +134,7 @@ final class InputHelper {
     private func updateStatus(extra: @autoclosure () -> String? = nil, force: Bool = false) {
         guard statusThrottle.shouldWrite(nowNs: monotonicNs(), force: force) else { return }
         var s = "listening 127.0.0.1:38410 postEvent=\(postEventAccess) keyEvents=\(keyEvents) mouseEvents=\(mouseEvents)"
-        s += " flags=0x\(String(currentFlags().rawValue, radix: 16)) activeSessions=\(activeSessions)"
+        s += " flags=0x\(String(currentFlags().rawValue, radix: 16)) activeSessions=\(activeSessions.count)"
         if !lifecycleNote.isEmpty { s += " \(lifecycleNote)" }
         if let extra = extra() { s += " \(extra)" }
         s += "\n"
@@ -142,8 +146,9 @@ final class InputHelper {
     /// SESSION_START: one permission check per viewer input session (not per
     /// event) and a forced status write. Held keys and buttons are kept: a
     /// second viewer joining must not break a drag or a held Shift.
-    private func sessionStarted() {
-        activeSessions += 1
+    private func sessionStarted(_ id: UInt32) {
+        // A repeated START for a live id changes nothing: one check per session.
+        guard activeSessions.insert(id).inserted else { return }
         preflightCalls += 1
         postEventAccess = preflight()
         if !postEventAccess {
@@ -157,9 +162,10 @@ final class InputHelper {
     /// SESSION_END: forced status write. Held keys and buttons are released
     /// only when the last session ends, so nothing stays stuck after the last
     /// viewer leaves while another viewer's drag survives.
-    private func sessionEnded() {
-        activeSessions = max(0, activeSessions - 1)
-        if activeSessions == 0 && anyHeld { releaseHeld() }
+    private func sessionEnded(_ id: UInt32) {
+        // Unknown or stale id (started before a socket drop): ignore it.
+        guard activeSessions.remove(id) != nil else { return }
+        if activeSessions.isEmpty && anyHeld { releaseHeld() }
         lifecycleNote = "clientClosed=true"
         updateStatus(force: true)
     }
@@ -350,15 +356,37 @@ final class InputHelper {
         }
     }
 
+    static func sessionID(_ p: [UInt8]) -> UInt32? {
+        guard p.count == 4 else { return nil }
+        return UInt32(p[0]) << 24 | UInt32(p[1]) << 16 | UInt32(p[2]) << 8 | UInt32(p[3])
+    }
+
+    /// The MRI1 socket closed: forget held state and every session. The
+    /// control service re-announces live sessions when it reconnects.
+    func connectionClosed() {
+        controlDown = false
+        optionDown = false
+        commandDown = false
+        shiftDown = false
+        leftDown = false
+        rightDown = false
+        middleDown = false
+        activeSessions.removeAll()
+        lifecycleNote = "clientClosed=true"
+        updateStatus(force: true)
+    }
+
     /// One MRI1 message. Returns the reply to send, if any.
     func handle(type: UInt8, payload p: [UInt8]) -> [UInt8]? {
         switch type {
         case 0x01:
             return packet(type: 0x02, payload: p)
         case MRI1Session.start:
-            sessionStarted()
+            guard let id = Self.sessionID(p) else { return nil }
+            sessionStarted(id)
         case MRI1Session.end:
-            sessionEnded()
+            guard let id = Self.sessionID(p) else { return nil }
+            sessionEnded(id)
         case 0x10:
             guard p.count == 3 else { return nil }
             let down = p[0] != 0
@@ -423,16 +451,7 @@ final class InputHelper {
             displayBounds.invalidate()
             handleClient(c)
             Darwin.close(c)
-            controlDown = false
-            optionDown = false
-            commandDown = false
-            shiftDown = false
-            leftDown = false
-            rightDown = false
-            middleDown = false
-            activeSessions = 0
-            lifecycleNote = "clientClosed=true"
-            updateStatus(force: true)
+            connectionClosed()
         }
     }
 }
@@ -474,14 +493,17 @@ func inputHelperSelfTest() -> Bool {
     check(c.get(nowNs: s + 500_000_001, read: { reads += 1; return current }) == a, "invalidate forces a re-read")
     check(reads == 3, "three reads in total (got \(reads))")
 
-    // Session lifecycle (MRI1 SESSION_START / SESSION_END).
+    // Session lifecycle (MRI1 SESSION_START / SESSION_END with a session id).
+    func sid(_ id: UInt32) -> [UInt8] {
+        [UInt8(id >> 24), UInt8((id >> 16) & 0xff), UInt8((id >> 8) & 0xff), UInt8(id & 0xff)]
+    }
     var posted: [CGEvent] = []
     var preflights = 0
     let h = InputHelper(preflight: { preflights += 1; return true },
                         postEvent: { posted.append($0) },
                         mouseLocation: { CGPoint(x: 10, y: 10) },
                         statusURL: nil)
-    _ = h.handle(type: MRI1Session.start, payload: [])
+    _ = h.handle(type: MRI1Session.start, payload: sid(1))
     check(preflights == 1 && h.preflightCalls == 1, "SESSION_START runs one preflight (got \(preflights))")
     check(h.lastStatus.contains("activeSessions=1 clientConnected=true"), "SESSION_START writes clientConnected (\(h.lastStatus))")
     _ = h.handle(type: 0x10, payload: [1, 0, 56])   // Shift down
@@ -496,16 +518,18 @@ func inputHelperSelfTest() -> Bool {
     check(h.shiftHeld && h.leftButtonHeld && posted.count == postedBefore && preflights == 1,
           "(a) non-input traffic keeps the drag and Shift, posts nothing, no preflight")
     // (b) Two input sessions.
-    _ = h.handle(type: MRI1Session.start, payload: [])
-    check(preflights == 2 && h.activeSessions == 2, "(c) second SESSION_START: exactly one more preflight")
-    _ = h.handle(type: MRI1Session.end, payload: [])
-    check(h.activeSessions == 1 && h.shiftHeld && h.leftButtonHeld && posted.count == postedBefore,
+    _ = h.handle(type: MRI1Session.start, payload: sid(2))
+    check(preflights == 2 && h.activeSessions.count == 2, "(c) second SESSION_START: exactly one more preflight")
+    _ = h.handle(type: MRI1Session.start, payload: sid(2))
+    check(preflights == 2 && h.activeSessions.count == 2, "repeated SESSION_START for a live id: no extra preflight")
+    _ = h.handle(type: MRI1Session.end, payload: sid(1))
+    check(h.activeSessions == [2] && h.shiftHeld && h.leftButtonHeld && posted.count == postedBefore,
           "(b) first session ends: drag and Shift kept, nothing posted")
     check(h.lastStatus.contains("activeSessions=1 clientClosed=true"), "(d) SESSION_END writes clientClosed (\(h.lastStatus))")
     let writes = h.statusWrites
-    _ = h.handle(type: MRI1Session.end, payload: [])
+    _ = h.handle(type: MRI1Session.end, payload: sid(2))
     check(h.statusWrites == writes + 1, "(d) SESSION_END forces a status write inside the throttle window")
-    check(h.activeSessions == 0 && !h.anyHeld, "(b) last session ends: held state released")
+    check(h.activeSessions.isEmpty && !h.anyHeld, "(b) last session ends: held state released")
     check(posted.count == postedBefore + 2
           && posted[postedBefore].getIntegerValueField(.keyboardEventKeycode) == 56
           && !posted[postedBefore].flags.contains(.maskShift)
@@ -515,11 +539,63 @@ func inputHelperSelfTest() -> Bool {
     _ = h.handle(type: 0x01, payload: [1, 2, 3, 4])
     check(h.statusWrites == writes + 1 && h.lastStatus.contains("clientClosed=true") && preflights == 2,
           "(d) clientClosed is not overwritten and no access check follows SESSION_END")
+    let writesBeforeStray = h.statusWrites
+    _ = h.handle(type: MRI1Session.end, payload: sid(99))
     _ = h.handle(type: MRI1Session.end, payload: [])
-    check(h.activeSessions == 0 && posted.count == postedBefore + 2, "stray SESSION_END floors at 0 and posts nothing")
+    check(h.activeSessions.isEmpty && posted.count == postedBefore + 2 && h.statusWrites == writesBeforeStray,
+          "unknown-id or malformed SESSION_END is ignored and posts nothing")
     let denied = InputHelper(preflight: { false }, postEvent: { _ in }, mouseLocation: { .zero }, statusURL: nil)
-    _ = denied.handle(type: MRI1Session.start, payload: [])
+    _ = denied.handle(type: MRI1Session.start, payload: sid(1))
     check(denied.lastStatus.contains("postEventDenied=true"), "denied access is reported in the status")
+
+    // Round 4 (a): interleaved reconnect. Viewer A starts, the MRI1 socket
+    // drops (helper forgets every session), viewer B starts and holds Shift
+    // and a drag, then A's END arrives. B's state must survive; only B's own
+    // END releases it.
+    var rPosted: [CGEvent] = []
+    var rPreflights = 0
+    let r = InputHelper(preflight: { rPreflights += 1; return true },
+                        postEvent: { rPosted.append($0) },
+                        mouseLocation: { CGPoint(x: 10, y: 10) },
+                        statusURL: nil)
+    _ = r.handle(type: MRI1Session.start, payload: sid(7))          // A
+    r.connectionClosed()                                             // MRI1 socket drop
+    check(r.activeSessions.isEmpty, "(a) MRI1 socket drop forgets every session")
+    _ = r.handle(type: MRI1Session.start, payload: sid(8))          // B
+    _ = r.handle(type: 0x10, payload: [1, 0, 56])                   // B: Shift down
+    _ = r.handle(type: 0x21, payload: [0, 1])                       // B: drag starts
+    let rBefore = rPosted.count
+    _ = r.handle(type: MRI1Session.end, payload: sid(7))            // stale END from A
+    check(r.activeSessions == [8] && r.shiftHeld && r.leftButtonHeld && rPosted.count == rBefore,
+          "(a) stale END from before the drop keeps B's Shift and drag")
+    _ = r.handle(type: MRI1Session.end, payload: sid(8))
+    check(r.activeSessions.isEmpty && !r.anyHeld && rPosted.count == rBefore + 2,
+          "(a) B's own END releases Shift and the drag")
+    // Same, with the control service re-announcing A after the reconnect.
+    _ = r.handle(type: MRI1Session.start, payload: sid(7))
+    r.connectionClosed()
+    let pfBefore = rPreflights
+    _ = r.handle(type: MRI1Session.start, payload: sid(7))          // re-announced A
+    _ = r.handle(type: MRI1Session.start, payload: sid(8))          // B
+    check(rPreflights == pfBefore + 2, "(a) re-announce after reconnect: one preflight per live session")
+    _ = r.handle(type: 0x10, payload: [1, 0, 56])
+    _ = r.handle(type: 0x21, payload: [0, 1])
+    let rBefore2 = rPosted.count
+    _ = r.handle(type: MRI1Session.end, payload: sid(7))
+    check(r.activeSessions == [8] && r.shiftHeld && r.leftButtonHeld && rPosted.count == rBefore2,
+          "(a) re-announced A ends: B's Shift and drag kept")
+    _ = r.handle(type: MRI1Session.end, payload: sid(8))
+    check(r.activeSessions.isEmpty && !r.anyHeld, "(a) last live session ends: released")
+    // (b) helper side: a START that arrives late (helper was down at the
+    // first input) still runs exactly one preflight.
+    var lPreflights = 0
+    let late = InputHelper(preflight: { lPreflights += 1; return true }, postEvent: { _ in },
+                           mouseLocation: { .zero }, statusURL: nil)
+    _ = late.handle(type: MRI1Session.start, payload: sid(3))
+    for _ in 0..<20 { _ = late.handle(type: 0x20, payload: [0, 1, 0, 1]) }
+    _ = late.handle(type: MRI1Session.end, payload: sid(3))
+    check(lPreflights == 1 && late.lastStatus.contains("activeSessions=0 clientClosed=true"),
+          "(b) late START: one preflight, END closes the session")
 
     print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
     return ok
