@@ -2,6 +2,61 @@ import Foundation
 import Darwin
 import CoreGraphics
 
+/// Decides when the status file may be rewritten: on connect/disconnect
+/// (`force`) and otherwise at most once per `minInterval`. Pure, so the
+/// self-test drives it with fixed times.
+struct StatusThrottle {
+    let minIntervalNs: UInt64
+    private(set) var lastWriteNs: UInt64? = nil
+    private(set) var dirty = false
+
+    init(minIntervalNs: UInt64 = 1_000_000_000) {
+        self.minIntervalNs = minIntervalNs
+    }
+
+    /// Marks the status changed and returns true when it should be written now.
+    mutating func shouldWrite(nowNs: UInt64, force: Bool = false) -> Bool {
+        dirty = true
+        if !force, let last = lastWriteNs, nowNs &- last < minIntervalNs { return false }
+        lastWriteNs = nowNs
+        dirty = false
+        return true
+    }
+}
+
+/// Main display bounds, re-read at most every `maxAgeNs` and on every viewer
+/// connect, instead of a WindowServer query per mouse event. A display mode
+/// change takes effect within `maxAgeNs`.
+struct DisplayBoundsCache {
+    let maxAgeNs: UInt64
+    private var bounds = CGRect.zero
+    private var readAtNs: UInt64? = nil
+
+    init(maxAgeNs: UInt64 = 500_000_000) {
+        self.maxAgeNs = maxAgeNs
+    }
+
+    mutating func invalidate() { readAtNs = nil }
+
+    mutating func get(nowNs: UInt64, read: () -> CGRect) -> CGRect {
+        if let at = readAtNs, nowNs &- at < maxAgeNs { return bounds }
+        bounds = read()
+        readAtNs = nowNs
+        return bounds
+    }
+}
+
+@inline(__always) private func monotonicNs() -> UInt64 {
+    DispatchTime.now().uptimeNanoseconds
+}
+
+private let statusDirURL: URL = {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}()
+
 final class InputHelper {
     private let host = "127.0.0.1"
     private let port: UInt16 = 38410
@@ -15,15 +70,15 @@ final class InputHelper {
     private var optionDown = false
     private var commandDown = false
     private var shiftDown = false
-    private var lastCG: UInt16 = 0
-    private var lastDown = false
+    /// Post-event access as checked when the current viewer connected. Events
+    /// are always posted: without access macOS drops them, and posting
+    /// unconditionally means a grant made mid-session works at once.
+    private var postEventAccess = false
+    private var statusThrottle = StatusThrottle()
+    private var displayBounds = DisplayBoundsCache()
 
-    private var statusURL: URL {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("input-helper-status.txt")
-    }
+    // Created once (the directory is made when this is first used).
+    private let statusURL = statusDirURL.appendingPathComponent("input-helper-status.txt")
 
     private func currentFlags() -> CGEventFlags {
         var f: CGEventFlags = []
@@ -34,13 +89,29 @@ final class InputHelper {
         return f
     }
 
-    private func updateStatus(extra: String? = nil) {
-        var s = "listening 127.0.0.1:38410 postEvent=\(CGPreflightPostEventAccess()) keyEvents=\(keyEvents) mouseEvents=\(mouseEvents)"
-        if keyEvents > 0 { s += " lastCG=\(lastCG) down=\(lastDown)" }
+    /// Rewrites the status file on connect/disconnect (`force`) and otherwise
+    /// at most once a second. It holds counters only, never key codes.
+    private func updateStatus(extra: @autoclosure () -> String? = nil, force: Bool = false) {
+        guard statusThrottle.shouldWrite(nowNs: monotonicNs(), force: force) else { return }
+        var s = "listening 127.0.0.1:38410 postEvent=\(postEventAccess) keyEvents=\(keyEvents) mouseEvents=\(mouseEvents)"
         s += " flags=0x\(String(currentFlags().rawValue, radix: 16))"
-        if let extra { s += " \(extra)" }
+        if let extra = extra() { s += " \(extra)" }
         s += "\n"
         try? s.write(to: statusURL, atomically: true, encoding: .utf8)
+    }
+
+    /// One permission check per viewer connection (not per event).
+    private func checkAccessOnConnect() {
+        postEventAccess = CGPreflightPostEventAccess()
+        if !postEventAccess {
+            FileHandle.standardError.write(Data("input helper: post-event (Accessibility) access is not granted; input from the viewer is dropped by macOS until it is\n".utf8))
+        }
+        displayBounds.invalidate()
+        updateStatus(extra: postEventAccess ? "clientConnected=true" : "clientConnected=true postEventDenied=true", force: true)
+    }
+
+    private func mainDisplayBounds() -> CGRect {
+        displayBounds.get(nowNs: monotonicNs()) { CGDisplayBounds(CGMainDisplayID()) }
     }
 
     private func packet(type: UInt8, payload: [UInt8]) -> [UInt8] {
@@ -90,22 +161,20 @@ final class InputHelper {
 
     private func postKey(cg: UInt16, down: Bool) {
         keyEvents += 1
-        lastCG = cg
-        lastDown = down
 
         if isModifier(cg) {
             setModifier(cg, down: down)
         }
         let flags = currentFlags()
 
-        if CGPreflightPostEventAccess(), let e = CGEvent(keyboardEventSource: nil,
-                                                        virtualKey: CGKeyCode(cg),
-                                                        keyDown: down) {
+        if let e = CGEvent(keyboardEventSource: nil,
+                           virtualKey: CGKeyCode(cg),
+                           keyDown: down) {
             e.flags = flags
             e.post(tap: .cghidEventTap)
         }
 
-        updateStatus(extra: "eventFlags=0x\(String(flags.rawValue, radix: 16))")
+        updateStatus()
     }
 
 
@@ -116,43 +185,35 @@ final class InputHelper {
 
     private func postMouseMove(dx: Int16, dy: Int16) {
         mouseEvents += 1
-        guard CGPreflightPostEventAccess(), let base = CGEvent(source: nil)?.location else {
-            updateStatus(extra: "mouseMoveDenied=true")
+        guard let base = CGEvent(source: nil)?.location else {
+            updateStatus(extra: "mouseLocationUnavailable=true")
             return
         }
         let target = CGPoint(x: base.x + CGFloat(dx), y: base.y + CGFloat(dy))
         postMouseMoveEvent(target: target)
-        updateStatus(extra: "mouseMove=\(dx),\(dy)")
+        updateStatus()
     }
 
     private func postMouseMoveAbsolute(x: UInt16, y: UInt16) {
         mouseEvents += 1
-        guard CGPreflightPostEventAccess() else {
-            updateStatus(extra: "mouseMoveAbsDenied=true")
-            return
-        }
-        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let bounds = mainDisplayBounds()
         let tx = min(max(CGFloat(x), bounds.minX), bounds.maxX - 1)
         let ty = min(max(CGFloat(y), bounds.minY), bounds.maxY - 1)
         let target = CGPoint(x: tx, y: ty)
         postMouseMoveEvent(target: target)
-        updateStatus(extra: "mouseMoveAbs=\(x),\(y)")
+        updateStatus()
     }
 
     private func postMouseMoveNormalized(nx: UInt16, ny: UInt16) {
         mouseEvents += 1
-        guard CGPreflightPostEventAccess() else {
-            updateStatus(extra: "mouseMoveNormDenied=true")
-            return
-        }
-        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let bounds = mainDisplayBounds()
         let fx = CGFloat(nx) / 65535.0
         let fy = CGFloat(ny) / 65535.0
         let tx = bounds.minX + fx * max(0, bounds.width - 1)
         let ty = bounds.minY + fy * max(0, bounds.height - 1)
         let target = CGPoint(x: tx, y: ty)
         postMouseMoveEvent(target: target)
-        updateStatus(extra: "mouseMoveNorm=\(nx),\(ny) bounds=\(Int(bounds.width))x\(Int(bounds.height))")
+        updateStatus(extra: "bounds=\(Int(bounds.width))x\(Int(bounds.height))")
     }
 
     private func postMouseMoveEvent(target: CGPoint) {
@@ -182,25 +243,26 @@ final class InputHelper {
             updateStatus(extra: "badMouseButton=\(code)")
             return
         }
-        if CGPreflightPostEventAccess(), let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
+        if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
             e.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, clickCount)))
             e.post(tap: .cghidEventTap)
         }
-        updateStatus(extra: "mouseButton=\(code) down=\(down) clicks=\(max(1, clickCount))")
+        updateStatus()
     }
 
     private func postScroll(dx: Int16, dy: Int16) {
         mouseEvents += 1
-        if CGPreflightPostEventAccess(), let e = CGEvent(scrollWheelEvent2Source: nil,
-                                                         units: .pixel,
-                                                         wheelCount: 2,
-                                                         wheel1: Int32(dy),
-                                                         wheel2: Int32(dx),
-                                                         wheel3: 0) {
+        if let e = CGEvent(scrollWheelEvent2Source: nil,
+                           units: .pixel,
+                           wheelCount: 2,
+                           wheel1: Int32(dy),
+                           wheel2: Int32(dx),
+                           wheel3: 0) {
             e.post(tap: .cghidEventTap)
         }
-        updateStatus(extra: "scroll=\(dx),\(dy)")
+        updateStatus()
     }
+
 
     private func handleClient(_ fd: Int32) {
         while true {
@@ -263,13 +325,15 @@ final class InputHelper {
         guard brc == 0 else { Darwin.close(s); throw NSError(domain: "MRI1", code: 2) }
         guard Darwin.listen(s, 4) == 0 else { Darwin.close(s); throw NSError(domain: "MRI1", code: 3) }
         listenFD = s
-        updateStatus()
+        postEventAccess = CGPreflightPostEventAccess()
+        updateStatus(force: true)
 
         while true {
             let c = Darwin.accept(s, nil, nil)
             if c < 0 { continue }
             var noSigPipe: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            checkAccessOnConnect()
             handleClient(c)
             Darwin.close(c)
             controlDown = false
@@ -279,9 +343,52 @@ final class InputHelper {
             leftDown = false
             rightDown = false
             middleDown = false
-            updateStatus(extra: "clientClosed=true")
+            updateStatus(extra: "clientClosed=true", force: true)
         }
     }
+}
+
+/// `JerisLinkInputHelper --self-test`: status throttle and display bounds
+/// cache. Pure; posts no events and writes no files.
+func inputHelperSelfTest() -> Bool {
+    var ok = true
+    func check(_ cond: Bool, _ what: String) {
+        if !cond { ok = false; print("FAIL \(what)") }
+    }
+    let s = 1_000_000_000 as UInt64
+    var t = StatusThrottle(minIntervalNs: s)
+    check(t.shouldWrite(nowNs: 10 * s), "first write goes through")
+    check(!t.shouldWrite(nowNs: 10 * s + 1), "second write within 1 s is held")
+    check(t.dirty, "held write leaves the status dirty")
+    check(!t.shouldWrite(nowNs: 11 * s - 1), "still held just under 1 s")
+    check(t.shouldWrite(nowNs: 11 * s), "write allowed at 1 s")
+    check(!t.dirty, "write clears dirty")
+    check(t.shouldWrite(nowNs: 11 * s + 5, force: true), "forced write (connect/disconnect) always goes through")
+    check(!t.shouldWrite(nowNs: 11 * s + 6), "throttle restarts after a forced write")
+    var held = 0
+    for i in 0..<10_000 where !t.shouldWrite(nowNs: 12 * s + UInt64(i) * 100_000) { held += 1 }
+    check(held == 9_999, "10k events in 1 s write once (held \(held))")
+
+    var c = DisplayBoundsCache(maxAgeNs: 500_000_000)
+    var reads = 0
+    let a = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    let b = CGRect(x: 0, y: 0, width: 3840, height: 2160)
+    var current = a
+    check(c.get(nowNs: s, read: { reads += 1; return current }) == a, "first read")
+    current = b
+    check(c.get(nowNs: s + 100, read: { reads += 1; return current }) == a, "cached within max age")
+    check(reads == 1, "one read while cached")
+    check(c.get(nowNs: s + 500_000_000, read: { reads += 1; return current }) == b, "re-read after max age")
+    c.invalidate()
+    current = a
+    check(c.get(nowNs: s + 500_000_001, read: { reads += 1; return current }) == a, "invalidate forces a re-read")
+    check(reads == 3, "three reads in total (got \(reads))")
+    print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
+    return ok
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    exit(inputHelperSelfTest() ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--version") {
@@ -329,9 +436,6 @@ if !CGPreflightPostEventAccess() {
 do {
     try InputHelper().run()
 } catch {
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    try? "fatal=\(error)\n".write(to: dir.appendingPathComponent("input-helper-status.txt"), atomically: true, encoding: .utf8)
+    try? "fatal=\(error)\n".write(to: statusDirURL.appendingPathComponent("input-helper-status.txt"), atomically: true, encoding: .utf8)
     exit(1)
 }
