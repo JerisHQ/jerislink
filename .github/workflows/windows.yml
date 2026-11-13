@@ -29,6 +29,10 @@ jobs:
         run: cmake --build build --config Release --target JerislinkOptionsTest
       - name: Launch-config unit test
         run: build\Release\JerislinkOptionsTest.exe
+      - name: Build receiver / NACK unit test
+        run: cmake --build build --config Release --target JerislinkReceiverTest
+      - name: Receiver / NACK unit test (loss simulation, NACK on vs off)
+        run: build\Release\JerislinkReceiverTest.exe
       - name: Saved settings drive a launch without connection arguments
         shell: pwsh
         run: |

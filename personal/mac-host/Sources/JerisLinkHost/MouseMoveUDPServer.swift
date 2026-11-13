@@ -153,11 +153,17 @@ final class LocalControlMouseClient {
 /// Common header:
 ///   0..3  "MRM1"
 ///   4     version = 1
-///   5     type (0x24 mouse move, 0x31 cursor state, 0x40 request keyframe)
+///   5     type (0x24 mouse move, 0x31 cursor state, 0x40 request keyframe,
+///         0x41 NACK, 0x43 ping, 0x44 pong)
 ///   6..9  sequence, big-endian UInt32
 /// Mouse move appends nx/ny as two big-endian UInt16 values (14 bytes total).
 /// Cursor state appends one RemoteCursorShape byte (11 bytes total, Mac->Windows).
 /// Keyframe request is header-only (10 bytes total).
+/// NACK appends frameID u64, count u8, then count x (start u16, count u16)
+/// packet ranges (19 + 4*count bytes, count 1...32). (0, 0xFFFF) = whole frame.
+/// Ping appends the viewer clock in microseconds (u64, 18 bytes total); the
+/// host echoes the same 18 bytes back with type 0x44 so the viewer can
+/// measure RTT on the live path.
 final class MouseMoveUDPServer: @unchecked Sendable {
     private let bindIP: String
     private let allowedClientIP: String?
@@ -172,6 +178,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var lastSequence: UInt32?
     private var lastPeerPort: UInt16?
     private var keyframeRequestHandler: (() -> Void)?
+    private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
     private var newSessionHandler: (() -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
@@ -190,6 +197,9 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var keyframeRequests: UInt64 = 0
     private(set) var cursorUpdates: UInt64 = 0
     private(set) var cursorUpdateDrops: UInt64 = 0
+    private(set) var nackRx: UInt64 = 0
+    private(set) var pingRx: UInt64 = 0
+    private(set) var pongDrops: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16) {
         self.bindIP = bindIP
@@ -260,12 +270,20 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Called on the receive queue for each valid NACK packet.
+    func setNackHandler(_ handler: @escaping (UInt64, [UDPFrameSender.NackRange]) -> Void) {
+        lock.lock()
+        nackHandler = handler
+        lock.unlock()
+    }
+
     func stop() {
         lock.lock()
         stopping = true
         let s = fd
         fd = -1
         keyframeRequestHandler = nil
+        nackHandler = nil
         newSessionHandler = nil
         lastPeerAddress = nil
         cursorProbePending = false
@@ -278,7 +296,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops)"
+        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops)"
     }
 
     /// Coalesce cursor-shape checks onto a separate queue. There is no periodic
@@ -370,7 +388,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     private func receiveLoop() {
-        var buffer = [UInt8](repeating: 0, count: 64)
+        var buffer = [UInt8](repeating: 0, count: 256)
         while true {
             lock.lock()
             let shouldStop = stopping
@@ -460,9 +478,57 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 print("video.keyframe_request_rx seq=\(seq) total=\(keyframeRequests)")
                 fflush(stdout)
                 handler?()
+            case 0x41:
+                guard let parsed = Self.parseNack(buffer, length: n) else {
+                    badPackets &+= 1
+                    continue
+                }
+                lock.lock()
+                let handler = nackHandler
+                lock.unlock()
+                nackRx &+= 1
+                handler?(parsed.0, parsed.1)
+            case 0x43:
+                guard n == 18 else {
+                    badPackets &+= 1
+                    continue
+                }
+                pingRx &+= 1
+                var pong = Array(buffer[0..<18])
+                pong[5] = 0x44
+                var destination = peer
+                let sent = pong.withUnsafeBytes { raw -> Int in
+                    guard let base = raw.baseAddress else { return -1 }
+                    return withUnsafePointer(to: &destination) { p in
+                        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            Darwin.sendto(s, base, 18, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                if sent != 18 { pongDrops &+= 1 }
             default:
                 badPackets &+= 1
             }
         }
+    }
+
+    /// Parses an MRM1 0x41 NACK. Returns nil unless the length matches the
+    /// declared range count exactly and every range is well formed.
+    static func parseNack(_ b: [UInt8], length n: Int) -> (UInt64, [UDPFrameSender.NackRange])? {
+        guard n >= 19, n <= b.count, b[5] == 0x41 else { return nil }
+        let count = Int(b[18])
+        guard count >= 1, count <= 32, n == 19 + 4 * count else { return nil }
+        var frameID: UInt64 = 0
+        for i in 10..<18 { frameID = frameID << 8 | UInt64(b[i]) }
+        var ranges: [UDPFrameSender.NackRange] = []
+        ranges.reserveCapacity(count)
+        for r in 0..<count {
+            let o = 19 + 4 * r
+            let start = UInt16(b[o]) << 8 | UInt16(b[o + 1])
+            let len = UInt16(b[o + 2]) << 8 | UInt16(b[o + 3])
+            if len == 0 { return nil }
+            ranges.append(UDPFrameSender.NackRange(start: start, count: len))
+        }
+        return (frameID, ranges)
     }
 }

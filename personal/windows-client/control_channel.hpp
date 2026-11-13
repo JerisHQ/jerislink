@@ -12,6 +12,7 @@ struct VideoConfigResult {
     bool streamRestarted = false;
     bool hostSupportsHevc = false;
     bool codecFallback = false;
+    bool hostSupportsNack = false;  // ACK flag 0x20: host keeps a frame cache and answers MRM1 0x41
     std::string codec = "h264";
     uint16_t bitrateMbps = 25;
     uint16_t remoteWidth = 0;
@@ -170,6 +171,7 @@ public:
         result.streamRestarted = (flags & 0x01) != 0;
         result.hostSupportsHevc = (flags & 0x02) != 0;
         result.codecFallback = (flags & 0x04) != 0;
+        result.hostSupportsNack = (flags & 0x20) != 0;
         result.codec = selected == 2 ? "hevc" : "h264";
         result.bitrateMbps = bitrate;
         if (reply.size() >= 10 && (flags & 0x08) != 0) {

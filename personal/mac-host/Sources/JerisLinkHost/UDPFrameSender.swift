@@ -29,6 +29,88 @@ struct UDPPacing: Equatable {
     }
 }
 
+/// Frames kept for NACK retransmit (MRM1 0x41). A frame leaves the cache when
+/// it is older than 250 ms, or when the cache holds more than 4 MiB or 32
+/// frames (oldest first). A frameID that goes backwards means the encoder
+/// restarted, so the old frames are dropped.
+struct RetransmitFrameCache {
+    struct Entry {
+        let frameID: UInt64
+        let data: Data
+        let keyFrame: Bool
+        let packetCount: Int
+        let insertedNanos: UInt64
+    }
+
+    static let maxAgeNanos: UInt64 = 250_000_000
+    static let maxBytes = 4 * 1024 * 1024
+    static let maxFrames = 32
+
+    private(set) var entries: [Entry] = [] // oldest first
+    private(set) var bytes = 0
+    private(set) var resets: UInt64 = 0
+
+    mutating func insert(frameID: UInt64, data: Data, keyFrame: Bool, packetCount: Int, now: UInt64) {
+        if let last = entries.last, frameID <= last.frameID {
+            removeAll()
+            resets &+= 1
+        }
+        entries.append(Entry(frameID: frameID, data: data, keyFrame: keyFrame,
+                             packetCount: packetCount, insertedNanos: now))
+        bytes += data.count
+        evict(now: now)
+    }
+
+    mutating func evict(now: UInt64) {
+        while let first = entries.first,
+              entries.count > Self.maxFrames || bytes > Self.maxBytes || Self.expired(first, now: now) {
+            bytes -= first.data.count
+            entries.removeFirst()
+        }
+    }
+
+    func lookup(frameID: UInt64, now: UInt64) -> Entry? {
+        guard let entry = entries.last(where: { $0.frameID == frameID }), !Self.expired(entry, now: now) else {
+            return nil
+        }
+        return entry
+    }
+
+    mutating func removeAll() {
+        entries.removeAll(keepingCapacity: true)
+        bytes = 0
+    }
+
+    private static func expired(_ entry: Entry, now: UInt64) -> Bool {
+        now > entry.insertedNanos && now - entry.insertedNanos > maxAgeNanos
+    }
+}
+
+/// Retransmit budget: at most 20% of the video bitrate in any 100 ms window.
+/// A NACK that does not fit is dropped whole (counted as nack_over_budget) and
+/// the caller falls back to a gated keyframe.
+struct RetransmitBudget {
+    static let windowNanos: UInt64 = 100_000_000
+    let bytesPerWindow: Int
+    private var windowStart: UInt64 = 0
+    private var used = 0
+
+    init(videoBitrateMbps: Int) {
+        // bitrate/8 bytes per second, /10 per 100 ms, 20% of that.
+        bytesPerWindow = max(1, videoBitrateMbps) * 1_000_000 / 8 / 10 / 5
+    }
+
+    mutating func take(_ bytes: Int, now: UInt64) -> Bool {
+        if now < windowStart || now - windowStart >= Self.windowNanos {
+            windowStart = now
+            used = 0
+        }
+        guard used + bytes <= bytesPerWindow else { return false }
+        used += bytes
+        return true
+    }
+}
+
 /// State is guarded by `lock`; the token bucket is only used on `sendQueue`.
 final class UDPFrameSender: @unchecked Sendable {
     private let socketFD: Int32
@@ -69,12 +151,39 @@ final class UDPFrameSender: @unchecked Sendable {
     private var tokens: Double = 0
     private var lastRefillNanos: UInt64 = 0
 
+    /// One NACK range: `count` packets from `start`. (0, 0xFFFF) = whole frame.
+    struct NackRange: Equatable {
+        var start: UInt16
+        var count: UInt16
+        static let wholeFrame = NackRange(start: 0, count: 0xFFFF)
+    }
+
+    enum RetransmitResult: Equatable {
+        case sent(packets: Int)
+        case miss        // frame no longer cached (or never was)
+        case overBudget  // would pass 20% of the bitrate in this 100 ms
+        case disabled
+    }
+
+    // NACK retransmit (design doc section 1), guarded by `lock`.
+    let retransmitEnabled: Bool
+    private var cache = RetransmitFrameCache()
+    private var budget: RetransmitBudget
+    /// Paced mode: retransmit packets wait here and leave before the next
+    /// packet of any new frame, through the same token bucket.
+    private var pendingRetransmit: [Data] = []
+    private var nackRequests: UInt64 = 0
+    private var nackPacketsResent: UInt64 = 0
+    private var nackBytes: UInt64 = 0
+    private var nackMiss: UInt64 = 0
+    private var nackOverBudget: UInt64 = 0
+
     /// A frame that would wait behind this many queued frames goes out without
     /// pacing, so a too-low rate cannot build latency without bound.
     private let maxQueuedBeforeFlush = 4
 
     init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int,
-         pacing: UDPPacing = .off) throws {
+         pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20) throws {
         guard packetBytes > headerBytes + 64 && packetBytes <= 1400 else {
             throw NSError(domain: "JerisLink.UDP", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "packetBytes must be between 85 and 1400"])
@@ -85,6 +194,8 @@ final class UDPFrameSender: @unchecked Sendable {
         self.pacing = p
         self.tokens = Double(p.burstBytes)
         self.lastRefillNanos = DispatchTime.now().uptimeNanoseconds
+        self.retransmitEnabled = retransmit
+        self.budget = RetransmitBudget(videoBitrateMbps: videoBitrateMbps)
 
         socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard socketFD >= 0 else {
@@ -121,7 +232,7 @@ final class UDPFrameSender: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "Invalid client IP: \(clientIP)"])
         }
 
-        print("UDP sender: \(bindIP) -> \(clientIP):\(clientPort), packetBytes=\(packetBytes), \(self.pacing.summary)")
+        print("UDP sender: \(bindIP) -> \(clientIP):\(clientPort), packetBytes=\(packetBytes), \(self.pacing.summary) nack=\(retransmit ? "on budget=\(budget.bytesPerWindow)B/100ms" : "off")")
     }
 
     deinit {
@@ -142,6 +253,10 @@ final class UDPFrameSender: @unchecked Sendable {
         maxPacketsPerFrame = max(maxPacketsPerFrame, UInt64(packetCount))
         maxFrameBytes = max(maxFrameBytes, UInt64(data.count))
         if keyFrame { keyFrames &+= 1 }
+        if retransmitEnabled {
+            cache.insert(frameID: frameID, data: data, keyFrame: keyFrame, packetCount: packetCount,
+                         now: DispatchTime.now().uptimeNanoseconds)
+        }
         lock.unlock()
 
         let enqueuedNanos = DispatchTime.now().uptimeNanoseconds
@@ -172,20 +287,10 @@ final class UDPFrameSender: @unchecked Sendable {
         var frameWaits: UInt64 = 0
         var frameWaitNanos: UInt64 = 0
         for packetIndex in 0..<packetCount {
-            let start = packetIndex * payloadCapacity
-            let end = min(start + payloadCapacity, data.count)
-            let payload = data.subdata(in: start..<end)
-            var packet = Data(capacity: headerBytes + payload.count)
-            packet.append(contentsOf: [0x4d, 0x52, 0x30, 0x32]) // MR02
-            packet.append(1) // protocol version
-            var flags: UInt8 = keyFrame ? 0x01 : 0x00
-            if packetIndex == packetCount - 1 { flags |= 0x02 }
-            packet.append(flags)
-            packet.appendBE(frameID)
-            packet.appendBE(UInt16(packetIndex))
-            packet.appendBE(UInt16(packetCount))
-            packet.appendBE(UInt16(payload.count))
-            packet.append(payload)
+            if paced { drainRetransmits(paced: true) }
+            let packet = Self.makePacket(frameID: frameID, data: data, keyFrame: keyFrame,
+                                         packetIndex: packetIndex, packetCount: packetCount,
+                                         payloadCapacity: payloadCapacity, retransmit: false)
 
             if paced {
                 let waited = takeTokens(packet.count)
@@ -195,27 +300,7 @@ final class UDPFrameSender: @unchecked Sendable {
                 }
             }
 
-            let result: ssize_t = packet.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return -1 }
-                return withUnsafePointer(to: &destination) { ptr in
-                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                        Darwin.sendto(socketFD, base, packet.count, 0, sa,
-                                      socklen_t(MemoryLayout<sockaddr_in>.size))
-                    }
-                }
-            }
-            let sentNanos = DispatchTime.now().uptimeNanoseconds
-
-            lock.lock()
-            if result == packet.count {
-                sentPackets &+= 1
-                sentBytes &+= UInt64(packet.count)
-                recordBurst(at: sentNanos, bytes: packet.count)
-            } else {
-                sendErrors &+= 1
-                frameHadError = true
-            }
-            lock.unlock()
+            if !sendCounted(packet) { frameHadError = true }
 
             // Old behaviour when pacing is off: 50us every 8 packets for large
             // frames. Also skipped for a flushed (overflow) frame.
@@ -233,6 +318,132 @@ final class UDPFrameSender: @unchecked Sendable {
         paceWaitNanos &+= frameWaitNanos
         if !frameHadError { sentFrames &+= 1 }
         lock.unlock()
+    }
+
+    /// Resend the packets a viewer NACKed (MRM1 0x41). Called on the mouse UDP
+    /// receive queue. Retransmitted packets are byte-identical to the
+    /// originals except for MR02 flag 0x04.
+    func retransmit(frameID: UInt64, ranges: [NackRange]) -> RetransmitResult {
+        guard retransmitEnabled else { return .disabled }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let payloadCapacity = packetBytes - headerBytes
+        lock.lock()
+        nackRequests &+= 1
+        cache.evict(now: now)
+        guard let entry = cache.lookup(frameID: frameID, now: now) else {
+            nackMiss &+= 1
+            lock.unlock()
+            return .miss
+        }
+        let indices = Self.packetIndices(for: ranges, packetCount: entry.packetCount)
+        let packets = indices.map {
+            Self.makePacket(frameID: entry.frameID, data: entry.data, keyFrame: entry.keyFrame,
+                            packetIndex: $0, packetCount: entry.packetCount,
+                            payloadCapacity: payloadCapacity, retransmit: true)
+        }
+        let bytes = packets.reduce(0) { $0 + $1.count }
+        guard budget.take(bytes, now: now) else {
+            nackOverBudget &+= 1
+            lock.unlock()
+            return .overBudget
+        }
+        nackPacketsResent &+= UInt64(packets.count)
+        nackBytes &+= UInt64(bytes)
+        if pacing.enabled { pendingRetransmit.append(contentsOf: packets) }
+        lock.unlock()
+
+        if pacing.enabled {
+            sendQueue.async { [self] in drainRetransmits(paced: true) }
+        } else {
+            for packet in packets { _ = sendCounted(packet) }
+        }
+        return .sent(packets: packets.count)
+    }
+
+    /// New viewer session or capture restart: old frames can no longer be asked for.
+    func clearRetransmitCache() {
+        lock.lock()
+        cache.removeAll()
+        pendingRetransmit.removeAll()
+        lock.unlock()
+    }
+
+    /// Packet indices for NACK ranges, sorted and without duplicates; ranges
+    /// past the end of the frame are clipped.
+    static func packetIndices(for ranges: [NackRange], packetCount: Int) -> [Int] {
+        guard packetCount > 0 else { return [] }
+        var wanted = [Bool](repeating: false, count: packetCount)
+        for range in ranges {
+            if range == .wholeFrame {
+                return Array(0..<packetCount)
+            }
+            let start = Int(range.start)
+            let end = min(start + Int(range.count), packetCount)
+            if start < end {
+                for i in start..<end { wanted[i] = true }
+            }
+        }
+        return wanted.indices.filter { wanted[$0] }
+    }
+
+    static func makePacket(frameID: UInt64, data: Data, keyFrame: Bool, packetIndex: Int,
+                           packetCount: Int, payloadCapacity: Int, retransmit: Bool) -> Data {
+        let start = data.startIndex + packetIndex * payloadCapacity
+        let end = min(start + payloadCapacity, data.endIndex)
+        let payload = data.subdata(in: start..<end)
+        var packet = Data(capacity: 20 + payload.count)
+        packet.append(contentsOf: [0x4d, 0x52, 0x30, 0x32]) // MR02
+        packet.append(1) // protocol version
+        var flags: UInt8 = keyFrame ? 0x01 : 0x00
+        if packetIndex == packetCount - 1 { flags |= 0x02 }
+        if retransmit { flags |= 0x04 }
+        packet.append(flags)
+        packet.appendBE(frameID)
+        packet.appendBE(UInt16(packetIndex))
+        packet.appendBE(UInt16(packetCount))
+        packet.appendBE(UInt16(payload.count))
+        packet.append(payload)
+        return packet
+    }
+
+    /// On `sendQueue` only (paced mode).
+    private func drainRetransmits(paced: Bool) {
+        while true {
+            lock.lock()
+            guard !pendingRetransmit.isEmpty else {
+                lock.unlock()
+                return
+            }
+            let packet = pendingRetransmit.removeFirst()
+            lock.unlock()
+            if paced { _ = takeTokens(packet.count) }
+            _ = sendCounted(packet)
+        }
+    }
+
+    /// Send one packet and count it. Returns false on a send error.
+    private func sendCounted(_ packet: Data) -> Bool {
+        var dest = destination
+        let result: ssize_t = packet.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return -1 }
+            return withUnsafePointer(to: &dest) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.sendto(socketFD, base, packet.count, 0, sa,
+                                  socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        let sentNanos = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        defer { lock.unlock() }
+        if result == packet.count {
+            sentPackets &+= 1
+            sentBytes &+= UInt64(packet.count)
+            recordBurst(at: sentNanos, bytes: packet.count)
+            return true
+        }
+        sendErrors &+= 1
+        return false
     }
 
     /// Token bucket: refill at the pace rate up to the burst size, then wait
@@ -290,7 +501,10 @@ final class UDPFrameSender: @unchecked Sendable {
             + String(format: "frame_send_avg=%.2fms frame_send_max=%.2fms ", sendAvgMS, Double(frameSendMaxNanos) / 1_000_000)
             + "pace_waits=\(paceWaits) pace_wait_total_ms=\(paceWaitNanos / 1_000_000) "
             + "send_queue_max=\(maxQueuedFrames) pace_overflow=\(queueOverflowFrames) "
-            + "max_kb_per_1ms=\(maxBytesPer1ms / 1024)"
+            + "max_kb_per_1ms=\(maxBytesPer1ms / 1024) "
+            + "nack=\(retransmitEnabled ? "on" : "off") nack_rx=\(nackRequests) nack_packets_resent=\(nackPacketsResent) "
+            + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) "
+            + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
     }
 
     private static func posixError(_ operation: String) -> NSError {

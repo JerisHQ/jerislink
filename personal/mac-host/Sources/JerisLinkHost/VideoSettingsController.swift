@@ -45,6 +45,9 @@ struct PersistedVideoSettings: Equatable {
     /// udpPaceMbps: missing = auto (UDPPacing.autoMbps), 0 = off, 1...1000 = Mbps.
     var udpPaceMbps: Int?
     var udpPaceBurstKB = UDPPacing.defaultBurstKB
+    /// nack: missing = on. Off makes the host drop NACKs and leave ACK flag
+    /// 0x20 clear, so the viewer falls back to keyframe requests only.
+    var nack = true
 
     /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
     /// BetterDisplay 4K virtual screen stops delivering frames after the first
@@ -60,6 +63,7 @@ struct PersistedVideoSettings: Equatable {
         keepDisplayAwake = Self.bool(dict["keepDisplayAwake"]) ?? false
         if let pace = Self.int(dict["udpPaceMbps"]), (0...1000).contains(pace) { udpPaceMbps = pace }
         if let burst = Self.int(dict["udpPaceBurstKB"]), (2...1024).contains(burst) { udpPaceBurstKB = burst }
+        nack = Self.bool(dict["nack"]) ?? true
     }
 
     var pacing: UDPPacing {
@@ -76,7 +80,7 @@ struct PersistedVideoSettings: Equatable {
     }
 
     var summary: String {
-        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary)"
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary) nack=\(nack ? "on" : "off")"
     }
 
     private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
@@ -134,6 +138,7 @@ final class VideoSettingsController: @unchecked Sendable {
         var flags: UInt8 = 0x02 // host HEVC
         if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
         if ignored { flags |= 0x10 }
+        if nackEnabled() { flags |= 0x20 } // host retransmits on NACK
         return VideoSettingsAck(
             status: 0,
             codec: current.codec == "hevc" ? 2 : 1,
@@ -229,6 +234,7 @@ final class VideoSettingsController: @unchecked Sendable {
             if hostHEVC { flags |= 0x02 }
             if fallback { flags |= 0x04 }
             if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
+            if nackEnabled() { flags |= 0x20 }
 
             if changed {
                 requestVideoRestart()
@@ -252,6 +258,11 @@ final class VideoSettingsController: @unchecked Sendable {
 
     private func readCurrent() -> (codec: String, bitrateMbps: Int) {
         Self.readPersisted(from: fileURL)
+    }
+
+    /// ACK flag 0x20: the video service answers MRM1 0x41 NACKs (plist `nack`).
+    private func nackEnabled() -> Bool {
+        PersistedVideoSettings.load(from: fileURL).nack
     }
 
     private func persist(codec: String, bitrateMbps: Int) throws {
