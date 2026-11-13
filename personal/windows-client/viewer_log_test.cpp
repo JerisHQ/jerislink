@@ -172,7 +172,7 @@ static void testOpenSharing(const std::string& d) {
 // file was rotated by the other keeps appending to .old.
 struct TwoWriterResult {
     uint64_t maxHistory = 0, maxOld = 0, reopens = 0, rotations = 0;
-    bool newestBothInHistory = false;
+    bool newestKept = false;
 };
 static TwoWriterResult runTwoHandles(const std::string& h, bool coordinated) {
     const uint64_t cap = 64 * 1024;
@@ -206,8 +206,11 @@ static TwoWriterResult runTwoHandles(const std::string& h, bool coordinated) {
     r.rotations = a.rotations() + b.rotations();
     a.close();
     b.close();
-    const std::string hist = readAll(h);
-    r.newestBothInHistory = hist.find(lastA + EOL) != std::string::npos && hist.find(lastB + EOL) != std::string::npos;
+    // B wrote last, so its newest line is in the history. A's may already
+    // be in .old if B's last write rotated the file.
+    const std::string hist = readAll(h), old = readAll(h + ".old");
+    r.newestKept = hist.find(lastB + EOL) != std::string::npos &&
+                   (hist.find(lastA + EOL) != std::string::npos || old.find(lastA + EOL) != std::string::npos);
     return r;
 }
 
@@ -226,7 +229,7 @@ static void testTwoWritersSeparateHandles(const std::string& d) {
     expect(after.maxOld <= cap, "two writers: .old stays <= cap (no writer left appending to it)");
     expect(after.rotations >= 10, "two writers: history rotated many times");
     expect(after.reopens >= 1, "two writers: the other writer followed the rotation and reopened");
-    expect(after.newestBothInHistory, "two writers: newest line of each writer is in the current history");
+    expect(after.newestKept, "two writers: newest line of each writer kept (last writer's in the current history)");
 }
 
 // Two viewer processes (this exe, --writer mode) writing the same history at
