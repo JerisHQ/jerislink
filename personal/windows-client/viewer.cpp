@@ -73,6 +73,9 @@ extern "C" const char* __asan_default_options() {
 class CpuPresenter;
 static CpuPresenter* gCpuPresenter = nullptr;
 static bool gHardwarePresenterActive = false;
+// WM_PAINT on the hardware path: the main loop re-presents the newest frame
+// after pumpMessages() (never from inside the window procedure).
+static bool gHardwareRepaintRequested = false;
 static void paintCpuFrame(HWND hwnd);
 static void logLine(const std::string& s);
 
@@ -1497,7 +1500,9 @@ static void paintCpuFrame(HWND hwnd) {
     if (dc) {
         if (gHardwarePresenterActive) {
             // DXGI owns the client area while the hardware presenter is
-            // active. Validate WM_PAINT without painting over the swapchain.
+            // active. Validate WM_PAINT without painting over the swapchain
+            // and ask the main loop to present the newest frame again.
+            gHardwareRepaintRequested = true;
         } else if (gCpuPresenter) {
             gCpuPresenter->paintToDc(dc);
         } else {
@@ -1676,7 +1681,8 @@ private:
 class VideoPipeline {
 public:
     VideoPipeline(HWND hwnd, UINT32 width, UINT32 height, UINT32 fps,
-                  const std::string& requestedBackend, const std::string& codecName)
+                  const std::string& requestedBackend, const std::string& codecName,
+                  const std::string& presentMode)
         : hwnd_(hwnd), width_(width), height_(height), fps_(fps),
           requestedBackend_(requestedBackend), codec_(jerisVideoCodecFromString(codecName)) {
         logLine("video.backend.requested=" + requestedBackend_);
@@ -1686,7 +1692,7 @@ public:
                 logLine("gpu.init=attempt");
                 hardware_ = std::make_unique<HardwareVideoPipeline>(
                     hwnd_, width_, height_, fps_, codec_,
-                    [](const std::string& message) { logLine(message); });
+                    [](const std::string& message) { logLine(message); }, presentMode);
                 adapterName_ = hardware_->adapterName();
                 gHardwarePresenterActive = true;
                 logLine("video.backend.active=hardware-d3d11-video-processor");
@@ -1743,6 +1749,37 @@ public:
         cpuDecoder_->submit(frameId, annexB, discontinuity);
     }
 
+    // Hardware path only (the CPU path paints synchronously). Non-blocking.
+    void servicePresent() {
+        if (!hardware_) return;
+        try {
+            hardware_->servicePresent();
+        } catch (const std::exception& e) {
+            logLine(std::string("gpu.runtime_failure reason=") + e.what());
+            fallbackToCpu();
+        }
+    }
+    void repaint() {
+        if (!hardware_) return;
+        try {
+            hardware_->repaint();
+        } catch (const std::exception& e) {
+            logLine(std::string("gpu.runtime_failure reason=") + e.what());
+            fallbackToCpu();
+        }
+    }
+    bool presentPending() const { return hardware_ && hardware_->presentPending(); }
+    HANDLE presentWaitHandle() const { return hardware_ ? hardware_->presentWaitHandle() : nullptr; }
+    void onPresentWaitSignaled() {
+        if (!hardware_) return;
+        try {
+            hardware_->onPresentWaitSignaled();
+        } catch (const std::exception& e) {
+            logLine(std::string("gpu.runtime_failure reason=") + e.what());
+            fallbackToCpu();
+        }
+    }
+
     void resetForNewStream() {
         // The Windows HEVCVideoExtension can accept a new IDR after a discontinuity,
         // but FLUSH + START_OF_STREAM during loss recovery can leave ProcessInput
@@ -1794,6 +1831,15 @@ public:
     uint64_t busyDrops() const {
         return hardwareBusySaved_ + (hardware_ ? hardware_->busyDrops() : 0) +
                (cpuPresenter_ ? cpuPresenter_->busyDrops() : 0);
+    }
+    uint64_t busyRetries() const {
+        return hardwareRetriesSaved_ + (hardware_ ? hardware_->busyRetries() : 0);
+    }
+    uint64_t repaints() const {
+        return hardwareRepaintsSaved_ + (hardware_ ? hardware_->repaints() : 0);
+    }
+    uint64_t latencyTimeouts() const {
+        return hardwareLatencyTimeoutsSaved_ + (hardware_ ? hardware_->latencyTimeouts() : 0);
     }
     uint64_t nonDxgiDrops() const {
         return hardwareNonDxgiSaved_ + (hardware_ ? hardware_->nonDxgiDrops() : 0) +
@@ -1853,6 +1899,9 @@ private:
         hardwareDecodedSaved_ += hardware_->decodedFrames();
         hardwarePresentedSaved_ += frames;
         hardwareBusySaved_ += hardware_->busyDrops();
+        hardwareRetriesSaved_ += hardware_->busyRetries();
+        hardwareRepaintsSaved_ += hardware_->repaints();
+        hardwareLatencyTimeoutsSaved_ += hardware_->latencyTimeouts();
         hardwareNonDxgiSaved_ += hardware_->nonDxgiDrops();
         hardwareStreamChangesSaved_ += hardware_->streamChanges();
         hardwareBackpressureSaved_ += hardware_->inputBackpressure();
@@ -1893,6 +1942,9 @@ private:
     uint64_t hardwareDecodedSaved_ = 0;
     uint64_t hardwarePresentedSaved_ = 0;
     uint64_t hardwareBusySaved_ = 0;
+    uint64_t hardwareRetriesSaved_ = 0;
+    uint64_t hardwareRepaintsSaved_ = 0;
+    uint64_t hardwareLatencyTimeoutsSaved_ = 0;
     uint64_t hardwareNonDxgiSaved_ = 0;
     uint64_t hardwareStreamChangesSaved_ = 0;
     uint64_t hardwareBackpressureSaved_ = 0;
@@ -2121,11 +2173,11 @@ static int appMain(int argc, char** argv) {
         ShowWindow(hwnd, o.startMaximized ? SW_MAXIMIZE : SW_SHOW);
         UpdateWindow(hwnd);
         logLine(o.startMaximized ? "window.start=maximized" : "window.start=normal");
-        logLine("present.mode=adaptive");
+        logLine("present.mode=" + o.presentMode);
         std::unique_ptr<VideoPipeline> video;
         try {
             video = std::make_unique<VideoPipeline>(
-                hwnd, o.width, o.height, o.fps, o.videoBackend, effectiveCodec);
+                hwnd, o.width, o.height, o.fps, o.videoBackend, effectiveCodec, o.presentMode);
         } catch (const std::exception& e) {
             if (effectiveCodec != "hevc" || !control) throw;
             logLine(std::string("video.hevc_init_failed reason=") + e.what());
@@ -2140,7 +2192,7 @@ static int appMain(int argc, char** argv) {
             logLine("video.fallback_selected codec=h264 bitrate_mbps=" +
                     std::to_string(effectiveBitrateMbps));
             video = std::make_unique<VideoPipeline>(
-                hwnd, o.width, o.height, o.fps, o.videoBackend, effectiveCodec);
+                hwnd, o.width, o.height, o.fps, o.videoBackend, effectiveCodec, o.presentMode);
         }
 
         gConnectionInfo.effectiveCodec = effectiveCodec;
@@ -2194,6 +2246,18 @@ static int appMain(int argc, char** argv) {
             DWORD nackTimeout = 5;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&nackTimeout), sizeof(nackTimeout));
         }
+        // The loop waits on the socket, window messages and (while a decoded
+        // frame waits for a free back buffer) the swap chain latency object,
+        // so a pending frame is presented as soon as the display frees a
+        // buffer instead of after the next packet or receive timeout.
+        // WSAEventSelect makes the socket non-blocking.
+        const DWORD loopWaitMs = (nackEnabled || abrEnabled) ? 5 : 16;
+        WSAEVENT socketEvent = WSACreateEvent();
+        if (socketEvent == WSA_INVALID_EVENT || WSAEventSelect(s, socketEvent, FD_READ) != 0) {
+            if (socketEvent != WSA_INVALID_EVENT) WSACloseEvent(socketEvent);
+            closesocket(s);
+            throw std::runtime_error("WSAEventSelect failed");
+        }
 
         uint64_t rejected = 0;
         std::vector<float> decodeMs;           // per submitted frame, whole session (capped)
@@ -2231,6 +2295,9 @@ static int appMain(int argc, char** argv) {
             return std::chrono::duration<double, std::milli>(t - start).count();
         };
         jl::PresentedFpsSampler presentedFps;
+        // Present counters at the previous stats line (window deltas).
+        uint64_t prevDecoded = 0, prevPresented = 0, prevBusyDrops = 0, prevBusyRetries = 0;
+        auto firstPacket = start;
         // Receiver loss counters at the previous stats line (window deltas).
         uint64_t prevLossExpected = 0, prevLossRaw = 0, prevLossAfter = 0;
         // ABR: arrival-delay slope and the loss deltas of each 250 ms report.
@@ -2249,6 +2316,11 @@ static int appMain(int argc, char** argv) {
             }
             pumpMessages();
             if (gWindowClosed) break;
+            if (gHardwareRepaintRequested) {
+                gHardwareRepaintRequested = false;
+                video->repaint();
+            }
+            video->servicePresent();
 
             auto now = std::chrono::steady_clock::now();
             presentedFps.update(msSince(now), video->presented());
@@ -2281,6 +2353,12 @@ static int appMain(int argc, char** argv) {
                 const jl::ReceiverLoss wloss = jl::receiverLoss(st.lossExpected - prevLossExpected,
                                                                 st.lossRaw - prevLossRaw,
                                                                 st.lossAfterNack - prevLossAfter);
+                const double windowSec = std::max(0.001,
+                    std::chrono::duration<double>(now - lastStats).count());
+                const uint64_t decodedNow = video->decodedFrames();
+                const uint64_t presentedNow = video->presented();
+                const uint64_t busyDropsNow = video->busyDrops();
+                const uint64_t busyRetriesNow = video->busyRetries();
                 std::ostringstream line;
                 line << std::fixed << std::setprecision(1)
                      << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
@@ -2291,6 +2369,10 @@ static int appMain(int argc, char** argv) {
                      << " presented_fps_p5=" << jl::receiverPercentile(presentedFps.window(), 5)
                      << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.window(), 50)
                      << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.window(), 95)
+                     << " decoded_fps=" << static_cast<double>(decodedNow - prevDecoded) / windowSec
+                     << " presented_fps=" << static_cast<double>(presentedNow - prevPresented) / windowSec
+                     << " present_busy_drops=" << (busyDropsNow - prevBusyDrops)
+                     << " present_busy_retries=" << (busyRetriesNow - prevBusyRetries)
                      << " nack_tx=" << st.nackTx
                      << " frames_repaired=" << st.framesRepaired
                      << " nack_deadline_miss=" << st.nackDeadlineMiss
@@ -2305,6 +2387,10 @@ static int appMain(int argc, char** argv) {
                 logLine(line.str());
                 decodeWindowMs.clear();
                 presentedFps.clearWindow();
+                prevDecoded = decodedNow;
+                prevPresented = presentedNow;
+                prevBusyDrops = busyDropsNow;
+                prevBusyRetries = busyRetriesNow;
                 prevLossExpected = st.lossExpected;
                 prevLossRaw = st.lossRaw;
                 prevLossAfter = st.lossAfterNack;
@@ -2312,24 +2398,38 @@ static int appMain(int argc, char** argv) {
             }
 
             sockaddr_in peer{}; int plen = sizeof(peer);
+            WSAResetEvent(socketEvent);
             int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                              reinterpret_cast<sockaddr*>(&peer), &plen);
             now = std::chrono::steady_clock::now();
             if (n == SOCKET_ERROR) {
                 int e = WSAGetLastError();
                 if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
+                    // Nothing to read: sleep until a packet, a window message,
+                    // a free back buffer, or the old receive-timeout tick.
+                    HANDLE waits[2] = {socketEvent, video->presentWaitHandle()};
+                    const DWORD waitCount = waits[1] ? 2 : 1;
+                    // Pending frame without a latency object to wait on
+                    // (nowait mode, or Present() said still drawing): poll.
+                    const DWORD waitMs = (video->presentPending() && !waits[1]) ? 1 : loopWaitMs;
+                    const DWORD w = MsgWaitForMultipleObjects(waitCount, waits, FALSE, waitMs, QS_ALLINPUT);
+                    // A successful wait consumed the latency object's signal.
+                    if (waitCount == 2 && w == WAIT_OBJECT_0 + 1) video->onPresentWaitSignaled();
+                    now = std::chrono::steady_clock::now();
                     receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
                     const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
                     continue;
                 }
+                WSACloseEvent(socketEvent);
                 closesocket(s);
                 throw std::runtime_error("recvfrom failed");
             }
             const auto packetGapMs = gotAny
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
                 : 0;
+            if (!gotAny) firstPacket = now;
             gotAny = true;
             lastPacket = now;
             if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
@@ -2340,7 +2440,9 @@ static int appMain(int argc, char** argv) {
             receiver.tick(msSince(now));
         }
 
+        const auto loopEnd = std::chrono::steady_clock::now();
         video->finish();
+        WSACloseEvent(socketEvent);
         closesocket(s);
         pumpMessages();
 
@@ -2348,6 +2450,12 @@ static int appMain(int argc, char** argv) {
         const auto& rst = receiver.stats();
         const jl::ReceiverLoss loss = jl::receiverLoss(rst.lossExpected, rst.lossRaw, rst.lossAfterNack);
         const uint64_t packets = rst.packets, complete = rst.complete, bad = rst.bad;
+        // Average over the streaming part of the session (first packet to loop end).
+        const double streamSec = gotAny
+            ? std::chrono::duration<double>(loopEnd - firstPacket).count() : 0.0;
+        const auto sessionFps = [streamSec](uint64_t frames) {
+            return streamSec > 0.5 ? static_cast<double>(frames) / streamSec : 0.0;
+        };
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
                 << " complete_frames=" << complete
@@ -2357,6 +2465,11 @@ static int appMain(int argc, char** argv) {
                 << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.session(), 50)
                 << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.session(), 95)
                 << " present_busy_drops=" << video->busyDrops()
+                << " present_busy_retries=" << video->busyRetries()
+                << " present_repaints=" << video->repaints()
+                << " present_latency_timeouts=" << video->latencyTimeouts()
+                << " decoded_fps_avg=" << sessionFps(video->decodedFrames())
+                << " presented_fps_avg=" << sessionFps(video->presented())
                 << " present_avg_ms=" << video->avgPresentMs()
                 << " present_max_ms=" << video->maxPresentMs()
                 << " non_dxgi_drops=" << video->nonDxgiDrops()

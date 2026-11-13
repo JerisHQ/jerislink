@@ -1,8 +1,10 @@
 #include "hardware_video_pipeline.hpp"
+#include "present_scheduler.hpp"
 
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -60,6 +62,19 @@ struct HardwareVideoPipeline::Impl {
     UINT resetToken = 0;
 
     ComPtr<IDXGISwapChain1> swapChain;
+    std::string presentMode = "waitable";
+    UINT swapFlags = 0;
+    HANDLE latencyHandle = nullptr;  // owned; closed in abandonD3DSafely()
+    // Newest decoded frame. Held so it can be presented after a busy
+    // Present() and drawn again on WM_PAINT / resize (FLIP_DISCARD leaves the
+    // back buffer undefined after every present).
+    ComPtr<IMFSample> lastSample;
+    std::unique_ptr<jl::LatestFramePresenter> presenter;
+    double renderMs = 0.0;
+    UINT lastTextureW = 0;
+    UINT lastTextureH = 0;
+    UINT lastArraySize = 0;
+    UINT lastArraySlice = 0;
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> renderTarget;
     ComPtr<ID3D11VideoProcessorEnumerator> vpEnumerator;
@@ -80,8 +95,6 @@ struct HardwareVideoPipeline::Impl {
     std::string decoderFriendlyName;
 
     uint64_t decoded = 0;
-    uint64_t presentedFrames = 0;
-    uint64_t droppedBusy = 0;
     uint64_t droppedNonDxgi = 0;
     uint64_t outputChanges = 0;
     uint64_t backpressure = 0;
@@ -90,11 +103,22 @@ struct HardwareVideoPipeline::Impl {
     double presentMsMax = 0.0;
 
     Impl(HWND inHwnd, UINT32 inW, UINT32 inH, UINT32 inFps,
-         JerisVideoCodec inCodec, Logger inLogger)
+         JerisVideoCodec inCodec, Logger inLogger, std::string inPresentMode)
         : hwnd(inHwnd), width(inW), height(inH), fps(inFps), codec(inCodec),
-          logger(std::move(inLogger)) {
+          logger(std::move(inLogger)), presentMode(std::move(inPresentMode)) {
         activeSourceW = inW;
         activeSourceH = inH;
+        jl::PresentOps ops;
+        ops.latencyReady = [this] {
+            return !latencyHandle || WaitForSingleObjectEx(latencyHandle, 0, FALSE) == WAIT_OBJECT_0;
+        };
+        ops.render = [this] { renderLastSample(); };
+        ops.present = [this] { return presentBackBuffer(); };
+        ops.nowMs = [] {
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        presenter = std::make_unique<jl::LatestFramePresenter>(std::move(ops));
         try {
             createD3D();
             createSwapChain();
@@ -114,6 +138,12 @@ struct HardwareVideoPipeline::Impl {
     }
 
     void abandonD3DSafely() noexcept {
+        if (presenter) presenter->clear();
+        lastSample.Reset();
+        if (latencyHandle) {
+            CloseHandle(latencyHandle);
+            latencyHandle = nullptr;
+        }
         decoder.Reset();
         outputView.Reset();
         videoProcessor.Reset();
@@ -198,17 +228,43 @@ struct HardwareVideoPipeline::Impl {
         sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount = 2;
+        // 3 buffers: one on screen, one queued for the next vsync, one free
+        // to draw into. With 2 the only spare buffer is often still queued,
+        // and DO_NOT_WAIT presents fail with WAS_STILL_DRAWING.
+        sd.BufferCount = 3;
         sd.Scaling = DXGI_SCALING_STRETCH;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        checkHr(factory->CreateSwapChainForHwnd(device.Get(), hwnd, &sd, nullptr, nullptr, &swapChain),
-                "CreateSwapChainForHwnd");
+        const bool wantWaitable = presentMode != "nowait";
+        sd.Flags = wantWaitable ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
+        HRESULT createHr = factory->CreateSwapChainForHwnd(device.Get(), hwnd, &sd, nullptr, nullptr, &swapChain);
+        if (FAILED(createHr) && sd.Flags) {
+            log("present.waitable=create_failed fallback=nowait");
+            sd.Flags = 0;
+            createHr = factory->CreateSwapChainForHwnd(device.Get(), hwnd, &sd, nullptr, nullptr, &swapChain);
+        }
+        checkHr(createHr, "CreateSwapChainForHwnd");
+        swapFlags = sd.Flags;
+        if (swapFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+            ComPtr<IDXGISwapChain2> swapChain2;
+            if (SUCCEEDED(swapChain.As(&swapChain2)) &&
+                SUCCEEDED(swapChain2->SetMaximumFrameLatency(1))) {
+                latencyHandle = swapChain2->GetFrameLatencyWaitableObject();
+            }
+            if (!latencyHandle) log("present.waitable=unavailable fallback=nowait");
+        }
         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
         swapW = cw;
         swapH = ch;
         rebuildOutputResources(cw, ch);
         log("present.path=d3d11-video-processor");
+        {
+            std::ostringstream os;
+            os << "present.swapchain buffers=3 mode=" << (latencyHandle ? "waitable" : "nowait")
+               << " max_frame_latency=" << (latencyHandle ? 1 : 0)
+               << " requested=" << presentMode;
+            log(os.str());
+        }
     }
 
     void rebuildOutputResources(UINT outW, UINT outH) {
@@ -274,7 +330,7 @@ struct HardwareVideoPipeline::Impl {
             backBuffer.Reset();
             videoProcessor.Reset();
             vpEnumerator.Reset();
-            checkHr(swapChain->ResizeBuffers(0, outW, outH, DXGI_FORMAT_UNKNOWN, 0),
+            checkHr(swapChain->ResizeBuffers(0, outW, outH, DXGI_FORMAT_UNKNOWN, swapFlags),
                     "SwapChain ResizeBuffers");
             swapW = outW;
             swapH = outH;
@@ -288,23 +344,69 @@ struct HardwareVideoPipeline::Impl {
         }
     }
 
-    void presentSample(IMFSample* sample) {
+    // Throws (so the viewer falls back to the CPU path) when the decoder
+    // output is not a DXGI NV12 surface. Same checks the old present did.
+    void validateSample(IMFSample* sample) {
+        ComPtr<IMFMediaBuffer> mediaBuffer;
+        checkHr(sample->GetBufferByIndex(0, &mediaBuffer), "GetBufferByIndex");
+        ComPtr<IMFDXGIBuffer> dxgiBuffer;
+        if (FAILED(mediaBuffer.As(&dxgiBuffer))) {
+            ++droppedNonDxgi;
+            throw std::runtime_error("hardware decoder returned a non-DXGI output sample");
+        }
+        sawDxgiSample = true;
+        ComPtr<ID3D11Texture2D> texture;
+        checkHr(dxgiBuffer->GetResource(IID_PPV_ARGS(&texture)), "DXGI buffer GetResource");
+        D3D11_TEXTURE2D_DESC td{};
+        texture->GetDesc(&td);
+        if (td.Format != DXGI_FORMAT_NV12) {
+            ++droppedNonDxgi;
+            throw std::runtime_error("hardware decoder output is not DXGI_FORMAT_NV12");
+        }
+    }
+
+    // A new decoded frame: it becomes the newest frame and is presented now
+    // if the swap chain can take it, otherwise on a later servicePresent().
+    void onDecodedSample(IMFSample* sample) {
         if (!sample) return;
         // The main window is destroyed before the final decoder drain when
         // the user closes Jerislink. Do not touch/resize the swapchain after
         // the HWND is gone; the remaining decoded frames can be discarded
         // during shutdown without being treated as a GPU runtime failure.
-        if (!IsWindow(hwnd)) return;
+        if (!IsWindow(hwnd) || !swapChain) return;
+        validateSample(sample);
+        lastSample = sample;  // AddRef; the previous newest frame is released
+        presenter->onDecoded();
+    }
 
+    bool clientSizeChanged() const {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        const UINT outW = std::max<LONG>(1, rc.right - rc.left);
+        const UINT outH = std::max<LONG>(1, rc.bottom - rc.top);
+        return outW != swapW || outH != swapH;
+    }
+
+    void servicePresent() {
+        if (!swapChain || !presenter->pending() || !IsWindow(hwnd)) return;
+        // A frame drawn before a resize must be drawn again at the new size.
+        if (clientSizeChanged()) presenter->onBuffersLost();
+        presenter->service();
+    }
+
+    void repaint() {
+        if (!swapChain || !lastSample || !IsWindow(hwnd)) return;
+        presenter->onRepaint();
+    }
+
+    // Draw lastSample into the current back buffer (no present).
+    void renderLastSample() {
+        IMFSample* sample = lastSample.Get();
+        if (!sample) throw std::runtime_error("present: no frame to render");
         ComPtr<IMFMediaBuffer> mediaBuffer;
         checkHr(sample->GetBufferByIndex(0, &mediaBuffer), "GetBufferByIndex");
         ComPtr<IMFDXGIBuffer> dxgiBuffer;
-        HRESULT dxgiHr = mediaBuffer.As(&dxgiBuffer);
-        if (FAILED(dxgiHr)) {
-            ++droppedNonDxgi;
-            throw std::runtime_error("hardware decoder returned a non-DXGI output sample");
-        }
-        sawDxgiSample = true;
+        checkHr(mediaBuffer.As(&dxgiBuffer), "QI IMFDXGIBuffer");
 
         ComPtr<ID3D11Texture2D> texture;
         checkHr(dxgiBuffer->GetResource(IID_PPV_ARGS(&texture)), "DXGI buffer GetResource");
@@ -313,10 +415,6 @@ struct HardwareVideoPipeline::Impl {
 
         D3D11_TEXTURE2D_DESC td{};
         texture->GetDesc(&td);
-        if (td.Format != DXGI_FORMAT_NV12) {
-            ++droppedNonDxgi;
-            throw std::runtime_error("hardware decoder output is not DXGI_FORMAT_NV12");
-        }
         const UINT arraySlice = td.MipLevels ? subresource / td.MipLevels : 0;
         ensureProcessor(td.Width, td.Height);
 
@@ -364,28 +462,36 @@ struct HardwareVideoPipeline::Impl {
         checkHr(videoContext->VideoProcessorBlt(
                     videoProcessor.Get(), outputView.Get(), 0, 1, &stream),
                 "VideoProcessorBlt");
+        renderMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        lastTextureW = td.Width;
+        lastTextureH = td.Height;
+        lastArraySize = td.ArraySize;
+        lastArraySlice = arraySlice;
+    }
+
+    // Non-blocking present of the rendered back buffer.
+    jl::PresentResult presentBackBuffer() {
+        auto t0 = std::chrono::steady_clock::now();
         HRESULT presentHr = swapChain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-        if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            ++droppedBusy;
-            return;
-        }
+        if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) return jl::PresentResult::Busy;
         checkHr(presentHr, "SwapChain Present");
         HRESULT removed = device->GetDeviceRemovedReason();
         if (FAILED(removed)) checkHr(removed, "D3D device removed");
 
-        double ms = std::chrono::duration<double, std::milli>(
+        double ms = renderMs + std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
-        ++presentedFrames;
         ++presentCalls;
         presentMsTotal += ms;
         presentMsMax = std::max(presentMsMax, ms);
 
-        if (presentedFrames == 1) {
+        if (presentCalls == 1) {
             std::ostringstream os;
-            os << "FIRST_PRESENT d3d11-video-processor texture=" << td.Width << "x" << td.Height
-               << " array=" << td.ArraySize << " slice=" << arraySlice;
+            os << "FIRST_PRESENT d3d11-video-processor texture=" << lastTextureW << "x" << lastTextureH
+               << " array=" << lastArraySize << " slice=" << lastArraySlice;
             log(os.str());
         }
+        return jl::PresentResult::Ok;
     }
 
     void createDecoder() {
@@ -522,9 +628,10 @@ struct HardwareVideoPipeline::Impl {
             }
             checkHr(hr, "decoder ProcessOutput");
             if (out.pSample) {
+                ComPtr<IMFSample> sample;
+                sample.Attach(out.pSample);  // released at scope end unless kept as lastSample
                 ++decoded;
-                presentSample(out.pSample);
-                out.pSample->Release();
+                onDecodedSample(sample.Get());
             }
         }
     }
@@ -569,6 +676,9 @@ struct HardwareVideoPipeline::Impl {
         checkHr(decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "NOTIFY_END_OF_STREAM");
         checkHr(decoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "COMMAND_DRAIN");
         drain();
+        // Release the held frame before the decoder lets go of its surfaces.
+        presenter->clear();
+        lastSample.Reset();
         checkHr(decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0), "NOTIFY_END_STREAMING");
         checkHr(decoder->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0), "CLEAR_D3D_MANAGER");
         finished = true;
@@ -577,8 +687,8 @@ struct HardwareVideoPipeline::Impl {
 
 HardwareVideoPipeline::HardwareVideoPipeline(
     HWND hwnd, UINT32 width, UINT32 height, UINT32 fps,
-    JerisVideoCodec codec, Logger logger)
-    : impl_(std::make_unique<Impl>(hwnd, width, height, fps, codec, std::move(logger))) {}
+    JerisVideoCodec codec, Logger logger, const std::string& presentMode)
+    : impl_(std::make_unique<Impl>(hwnd, width, height, fps, codec, std::move(logger), presentMode)) {}
 
 HardwareVideoPipeline::~HardwareVideoPipeline() = default;
 
@@ -593,8 +703,24 @@ void HardwareVideoPipeline::abandon() noexcept {
     impl_->abandonD3DSafely();
 }
 uint64_t HardwareVideoPipeline::decodedFrames() const { return impl_->decoded; }
-uint64_t HardwareVideoPipeline::presented() const { return impl_->presentedFrames; }
-uint64_t HardwareVideoPipeline::busyDrops() const { return impl_->droppedBusy; }
+void HardwareVideoPipeline::servicePresent() { impl_->servicePresent(); }
+void HardwareVideoPipeline::repaint() { impl_->repaint(); }
+bool HardwareVideoPipeline::presentPending() const {
+    return impl_->swapChain && impl_->presenter->pending();
+}
+HANDLE HardwareVideoPipeline::presentWaitHandle() const {
+    if (!impl_->swapChain || !impl_->latencyHandle) return nullptr;
+    return impl_->presenter->waitingForLatency() ? impl_->latencyHandle : nullptr;
+}
+void HardwareVideoPipeline::onPresentWaitSignaled() {
+    if (!impl_->swapChain) return;
+    impl_->presenter->onLatencySignalled();
+}
+uint64_t HardwareVideoPipeline::presented() const { return impl_->presenter->counters().presented; }
+uint64_t HardwareVideoPipeline::busyDrops() const { return impl_->presenter->counters().busyDrops; }
+uint64_t HardwareVideoPipeline::busyRetries() const { return impl_->presenter->counters().busyRetries; }
+uint64_t HardwareVideoPipeline::repaints() const { return impl_->presenter->counters().repaints; }
+uint64_t HardwareVideoPipeline::latencyTimeouts() const { return impl_->presenter->counters().latencyTimeouts; }
 uint64_t HardwareVideoPipeline::nonDxgiDrops() const { return impl_->droppedNonDxgi; }
 uint64_t HardwareVideoPipeline::streamChanges() const { return impl_->outputChanges; }
 uint64_t HardwareVideoPipeline::inputBackpressure() const { return impl_->backpressure; }

@@ -115,6 +115,12 @@ int main() {
         CHECK(resolveLaunch({"--source-ip"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--bogus", "1"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
     }
+    // --present-mode: waitable is the default, nowait still parses.
+    {
+        CHECK(resolveLaunch({}, typicalSaved(), "", tailnet).options.presentMode == "waitable");
+        CHECK(resolveLaunch({"--present-mode", "nowait"}, typicalSaved(), "", tailnet).options.presentMode == "nowait");
+        CHECK(resolveLaunch({"--present-mode", "vsync"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+    }
     // IPv4 validation.
     {
         CHECK(isIPv4("192.0.2.25"));
