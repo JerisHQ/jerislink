@@ -209,14 +209,14 @@ enum ListenConfigSelfTest {
         }
         let mac = [LocalAddress(interface: "lo0", ip: "127.0.0.1"),
                    LocalAddress(interface: "en0", ip: "192.168.1.20"),
-                   LocalAddress(interface: "utun4", ip: "100.64.0.25")]
+                   LocalAddress(interface: "utun4", ip: "100.64.0.10")]
         let offline = [LocalAddress(interface: "lo0", ip: "127.0.0.1"),
                        LocalAddress(interface: "en0", ip: "192.168.1.20")]
         let noConf: (bindIP: String?, clientIP: String?) = (nil, nil)
-        let legacy: (bindIP: String?, clientIP: String?) = ("100.64.0.25", "100.64.0.16")
+        let legacy: (bindIP: String?, clientIP: String?) = ("100.64.0.10", "100.64.0.20")
 
         expect(ListenConfig.resolve(plist: nil, conf: legacy, local: mac)
-               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.25", clientIP: "100.64.0.16", source: "network.conf")),
+               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "100.64.0.20", source: "network.conf")),
                "network.conf fallback keeps today's addresses")
         if case .waiting = ListenConfig.resolve(plist: nil, conf: legacy, local: offline) {
             expect(true, "network.conf waits while the tailnet address is down")
@@ -225,20 +225,20 @@ enum ListenConfigSelfTest {
             expect(true, "no settings at all is not configured")
         } else { expect(false, "no settings at all is not configured") }
 
-        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.16"], conf: noConf, local: mac)
-               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.25", clientIP: "100.64.0.16", source: "listen.plist")),
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.20"], conf: noConf, local: mac)
+               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "100.64.0.20", source: "listen.plist")),
                "tailnet mode finds this Mac's tailnet address on utun")
-        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.16"], conf: legacy, local: offline)
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.20"], conf: legacy, local: offline)
                == .waiting("no tailnet address on this Mac (Tailscale not connected)"),
                "tailnet down: waits, never falls back to en0 or network.conf")
         expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "192.168.1.30"], conf: legacy, local: mac)
                == .notConfigured("listen.plist tailnet mode needs clientIP in 100.64.0.0/10"),
                "tailnet mode rejects a LAN viewer address")
-        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.16", "bindIP": "192.168.1.20"],
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "100.64.0.20", "bindIP": "192.168.1.20"],
                                     conf: noConf, local: mac)
                == .notConfigured("listen.plist bindIP 192.168.1.20 is not a tailnet address"),
                "tailnet mode rejects a LAN bind address")
-        expect(ListenConfig.resolve(plist: ["mode": "loopback", "clientIP": "100.64.0.16"], conf: legacy, local: offline)
+        expect(ListenConfig.resolve(plist: ["mode": "loopback", "clientIP": "100.64.0.20"], conf: legacy, local: offline)
                == .ready(ListenEndpoint(mode: .loopback, bindIP: "127.0.0.1", clientIP: "127.0.0.1", source: "listen.plist")),
                "loopback mode binds and allows 127.0.0.1 only")
         expect(ListenConfig.resolve(plist: ["mode": "lan"], conf: legacy, local: mac)
