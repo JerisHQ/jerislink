@@ -89,6 +89,32 @@ enum ControlServiceSelfTest {
         }
         expect(helper.maxConcurrentConnections == 1, "control e2e: one helper connection for both listeners")
 
+        // F3: the helper checks access once per viewer session. A viewer
+        // connect and a viewer disconnect each reopen the helper connection
+        // once; events and relay clients do not.
+        let beforeViewer = helper.acceptedConnections
+        let viewer2 = MRC1Client(port: directPort)
+        expect(viewer2 != nil && helper.waitAccepted(beforeViewer + 1),
+               "control e2e: viewer connect reopens the helper connection (access check)")
+        let marker = FakeInputHelper.Event(type: 0x24, payload: [0x00, 0x07, 0x00, 0x09])
+        for _ in 0..<50 { _ = viewer2?.send(type: 0x24, payload: marker.payload) }
+        let markerDeadline = Date().addingTimeInterval(5)
+        while Date() < markerDeadline, !helper.received(marker) { usleep(20_000) }
+        expect(helper.received(marker), "control e2e: events after the reconnect reach the helper")
+        usleep(200_000)
+        expect(helper.acceptedConnections == beforeViewer + 1, "control e2e: no helper reconnect per event (50 events)")
+        viewer2?.close()
+        expect(helper.waitAccepted(beforeViewer + 2),
+               "control e2e: viewer disconnect reopens the helper connection (status write)")
+        let beforeRelay = helper.acceptedConnections
+        let relay2 = MRC1Client(port: relayPort)
+        usleep(300_000)
+        relay2?.close()
+        usleep(300_000)
+        expect(relay2 != nil && helper.acceptedConnections == beforeRelay,
+               "control e2e: relay client connect/disconnect does not reopen the helper connection")
+        expect(helper.maxConcurrentConnections == 1, "control e2e: still one helper connection at a time after reconnects")
+
         direct?.close()
         relayKey?.close()
         relayMouse.closeConnection()
@@ -168,6 +194,21 @@ private final class FakeInputHelper: @unchecked Sendable {
     private var events: [Event] = []
     private var active = 0
     private(set) var maxConcurrentConnections = 0
+    private var accepted = 0
+
+    var acceptedConnections: Int {
+        lock.lock(); defer { lock.unlock() }
+        return accepted
+    }
+
+    /// Wait up to 5 s until at least `count` connections were accepted.
+    func waitAccepted(_ count: Int) -> Bool {
+        for _ in 0..<250 {
+            if acceptedConnections >= count { return true }
+            usleep(20_000)
+        }
+        return false
+    }
     private var stopping = false
 
     private init(fd: Int32, port: UInt16) {
@@ -221,6 +262,7 @@ private final class FakeInputHelper: @unchecked Sendable {
                 continue
             }
             lock.lock()
+            accepted += 1
             active += 1
             maxConcurrentConnections = max(maxConcurrentConnections, active)
             lock.unlock()

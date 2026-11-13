@@ -37,6 +37,20 @@ final class InputHelperClient: @unchecked Sendable {
         closeLocked()
     }
 
+    /// Close the MRI1 connection and open a fresh one. The helper serves one
+    /// connection at a time, so this makes it finish the old connection
+    /// (status write with `clientClosed=true`) and accept the new one, where
+    /// it checks post-event access once and writes its status file. Called
+    /// once per viewer connect and once per viewer disconnect, never per
+    /// event. Returns false when the helper is not reachable; the next event
+    /// then reconnects lazily as before.
+    @discardableResult
+    func reconnect() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        closeLocked()
+        return ensureConnected()
+    }
+
     /// Send one packet, reconnecting once if the connection dropped.
     private func deliver(_ bytes: [UInt8]) -> Bool {
         lock.lock(); defer { lock.unlock() }

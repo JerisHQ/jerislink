@@ -33,13 +33,20 @@ final class ControlServer: @unchecked Sendable {
     /// Read PROXY headers from loopback peers (legacy `tailscale serve`
     /// forward). Off for `--service control`, whose sockets see real peers.
     private let acceptProxy: Bool
+    /// Reconnect the input helper when a client connects and when it
+    /// disconnects, so the helper checks post-event access once per viewer
+    /// session and writes its status. On for viewer-facing listeners; off for
+    /// the loopback relay, whose client is the long-lived video service.
+    private let reconnectHelperOnClient: Bool
     private static let maxClipboardBytes = 60 * 1024
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
          acceptProxy: Bool = true,
-         inputHelper: InputHelperClient? = nil) {
+         inputHelper: InputHelperClient? = nil,
+         reconnectHelperOnClient: Bool = true) {
         self.bindIP = bindIP
+        self.reconnectHelperOnClient = reconnectHelperOnClient
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -163,14 +170,23 @@ final class ControlServer: @unchecked Sendable {
                     Darwin.close(c)
                     return
                 }
+                self.reconnectHelperForSession()
                 self.handleClient(c, tcpPeerIP: peerIP)
                 self.lock.lock()
                 self.clientFDs.remove(c)
                 self.lock.unlock()
                 Darwin.close(c)
+                self.reconnectHelperForSession()
                 print("Control client disconnected: \(peerIP):\(peerPort)")
             }
         }
+    }
+
+    /// One helper reconnect per viewer connect or disconnect (see
+    /// `reconnectHelperOnClient`). Not on the event path.
+    private func reconnectHelperForSession() {
+        guard reconnectHelperOnClient, let helper = inputHelper else { return }
+        helper.reconnect()
     }
 
     private func handleClient(_ fd: Int32, tcpPeerIP: String) {

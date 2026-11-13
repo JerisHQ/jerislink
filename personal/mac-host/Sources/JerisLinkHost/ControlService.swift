@@ -46,7 +46,7 @@ enum ControlService {
                 let relay = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                           port: relayPort, inject: inject,
                                           settingsClientIP: { clientIP }, acceptProxy: false,
-                                          inputHelper: helper)
+                                          inputHelper: helper, reconnectHelperOnClient: false)
                 try relay.start()
                 servers.append(relay)
             }
