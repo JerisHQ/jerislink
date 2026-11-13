@@ -421,9 +421,11 @@ private:
         return false;
     }
     // While NACK is paused, held frames are settled on the NACK path until
-    // no hole is held any more or recovery took over (then strict waits).
+    // no hole is held any more: each one is either completed in time or
+    // expired by its 40 ms deadline (counted). This holds while waiting for a
+    // keyframe too (startup or recovery): a held keyframe keeps its deadline.
     void updateSettling() {
-        if (settling_ && (waiting_ || !holdingHole())) {
+        if (settling_ && !holdingHole()) {
             settling_ = false;
             log("loss.nack_settled waiting=" + std::string(waiting_ ? "1" : "0"));
         }
@@ -434,6 +436,14 @@ private:
                         const uint8_t* payload, uint16_t len) {
         const bool strict = cfg_.strict;
         newest_ = std::max(newest_, fid);
+        // Same per-stream watermark as the NACK path: recovery clears
+        // lastSubmitted_, but a frame at or below one already shown (a late
+        // original or a copy) must never be shown again. Only a real restart
+        // resets submittedMax_.
+        if (strict && submittedMax_ && fid <= submittedMax_) {
+            ++st_.latePacketsIgnored;
+            return;
+        }
         if (waiting_ && (flags & 0x01) == 0) {
             ++st_.recoveryWaitPacketDrops;
             requestKeyframe();
