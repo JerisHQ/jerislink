@@ -18,25 +18,25 @@ static int gChecks = 0;
 using namespace jl;
 using Args = std::vector<std::string>;
 
-static SavedSettings morrisSaved() {
+static SavedSettings typicalSaved() {
     SavedSettings s;
-    s.hostIp = "100.64.0.25";
+    s.hostIp = "192.0.2.25";
     s.codec = "hevc";
     s.bitrateMbps = 18;
     return s;
 }
 
 int main() {
-    const std::optional<std::string> tailnet = std::string("100.64.0.16");
+    const std::optional<std::string> tailnet = std::string("198.51.100.16");
     const std::optional<std::string> noTailnet;
 
     // No arguments, saved settings: connects to the saved host, bind auto-detected.
     {
-        auto r = resolveLaunch({}, morrisSaved(), "", tailnet);
+        auto r = resolveLaunch({}, typicalSaved(), "", tailnet);
         CHECK(r.status == LaunchStatus::Ok);
-        CHECK(r.options.sourceIp == "100.64.0.25");
+        CHECK(r.options.sourceIp == "192.0.2.25");
         CHECK(r.hostSource == "saved");
-        CHECK(r.options.bindIp == "100.64.0.16");
+        CHECK(r.options.bindIp == "198.51.100.16");
         CHECK(r.bindSource == "auto");
         CHECK(r.options.codec == "hevc");
         CHECK(r.options.bitrateMbps == 18);
@@ -51,44 +51,44 @@ int main() {
     }
     // The old full command line still works and wins over saved settings.
     {
-        Args a{"--bind-ip", "100.64.0.16", "--source-ip", "100.64.0.25",
+        Args a{"--bind-ip", "198.51.100.16", "--source-ip", "192.0.2.25",
                "--codec", "hevc", "--bitrate-mbps", "18"};
         SavedSettings s;
-        s.hostIp = "100.64.0.99";
-        s.bindIp = "100.64.0.98";
+        s.hostIp = "192.0.2.99";
+        s.bindIp = "192.0.2.98";
         s.codec = "h264";
         s.bitrateMbps = 40;
-        auto r = resolveLaunch(a, s, "100.64.0.97", noTailnet);
+        auto r = resolveLaunch(a, s, "192.0.2.97", noTailnet);
         CHECK(r.status == LaunchStatus::Ok);
-        CHECK(r.options.sourceIp == "100.64.0.25" && r.hostSource == "cli");
-        CHECK(r.options.bindIp == "100.64.0.16" && r.bindSource == "cli");
+        CHECK(r.options.sourceIp == "192.0.2.25" && r.hostSource == "cli");
+        CHECK(r.options.bindIp == "198.51.100.16" && r.bindSource == "cli");
         CHECK(r.options.codec == "hevc");
         CHECK(r.options.bitrateMbps == 18);
     }
     // Saved bind IP overrides auto-detect.
     {
-        auto s = morrisSaved();
-        s.bindIp = "100.64.0.42";
+        auto s = typicalSaved();
+        s.bindIp = "192.0.2.42";
         auto r = resolveLaunch({}, s, "", tailnet);
-        CHECK(r.options.bindIp == "100.64.0.42" && r.bindSource == "saved");
+        CHECK(r.options.bindIp == "192.0.2.42" && r.bindSource == "saved");
     }
     // Saved host wins over JERISLINK_SOURCE_IP; env is used when nothing is saved.
     {
-        auto r = resolveLaunch({}, morrisSaved(), "100.64.0.7", tailnet);
-        CHECK(r.options.sourceIp == "100.64.0.25" && r.hostSource == "saved");
-        auto e = resolveLaunch({}, SavedSettings{}, "100.64.0.7", tailnet);
+        auto r = resolveLaunch({}, typicalSaved(), "192.0.2.7", tailnet);
+        CHECK(r.options.sourceIp == "192.0.2.25" && r.hostSource == "saved");
+        auto e = resolveLaunch({}, SavedSettings{}, "192.0.2.7", tailnet);
         CHECK(e.status == LaunchStatus::Ok);
-        CHECK(e.options.sourceIp == "100.64.0.7" && e.hostSource == "env");
+        CHECK(e.options.sourceIp == "192.0.2.7" && e.hostSource == "env");
     }
     // No tailnet address and none saved.
     {
-        auto r = resolveLaunch({}, morrisSaved(), "", noTailnet);
+        auto r = resolveLaunch({}, typicalSaved(), "", noTailnet);
         CHECK(r.status == LaunchStatus::NoTailnet);
         CHECK(r.bindSource == "none");
     }
     // A corrupt saved host is treated as unset.
     {
-        auto s = morrisSaved();
+        auto s = typicalSaved();
         s.hostIp = "100.64.0";
         auto r = resolveLaunch({}, s, "", tailnet);
         CHECK(r.status == LaunchStatus::NeedsSetup);
@@ -96,30 +96,30 @@ int main() {
     // --settings and --print-config are flags, not connection settings.
     {
         auto r = resolveLaunch({"--settings", "--print-config", "C:\\t\\out.txt"},
-                               morrisSaved(), "", tailnet);
+                               typicalSaved(), "", tailnet);
         CHECK(r.status == LaunchStatus::Ok);
         CHECK(r.openSettings);
         CHECK(r.printConfigPath == "C:\\t\\out.txt");
     }
     // Invalid arguments are still rejected.
     {
-        CHECK(resolveLaunch({"--codec", "vp9"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
-        CHECK(resolveLaunch({"--bitrate-mbps", "2"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
-        CHECK(resolveLaunch({"--nack", "maybe"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
-        CHECK(resolveLaunch({}, morrisSaved(), "", tailnet).options.nack == "on");
-        CHECK(resolveLaunch({"--nack", "off"}, morrisSaved(), "", tailnet).options.nack == "off");
-        CHECK(resolveLaunch({"--port", "abc"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
-        CHECK(resolveLaunch({"--source-ip"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
-        CHECK(resolveLaunch({"--bogus", "1"}, morrisSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--codec", "vp9"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--bitrate-mbps", "2"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--nack", "maybe"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({}, typicalSaved(), "", tailnet).options.nack == "on");
+        CHECK(resolveLaunch({"--nack", "off"}, typicalSaved(), "", tailnet).options.nack == "off");
+        CHECK(resolveLaunch({"--port", "abc"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--source-ip"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--bogus", "1"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
     }
     // IPv4 validation.
     {
-        CHECK(isIPv4("100.64.0.25"));
+        CHECK(isIPv4("192.0.2.25"));
         CHECK(isIPv4("0.0.0.0"));
         CHECK(!isIPv4(""));
         CHECK(!isIPv4("100.64.0"));
-        CHECK(!isIPv4("100.64.0.256"));
-        CHECK(!isIPv4("100.64.0.25."));
+        CHECK(!isIPv4("192.0.2.256"));
+        CHECK(!isIPv4("192.0.2.25."));
         CHECK(!isIPv4("100.64..25"));
         CHECK(!isIPv4("01.2.3.4"));
         CHECK(!isIPv4("1.2.3.4.5"));
@@ -128,9 +128,9 @@ int main() {
     }
     // describeLaunch output used by --print-config.
     {
-        auto d = describeLaunch(resolveLaunch({}, morrisSaved(), "", tailnet));
+        auto d = describeLaunch(resolveLaunch({}, typicalSaved(), "", tailnet));
         CHECK(d.find("status=ok\n") != std::string::npos);
-        CHECK(d.find("host=100.64.0.25\n") != std::string::npos);
+        CHECK(d.find("host=192.0.2.25\n") != std::string::npos);
         CHECK(d.find("host_source=saved\n") != std::string::npos);
     }
 

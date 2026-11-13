@@ -41,12 +41,35 @@ enum RetransmitSelfTest {
         cache.insert(frameID: 1, data: small, keyFrame: true, packetCount: 1, now: 40 * ms)
         expect(cache.entries.count == 1 && cache.resets == 1, "cache: frameID going back (encoder restart) clears it")
 
-        // Budget: 20 Mbps -> 20% of 250 KB per 100 ms = 50,000 bytes.
+        // Budget: 20 Mbps -> 20% of 250 KB per 100 ms = 50,000 bytes, sliding.
         var budget = RetransmitBudget(videoBitrateMbps: 20)
         expect(budget.bytesPerWindow == 50_000, "budget: 20% of bitrate per 100 ms")
-        expect(budget.take(40_000, now: 1_000 * ms), "budget: within window allowed")
-        expect(!budget.take(20_000, now: 1_050 * ms), "budget: over window refused")
-        expect(budget.take(20_000, now: 1_100 * ms), "budget: next window allowed")
+        expect(budget.take(30_000, now: 1_000 * ms), "budget: first send allowed")
+        expect(budget.take(20_000, now: 1_099 * ms), "budget: up to the limit allowed")
+        expect(!budget.take(1, now: 1_099 * ms), "budget: one byte over refused")
+        expect(!budget.take(30_000, now: 1_100 * ms - 1), "budget: first send still counted just before 100 ms")
+        expect(budget.take(30_000, now: 1_100 * ms), "budget: first send leaves the window at 100 ms")
+        // A fixed window would reset at 1_100 ms and allow a full 50 KB burst
+        // right after the 20 KB sent at 1_099 ms; the sliding one must not.
+        expect(!budget.take(1, now: 1_150 * ms), "budget: no reset burst across a window edge")
+        expect(budget.take(20_000, now: 1_199 * ms), "budget: 1_099 ms send gone at 1_199 ms")
+        expect(budget.used == 50_000, "budget: used counts only the last 100 ms")
+        var backwards = RetransmitBudget(videoBitrateMbps: 20)
+        _ = backwards.take(50_000, now: 2_000 * ms)
+        expect(backwards.take(50_000, now: 1_000 * ms), "budget: clock going backwards empties the window")
+        var many = RetransmitBudget(videoBitrateMbps: 20)
+        var allowed = 0
+        for i in stride(from: 0, to: 10_000, by: 2) where many.take(1_000, now: UInt64(i) * ms) { allowed += 1 }
+        expect(allowed == 5_000 && many.used == 50_000, "budget: steady 1 KB per 2 ms (exactly 20%) always fits")
+        expect(!many.take(1_000, now: 9_999 * ms), "budget: one more in that window refused")
+
+        // Control sequence numbers survive the UInt32 wrap.
+        expect(MouseMoveUDPServer.isNewer(1, than: 0) && !MouseMoveUDPServer.isNewer(0, than: 0) && !MouseMoveUDPServer.isNewer(0, than: 1),
+               "seq: plain order")
+        expect(MouseMoveUDPServer.isNewer(0, than: UInt32.max) && MouseMoveUDPServer.isNewer(1, than: 0),
+               "seq: UInt32.max -> 0 -> 1 accepted")
+        expect(!MouseMoveUDPServer.isNewer(UInt32.max, than: 0) && !MouseMoveUDPServer.isNewer(UInt32.max - 5, than: 1),
+               "seq: pre-wrap packet after the wrap is stale")
 
         // Packet format: a retransmit is the original plus flag 0x04.
         let frame = Data((0..<3000).map { UInt8($0 & 0xff) })
@@ -69,6 +92,21 @@ enum RetransmitSelfTest {
         // Persisted setting: missing = on.
         expect(PersistedVideoSettings(dictionary: [:]).nack, "settings: nack defaults on")
         expect(!PersistedVideoSettings(dictionary: ["nack": false]).nack, "settings: nack false turns it off")
+
+        // Capture->encode latency histogram (host metrics).
+        var hist = LatencyHistogram()
+        expect(hist.fields("x") == "x_p50=0.0ms x_p95=0.0ms x_max=0.0ms", "latency: empty histogram is zero")
+        for i in 1...100 { hist.add(Double(i)) }   // 1..100 ms
+        expect(abs(hist.percentile(0.50) - 50) <= 0.15, "latency: p50 of 1..100 ms")
+        expect(abs(hist.percentile(0.95) - 95) <= 0.15, "latency: p95 of 1..100 ms")
+        expect(hist.maxMS == 100 && hist.samples == 100, "latency: max and count")
+        hist.add(5_000); hist.add(-3); hist.add(.nan)
+        expect(hist.maxMS == 5_000 && hist.percentile(1.0) == 5_000, "latency: overflow bucket reports max")
+        expect(hist.percentile(0.0001) == 0.1, "latency: negative and NaN count as 0")
+        hist.reset()
+        expect(hist.samples == 0 && hist.maxMS == 0, "latency: reset")
+        expect(CaptureClock.elapsedMS(since: 1_000_000, now: 13_500_000) == 12.5, "latency: capture elapsed ms")
+        expect(CaptureClock.elapsedMS(since: 0, now: 5) == 0 && CaptureClock.elapsedMS(since: 9, now: 5) == 0, "latency: unknown or future capture is 0")
 
         loopback(expect)
         return failures == 0 ? 0 : 1

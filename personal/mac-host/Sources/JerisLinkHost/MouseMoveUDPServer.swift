@@ -448,7 +448,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                       UInt32(buffer[7]) << 16 |
                       UInt32(buffer[8]) << 8 |
                       UInt32(buffer[9])
-            if let last = lastSequence, seq <= last {
+            if let last = lastSequence, !Self.isNewer(seq, than: last) {
                 staleDropped &+= 1
                 continue
             }
@@ -510,6 +510,12 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 badPackets &+= 1
             }
         }
+    }
+
+    /// Sequence order that survives the UInt32 wrap (RFC 1982 style): `seq` is
+    /// newer when it is less than 2^31 steps ahead of `last`.
+    static func isNewer(_ seq: UInt32, than last: UInt32) -> Bool {
+        Int32(bitPattern: seq &- last) > 0
     }
 
     /// Parses an MRM1 0x41 NACK. Returns nil unless the length matches the

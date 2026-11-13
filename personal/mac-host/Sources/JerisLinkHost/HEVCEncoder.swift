@@ -6,11 +6,13 @@ import Darwin
 
 private final class HEVCFrameContext {
     let frameID: UInt64
+    let captureNanos: UInt64
     let submitNanos: UInt64
     let forcedKeyframeRequested: Bool
 
-    init(frameID: UInt64, submitNanos: UInt64, forcedKeyframeRequested: Bool) {
+    init(frameID: UInt64, captureNanos: UInt64, submitNanos: UInt64, forcedKeyframeRequested: Bool) {
         self.frameID = frameID
+        self.captureNanos = captureNanos
         self.submitNanos = submitNanos
         self.forcedKeyframeRequested = forcedKeyframeRequested
     }
@@ -23,6 +25,10 @@ final class HEVCEncoder: FrameEncoder {
     private let udpSender: UDPFrameSender?
     private var frameID: UInt64 = 0
     private var encodedFrames: UInt64 = 0
+    // Capture (SCStreamFrameInfo.displayTime) -> encoded frame out of VT:
+    // window since the previous stats line, and the whole session.
+    private var captureEncodeWindow = LatencyHistogram()
+    private var captureEncodeSession = LatencyHistogram()
     private var latencySumMS: Double = 0
     private var latencyMaxMS: Double = 0
     private var callbackLatencySumMS: Double = 0
@@ -133,7 +139,7 @@ final class HEVCEncoder: FrameEncoder {
         fflush(stdout)
     }
 
-    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, captureNanos: UInt64) {
         guard let session else { return }
 
         keyframeRequestLock.lock()
@@ -147,6 +153,7 @@ final class HEVCEncoder: FrameEncoder {
         statsLock.unlock()
         let context = HEVCFrameContext(
             frameID: submittedID,
+            captureNanos: captureNanos,
             submitNanos: DispatchTime.now().uptimeNanoseconds,
             forcedKeyframeRequested: forceKeyframe
         )
@@ -211,8 +218,12 @@ final class HEVCEncoder: FrameEncoder {
                              fps, frameID, vtDroppedFrames, encodeErrors,
                              idrFrames, idrFrames > 0 ? idrEncodeSumMS / Double(idrFrames) : 0, idrEncodeMaxMS,
                              pFrames, pFrames > 0 ? pEncodeSumMS / Double(pFrames) : 0, pEncodeMaxMS)
-        if let udpSender { return base + metrics + " " + udpSender.statsLine() }
-        return base + metrics
+        // cap_enc_*: capture -> encoded, since the previous stats line;
+        // cap_enc_all_*: the same over the whole session.
+        let capture = " " + captureEncodeWindow.fields("cap_enc") + " " + captureEncodeSession.fields("cap_enc_all")
+        captureEncodeWindow.reset()
+        if let udpSender { return base + metrics + capture + " " + udpSender.statsLine() }
+        return base + metrics + capture
     }
 
     private func setProperty(_ key: CFString, _ value: CFTypeRef) throws {
@@ -277,8 +288,11 @@ final class HEVCEncoder: FrameEncoder {
             let callbackLatencyMS = Double(callbackNanos &- context.submitNanos) / 1_000_000.0
             let sendLatencyMS = Double(now - sendStartNanos) / 1_000_000.0
 
+            let captureEncodeMS = CaptureClock.elapsedMS(since: context.captureNanos, now: callbackNanos)
             statsLock.lock()
             encodedFrames &+= 1
+            captureEncodeWindow.add(captureEncodeMS)
+            captureEncodeSession.add(captureEncodeMS)
             latencySumMS += latencyMS
             latencyMaxMS = max(latencyMaxMS, latencyMS)
             callbackLatencySumMS += callbackLatencyMS

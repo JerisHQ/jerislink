@@ -86,14 +86,16 @@ struct RetransmitFrameCache {
     }
 }
 
-/// Retransmit budget: at most 20% of the video bitrate in any 100 ms window.
-/// A NACK that does not fit is dropped whole (counted as nack_over_budget) and
-/// the caller falls back to a gated keyframe.
+/// Retransmit budget: at most 20% of the video bitrate in any 100 ms window
+/// (sliding: every send stays counted for 100 ms after it went out). A NACK
+/// that does not fit is dropped whole (counted as nack_over_budget) and the
+/// caller falls back to a gated keyframe.
 struct RetransmitBudget {
     static let windowNanos: UInt64 = 100_000_000
     let bytesPerWindow: Int
-    private var windowStart: UInt64 = 0
-    private var used = 0
+    private var sends: [(at: UInt64, bytes: Int)] = []
+    private var head = 0
+    private(set) var used = 0
 
     init(videoBitrateMbps: Int) {
         // bitrate/8 bytes per second, /10 per 100 ms, 20% of that.
@@ -101,11 +103,17 @@ struct RetransmitBudget {
     }
 
     mutating func take(_ bytes: Int, now: UInt64) -> Bool {
-        if now < windowStart || now - windowStart >= Self.windowNanos {
-            windowStart = now
-            used = 0
+        // Drop sends that left the window. A clock that went backwards empties it.
+        while head < sends.count, now < sends[head].at || now - sends[head].at >= Self.windowNanos {
+            used -= sends[head].bytes
+            head += 1
+        }
+        if head > 64, head * 2 > sends.count {
+            sends.removeFirst(head)
+            head = 0
         }
         guard used + bytes <= bytesPerWindow else { return false }
+        sends.append((now, bytes))
         used += bytes
         return true
     }

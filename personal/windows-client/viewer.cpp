@@ -739,7 +739,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                     " bitrate=" + std::to_string(bitrate));
             if (!jl::isIPv4(host)) {
                 MessageBoxW(dlg,
-                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.64.0.25.",
+                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.101.102.103.",
                     L"JerisLink Settings", MB_OK | MB_ICONWARNING);
                 SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
                 return TRUE;
@@ -2206,6 +2206,9 @@ static int appMain(int argc, char** argv) {
         const auto msSince = [&start](std::chrono::steady_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(t - start).count();
         };
+        jl::PresentedFpsSampler presentedFps;
+        // Receiver loss counters at the previous stats line (window deltas).
+        uint64_t prevHoles = 0, prevRecovered = 0, prevOriginals = 0;
 
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
@@ -2219,12 +2222,16 @@ static int appMain(int argc, char** argv) {
             if (gWindowClosed) break;
 
             auto now = std::chrono::steady_clock::now();
+            presentedFps.update(msSince(now), video->presented());
             if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
             }
             if (now - lastStats >= std::chrono::seconds(5)) {
                 const auto& st = receiver.stats();
+                const jl::ReceiverLoss wloss = jl::receiverLoss(st.lostPacketsRaw - prevHoles,
+                                                                st.holesRecovered - prevRecovered,
+                                                                st.originalPackets - prevOriginals);
                 std::ostringstream line;
                 line << std::fixed << std::setprecision(1)
                      << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
@@ -2232,13 +2239,24 @@ static int appMain(int argc, char** argv) {
                      << " decode_ms_p95=" << jl::receiverPercentile(decodeWindowMs, 95)
                      << " decode_ms_max=" << jl::receiverPercentile(decodeWindowMs, 100)
                      << " frames=" << decodeWindowMs.size()
+                     << " presented_fps_p5=" << jl::receiverPercentile(presentedFps.window(), 5)
+                     << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.window(), 50)
+                     << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.window(), 95)
                      << " nack_tx=" << st.nackTx
                      << " frames_repaired=" << st.framesRepaired
                      << " nack_deadline_miss=" << st.nackDeadlineMiss
                      << " strict_recovery_events=" << st.strictRecoveryEvents
+                     << " nack_paused_rtt=" << st.nackPausedRtt
+                     << std::setprecision(3)
+                     << " loss_raw_pct=" << wloss.rawPct
+                     << " loss_after_nack_pct=" << wloss.afterNackPct
                      << " held_frames=" << receiver.heldFrames();
                 logLine(line.str());
                 decodeWindowMs.clear();
+                presentedFps.clearWindow();
+                prevHoles = st.lostPacketsRaw;
+                prevRecovered = st.holesRecovered;
+                prevOriginals = st.originalPackets;
                 lastStats = now;
             }
 
@@ -2273,12 +2291,16 @@ static int appMain(int argc, char** argv) {
         pumpMessages();
 
         const auto& rst = receiver.stats();
+        const jl::ReceiverLoss loss = jl::receiverLoss(rst.lostPacketsRaw, rst.holesRecovered, rst.originalPackets);
         const uint64_t packets = rst.packets, complete = rst.complete, bad = rst.bad;
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
                 << " complete_frames=" << complete
                 << " decoded_frames=" << video->decodedFrames()
                 << " presented_frames=" << video->presented()
+                << " presented_fps_p5=" << jl::receiverPercentile(presentedFps.session(), 5)
+                << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.session(), 50)
+                << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.session(), 95)
                 << " present_busy_drops=" << video->busyDrops()
                 << " present_avg_ms=" << video->avgPresentMs()
                 << " present_max_ms=" << video->maxPresentMs()
@@ -2294,6 +2316,10 @@ static int appMain(int argc, char** argv) {
                 << " nack_packets_requested=" << rst.nackPacketsRequested
                 << " nack_whole_frames=" << rst.nackWholeFrames
                 << " lost_packets_raw=" << rst.lostPacketsRaw
+                << " original_packets=" << rst.originalPackets
+                << " loss_raw_pct=" << loss.rawPct
+                << " loss_after_nack_pct=" << loss.afterNackPct
+                << " nack_paused_rtt=" << rst.nackPausedRtt
                 << " retransmit_rx=" << rst.retransmitRx
                 << " frames_repaired=" << rst.framesRepaired
                 << " nack_deadline_miss=" << rst.nackDeadlineMiss

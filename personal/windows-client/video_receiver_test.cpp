@@ -123,6 +123,8 @@ static void testTailLossAndWholeFrame() {
     CHECK(rec.nacks.empty());
     // frame 3 lost entirely, frame 4 arrives
     feed(r, 4, 2, false, 50);
+    CHECK(rec.nacks.empty());  // 2 ms reorder grace first
+    r.tick(52.5);
     bool tail = false, whole = false;
     for (auto& n : rec.nacks) {
         if (n.first == 2 && n.second.size() == 1 && n.second[0].start == 3 && n.second[0].count == 2) tail = true;
@@ -148,7 +150,7 @@ static void testDeadlineMiss() {
     feed(r, 2, 4, false, 16, {1});
     feed(r, 3, 2, false, 33);
     CHECK(rec.keyframeRequests == 1);
-    r.tick(33 + 41);  // hole confirmed when frame 3 arrives (33 ms); 40 ms hold is over
+    r.tick(16 + 41);  // hole seen when index 2 arrived (16 ms); 40 ms hold is over
     CHECK(r.stats().nackDeadlineMiss == 1);
     CHECK(rec.keyframeRequests == 2);
     feed(r, 4, 2, false, 80);  // non-key while waiting: dropped
@@ -181,6 +183,169 @@ static void testNackEncoding() {
     CHECK(encodeNack(1, 1, many).size() == 19 + 4 * 32);
 }
 
+// Review item 1: a late duplicate retransmit of an old frame must not look
+// like a stream restart (fid <= 5 used to trip earlyRestart).
+static void testLateRetransmitIsNotRestart() {
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    feed(r, 1, 3, true, 0);
+    for (uint64_t f = 2; f <= 6; ++f) feed(r, f, 2, false, double(f) * 16);
+    CHECK(rec.subs.size() == 6);
+    auto late = packet(1, 1, 3, true, true);  // duplicate retransmit of frame 1
+    r.onPacket(late.data(), late.size(), 100, 0);
+    CHECK(r.stats().streamRestarts == 0);
+    CHECK(r.stats().latePacketsIgnored == 1);
+    CHECK(rec.keyframeRequests == 1);  // startup only
+    feed(r, 7, 2, false, 112);
+    CHECK(rec.subs.size() == 7 && rec.subs.back().fid == 7 && !rec.subs.back().disc);
+    // A fresh fid 1 from a restarted host is still a restart.
+    auto fresh = packet(1, 0, 3, true);
+    r.onPacket(fresh.data(), fresh.size(), 130, 0);
+    CHECK(r.stats().streamRestarts == 1);
+}
+
+// Review item 2: reorder grace, ranges merged into one message, at most 2
+// NACK messages per frame, RTT-spaced.
+static void testNackAttemptsPerFrame() {
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    feed(r, 1, 2, true, 0);
+    const std::vector<uint16_t> lost{1, 3, 5, 7, 9, 11, 13, 15};
+    feed(r, 2, 20, false, 16, lost);
+    CHECK(rec.nacks.empty());  // grace not over
+    r.tick(17.5);
+    CHECK(rec.nacks.empty());
+    r.tick(18.5);
+    CHECK(rec.nacks.size() == 1);
+    if (!rec.nacks.empty()) CHECK(rec.nacks[0].first == 2 && rec.nacks[0].second.size() == lost.size());
+    for (double t = 19; t < 18.5 + 24; t += 1) r.tick(t);  // retry after 1.2 x 20 ms RTT
+    CHECK(rec.nacks.size() == 1);
+    r.tick(18.5 + 24.1);
+    CHECK(rec.nacks.size() == 2);
+    for (double t = 43; t < 56; t += 1) r.tick(t);
+    CHECK(rec.nacks.size() == 2);  // no third attempt
+    CHECK(r.stats().nackTx == 2);
+    CHECK(r.stats().lostPacketsRaw == lost.size());
+
+    auto m = VideoReceiver::mergeRanges({1, 2, 3, 7, 8, 20}, 32);
+    CHECK(m.size() == 3 && m[0].start == 1 && m[0].count == 3 && m[1].start == 7 && m[1].count == 2);
+    auto m2 = VideoReceiver::mergeRanges({1, 2, 3, 7, 8, 20}, 2);
+    CHECK(m2.size() == 2 && m2[0].start == 1 && m2[0].count == 8 && m2[1].start == 20 && m2[1].count == 1);
+}
+
+// Review item 3: a repair that lands after the 40 ms hold is not accepted.
+static void testDeadlineEnforcedBeforeRepair() {
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    feed(r, 1, 2, true, 0);
+    feed(r, 2, 4, false, 16, {1});  // hole seen at 16 ms
+    r.tick(18.5);                   // NACK sent
+    feed(r, 3, 2, false, 33);       // held
+    CHECK(rec.subs.size() == 1);
+    auto p = packet(2, 1, 4, false, true);
+    r.onPacket(p.data(), p.size(), 16 + 42, 0);  // repair 42 ms after the hole, no tick in between
+    CHECK(r.stats().nackDeadlineMiss == 1);
+    CHECK(r.stats().framesRepaired == 0);
+    CHECK(rec.subs.size() == 1);
+    CHECK(rec.keyframeRequests >= 2);
+    // Exactly at the deadline is still in time.
+    Recorder rec2;
+    VideoReceiver r2(nackConfig(), rec2.hooks());
+    r2.start();
+    feed(r2, 1, 2, true, 0);
+    feed(r2, 2, 4, false, 16, {1});
+    r2.tick(18.5);
+    r2.onPacket(p.data(), p.size(), 16 + 40, 0);
+    CHECK(r2.stats().nackDeadlineMiss == 0 && r2.stats().framesRepaired == 1 && rec2.subs.size() == 2);
+}
+
+static void testHighRttSkipsHold() {
+    // RTT 60 ms cannot fit the 40 ms hold: NACK pauses, strict behaviour.
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.setRttMs(60);
+    r.start();
+    feed(r, 1, 2, true, 0);
+    const int keyBefore = rec.keyframeRequests;
+    feed(r, 2, 4, false, 16, {1});
+    r.tick(30);
+    CHECK(rec.nacks.empty());
+    CHECK(rec.keyframeRequests == keyBefore);
+    feed(r, 3, 2, false, 33);  // frame gap -> keyframe at once, like NACK off
+    CHECK(rec.nacks.empty() && r.stats().nackTx == 0);
+    CHECK(r.stats().nackPausedRtt == 1);
+    CHECK(r.stats().strictRecoveryEvents == 1);
+    CHECK(rec.keyframeRequests == keyBefore + 1);
+    // RTT 30 ms still fits: NACK as usual.
+    Recorder rec2;
+    VideoReceiver r2(nackConfig(), rec2.hooks());
+    r2.setRttMs(30);
+    r2.start();
+    feed(r2, 1, 2, true, 0);
+    feed(r2, 2, 4, false, 16, {1});
+    r2.tick(18.5);
+    CHECK(rec2.nacks.size() == 1 && r2.stats().nackPausedRtt == 0);
+}
+
+static void testPresentedFps() {
+    PresentedFpsSampler s;
+    s.update(0, 0);                 // baseline
+    s.update(500, 30);              // < 1 s: no sample
+    CHECK(s.window().empty());
+    s.update(1000, 60);             // 60 frames in 1 s
+    s.update(2500, 105);            // 45 frames in 1.5 s = 30 fps
+    CHECK(s.window().size() == 2);
+    CHECK(std::fabs(s.window()[0] - 60.f) < 1e-3f && std::fabs(s.window()[1] - 30.f) < 1e-3f);
+    CHECK(receiverPercentile(s.window(), 0) == 30.f && receiverPercentile(s.window(), 100) == 60.f);
+    s.clearWindow();
+    CHECK(s.window().empty() && s.session().size() == 2);
+    s.update(3000, 10);             // counter went back: new baseline, no sample
+    s.update(4000, 70);             // 60 fps from the new baseline
+    CHECK(s.window().size() == 1 && std::fabs(s.window()[0] - 60.f) < 1e-3f && s.session().size() == 3);
+}
+
+static void testRebuiltFrameNotDoubleCounted() {
+    // A long IDR with an early hole misses the deadline while its tail is still
+    // on the wire. The tail assembles the frame again; the hole it already
+    // NACKed must not count as a second lost packet.
+    Recorder rec;
+    VideoReceiver r(nackConfig(), rec.hooks());
+    r.start();
+    for (uint16_t i = 0; i < 5; ++i) {
+        if (i == 2) continue;
+        auto p = packet(1, i, 10, true);
+        r.onPacket(p.data(), p.size(), 0, 0);
+    }
+    r.tick(2.5);
+    CHECK(rec.nacks.size() == 1);
+    CHECK(r.stats().lostPacketsRaw == 1);
+    r.tick(41);
+    CHECK(r.stats().nackDeadlineMiss == 1);
+    for (uint16_t i = 5; i < 10; ++i) {
+        auto p = packet(1, i, 10, true);
+        r.onPacket(p.data(), p.size(), 42, 0);
+    }
+    r.tick(42.5);
+    r.tick(45);
+    CHECK(rec.nacks.size() == 2);
+    CHECK(r.stats().lostPacketsRaw == 1);
+    auto p = packet(1, 2, 10, true, true);
+    r.onPacket(p.data(), p.size(), 50, 0);
+    CHECK(r.stats().holesRecovered == 1);
+    CHECK(!rec.subs.empty() && rec.subs.back().fid == 1);
+    auto l = receiverLoss(r.stats().lostPacketsRaw, r.stats().holesRecovered, r.stats().originalPackets);
+    CHECK(l.afterNackPct == 0);
+}
+
+static void testLossPercent() {
+    auto l = receiverLoss(10, 8, 990);
+    CHECK(std::fabs(l.rawPct - 1.0) < 1e-9 && std::fabs(l.afterNackPct - 0.2) < 1e-9);
+    CHECK(receiverLoss(0, 0, 0).rawPct == 0);
+}
+
 // ---------------------------------------------------------------- simulation
 
 struct SimConfig {
@@ -198,6 +363,8 @@ struct SimResult {
     uint64_t nackTx = 0, repaired = 0, deadlineMiss = 0, hostMiss = 0, overBudget = 0;
     uint64_t resent = 0, lostVideoPackets = 0, keyframeReqTx = 0;
     double repairP50 = 0, repairP95 = 0;
+    double lossRawPct = 0;
+    double lossAfterNackPct = 0;
 };
 
 class Sim {
@@ -237,6 +404,9 @@ public:
         r_.deadlineMiss = st.nackDeadlineMiss;
         r_.repairP50 = receiverPercentile(st.repairMs, 50);
         r_.repairP95 = receiverPercentile(st.repairMs, 95);
+        const ReceiverLoss loss = receiverLoss(st.lostPacketsRaw, st.holesRecovered, st.originalPackets);
+        r_.lossRawPct = loss.rawPct;
+        r_.lossAfterNackPct = loss.afterNackPct;
         return r_;
     }
 
@@ -310,9 +480,9 @@ private:
         evict();
         auto it = cache_.find(fid);
         if (it == cache_.end()) { ++r_.hostMiss; hostKeyframeRequest(); return; }  // D2-B
-        // 20% of 18 Mbps per 100 ms window
+        // 20% of 18 Mbps in any 100 ms (sliding, same as RetransmitBudget)
         const double budgetBytes = 18e6 / 8 * 0.2 * 0.1;
-        while (!budget_.empty() && now_ - budget_.front().first > 100) {
+        while (!budget_.empty() && now_ - budget_.front().first >= 100) {
             budgetUsed_ -= budget_.front().second;
             budget_.pop_front();
         }
@@ -378,19 +548,19 @@ static void runSimulation() {
         {"derp_0.5pct_rtt60", 0.005, 0, 0, 30, 60, 15},
     };
     std::printf("\nloss simulation, 60 s at 60 fps, 28-packet P frames, 250-packet IDR\n");
-    std::printf("%-20s %-5s %8s %8s %7s %8s %8s %7s %7s %7s %8s %8s\n", "scenario", "nack", "forced", "shown",
-                "corrupt", "nack_tx", "repaired", "dl_miss", "h_miss", "budget", "rep_p50", "rep_p95");
+    std::printf("%-20s %-5s %8s %8s %7s %8s %8s %7s %7s %7s %8s %8s %9s %9s\n", "scenario", "nack", "forced", "shown",
+                "corrupt", "nack_tx", "repaired", "dl_miss", "h_miss", "budget", "rep_p50", "rep_p95", "loss_raw", "loss_left");
     for (const auto& s : scenarios) {
         SimResult off = Sim(s, false).run();
         SimResult on = Sim(s, true).run();
         for (int k = 0; k < 2; ++k) {
             const SimResult& r = k ? on : off;
-            std::printf("%-20s %-5s %8llu %8llu %7llu %8llu %8llu %7llu %7llu %7llu %7.1fms %7.1fms\n", s.name,
+            std::printf("%-20s %-5s %8llu %8llu %7llu %8llu %8llu %7llu %7llu %7llu %7.1fms %7.1fms %8.3f%% %8.3f%%\n", s.name,
                         k ? "on" : "off", (unsigned long long)r.forcedIdr, (unsigned long long)r.framesShown,
                         (unsigned long long)r.corrupt, (unsigned long long)r.nackTx,
                         (unsigned long long)r.repaired, (unsigned long long)r.deadlineMiss,
                         (unsigned long long)r.hostMiss, (unsigned long long)r.overBudget, r.repairP50,
-                        r.repairP95);
+                        r.repairP95, r.lossRawPct, r.lossAfterNackPct);
         }
         CHECK(off.corrupt == 0);
         CHECK(on.corrupt == 0);
@@ -417,6 +587,13 @@ int main() {
     testDeadlineMiss();
     testKeyframeJump();
     testNackEncoding();
+    testLateRetransmitIsNotRestart();
+    testNackAttemptsPerFrame();
+    testDeadlineEnforcedBeforeRepair();
+    testLossPercent();
+    testHighRttSkipsHold();
+    testRebuiltFrameNotDoubleCounted();
+    testPresentedFps();
     runSimulation();
     if (gFailures) {
         std::printf("\n%d check(s) failed\n", gFailures);
