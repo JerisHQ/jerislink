@@ -81,7 +81,11 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
 
         receivedFrames &+= 1
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        encoder.encode(pixelBuffer: imageBuffer, presentationTimeStamp: pts)
+        // displayTime (mach ticks) is when the frame was captured; it makes the
+        // encoder latency include the capture-to-callback delay.
+        let captureNanos = (attachments[.displayTime] as? UInt64).map(CaptureClock.nanos(fromMachTicks:))
+            ?? DispatchTime.now().uptimeNanoseconds
+        encoder.encode(pixelBuffer: imageBuffer, presentationTimeStamp: pts, captureNanos: captureNanos)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {

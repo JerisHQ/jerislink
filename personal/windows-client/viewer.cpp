@@ -21,6 +21,7 @@
 #include "hardware_video_pipeline.hpp"
 #include "resource.h"
 #include "viewer_options.hpp"
+#include "video_receiver.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -145,6 +146,41 @@ public:
         return false;
     }
 
+    // MRM1 0x41: ask the host to send these packets of frame fid again.
+    bool sendNack(uint64_t fid, const std::vector<jl::NackRange>& ranges) {
+        if (s_ == INVALID_SOCKET || ranges.empty()) return false;
+        const auto p = jl::encodeNack(++sequence_, fid, ranges);
+        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
+                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        if (n == static_cast<int>(p.size())) { ++nackSent_; return true; }
+        ++nackDrops_;
+        return false;
+    }
+
+    // MRM1 0x43 ping carrying the viewer's send time; the host echoes it as
+    // 0x44 and pollCursorShape() turns the echo into an RTT sample.
+    bool sendPing() {
+        if (s_ == INVALID_SOCKET) return false;
+        const uint32_t seq = ++sequence_;
+        const uint64_t t = nowUs();
+        uint8_t p[18]{'M','R','M','1', 1, 0x43,
+                      uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)};
+        for (int i = 0; i < 8; ++i) p[10 + i] = uint8_t(t >> (56 - 8 * i));
+        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
+                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        if (n == sizeof(p)) { ++pingSent_; return true; }
+        return false;
+    }
+
+    // Smoothed RTT from 0x44 echoes (EWMA 1/8), 0 until the first echo.
+    double rttMs() const { return rttEwmaMs_; }
+    double rttMaxMs() const { return rttMaxMs_; }
+    double rttLastMs() const { return rttLastMs_; }
+    uint64_t pingSent() const { return pingSent_; }
+    uint64_t pongRx() const { return pongRx_; }
+    uint64_t nackSent() const { return nackSent_; }
+    uint64_t nackDrops() const { return nackDrops_; }
+
     bool pollCursorShape(uint8_t& shape) {
         if (s_ == INVALID_SOCKET) return false;
         bool updated = false;
@@ -159,6 +195,21 @@ public:
                 if (e == WSAEWOULDBLOCK) break;
                 ++cursorRxBad_;
                 break;
+            }
+            if (peer.sin_addr.s_addr == remote_.sin_addr.s_addr &&
+                peer.sin_port == remote_.sin_port &&
+                n == 18 && std::memcmp(p, "MRM1", 4) == 0 && p[4] == 1 && p[5] == 0x44) {
+                uint64_t sentUs = 0;
+                for (int i = 0; i < 8; ++i) sentUs = (sentUs << 8) | p[10 + i];
+                const uint64_t now = nowUs();
+                if (sentUs <= now && now - sentUs < 10'000'000) {
+                    const double rtt = double(now - sentUs) / 1000.0;
+                    rttLastMs_ = rtt;
+                    rttMaxMs_ = std::max(rttMaxMs_, rtt);
+                    rttEwmaMs_ = pongRx_ == 0 ? rtt : rttEwmaMs_ + (rtt - rttEwmaMs_) / 8.0;
+                    ++pongRx_;
+                }
+                continue;
             }
             if (peer.sin_addr.s_addr != remote_.sin_addr.s_addr ||
                 peer.sin_port != remote_.sin_port ||
@@ -209,6 +260,17 @@ private:
     uint64_t cursorRx_ = 0;
     uint64_t cursorRxBad_ = 0;
     uint64_t cursorRxStale_ = 0;
+    static uint64_t nowUs() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    uint64_t nackSent_ = 0;
+    uint64_t nackDrops_ = 0;
+    uint64_t pingSent_ = 0;
+    uint64_t pongRx_ = 0;
+    double rttEwmaMs_ = 0.0;
+    double rttMaxMs_ = 0.0;
+    double rttLastMs_ = 0.0;
 };
 
 static bool gWindowClosed = false;
@@ -811,43 +873,6 @@ static std::string envValue(const char* name) {
     free(value);
     return out;
 }
-
-static uint16_t be16(const uint8_t* p) {
-    return static_cast<uint16_t>((uint16_t(p[0]) << 8) | uint16_t(p[1]));
-}
-static uint64_t be64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = (v << 8) | uint64_t(p[i]);
-    return v;
-}
-
-struct FrameAssembly {
-    uint16_t packetCount = 0;
-    bool keyFrame = false;
-    std::vector<std::vector<uint8_t>> parts;
-    std::vector<bool> present;
-    size_t received = 0;
-
-    explicit FrameAssembly(uint16_t count = 0)
-        : packetCount(count), parts(count), present(count, false) {}
-
-    void add(uint16_t index, const uint8_t* data, size_t size, bool key) {
-        if (index >= packetCount || present[index]) return;
-        parts[index].assign(data, data + size);
-        present[index] = true;
-        keyFrame = keyFrame || key;
-        ++received;
-    }
-    bool complete() const { return packetCount && received == packetCount; }
-    std::vector<uint8_t> join() const {
-        size_t total = 0;
-        for (const auto& p : parts) total += p.size();
-        std::vector<uint8_t> out;
-        out.reserve(total);
-        for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
-        return out;
-    }
-};
 
 static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1930,6 +1955,7 @@ static int appMain(int argc, char** argv) {
             " bitrate_mbps=" + std::to_string(o.bitrateMbps));
     std::string effectiveCodec = "h264";
     uint16_t effectiveBitrateMbps = 25;
+    bool hostSupportsNack = false;
     gRemoteWidth = o.width;
     gRemoteHeight = o.height;
     gScrollScale = o.scrollScale;
@@ -1989,6 +2015,7 @@ static int appMain(int argc, char** argv) {
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps);
                 if (videoConfig.negotiated) {
                     effectiveCodec = videoConfig.codec;
+                    hostSupportsNack = videoConfig.hostSupportsNack;
                     effectiveBitrateMbps = videoConfig.bitrateMbps;
                     if (!o.widthExplicit &&
                         videoConfig.remoteWidth > 0 && videoConfig.remoteHeight > 0) {
@@ -2003,6 +2030,7 @@ static int appMain(int argc, char** argv) {
                         << " restarted=" << (videoConfig.streamRestarted ? "yes" : "no")
                         << " host_hevc=" << (videoConfig.hostSupportsHevc ? "yes" : "no")
                         << " fallback=" << (videoConfig.codecFallback ? "yes" : "no")
+                        << " host_nack=" << (videoConfig.hostSupportsNack ? "yes" : "no")
                         << " remote_size=" << videoConfig.remoteWidth << "x"
                         << videoConfig.remoteHeight;
                     logLine(cfg.str());
@@ -2132,22 +2160,55 @@ static int appMain(int argc, char** argv) {
         logLine("viewer.waiting_for_stream");
         const bool strictLossRecovery = o.lossRecovery == "strict";
         logLine("loss.recovery=" + o.lossRecovery);
-
-        std::unordered_map<uint64_t, FrameAssembly> assembling;
-        uint64_t packets = 0, complete = 0, incompleteDropped = 0, bad = 0, rejected = 0;
-        uint64_t newestFrameSeen = 0, lastSubmitted = 0, streamRestarts = 0;
-        uint64_t strictRecoveryEvents = 0, lateFramesDropped = 0, recoveryWaitPacketDrops = 0;
-        bool waitingForKeyframe = strictLossRecovery;
-        bool forceDiscontinuity = strictLossRecovery;
-        if (strictLossRecovery) {
-            video->resetForNewStream();
-            logLine("loss.strict_wait_for_keyframe reason=startup");
-            if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
+        // NACK needs strict recovery, the MRM1 channel and a host that said so.
+        const bool nackEnabled = strictLossRecovery && o.nack == "on" && hostSupportsNack && mouseMoveUdp;
+        logLine(std::string("loss.nack=") + (nackEnabled ? "on" : "off") +
+                " requested=" + o.nack +
+                " host_nack=" + (hostSupportsNack ? "yes" : "no"));
+        if (nackEnabled) {
+            // Wake up often enough for the 2 ms reorder grace and 40 ms hold.
+            DWORD nackTimeout = 5;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&nackTimeout), sizeof(nackTimeout));
         }
+
+        uint64_t rejected = 0;
+        std::vector<float> decodeMs;           // per submitted frame, whole session (capped)
+        std::vector<float> decodeWindowMs;     // last 5 s, for the periodic stats line
+        constexpr size_t kMaxDecodeSamples = 1u << 20;
+
+        jl::ReceiverConfig rcfg;
+        rcfg.strict = strictLossRecovery;
+        rcfg.nack = nackEnabled;
+        if (gConnectionInfo.rttMs > 0) rcfg.defaultRttMs = gConnectionInfo.rttMs;
+        jl::ReceiverHooks hooks;
+        hooks.submit = [&](uint64_t fid, const std::vector<uint8_t>& frame, bool discontinuity, bool keyFrame) {
+            const auto t0 = std::chrono::steady_clock::now();
+            video->submit(fid, frame, discontinuity, keyFrame);
+            const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (decodeMs.size() < kMaxDecodeSamples) decodeMs.push_back(ms);
+            decodeWindowMs.push_back(ms);
+        };
+        hooks.resetForNewStream = [&] { video->resetForNewStream(); };
+        hooks.requestKeyframe = [] { if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe(); };
+        hooks.sendNack = [](uint64_t fid, const std::vector<jl::NackRange>& ranges) {
+            if (gMouseMoveUdp) gMouseMoveUdp->sendNack(fid, ranges);
+        };
+        hooks.log = [](const std::string& line) { logLine(line); };
+        jl::VideoReceiver receiver(rcfg, std::move(hooks));
+        receiver.start();
+
         std::vector<uint8_t> buf(2048);
         auto start = std::chrono::steady_clock::now();
         auto lastPacket = start;
+        auto lastPing = start - std::chrono::seconds(1);
+        auto lastStats = start;
         bool gotAny = false;
+        const auto msSince = [&start](std::chrono::steady_clock::time_point t) {
+            return std::chrono::duration<double, std::milli>(t - start).count();
+        };
+        jl::PresentedFpsSampler presentedFps;
+        // Receiver loss counters at the previous stats line (window deltas).
+        uint64_t prevLossExpected = 0, prevLossRaw = 0, prevLossAfter = 0;
 
         while (!gWindowClosed) {
             if (mouseMoveUdp) {
@@ -2155,17 +2216,58 @@ static int appMain(int argc, char** argv) {
                 if (mouseMoveUdp->pollCursorShape(cursorShape)) {
                     applyRemoteCursorShape(hwnd, cursorShape);
                 }
+                if (mouseMoveUdp->pongRx() > 0) receiver.setRttMs(mouseMoveUdp->rttMs());
             }
             pumpMessages();
             if (gWindowClosed) break;
 
+            auto now = std::chrono::steady_clock::now();
+            presentedFps.update(msSince(now), video->presented());
+            if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
+                mouseMoveUdp->sendPing();
+                lastPing = now;
+            }
+            if (now - lastStats >= std::chrono::seconds(5)) {
+                const auto& st = receiver.stats();
+                const jl::ReceiverLoss wloss = jl::receiverLoss(st.lossExpected - prevLossExpected,
+                                                                st.lossRaw - prevLossRaw,
+                                                                st.lossAfterNack - prevLossAfter);
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(1)
+                     << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
+                     << " decode_ms_p50=" << jl::receiverPercentile(decodeWindowMs, 50)
+                     << " decode_ms_p95=" << jl::receiverPercentile(decodeWindowMs, 95)
+                     << " decode_ms_max=" << jl::receiverPercentile(decodeWindowMs, 100)
+                     << " frames=" << decodeWindowMs.size()
+                     << " presented_fps_p5=" << jl::receiverPercentile(presentedFps.window(), 5)
+                     << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.window(), 50)
+                     << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.window(), 95)
+                     << " nack_tx=" << st.nackTx
+                     << " frames_repaired=" << st.framesRepaired
+                     << " nack_deadline_miss=" << st.nackDeadlineMiss
+                     << " strict_recovery_events=" << st.strictRecoveryEvents
+                     << " nack_paused_rtt=" << st.nackPausedRtt
+                     << std::setprecision(3)
+                     << " loss_raw_pct=" << wloss.rawPct
+                     << " loss_after_nack_pct=" << wloss.afterNackPct
+                     << " held_frames=" << receiver.heldFrames();
+                logLine(line.str());
+                decodeWindowMs.clear();
+                presentedFps.clearWindow();
+                prevLossExpected = st.lossExpected;
+                prevLossRaw = st.lossRaw;
+                prevLossAfter = st.lossAfterNack;
+                lastStats = now;
+            }
+
             sockaddr_in peer{}; int plen = sizeof(peer);
             int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                              reinterpret_cast<sockaddr*>(&peer), &plen);
-            auto now = std::chrono::steady_clock::now();
+            now = std::chrono::steady_clock::now();
             if (n == SOCKET_ERROR) {
                 int e = WSAGetLastError();
                 if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
+                    receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
                     const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
@@ -2180,122 +2282,65 @@ static int appMain(int argc, char** argv) {
             gotAny = true;
             lastPacket = now;
             if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
-            ++packets;
-            if (n < 20 || std::memcmp(buf.data(), "MR02", 4) || buf[4] != 1) { ++bad; continue; }
-            uint8_t flags = buf[5];
-            uint64_t fid = be64(buf.data()+6);
-            uint16_t idx = be16(buf.data()+14), cnt = be16(buf.data()+16), len = be16(buf.data()+18);
-            if (!cnt || idx >= cnt || len != static_cast<uint16_t>(n-20)) { ++bad; continue; }
-
-            const bool frameWentBackward = newestFrameSeen > 0 && fid + 2 < newestFrameSeen;
-            const bool farBackward = newestFrameSeen > fid + 120;
-            const bool earlyRestart = frameWentBackward && fid <= 5;
-            const bool gapRestart = frameWentBackward && packetGapMs >= 250;
-            if (frameWentBackward && (farBackward || earlyRestart || gapRestart)) {
-                std::ostringstream restart;
-                restart << "stream.restart_detected old_newest=" << newestFrameSeen
-                        << " new_fid=" << fid
-                        << " gap_ms=" << packetGapMs
-                        << " key=" << ((flags & 0x01) ? 1 : 0);
-                logLine(restart.str());
-                assembling.clear();
-                newestFrameSeen = fid;
-                lastSubmitted = 0;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                video->resetForNewStream();
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                ++streamRestarts;
-            }
-
-            newestFrameSeen = std::max(newestFrameSeen, fid);
-            if (waitingForKeyframe && (flags & 0x01) == 0) {
-                ++recoveryWaitPacketDrops;
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                continue;
-            }
-            bool staleLossDetected = false;
-            for (auto it = assembling.begin(); it != assembling.end();) {
-                if (it->first + 2 < newestFrameSeen) {
-                    ++incompleteDropped;
-                    staleLossDetected = true;
-                    it = assembling.erase(it);
-                }
-                else ++it;
-            }
-            if (strictLossRecovery && staleLossDetected) {
-                ++strictRecoveryEvents;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                lastSubmitted = 0;
-                assembling.clear();
-                video->resetForNewStream();
-                logLine("loss.strict_wait_for_keyframe reason=stale_incomplete newest=" +
-                        std::to_string(newestFrameSeen));
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                if ((flags & 0x01) == 0) {
-                    ++recoveryWaitPacketDrops;
-                    continue;
-                }
-            }
-            auto it = assembling.find(fid);
-            if (it == assembling.end()) it = assembling.emplace(fid, FrameAssembly(cnt)).first;
-            if (it->second.packetCount != cnt) { ++bad; assembling.erase(it); continue; }
-            it->second.add(idx, buf.data()+20, len, (flags & 0x01) != 0);
-            if (!it->second.complete()) continue;
-
-            auto frame = it->second.join();
-            const bool keyFrame = it->second.keyFrame;
-            if (strictLossRecovery && lastSubmitted && fid <= lastSubmitted) {
-                ++lateFramesDropped;
-                logLine("loss.strict_drop_late fid=" + std::to_string(fid) +
-                        " last=" + std::to_string(lastSubmitted));
-                assembling.erase(it);
-                continue;
-            }
-            if (strictLossRecovery && lastSubmitted && fid > lastSubmitted + 1) {
-                ++strictRecoveryEvents;
-                waitingForKeyframe = true;
-                forceDiscontinuity = true;
-                lastSubmitted = 0;
-                video->resetForNewStream();
-                logLine("loss.strict_wait_for_keyframe reason=frame_gap fid=" +
-                        std::to_string(fid));
-                if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe();
-                if (!keyFrame) {
-                    assembling.clear();
-                    continue;
-                }
-            }
-            bool discontinuity = forceDiscontinuity || (lastSubmitted && fid != lastSubmitted + 1);
-            video->submit(fid, frame, discontinuity, keyFrame);
-            lastSubmitted = fid;
-            if (waitingForKeyframe) {
-                waitingForKeyframe = false;
-                logLine("stream.keyframe_reacquired fid=" + std::to_string(fid));
-            }
-            forceDiscontinuity = false;
-            ++complete;
-            assembling.erase(it);
+            receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
+            receiver.tick(msSince(now));
         }
 
         video->finish();
         closesocket(s);
         pumpMessages();
 
+        receiver.flushLoss();
+        const auto& rst = receiver.stats();
+        const jl::ReceiverLoss loss = jl::receiverLoss(rst.lossExpected, rst.lossRaw, rst.lossAfterNack);
+        const uint64_t packets = rst.packets, complete = rst.complete, bad = rst.bad;
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
                 << " complete_frames=" << complete
                 << " decoded_frames=" << video->decodedFrames()
                 << " presented_frames=" << video->presented()
+                << " presented_fps_p5=" << jl::receiverPercentile(presentedFps.session(), 5)
+                << " presented_fps_p50=" << jl::receiverPercentile(presentedFps.session(), 50)
+                << " presented_fps_p95=" << jl::receiverPercentile(presentedFps.session(), 95)
                 << " present_busy_drops=" << video->busyDrops()
                 << " present_avg_ms=" << video->avgPresentMs()
                 << " present_max_ms=" << video->maxPresentMs()
                 << " non_dxgi_drops=" << video->nonDxgiDrops()
-                << " stale_incomplete_dropped=" << incompleteDropped
-                << " strict_recovery_events=" << strictRecoveryEvents
-                << " late_frames_dropped=" << lateFramesDropped
-                << " recovery_wait_packet_drops=" << recoveryWaitPacketDrops
+                << " stale_incomplete_dropped=" << rst.incompleteDropped
+                << " strict_recovery_events=" << rst.strictRecoveryEvents
+                << " late_frames_dropped=" << rst.lateFramesDropped
+                << " recovery_wait_packet_drops=" << rst.recoveryWaitPacketDrops
+                << " stream_restarts=" << rst.streamRestarts
+                << " nack=" << (receiver.nackActive() ? "on" : "off")
+                << " nack_tx=" << rst.nackTx
+                << " nack_send_drops=" << (mouseMoveUdp ? mouseMoveUdp->nackDrops() : 0)
+                << " nack_packets_requested=" << rst.nackPacketsRequested
+                << " nack_whole_frames=" << rst.nackWholeFrames
+                << " lost_packets_raw=" << rst.lostPacketsRaw
+                << " original_packets=" << rst.originalPackets
+                << " loss_expected_packets=" << rst.lossExpected
+                << " loss_whole_frames=" << rst.lossWholeFrames
+                << " loss_raw_pct=" << loss.rawPct
+                << " loss_after_nack_pct=" << loss.afterNackPct
+                << " nack_paused_rtt=" << rst.nackPausedRtt
+                << " retransmit_rx=" << rst.retransmitRx
+                << " frames_repaired=" << rst.framesRepaired
+                << " nack_deadline_miss=" << rst.nackDeadlineMiss
+                << " nack_held_cap_miss=" << rst.heldCapMiss
+                << " nack_keyframe_jumps=" << rst.keyframeJumps
+                << " held_frames_max=" << rst.heldFramesMax
+                << " duplicate_packets=" << rst.duplicatePackets
+                << " late_packets_ignored=" << rst.latePacketsIgnored
+                << " repair_ms_p50=" << jl::receiverPercentile(rst.repairMs, 50)
+                << " repair_ms_p95=" << jl::receiverPercentile(rst.repairMs, 95)
+                << " repair_ms_max=" << jl::receiverPercentile(rst.repairMs, 100)
+                << " decode_ms_p50=" << jl::receiverPercentile(decodeMs, 50)
+                << " decode_ms_p95=" << jl::receiverPercentile(decodeMs, 95)
+                << " decode_ms_max=" << jl::receiverPercentile(decodeMs, 100)
+                << " rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
+                << " rtt_max_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMaxMs() : 0.0)
+                << " rtt_samples=" << (mouseMoveUdp ? mouseMoveUdp->pongRx() : 0)
+                << " connect_rtt_ms=" << gConnectionInfo.rttMs
                 << " stream_changes=" << video->streamChanges()
                 << " backpressure=" << video->inputBackpressure()
                 << " video_backend=" << video->activeBackend()

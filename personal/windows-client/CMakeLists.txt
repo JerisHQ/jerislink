@@ -49,3 +49,6 @@ endif()
 
 # Console unit test for the launch-config rules (viewer_options.hpp).
 add_executable(JerislinkOptionsTest viewer_options_test.cpp)
+
+# Console unit test for the MR02 receive / NACK logic (video_receiver.hpp).
+add_executable(JerislinkReceiverTest video_receiver_test.cpp)

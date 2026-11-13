@@ -6,11 +6,13 @@ import Darwin
 
 private final class FrameContext {
     let frameID: UInt64
+    let captureNanos: UInt64
     let submitNanos: UInt64
     let forcedKeyframeRequested: Bool
 
-    init(frameID: UInt64, submitNanos: UInt64, forcedKeyframeRequested: Bool) {
+    init(frameID: UInt64, captureNanos: UInt64, submitNanos: UInt64, forcedKeyframeRequested: Bool) {
         self.frameID = frameID
+        self.captureNanos = captureNanos
         self.submitNanos = submitNanos
         self.forcedKeyframeRequested = forcedKeyframeRequested
     }
@@ -23,6 +25,10 @@ final class H264Encoder: FrameEncoder {
     private let udpSender: UDPFrameSender?
     private var frameID: UInt64 = 0
     private var encodedFrames: UInt64 = 0
+    // Capture (SCStreamFrameInfo.displayTime) -> encoded frame out of VT:
+    // window since the previous stats line, and the whole session.
+    private var captureEncodeWindow = LatencyHistogram()
+    private var captureEncodeSession = LatencyHistogram()
     private var callbackLatencySumMS: Double = 0
     private var callbackLatencyMaxMS: Double = 0
     private var prepLatencySumMS: Double = 0
@@ -156,7 +162,7 @@ final class H264Encoder: FrameEncoder {
         fflush(stdout)
     }
 
-    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
+    func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, captureNanos: UInt64) {
         guard let session else { return }
 
         keyframeRequestLock.lock()
@@ -167,6 +173,7 @@ final class H264Encoder: FrameEncoder {
         frameID &+= 1
         let context = FrameContext(
             frameID: frameID,
+            captureNanos: captureNanos,
             submitNanos: DispatchTime.now().uptimeNanoseconds,
             forcedKeyframeRequested: forceKeyframe
         )
@@ -222,8 +229,10 @@ final class H264Encoder: FrameEncoder {
             totalLatencySumMS / n,
             totalLatencyMaxMS
         )
-        if let udpSender { return base + " " + udpSender.statsLine() }
-        return base
+        let capture = " " + captureEncodeWindow.fields("cap_enc") + " " + captureEncodeSession.fields("cap_enc_all")
+        captureEncodeWindow.reset()
+        if let udpSender { return base + capture + " " + udpSender.statsLine() }
+        return base + capture
     }
 
     private func setProperty(_ key: CFString, _ value: CFTypeRef) throws {
@@ -293,8 +302,11 @@ final class H264Encoder: FrameEncoder {
         let sendLatencyMS = Double(sendEndNanos - sendStartNanos) / 1_000_000.0
         let totalLatencyMS = Double(sendEndNanos - context.submitNanos) / 1_000_000.0
 
+        let captureEncodeMS = CaptureClock.elapsedMS(since: context.captureNanos, now: callbackNanos)
         statsLock.lock()
         encodedFrames &+= 1
+        captureEncodeWindow.add(captureEncodeMS)
+        captureEncodeSession.add(captureEncodeMS)
         callbackLatencySumMS += callbackLatencyMS
         callbackLatencyMaxMS = max(callbackLatencyMaxMS, callbackLatencyMS)
         prepLatencySumMS += prepLatencyMS

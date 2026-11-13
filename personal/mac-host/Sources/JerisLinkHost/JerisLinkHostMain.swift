@@ -23,6 +23,8 @@ struct Options {
     /// Host send pacing (UDPPacing): 0 = off (old behaviour), else Mbps.
     var udpPaceMbps: Int = 0
     var udpPaceBurstKB: Int = UDPPacing.defaultBurstKB
+    /// NACK retransmit (MRM1 0x41) with a 250 ms / 4 MiB / 32-frame cache.
+    var nackEnabled = true
     var controlPort: UInt16 = 38400
     /// `--service control`: loopback listener for the video service's mouse
     /// relay (MouseMoveUDPServer -> 127.0.0.1:38411). 0 = off.
@@ -147,6 +149,8 @@ struct Options {
                 if let parsed = Int(value), parsed >= 0 { o.udpPaceMbps = parsed }
             case "--udp-pace-burst-kb":
                 if let parsed = Int(value), parsed > 0 { o.udpPaceBurstKB = parsed }
+            case "--nack":
+                if value == "on" { o.nackEnabled = true } else if value == "off" { o.nackEnabled = false }
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--relay-port": o.relayPort = UInt16(value) ?? o.relayPort
@@ -179,7 +183,8 @@ struct JerisLinkHostMain {
             let peer = ControlPeerSelfTest.run()
             let listen = ListenConfigSelfTest.run()
             let control = ControlServiceSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 ? 0 : 1)
+            let nack = RetransmitSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -301,7 +306,9 @@ struct JerisLinkHostMain {
                 sender = try UDPFrameSender(bindIP: bindIP, clientIP: clientIP,
                                             clientPort: o.clientPort, packetBytes: o.packetBytes,
                                             pacing: UDPPacing(mbps: o.udpPaceMbps,
-                                                              burstBytes: o.udpPaceBurstKB * 1024))
+                                                              burstBytes: o.udpPaceBurstKB * 1024),
+                                            retransmit: o.nackEnabled,
+                                            videoBitrateMbps: o.bitrateMbps)
                 if let mouseUDPPort = o.mouseUDPPort {
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
@@ -359,16 +366,30 @@ struct JerisLinkHostMain {
                     // request per 500 ms instead of an IDR every few frames.
                     if keyframeGate.allow() { encoder.requestKeyframe() }
                 }
+                let nackSender = sender
+                mouseUDP?.setNackHandler { frameID, ranges in
+                    guard let nackSender else { return }
+                    switch nackSender.retransmit(frameID: frameID, ranges: ranges) {
+                    case .miss, .overBudget:
+                        // D2-B: a NACK the cache cannot serve becomes one
+                        // keyframe, through the same gate as viewer requests.
+                        if keyframeGate.allow() { encoder.requestKeyframe() }
+                    case .sent, .disabled:
+                        break
+                    }
+                }
                 mouseUDP?.setNewSessionHandler {
                     // A viewer connected or reconnected: send it an IDR now
                     // instead of waiting up to 10 s for the periodic one.
                     print("video.viewer_new_session forcing keyframe")
+                    nackSender?.clearRetransmitCache()
                     encoder.requestKeyframe()
                     keyframeGate.markForced()
                 }
                 if sessionIndex > 1 {
                     // Restart after a display change: the viewer keeps the same
                     // UDP stream, so make it resync on the new size at once.
+                    nackSender?.clearRetransmitCache()
                     encoder.requestKeyframe()
                     keyframeGate.markForced()
                 }

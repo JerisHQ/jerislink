@@ -105,6 +105,9 @@ int main() {
     {
         CHECK(resolveLaunch({"--codec", "vp9"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--bitrate-mbps", "2"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({"--nack", "maybe"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({}, typicalSaved(), "", tailnet).options.nack == "on");
+        CHECK(resolveLaunch({"--nack", "off"}, typicalSaved(), "", tailnet).options.nack == "off");
         CHECK(resolveLaunch({"--port", "abc"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--source-ip"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--bogus", "1"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
