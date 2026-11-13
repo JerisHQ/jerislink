@@ -13,6 +13,13 @@
 //   before this change grew without a limit) is rotated the same way, but
 //   only its newest cap bytes are kept in .old, cut at a line start.
 //
+// More than one viewer process may write the same files. The cap is
+// checked against the real file size, not against what this process wrote,
+// and a rotation or legacy trim runs under a named mutex per file path.
+// Before each write the writer checks that its handle is still the file at
+// the path; if another viewer has rotated it to .old, the handle is
+// reopened, so .old never keeps growing.
+//
 // Lines end in CRLF, as the old std::ofstream (text mode) wrote them.
 //
 // Header-only so viewer_log_test.cpp runs the same code.
@@ -20,8 +27,10 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -37,7 +46,10 @@ public:
     LogFile() = default;
     LogFile(const LogFile&) = delete;
     LogFile& operator=(const LogFile&) = delete;
-    ~LogFile() { close(); }
+    ~LogFile() {
+        close();
+        if (mutex_) CloseHandle(mutex_);
+    }
 
     // keepOld: rotate to path + ".old" at the cap; otherwise empty in place.
     void configure(std::string path, uint64_t cap, bool keepOld, bool truncateAtOpen) {
@@ -45,7 +57,13 @@ public:
         cap_ = cap;
         keepOld_ = keepOld;
         truncateAtOpen_ = truncateAtOpen;
+        if (mutex_) CloseHandle(mutex_);
+        mutex_ = CreateMutexA(nullptr, FALSE, mutexName(path_).c_str());
     }
+
+    // Test only: false restores the per-process size count (the behaviour
+    // before multi-writer coordination), to show what the coordination fixes.
+    void setCoordinated(bool on) { coordinated_ = on; }
 
     bool open() {
         if (truncateAtOpen_) {
@@ -54,6 +72,7 @@ public:
             return h_ != INVALID_HANDLE_VALUE;
         }
         if (keepOld_) {
+            CapLock lk(coordinated_ ? mutex_ : nullptr);
             const uint64_t existing = fileSize(path_);
             if (existing >= cap_) rotateLegacy(existing);
         }
@@ -64,9 +83,20 @@ public:
 
     void write(const std::string& data) {
         if (h_ == INVALID_HANDLE_VALUE) return;
+        if (coordinated_) {
+            syncWithPath();
+            if (h_ == INVALID_HANDLE_VALUE) return;
+        }
         if (size_ > 0 && size_ + data.size() > cap_) {
-            if (keepOld_) rotate();
-            else emptyInPlace();
+            if (coordinated_) {
+                // Another viewer may have rotated or emptied the file while
+                // we waited for the lock: check again before acting.
+                CapLock lk(mutex_);
+                syncWithPath();
+                if (h_ != INVALID_HANDLE_VALUE && size_ > 0 && size_ + data.size() > cap_) capReached();
+            } else {
+                capReached();
+            }
             if (h_ == INVALID_HANDLE_VALUE) return;
         }
         DWORD wrote = 0;
@@ -81,6 +111,7 @@ public:
     const std::string& path() const { return path_; }
     std::string oldPath() const { return path_ + ".old"; }
     uint64_t rotations() const { return rotations_; }
+    uint64_t reopens() const { return reopens_; }
 
     static uint64_t fileSize(const std::string& path) {
         WIN32_FILE_ATTRIBUTE_DATA a{};
@@ -89,6 +120,40 @@ public:
     }
 
 private:
+    // Holds the per-path mutex. A wait that times out (a stuck viewer)
+    // goes on without it: the cap check still uses the real size.
+    class CapLock {
+    public:
+        explicit CapLock(HANDLE m) : m_(m) {
+            if (!m_) return;
+            const DWORD r = WaitForSingleObject(m_, 2000);
+            if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) m_ = nullptr;
+        }
+        ~CapLock() {
+            if (m_) ReleaseMutex(m_);
+        }
+        CapLock(const CapLock&) = delete;
+        CapLock& operator=(const CapLock&) = delete;
+
+    private:
+        HANDLE m_;
+    };
+
+    // One name per file: FNV-1a of the lower-cased full path.
+    static std::string mutexName(const std::string& path) {
+        char full[MAX_PATH * 2]{};
+        const DWORD n = GetFullPathNameA(path.c_str(), sizeof(full), full, nullptr);
+        const std::string p = (n > 0 && n < sizeof(full)) ? std::string(full, n) : path;
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : p) {
+            h ^= static_cast<unsigned char>(std::tolower(c));
+            h *= 1099511628211ull;
+        }
+        char name[64];
+        std::snprintf(name, sizeof(name), "Local\\jerislink-log-%016llx", static_cast<unsigned long long>(h));
+        return name;
+    }
+
     HANDLE openHandle(DWORD disposition) const {
         // FILE_APPEND_DATA: every write goes to the end, also when a second
         // viewer appends to the same history. Others may read, write,
@@ -103,12 +168,42 @@ private:
         return GetFileSizeEx(h, &sz) ? static_cast<uint64_t>(sz.QuadPart) : 0;
     }
 
+    // True if our handle is still the file at path_ (same volume and file
+    // id). False after another viewer renamed it to .old or removed it.
+    bool handleIsPath() const {
+        BY_HANDLE_FILE_INFORMATION a{}, b{};
+        if (!GetFileInformationByHandle(h_, &a)) return false;
+        HANDLE p = CreateFileA(path_.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (p == INVALID_HANDLE_VALUE) return false;
+        const bool ok = GetFileInformationByHandle(p, &b) != 0;
+        CloseHandle(p);
+        return ok && a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
+               a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+    }
+
+    // Follow the path if another viewer rotated the file, then take the
+    // real size (it includes what other viewers appended).
+    void syncWithPath() {
+        if (!handleIsPath()) {
+            close();
+            h_ = openHandle(OPEN_ALWAYS);
+            ++reopens_;
+        }
+        size_ = h_ != INVALID_HANDLE_VALUE ? fileSize(h_) : 0;
+    }
+
+    void capReached() {
+        if (keepOld_) rotate();
+        else emptyInPlace();
+    }
+
     void rotate() {
         close();
         if (MoveFileExA(path_.c_str(), oldPath().c_str(), MOVEFILE_REPLACE_EXISTING)) {
             ++rotations_;
-            h_ = openHandle(CREATE_ALWAYS);
-            size_ = 0;
+            h_ = openHandle(OPEN_ALWAYS);
+            size_ = h_ != INVALID_HANDLE_VALUE ? fileSize(h_) : 0;
         } else {
             // .old is held open by someone (a reader, or a second viewer),
             // so it cannot be replaced. Empty the history in place instead,
@@ -177,9 +272,12 @@ private:
     uint64_t cap_ = 0;
     bool keepOld_ = false;
     bool truncateAtOpen_ = false;
+    bool coordinated_ = true;
     HANDLE h_ = INVALID_HANDLE_VALUE;
+    HANDLE mutex_ = nullptr;
     uint64_t size_ = 0;
     uint64_t rotations_ = 0;
+    uint64_t reopens_ = 0;
     uint64_t legacyTrimmedFrom_ = 0;
 };
 
@@ -237,6 +335,7 @@ public:
     }
 
     uint64_t historyRotations() const { return history_.rotations(); }
+    uint64_t historyReopens() const { return history_.reopens(); }
     uint64_t sessionTruncations() const { return session_.rotations(); }
     uint64_t legacyTrimmedFrom() const { return history_.legacyTrimmedFrom(); }
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -165,6 +166,148 @@ static void testOpenSharing(const std::string& d) {
     expect(sizeOf(h) <= cap, "history <= cap with a reader attached");
 }
 
+// Two writers on one history, through two separate handles, taking turns.
+// coordinated=false is the per-process size count from before: each writer
+// sees only its own bytes, so the file passes the cap and a writer whose
+// file was rotated by the other keeps appending to .old.
+struct TwoWriterResult {
+    uint64_t maxHistory = 0, maxOld = 0, reopens = 0, rotations = 0;
+    bool newestBothInHistory = false;
+};
+static TwoWriterResult runTwoHandles(const std::string& h, bool coordinated) {
+    const uint64_t cap = 64 * 1024;
+    DeleteFileA(h.c_str());
+    DeleteFileA((h + ".old").c_str());
+    TwoWriterResult r;
+    jl::LogFile a, b;
+    a.configure(h, cap, true, false);
+    b.configure(h, cap, true, false);
+    a.setCoordinated(coordinated);
+    b.setCoordinated(coordinated);
+    a.open();
+    b.open();
+    std::string lastA, lastB;
+    for (int i = 0; i < 200; ++i) {  // 200 x 2 x ~4 KB = ~1.6 MB, ~25 x cap
+        std::string ca, cb;
+        for (int k = 0; k < 50; ++k) {
+            lastA = "A " + lineN(i * 50 + k);
+            lastB = "B " + lineN(i * 50 + k);
+            ca += lastA + EOL;
+            cb += lastB + EOL;
+        }
+        a.write(ca);
+        r.maxHistory = std::max(r.maxHistory, sizeOf(h));
+        r.maxOld = std::max(r.maxOld, sizeOf(h + ".old"));
+        b.write(cb);
+        r.maxHistory = std::max(r.maxHistory, sizeOf(h));
+        r.maxOld = std::max(r.maxOld, sizeOf(h + ".old"));
+    }
+    r.reopens = a.reopens() + b.reopens();
+    r.rotations = a.rotations() + b.rotations();
+    a.close();
+    b.close();
+    const std::string hist = readAll(h);
+    r.newestBothInHistory = hist.find(lastA + EOL) != std::string::npos && hist.find(lastB + EOL) != std::string::npos;
+    return r;
+}
+
+static void testTwoWritersSeparateHandles(const std::string& d) {
+    const uint64_t cap = 64 * 1024;
+    const TwoWriterResult before = runTwoHandles(d + "two-before-history.log", false);
+    const TwoWriterResult after = runTwoHandles(d + "two-after-history.log", true);
+    std::printf("  two writers, cap=%llu: before max history=%llu max old=%llu | after max history=%llu "
+                "max old=%llu rotations=%llu reopens=%llu\n",
+                (unsigned long long)cap, (unsigned long long)before.maxHistory, (unsigned long long)before.maxOld,
+                (unsigned long long)after.maxHistory, (unsigned long long)after.maxOld,
+                (unsigned long long)after.rotations, (unsigned long long)after.reopens);
+    expect(before.maxHistory > cap || before.maxOld > cap,
+           "two writers, per-process count (old code): a file passes the cap (the bug this test catches)");
+    expect(after.maxHistory <= cap, "two writers: history stays <= cap");
+    expect(after.maxOld <= cap, "two writers: .old stays <= cap (no writer left appending to it)");
+    expect(after.rotations >= 10, "two writers: history rotated many times");
+    expect(after.reopens >= 1, "two writers: the other writer followed the rotation and reopened");
+    expect(after.newestBothInHistory, "two writers: newest line of each writer is in the current history");
+}
+
+// Two viewer processes (this exe, --writer mode) writing the same history at
+// the same time through ViewerLog.
+static int writerMain(int argc, char** argv) {
+    if (argc < 6) return 2;
+    const std::string sess = argv[2], hist = argv[3], tag = argv[4];
+    const int n = std::atoi(argv[5]);
+    jl::ViewerLog log;
+    log.start(sess, hist, 1ull << 30, 64 * 1024);
+    for (int i = 0; i < n; ++i) {
+        log.line(tag + " " + lineN(i));
+        if (i % 200 == 0) Sleep(0);
+    }
+    log.stop();
+    std::printf("writer %s rotations=%llu reopens=%llu\n", tag.c_str(),
+                (unsigned long long)log.historyRotations(), (unsigned long long)log.historyReopens());
+    return 0;
+}
+
+static HANDLE spawnWriter(const std::string& sess, const std::string& hist, const std::string& tag, int n) {
+    char exe[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string cmd = "\"" + std::string(exe) + "\" --writer \"" + sess + "\" \"" + hist + "\" " + tag + " " +
+                      std::to_string(n);
+    std::vector<char> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        return nullptr;
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
+static void testTwoWriterProcesses(const std::string& d) {
+    const uint64_t cap = 64 * 1024;
+    const std::string h = d + "proc-history.log";
+    const int n = 20000;  // ~1.3 MB per process
+    HANDLE p1 = spawnWriter(d + "proc-session-1.log", h, "P1", n);
+    HANDLE p2 = spawnWriter(d + "proc-session-2.log", h, "P2", n);
+    expect(p1 && p2, "two writer processes started");
+    if (!p1 || !p2) return;
+    HANDLE both[2] = {p1, p2};
+    const DWORD w = WaitForMultipleObjects(2, both, TRUE, 120000);
+    DWORD e1 = 1, e2 = 1;
+    GetExitCodeProcess(p1, &e1);
+    GetExitCodeProcess(p2, &e2);
+    CloseHandle(p1);
+    CloseHandle(p2);
+    expect(w != WAIT_TIMEOUT && e1 == 0 && e2 == 0, "both writer processes finished");
+    const std::string hist = readAll(h), old = readAll(h + ".old");
+    std::printf("  two processes, cap=%llu: history=%llu old=%llu\n", (unsigned long long)cap,
+                (unsigned long long)hist.size(), (unsigned long long)old.size());
+    // Without the lock a writer can append one batch (<= 8 KB + one line)
+    // between its size check and its write.
+    const uint64_t slack = jl::ViewerLog::kChunk + 256;
+    expect(hist.size() <= cap + slack, "two processes: history <= cap (+ one batch)");
+    expect(old.size() <= cap + slack, "two processes: .old <= cap (+ one batch)");
+    bool whole = true;
+    for (const std::string* f : {&hist, &old}) {
+        size_t pos = 0;
+        while (pos < f->size()) {
+            const size_t e = f->find('\n', pos);
+            if (e == std::string::npos) { whole = false; break; }
+            const std::string l = f->substr(pos, e - pos);
+            if (!(l.rfind("P1 stats.line ", 0) == 0 || l.rfind("P2 stats.line ", 0) == 0 ||
+                  l.rfind("log.", 0) == 0) || l.empty() || l.back() != '\r')
+                whole = false;
+            pos = e + 1;
+        }
+    }
+    expect(whole, "two processes: every line whole, none torn or mixed");
+    // Whichever process finished last wrote the newest line: it must be in
+    // the current history, not in .old or a file renamed away.
+    expect(hist.find("P1 " + lineN(n - 1) + EOL) != std::string::npos ||
+               hist.find("P2 " + lineN(n - 1) + EOL) != std::string::npos,
+           "two processes: newest line is in the current history");
+}
+
 static double pct(std::vector<double> v, double p) {
     std::sort(v.begin(), v.end());
     return v[std::min(v.size() - 1, static_cast<size_t>(p * (v.size() - 1) + 0.5))];
@@ -207,7 +350,8 @@ static void testCallerCost(const std::string& d) {
     expect(readAll(ns) == readAll(os) && readAll(nh) == readAll(oh), "new and old loggers write identical bytes");
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--writer") return writerMain(argc, argv);
     const std::string d = dir();
     testOrderAndContents(d);
     testHistoryRotation(d);
@@ -215,6 +359,8 @@ int main() {
     testUnderCapUntouched(d);
     testSessionCap(d);
     testOpenSharing(d);
+    testTwoWritersSeparateHandles(d);
+    testTwoWriterProcesses(d);
     testCallerCost(d);
     std::printf("%d PASS, %d FAIL\n", gPass, gFail);
     if (gFail) return 1;
