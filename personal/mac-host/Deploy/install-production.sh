@@ -40,7 +40,12 @@ fi
 rm -rf "$DEST"
 ditto "$APP_SRC" "$DEST"
 
-# 3. Register the agents from the installed app.
+# 3. Logs from an older install may be world-readable: owner only (0600).
+for f in /tmp/jerislink-*.log(N) /tmp/jerislink-*.err(N); do
+    [[ -O "$f" ]] && chmod 600 "$f"
+done
+
+# 4. Register the agents from the installed app.
 "$DEST/Contents/MacOS/JerisLinkHost" --register || true
 "$DEST/Contents/MacOS/JerisLinkHost" --status
 

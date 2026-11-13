@@ -19,11 +19,14 @@ protocol FrameEncoder: AnyObject {
     /// frame. idrCapFrames > 0 also sets DataRateLimits so one frame (an IDR)
     /// is at most that many times the average frame size.
     func setRateTarget(bitrateBps: Int, idrCapFrames: Int)
+    /// Counts an ABR change for the stats line (no log line per change).
+    func noteAbrChange(_ change: AbrChange)
 }
 
 extension FrameEncoder {
     func requestKeyframe() {}
     func setRateTarget(bitrateBps: Int, idrCapFrames: Int) {}
+    func noteAbrChange(_ change: AbrChange) {}
 }
 
 /// Pending ABR rate change for a VT session (set from any thread, applied on
@@ -34,6 +37,16 @@ final class EncoderRateTarget: @unchecked Sendable {
     private var pending: (bps: Int, cap: Int)?
     private var applied: UInt64 = 0
     private var errors: UInt64 = 0
+    private var currentBps = 0
+    private var abrUp: UInt64 = 0
+    private var abrDown: UInt64 = 0
+    private var abrReasons: [String: UInt64] = [:]
+
+    func noteAbr(_ change: AbrChange) {
+        lock.lock(); defer { lock.unlock() }
+        if change.toKbps < change.fromKbps { abrDown &+= 1 } else { abrUp &+= 1 }
+        abrReasons[change.reason, default: 0] &+= 1
+    }
 
     func request(bitrateBps: Int, idrCapFrames: Int) {
         lock.lock(); pending = (bitrateBps, idrCapFrames); lock.unlock()
@@ -55,16 +68,21 @@ final class EncoderRateTarget: @unchecked Sendable {
             let limits = [NSNumber(value: capBytes), NSNumber(value: frameSeconds)] as CFArray
             limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
         }
+        let ok = rateStatus == noErr && limitStatus == noErr
         lock.lock()
-        if rateStatus == noErr && limitStatus == noErr { applied &+= 1 } else { errors &+= 1 }
+        if ok { applied &+= 1; currentBps = p.bps } else { errors &+= 1 }
         lock.unlock()
-        print("encoder.rate bitrate=\(p.bps) frame_cap_bytes=\(capBytes) status=\(rateStatus) limit_status=\(limitStatus)")
-        fflush(stdout)
+        // Applied changes go to the stats line; only a failure gets a line.
+        if !ok {
+            print("encoder.rate_failed bitrate=\(p.bps) frame_cap_bytes=\(capBytes) status=\(rateStatus) limit_status=\(limitStatus)")
+            fflush(stdout)
+        }
     }
 
     var statsFields: String {
         lock.lock(); defer { lock.unlock() }
-        return "rate_set=\(applied) rate_set_errors=\(errors)"
+        let reasons = abrReasons.keys.sorted().map { "\($0):\(abrReasons[$0]!)" }.joined(separator: ",")
+        return "rate_set=\(applied) rate_set_errors=\(errors) rate_kbps=\(currentBps / 1000) abr_up=\(abrUp) abr_down=\(abrDown) abr_reasons=\(reasons.isEmpty ? "-" : reasons)"
     }
 }
 

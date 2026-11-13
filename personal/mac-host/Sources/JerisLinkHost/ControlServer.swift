@@ -23,6 +23,9 @@ final class ControlServer: @unchecked Sendable {
     private(set) var messages: UInt64 = 0
     private(set) var keyEvents: UInt64 = 0
     private(set) var mouseEvents: UInt64 = 0
+    /// Input helper send failures: counted, and logged at most once per 10 s.
+    private var sendFailures = LogRateLimiter()
+    private let sendFailuresLock = NSLock()
     private(set) var clipboardSent: UInt64 = 0
     private(set) var clipboardReceived: UInt64 = 0
     private(set) var rejectedClients: UInt64 = 0
@@ -119,8 +122,23 @@ final class ControlServer: @unchecked Sendable {
         if s >= 0 { Darwin.shutdown(s, SHUT_RDWR); Darwin.close(s) }
     }
 
+    private var helperSendFailures: UInt64 {
+        sendFailuresLock.lock(); defer { sendFailuresLock.unlock() }
+        return sendFailures.total
+    }
+
+    /// One send failure per input event is possible while the helper is
+    /// down, so log the first and then at most one per 10 s.
+    private func warnSendFailed(_ what: String) {
+        sendFailuresLock.lock()
+        let folded = sendFailures.record(nowNs: DispatchTime.now().uptimeNanoseconds)
+        sendFailuresLock.unlock()
+        guard let folded else { return }
+        print("Control warning: input helper \(what) send failed" + (folded > 0 ? " (\(folded) more since the last warning)" : ""))
+    }
+
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) helper_send_failures=\(helperSendFailures)"
     }
 
     private func acceptLoop() {
@@ -411,7 +429,6 @@ final class ControlServer: @unchecked Sendable {
             if current == Self.usInputSourceID && Self.selectInputSource(id: saved) {
                 capsTemporaryInputSourceID = nil
                 capsAlphaMode = false
-                print("Control CapsLock restored input source: \(saved)")
                 return
             }
             // The user changed input source through another shortcut while in
@@ -423,21 +440,18 @@ final class ControlServer: @unchecked Sendable {
             if Self.selectInputSource(id: Self.usInputSourceID) {
                 capsTemporaryInputSourceID = current
                 capsAlphaMode = false
-                print("Control CapsLock temporary ABC from: \(current)")
                 return
             }
         }
 
         capsAlphaMode.toggle()
-        print("Control CapsLock alpha mode: \(capsAlphaMode ? "ON" : "OFF")")
     }
 
     private func handleKey(semantic: UInt16, down: Bool) {
+        // Keys are never logged (privacy): only keyEvents counts them.
         keyEvents += 1
-        let name = Self.keyName(semantic)
 
         if semantic == 20 { // Windows VK_CAPITAL / Caps Lock.
-            print("Control KEY \(down ? "down" : "up") CapsLock")
             handleCapsLock(down: down)
             return
         }
@@ -450,7 +464,6 @@ final class ControlServer: @unchecked Sendable {
         }
 
         let cg = Self.macKeyCode(semantic)
-        print("Control KEY \(down ? "down" : "up") \(name) -> macCG=\(cg.map(String.init) ?? "nil")")
 
         if semantic == 4 { shiftDown = down }
         guard injectRequested, let cg, let helper = inputHelper else { return }
@@ -463,13 +476,13 @@ final class ControlServer: @unchecked Sendable {
             let keyOK = helper.sendKey(cgCode: UInt16(cg), down: down)
             let postOK = helper.sendKey(cgCode: 56, down: shiftDown)
             if !(preOK && keyOK && postOK) {
-                print("Control warning: caps-aware input helper send failed")
+                warnSendFailed("caps-aware key")
             }
             return
         }
 
         if !helper.sendKey(cgCode: UInt16(cg), down: down) {
-            print("Control warning: input helper send failed")
+            warnSendFailed("key")
         }
     }
 
@@ -479,7 +492,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendMouseMove(dx: dx, dy: dy) {
-            print("Control warning: input helper mouse-move send failed")
+            warnSendFailed("mouse-move")
         }
     }
 
@@ -487,7 +500,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendMouseMoveAbsolute(x: x, y: y) {
-            print("Control warning: input helper absolute mouse-move send failed")
+            warnSendFailed("absolute mouse-move")
         }
     }
 
@@ -495,7 +508,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendMouseMoveNormalized(nx: nx, ny: ny) {
-            print("Control warning: input helper normalized mouse-move send failed")
+            warnSendFailed("normalized mouse-move")
         }
     }
 
@@ -503,7 +516,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendMouseButton(button: button, down: down) {
-            print("Control warning: input helper mouse-button send failed")
+            warnSendFailed("mouse-button")
         }
     }
 
@@ -511,7 +524,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendMouseButtonExtended(button: button, down: down, clickCount: clickCount) {
-            print("Control warning: input helper extended mouse-button send failed")
+            warnSendFailed("extended mouse-button")
         }
     }
 
@@ -519,7 +532,7 @@ final class ControlServer: @unchecked Sendable {
         mouseEvents += 1
         guard injectRequested, let helper = inputHelper else { return }
         if !helper.sendScroll(dx: dx, dy: dy) {
-            print("Control warning: input helper scroll send failed")
+            warnSendFailed("scroll")
         }
     }
 
@@ -549,34 +562,6 @@ final class ControlServer: @unchecked Sendable {
             offset += n
         }
         return true
-    }
-
-    private static func keyName(_ code: UInt16) -> String {
-        switch code {
-        case 1: return "Control"
-        case 2: return "Option"
-        case 3: return "Command"
-        case 4: return "Shift"
-        case 8: return "Backspace"
-        case 9: return "Tab"
-        case 13: return "Return"
-        case 20: return "CapsLock"
-        case 27: return "Escape"
-        case 32: return "Space"
-        case 33: return "PageUp"
-        case 34: return "PageDown"
-        case 35: return "End"
-        case 36: return "Home"
-        case 37: return "Left"
-        case 38: return "Up"
-        case 39: return "Right"
-        case 40: return "Down"
-        case 45: return "Insert"
-        case 46: return "Delete"
-        case 48...57, 65...90: return String(UnicodeScalar(Int(code))!)
-        case 112...123: return "F\(code - 111)"
-        default: return "Key(\(code))"
-        }
     }
 
     private static func macKeyCode(_ code: UInt16) -> UInt16? {

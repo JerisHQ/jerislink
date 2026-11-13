@@ -23,6 +23,8 @@
 	<true/>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
+	<key>Umask</key>
+	<integer>63</integer>
 	<key>StandardOutPath</key>
 	<string>/tmp/jerislink-control-service.log</string>
 	<key>StandardErrorPath</key>

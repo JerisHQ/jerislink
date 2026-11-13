@@ -3,16 +3,26 @@ import CoreMedia
 import VideoToolbox
 
 final class H264AnnexBWriter {
-    private let handle: FileHandle
+    /// nil when the output is /dev/null (the video service): no file and no
+    /// write per frame.
+    private let handle: FileHandle?
     private let lock = NSLock()
     private let startCode = Data([0x00, 0x00, 0x00, 0x01])
 
+    static func discards(_ url: URL) -> Bool {
+        url.standardizedFileURL.path == "/dev/null"
+    }
+
     init(url: URL) throws {
+        if Self.discards(url) {
+            self.handle = nil
+            return
+        }
         FileManager.default.createFile(atPath: url.path, contents: nil)
         self.handle = try FileHandle(forWritingTo: url)
     }
 
-    deinit { try? handle.close() }
+    deinit { try? handle?.close() }
 
     func annexBFrame(sampleBuffer: CMSampleBuffer) -> (data: Data, keyFrame: Bool)? {
         let isKeyFrame: Bool = {
@@ -51,11 +61,13 @@ final class H264AnnexBWriter {
     }
 
     func write(data: Data) {
+        guard let handle else { return }
         lock.lock(); defer { lock.unlock() }
         handle.write(data)
     }
 
     func synchronize() {
+        guard let handle else { return }
         lock.lock(); defer { lock.unlock() }
         try? handle.synchronize()
     }

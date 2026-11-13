@@ -42,6 +42,8 @@ final class H264Encoder: FrameEncoder {
     private var forceKeyframePending = false
     private var forceKeyframeRequests: UInt64 = 0
     private var forceKeyframesEmitted: UInt64 = 0
+    private var forceKeyframesMissed: UInt64 = 0
+    private var statsTicker = StatsTicker()
 
     init(width: Int32, height: Int32, fps: Int32, bitrate: Int,
          keyframeInterval: Int32? = nil,
@@ -157,10 +159,7 @@ final class H264Encoder: FrameEncoder {
         keyframeRequestLock.lock()
         forceKeyframePending = true
         forceKeyframeRequests &+= 1
-        let total = forceKeyframeRequests
         keyframeRequestLock.unlock()
-        print("encoder.force_keyframe_requested total=\(total)")
-        fflush(stdout)
     }
 
     func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, captureNanos: UInt64) {
@@ -215,7 +214,18 @@ final class H264Encoder: FrameEncoder {
         self.session = nil
     }
 
+    func noteAbrChange(_ change: AbrChange) {
+        rateTarget.noteAbr(change)
+    }
+
+    private var keyframeFields: String {
+        keyframeRequestLock.lock(); defer { keyframeRequestLock.unlock() }
+        return "kf_forced=\(forceKeyframeRequests) kf_emitted=\(forceKeyframesEmitted) kf_missed=\(forceKeyframesMissed)"
+    }
+
     func statsLine() -> String {
+        // Read before statsLock: the two locks are never held together.
+        let keyframes = " " + keyframeFields
         statsLock.lock()
         defer { statsLock.unlock() }
         guard encodedFrames > 0 else { return "encoded=0" }
@@ -233,8 +243,8 @@ final class H264Encoder: FrameEncoder {
         )
         let capture = " " + captureEncodeWindow.fields("cap_enc") + " " + captureEncodeSession.fields("cap_enc_all")
         captureEncodeWindow.reset()
-        if let udpSender { return base + capture + " " + rateTarget.statsFields + " " + udpSender.statsLine() }
-        return base + capture
+        if let udpSender { return base + capture + keyframes + " " + rateTarget.statsFields + " " + udpSender.statsLine() }
+        return base + capture + keyframes
     }
 
     func setRateTarget(bitrateBps: Int, idrCapFrames: Int) {
@@ -291,13 +301,12 @@ final class H264Encoder: FrameEncoder {
             if encoded.keyFrame {
                 keyframeRequestLock.lock()
                 forceKeyframesEmitted &+= 1
-                let total = forceKeyframesEmitted
                 keyframeRequestLock.unlock()
-                print("encoder.force_keyframe_emitted frame=\(context.frameID) total=\(total)")
             } else {
-                print("encoder.force_keyframe_missed frame=\(context.frameID)")
+                keyframeRequestLock.lock()
+                forceKeyframesMissed &+= 1
+                keyframeRequestLock.unlock()
             }
-            fflush(stdout)
         }
         writer.write(data: encoded.data)
         let sendStartNanos = DispatchTime.now().uptimeNanoseconds
@@ -320,7 +329,7 @@ final class H264Encoder: FrameEncoder {
         sendLatencyMaxMS = max(sendLatencyMaxMS, sendLatencyMS)
         totalLatencySumMS += totalLatencyMS
         totalLatencyMaxMS = max(totalLatencyMaxMS, totalLatencyMS)
-        let shouldPrint = encodedFrames % 120 == 0
+        let shouldPrint = statsTicker.due(nowNs: sendEndNanos)
         statsLock.unlock()
 
         if shouldPrint {

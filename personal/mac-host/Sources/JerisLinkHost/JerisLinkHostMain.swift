@@ -192,7 +192,8 @@ struct JerisLinkHostMain {
             let control = ControlServiceSelfTest.run()
             let nack = RetransmitSelfTest.run()
             let abr = AbrSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 ? 0 : 1)
+            let logs = LogHygieneSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -384,8 +385,7 @@ struct JerisLinkHostMain {
                 let applyAbr: (AbrChange) -> Void = { change in
                     encoder.setRateTarget(bitrateBps: change.toKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
                     nackSender?.setVideoBitrate(kbps: change.toKbps, paceFollows: o.udpPaceAuto)
-                    print("abr.\(change.toKbps < change.fromKbps ? "down" : "up") from=\(change.fromKbps)kbps to=\(change.toKbps)kbps reason=\(change.reason)")
-                    fflush(stdout)
+                    encoder.noteAbrChange(change)
                 }
                 if abr.enabled {
                     encoder.setRateTarget(bitrateBps: abr.currentKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
