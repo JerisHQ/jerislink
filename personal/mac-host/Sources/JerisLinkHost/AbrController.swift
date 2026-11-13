@@ -46,6 +46,9 @@ struct AbrInput: Equatable {
     var slope01Ms = 0
     var overBudgetDelta: UInt64 = 0  // host nack_over_budget since the last report
     var queueMax = 0                 // host send queue max since the last report
+    /// Slope state: slopeValid = measured (slope01Ms); slopeFlat = within the
+    /// relay jitter (SlopeFilter gate), counts as clear; neither = unknown.
+    var slopeFlat = false
 }
 
 struct AbrChange: Equatable {
@@ -66,7 +69,9 @@ struct AbrChange: Equatable {
 /// Loss is judged on at least 30 expected packets: smaller reports are summed
 /// until they reach 30. Until then loss is unknown: such a report can still
 /// step down for delay, queue or NACK budget, but never counts as clear (the
-/// clear timer is kept as it is and there is no step up).
+/// clear time so far is kept, does not grow, and there is no step up). An
+/// unknown slope (neither measured nor flat) is held the same way. The 3 s
+/// is the sum of report intervals with loss and slope both known and clear.
 struct AbrController {
     let ceilingKbps: Int
     private(set) var currentKbps: Int
@@ -77,7 +82,8 @@ struct AbrController {
     private var queueStreak = 0
     private var lastDownMs: UInt64?
     private var lastUpMs: UInt64?
-    private var clearSinceMs: UInt64?
+    private var clearMs: UInt64?
+    private var lastReportMs: UInt64 = 0
     private var accExpected: UInt64 = 0
     private var accRaw: UInt64 = 0
     private var accAfter: UInt64 = 0
@@ -92,11 +98,13 @@ struct AbrController {
     mutating func reset() {
         currentKbps = ceilingKbps
         slopeStreak = 0; budgetStreak = 0; queueStreak = 0
-        lastDownMs = nil; lastUpMs = nil; clearSinceMs = nil
+        lastDownMs = nil; lastUpMs = nil; clearMs = nil; lastReportMs = 0
         accExpected = 0; accRaw = 0; accAfter = 0
     }
 
     mutating func onReport(_ i: AbrInput) -> AbrChange? {
+        let sincePrev = i.nowMs &- lastReportMs
+        lastReportMs = i.nowMs
         accExpected &+= UInt64(i.expected)
         accRaw &+= UInt64(i.lostRaw)
         accAfter &+= UInt64(i.lostAfterNack)
@@ -120,7 +128,7 @@ struct AbrController {
         else if queueStreak >= 2 { reason = "send_queue" }
 
         if let reason {
-            clearSinceMs = nil
+            clearMs = nil
             if let last = lastDownMs, i.nowMs &- last < 500 { return nil }
             let next = max(floorKbps, heavy ? currentKbps / 2 : currentKbps * 4 / 5)
             guard next < currentKbps else { return nil }
@@ -130,10 +138,13 @@ struct AbrController {
             return AbrChange(fromKbps: currentKbps, toKbps: next, reason: reason)
         }
         let clear = afterBp < 50 && !(i.slopeValid && i.slope01Ms > 10) && i.overBudgetDelta == 0
-        guard clear else { clearSinceMs = nil; return nil }
-        guard lossKnown else { return nil }  // loss unknown: not clear, timer kept
-        if clearSinceMs == nil { clearSinceMs = i.nowMs }
-        guard currentKbps < ceilingKbps, let since = clearSinceMs, i.nowMs &- since >= 3000 else { return nil }
+        guard clear else { clearMs = nil; return nil }
+        // Loss or slope unknown: not clear. The clear time so far is kept but
+        // does not grow; only reports with both known count towards the 3 s.
+        guard lossKnown, i.slopeValid || i.slopeFlat else { return nil }
+        let soFar = clearMs.map { $0 &+ sincePrev } ?? 0
+        clearMs = soFar
+        guard currentKbps < ceilingKbps, soFar >= 3000 else { return nil }
         if let last = lastUpMs, i.nowMs &- last < 1000 { return nil }
         let next = min(ceilingKbps, currentKbps + max(1, ceilingKbps / 20))
         lastUpMs = i.nowMs
@@ -173,6 +184,11 @@ struct ArrivalSlope {
         at = nowMs
     }
 
+    /// Capture restart: frame ids start again at 1, which the 120-frame rule
+    /// above does not see when the old id was small. Forget the baseline and
+    /// the open window.
+    mutating func reset() { have = false; last = 0; at = 0; sum = 0; n = 0 }
+
     mutating func take() -> Window {
         var w = Window()
         w.samples = n
@@ -198,14 +214,20 @@ func abrSlopeTo01Ms(_ ms: Double) -> Int {
 /// 2. Jitter gate: over a relay (DERP) the compensated slope moves ~8 ms from
 ///    one report to the next, twice the 4 ms delay threshold. Noise is the
 ///    median |change| between consecutive compensated slopes over the last
-///    16 reports; a slope within 2x the noise is reported as unknown (no
-///    delay step-down, no blocked step-up). A growing queue changes little
-///    report to report and stays visible; with no noise nothing is gated.
+///    16 reports; a slope within 2x the noise is "flat within noise" (no
+///    delay step-down, counts as clear). With no noise nothing is gated.
+/// 3. Drift bound: each slope is the delay change over its 250 ms window,
+///    so the sum of the last 16 is the delay added over ~4 s. When that sum
+///    is above 30 ms the gate does not apply and the slope is reported as
+///    their mean (the trend), so a queue growing under heavy jitter is seen.
+/// valid = measured, flat = gated, neither = unknown (holds the clear time).
 struct SlopeFilter {
-    struct Estimate: Equatable { var valid = false; var slope01Ms = 0 }
+    struct Estimate: Equatable { var valid = false; var slope01Ms = 0; var flat = false }
     static let history = 16
     static let minDiffs = 4
+    static let driftLimit01Ms = 300  // 30 ms added over the last 16 reports
     private var diffs: [Int] = []
+    private var slopes: [Int] = []
     private var haveLast = false
     private var last = 0
 
@@ -223,10 +245,20 @@ struct SlopeFilter {
         }
         haveLast = true
         last = e.slope01Ms
+        slopes.append(e.slope01Ms)
+        if slopes.count > Self.history { slopes.removeFirst() }
         let n = noise01Ms
-        if n > 0 && abs(e.slope01Ms) <= 2 * n { e.valid = false }
+        if n > 0 && abs(e.slope01Ms) <= 2 * n {
+            if drift01Ms > Self.driftLimit01Ms { e.slope01Ms = trend01Ms }  // sustained growth
+            else { e.valid = false; e.flat = true }
+        }
         return e
     }
+
+    /// Delay added over the last 16 compensated slopes (0.1 ms), and their
+    /// mean (truncated toward zero, as C++ int division).
+    var drift01Ms: Int { slopes.reduce(0, +) }
+    var trend01Ms: Int { slopes.isEmpty ? 0 : drift01Ms / slopes.count }
 
     /// Median |change| (0.1 ms), 0 until 4 changes. Same element as nth_element(size / 2).
     var noise01Ms: Int {
@@ -234,7 +266,7 @@ struct SlopeFilter {
         return diffs.sorted()[diffs.count / 2]
     }
 
-    mutating func reset() { diffs.removeAll(); haveLast = false; last = 0 }
+    mutating func reset() { diffs.removeAll(); slopes.removeAll(); haveLast = false; last = 0 }
 }
 
 /// Host-side ABR state for one video service run (any thread). Reports come
@@ -272,10 +304,20 @@ final class AbrHost: @unchecked Sendable {
         return from == controller.currentKbps ? nil : AbrChange(fromKbps: from, toKbps: controller.currentKbps, reason: "new_session")
     }
 
+    /// Capture restarted in the same viewer session: the sender's cadence
+    /// baseline is gone (UDPFrameSender.captureRestarted), so the jitter
+    /// history no longer matches. The bitrate stays as it is.
+    func captureRestarted() {
+        lock.lock(); defer { lock.unlock() }
+        slopeFilter.reset()
+        lastEffective = nil
+        lastHostSlope01Ms = nil
+    }
+
     /// One 0x42 report plus the sender's window counters. MouseMoveUDPServer
     /// already drops old or duplicate MRM1 sequence numbers. sendSlope: the
     /// sender's send-cadence window since the last report; nil uses the
-    /// viewer slope as is (ABR v1).
+    /// viewer slope as is, and an invalid viewer slope is unknown.
     func onReport(_ r: ReceiverReport, overBudgetTotal: UInt64, queueMax: Int,
                   sendSlope: ArrivalSlope.Window? = nil,
                   nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds) -> AbrChange? {
@@ -293,6 +335,7 @@ final class AbrHost: @unchecked Sendable {
             let e = slopeFilter.onReport(viewerValid: r.slopeValid, viewer01Ms: Int(r.slope01Ms), host: sendSlope)
             i.slopeValid = e.valid
             i.slope01Ms = e.slope01Ms
+            i.slopeFlat = e.flat
             lastHostSlope01Ms = sendSlope.valid ? abrSlopeTo01Ms(sendSlope.slopeMs) : nil
             lastEffective = e
         }
@@ -313,11 +356,11 @@ final class AbrHost: @unchecked Sendable {
             + slopeFields()
     }
 
-    /// Host slope, effective slope ("na" = unknown or gated) and jitter noise.
+    /// Host slope, effective slope ("flat" = gated, "na" = unknown) and jitter noise.
     private func slopeFields() -> String {
         guard let e = lastEffective else { return "" }
         func ms(_ v: Int?) -> String { v.map { String(format: "%.1fms", Double($0) / 10) } ?? "na" }
-        return " abr_slope_host=\(ms(lastHostSlope01Ms)) abr_slope_eff=\(ms(e.valid ? e.slope01Ms : nil))"
+        return " abr_slope_host=\(ms(lastHostSlope01Ms)) abr_slope_eff=\(e.flat ? "flat" : ms(e.valid ? e.slope01Ms : nil))"
             + " abr_slope_noise=\(ms(slopeFilter.noise01Ms))"
     }
 }

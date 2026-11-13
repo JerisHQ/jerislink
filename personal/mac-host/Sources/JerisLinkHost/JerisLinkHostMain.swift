@@ -421,7 +421,10 @@ struct JerisLinkHostMain {
                 if sessionIndex > 1 {
                     // Restart after a display change: the viewer keeps the same
                     // UDP stream, so make it resync on the new size at once.
-                    nackSender?.clearRetransmitCache()
+                    // Frame ids restart at 1: reset the send-cadence slope and
+                    // the ABR jitter history with the retransmit cache.
+                    nackSender?.captureRestarted()
+                    abr.captureRestarted()
                     encoder.requestKeyframe()
                     keyframeGate.markForced()
                 }

@@ -926,6 +926,9 @@ private:
             const SlopeEstimate e = slopeFilter_.onReport(rep.slopeValid, rep.slope01Ms, hostWindow);
             in.slopeValid = e.valid;
             in.slope01Ms = e.slope01Ms;
+            in.slopeFlat = e.flat;
+        } else {
+            in.slopeFlat = !rep.slopeValid;  // ABR v1 as merged: no slope counted as clear
         }
         in.overBudgetDelta = overBudgetTotal_ - overBudgetSeen_;
         overBudgetSeen_ = overBudgetTotal_;
@@ -1113,10 +1116,117 @@ static void testAbrLowSampleNeverClear() {
         CHECK(z.current() == 6000);
     }
     CHECK(z.ups() == 0);
-    // They do not reset a clear period either: clear, idle, clear 3 s later -> up.
+    // They keep a clear period without advancing it: clear 12.0, idle 13.5,
+    // clear 15.0 is 1.5 s of clear time (not 3 s), clear 16.5 is 3 s -> up.
     CHECK(!z.onReport({12000, 400, 0, 0, true, 0, 0, 0}, ch));
     CHECK(!z.onReport({13500, 0, 0, 0, false, 0, 0, 0}, ch));
-    CHECK(z.onReport({15000, 400, 0, 0, true, 0, 0, 0}, ch) && z.current() == 6900);
+    CHECK(!z.onReport({15000, 400, 0, 0, true, 0, 0, 0}, ch) && z.current() == 6000);
+    CHECK(z.onReport({16500, 400, 0, 0, true, 0, 0, 0}, ch) && z.current() == 6900);
+}
+
+// Review P1 (Pepper, PR #18): an unknown slope is not clear. Host cadence
+// unknown the whole time while the viewer reads +25 ms per 250 ms: v1-style
+// "unknown = clear" climbed 6 -> 18 Mbps with 14 up-steps. Now no up-step.
+static void testAbrUnknownSlopeNeverClear() {
+    AbrController c(18000);
+    SlopeFilter f;
+    AbrChange ch;
+    c.onReport({250, 400, 100, 100, true, 0, 0, 0}, ch);
+    c.onReport({750, 400, 100, 100, true, 0, 0, 0}, ch);
+    CHECK(c.current() == 6000);
+    ArrivalSlope::Window none;  // host window unknown (e.g. 30 fps cadence)
+    for (uint64_t t = 1000; t <= 31000; t += 250) {
+        const SlopeEstimate e = f.onReport(true, 250, none);
+        CHECK(!e.valid && !e.flat);
+        AbrInput in{t, 400, 0, 0, e.valid, e.slope01Ms, 0, 0};
+        in.slopeFlat = e.flat;
+        c.onReport(in, ch);
+        CHECK(c.current() == 6000);
+    }
+    CHECK(c.ups() == 0);
+    // Unknown in the middle of a clear period holds it: 2 s flat, 5 s
+    // unknown, then 1 s flat is 3 s of clear time -> one up-step.
+    AbrController h(18000);
+    h.onReport({250, 400, 100, 100, true, 0, 0, 0}, ch);
+    h.onReport({750, 400, 100, 100, true, 0, 0, 0}, ch);
+    bool up = false;
+    uint64_t upAt = 0;
+    for (uint64_t t = 1000; t <= 9000 && !up; t += 250) {
+        const bool unknown = t > 3000 && t <= 8000;
+        AbrInput in{t, 400, 0, 0, false, 0, 0, 0};
+        in.slopeFlat = !unknown;
+        if (h.onReport(in, ch)) { up = true; upAt = t; }
+    }
+    CHECK(up && upAt == 9000 && h.current() == 6900);
+}
+
+// Review P2: the jitter gate must not hide a queue that keeps growing.
+static void testSlopeDriftBound() {
+    ArrivalSlope::Window host;
+    host.valid = true;
+    host.samples = 14;
+    {   // B: exactly 4 changes, 0,0,+10,+10,+20 ms. Noise 10 ms gates the
+        // last +20 ms, but 40 ms was added over 5 reports: valid, trend 8 ms.
+        SlopeFilter f;
+        const int s[] = {0, 0, 100, 100, 200};
+        SlopeEstimate e;
+        for (int v : s) e = f.onReport(true, v, host);
+        CHECK(f.noise01Ms() == 100 && f.drift01Ms() == 400);
+        CHECK(e.valid && !e.flat && e.slope01Ms == 80);
+    }
+    {   // A: mean delay and jitter rise together. Mean +10.1 ms per 250 ms
+        // (808 ms over 20 s), +-(12 + k/10) ms alternating on top: the old gate
+        // hid all 80 reports. Now the trend shows and ABR steps down for delay.
+        SlopeFilter f;
+        AbrController c(18000);
+        AbrChange ch;
+        int valid = 0, delayDowns = 0, sum = 0;
+        for (int k = 0; k < 80; ++k) {
+            const int v = 101 + (k % 2 ? -1 : 1) * (120 + k);
+            sum += v;
+            const SlopeEstimate e = f.onReport(true, v, host);
+            if (k >= 16) CHECK(e.valid && e.slope01Ms > 40);
+            if (e.valid) ++valid;
+            AbrInput in{uint64_t(250 * (k + 1)), 400, 0, 0, e.valid, e.slope01Ms, 0, 0};
+            in.slopeFlat = e.flat;
+            if (c.onReport(in, ch) && ch.reason == "delay") ++delayDowns;
+        }
+        CHECK(sum >= 8000);
+        CHECK(valid >= 64 && delayDowns >= 2 && c.current() < 18000);
+    }
+    {   // Pure relay jitter (+-8 ms, no growth) stays flat, and flat is clear:
+        // from the floor ABR climbs back.
+        SlopeFilter f;
+        AbrController c(18000);
+        AbrChange ch;
+        c.onReport({250, 400, 100, 100, true, 0, 0, 0}, ch);
+        c.onReport({750, 400, 100, 100, true, 0, 0, 0}, ch);
+        int flat = 0;
+        for (int k = 0; k < 40; ++k) {
+            const SlopeEstimate e = f.onReport(true, k % 2 ? -80 : 80, host);
+            if (e.flat) ++flat;
+            AbrInput in{uint64_t(1000 + 250 * k), 400, 0, 0, e.valid, e.slope01Ms, 0, 0};
+            in.slopeFlat = e.flat;
+            c.onReport(in, ch);
+        }
+        CHECK(flat == 36 && c.ups() >= 3);
+    }
+}
+
+// Review P3: a capture restart numbers frames from 1 again. Without a reset
+// the old id 100 makes ids 1..13 "old" (restart rule needs a 120-frame drop)
+// and the first window has no samples; after reset() it measures 12 gaps.
+static void testCaptureRestartCadence() {
+    const double T = 1000.0 / 60;
+    ArrivalSlope a(T), b(T);
+    for (int f = 1; f <= 100; ++f) { a.onPacket(f, false, f * T); b.onPacket(f, false, f * T); }
+    a.take();
+    b.take();
+    a.reset();
+    for (int f = 1; f <= 13; ++f) { a.onPacket(f, false, 5000 + f * T); b.onPacket(f, false, 5000 + f * T); }
+    const auto wa = a.take(), wb = b.take();
+    CHECK(wa.valid && wa.samples == 12 && std::fabs(wa.slopeMs) < 1e-6);
+    CHECK(!wb.valid && wb.samples == 0);
 }
 
 static void testArrivalSlope() {
@@ -1172,7 +1282,7 @@ static void testSlopeFilter() {
     }
     for (int i = 4; i < 12; ++i) {
         const SlopeEstimate e = f.onReport(true, i % 2 ? -80 : 80, host);
-        CHECK(!e.valid);
+        CHECK(!e.valid && e.flat);
     }
     CHECK(f.noise01Ms() == 160);
     // A queue growing +15 ms per 250 ms barely changes report to report:
@@ -1193,9 +1303,11 @@ static void testSlopeFilter() {
     // Unknown viewer or host window: unknown, and no change is measured across it.
     SlopeFilter g;
     CHECK(g.onReport(true, 30, host).valid);
-    CHECK(!g.onReport(false, 0, host).valid);
+    const SlopeEstimate gv = g.onReport(false, 0, host);
+    CHECK(!gv.valid && !gv.flat);
     ArrivalSlope::Window none;
-    CHECK(!g.onReport(true, 30, none).valid);
+    const SlopeEstimate gh = g.onReport(true, 30, none);
+    CHECK(!gh.valid && !gh.flat);
     CHECK(g.onReport(true, 500, host).valid);
     CHECK(g.noise01Ms() == 0);
 }
@@ -1246,10 +1358,15 @@ static const AbrGolden kAbrGolden[] = {
     {{6500, 400, 0, 0, true, 0, 1, 0}, 7800},        // NACK over budget once: hold
     {{6750, 400, 0, 0, true, 0, 1, 0}, 6000},        // twice: heavy x0.5 -> floor
     {{7000, 400, 24, 0, true, 0, 0, 0}, 6000},       // raw 6%, within 500 ms
-    {{7250, 20, 10, 10, false, 0, 0, 0}, 6000},      // under 30 expected: loss unknown, held over
-    {{10250, 400, 0, 0, false, 0, 0, 0}, 6000},      // 10 of 420 (2.4%): loss, already at floor
-    {{10500, 400, 0, 0, false, 0, 0, 0}, 6000},      // clear starts
-    {{13500, 400, 0, 0, false, 0, 0, 0}, 6900},      // clear 3 s: +5% of ceiling
+    {{7250, 20, 10, 10, false, 0, 0, 0, true}, 6000},   // under 30 expected: loss unknown, held over
+    {{10250, 400, 0, 0, false, 0, 0, 0, true}, 6000},   // 10 of 420 (2.4%): loss, already at floor
+    {{10500, 400, 0, 0, false, 0, 0, 0, true}, 6000},   // slope flat (gated): clear starts
+    {{13500, 400, 0, 0, false, 0, 0, 0, true}, 6900},   // clear 3 s: +5% of ceiling
+    {{13750, 400, 0, 0, true, 50, 0, 0}, 6900},         // slope +5 ms: not clear
+    {{14000, 400, 0, 0, false, 0, 0, 0}, 6900},         // slope unknown: clear does not start
+    {{17000, 400, 0, 0, false, 0, 0, 0}, 6900},         // still unknown 3 s later: no step up
+    {{17250, 400, 0, 0, false, 0, 0, 0, true}, 6900},   // flat: clear starts
+    {{20250, 400, 0, 0, false, 0, 0, 0, true}, 7800},   // clear 3 s
 };
 
 static void testAbrControllerGolden() {
@@ -1263,7 +1380,7 @@ static void testAbrControllerGolden() {
         CHECK(changed == (before != g.kbps));
         if (changed) CHECK(ch.fromKbps == before && ch.toKbps == g.kbps && !ch.reason.empty());
     }
-    CHECK(c.downs() == 4 && c.ups() == 3);
+    CHECK(c.downs() == 4 && c.ups() == 4);
     c.reset();
     CHECK(c.current() == 18000);
     AbrController low(4000);  // ceiling below 6 Mbps: floor = ceiling, never changes
@@ -1409,6 +1526,9 @@ int main() {
     testAbrControllerGolden();
     testReceiverReportRejectsMalformed();
     testAbrLowSampleNeverClear();
+    testAbrUnknownSlopeNeverClear();
+    testSlopeDriftBound();
+    testCaptureRestartCadence();
     runSimulation();
     runAbrSimulation();
     if (gFailures) {

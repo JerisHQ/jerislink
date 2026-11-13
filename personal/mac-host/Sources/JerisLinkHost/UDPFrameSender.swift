@@ -272,8 +272,8 @@ final class UDPFrameSender: @unchecked Sendable {
             return
         }
 
+        noteFrameCadence(frameID, nowMs: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000)
         lock.lock()
-        sendSlope.onFrame(frameID, nowMs: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000)
         maxPacketsPerFrame = max(maxPacketsPerFrame, UInt64(packetCount))
         maxFrameBytes = max(maxFrameBytes, UInt64(data.count))
         if keyFrame { keyFrames &+= 1 }
@@ -412,11 +412,31 @@ final class UDPFrameSender: @unchecked Sendable {
         if mbps > 0 { sendQueue.async { [self] in paceMbpsLive = mbps } }
     }
 
-    /// New viewer session or capture restart: old frames can no longer be asked for.
+    /// New viewer session: old frames can no longer be asked for.
     func clearRetransmitCache() {
         lock.lock()
         cache.removeAll()
         pendingRetransmit.removeAll()
+        lock.unlock()
+    }
+
+    /// Capture restart (display change): the new capture numbers frames from
+    /// 1 again. Clear the cache as for a new session, and start the
+    /// send-cadence slope again, so the first frames of the new capture are
+    /// measured instead of ignored as "old" ids (ABR v1 review P3).
+    func captureRestarted() {
+        lock.lock()
+        cache.removeAll()
+        pendingRetransmit.removeAll()
+        sendSlope.reset()
+        lock.unlock()
+    }
+
+    /// The encoder handed over frame `frameID` at `nowMs` (send() calls it;
+    /// self-tests call it with fixed times).
+    func noteFrameCadence(_ frameID: UInt64, nowMs: Double) {
+        lock.lock()
+        sendSlope.onFrame(frameID, nowMs: nowMs)
         lock.unlock()
     }
 

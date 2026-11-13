@@ -147,6 +147,18 @@ enum RetransmitSelfTest {
             sender.clearRetransmitCache()
             check(sender.retransmit(frameID: 42, ranges: [.wholeFrame]) == .miss, "loopback \(mode): cleared cache is a miss")
             check(sender.statsLine().contains("nack_rx=3 nack_packets_resent=2"), "loopback \(mode): stats count NACKs")
+            // Review P3: a capture restart numbers frames from 1 again. The
+            // send-cadence slope starts over instead of ignoring ids 1..13 as
+            // "old" (frame 100 -> 1 left the first 12 frames without samples).
+            let T = 1000.0 / 60
+            for f in 1...100 { sender.noteFrameCadence(UInt64(1000 + f), nowMs: Double(f) * T) }
+            _ = sender.abrWindow()
+            sender.captureRestarted()
+            for f in 1...13 { sender.noteFrameCadence(UInt64(f), nowMs: 5000 + Double(f) * T) }
+            let w = sender.abrWindow().sendSlope
+            check(w.valid && w.samples == 12 && abs(w.slopeMs) < 1e-6
+                  && sender.retransmit(frameID: 42, ranges: [.wholeFrame]) == .miss,
+                  "loopback \(mode): capture restart resets the send cadence and the cache")
         }
 
         // MouseMoveUDPServer: 0x41 reaches the handler, 0x43 is echoed as 0x44.
