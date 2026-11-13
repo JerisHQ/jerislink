@@ -535,6 +535,119 @@ static void testLockTimeoutOverflow(const std::string& d) {
            "pending over its cap: note reports the drops, newest 3 chunks kept in order");
 }
 
+static std::string legacyLines(size_t atLeast, int* last) {
+    std::string big;
+    int n = 0;
+    while (big.size() < atLeast) big += lineN(n++) + "\n";
+    if (last) *last = n - 1;
+    return big;
+}
+
+// CreateMutex fails: no lock, so no truncate, no trim, no rotate, no write.
+static void testMutexCreateFails(const std::string& d) {
+    const std::string s = d + "nomutex-session.log", h = d + "nomutex-history.log";
+    const uint64_t cap = 4096;
+    writeAll(s, "previous run\n");
+    const std::string big = legacyLines(10000, nullptr);
+    writeAll(h, big);
+    DeleteFileA((h + ".old").c_str());
+    jl::LogFile ws, wh;
+    ws.configure(s, 1 << 20, false, true);
+    wh.configure(h, cap, true, false);
+    ws.setMutexCreateFailsForTest(true);
+    wh.setMutexCreateFailsForTest(true);
+    const bool opened = ws.open() || wh.open();
+    const bool wrote = ws.write("new line" + EOL) || wh.write("new line" + EOL);
+    expect(!opened && !wrote, "no mutex: open() and write() report the lock as not taken");
+    expect(readShared(s) == "previous run\n", "no mutex: session log not truncated");
+    expect(readShared(h) == big && !exists(h + ".old"), "no mutex: history not trimmed, rotated or written");
+    expect(ws.pendingBytes() == 10 && wh.pendingBytes() == 10, "no mutex: the line stays pending");
+    expect(ws.lockFailures() == 2 && wh.lockFailures() == 2, "no mutex: each failed try is counted");
+    ws.setMutexCreateFailsForTest(false);
+    wh.setMutexCreateFailsForTest(false);
+    expect(ws.flushPending() && wh.flushPending(), "mutex available: pending data written");
+    ws.close();
+    wh.close();
+    const std::string note = "log.lock_timeout failures=2 dropped_chunks=0 dropped_bytes=0" + EOL;
+    expect(readAll(s) == note + "new line" + EOL, "mutex available: session truncated first, then note and line");
+    expect(readAll(h) == "log.history_trimmed old_bytes=" + std::to_string(big.size()) + EOL + note + "new line" + EOL &&
+               sizeOf(h + ".old") <= cap,
+           "mutex available: legacy trim first, then note and line");
+}
+
+// Oversized legacy history and the start-up lock times out: the trim must
+// still run (on the first lock taken), not a whole-file rename to .old.
+static void testStartupTimeoutLegacy(const std::string& d) {
+    const std::string h = d + "startup-locked-history.log";
+    const uint64_t cap = 4096;
+    int last = 0;
+    const std::string big = legacyLines(20000, &last);
+    writeAll(h, big);
+    DeleteFileA((h + ".old").c_str());
+    jl::LogFile w;
+    w.configure(h, cap, true, false);
+    w.setLockTimeoutMs(50);
+    {
+        LockHolder holder(h);
+        const bool opened = w.open();
+        const bool wrote = w.write("after start" + EOL);
+        expect(!opened && !wrote, "start-up timeout: open() and write() report the lock as not taken");
+        expect(readShared(h) == big && !exists(h + ".old"), "start-up timeout: oversized history left alone, no .old");
+        holder.let();
+        expect(w.flushPending(), "start-up timeout: written once the lock is free");
+    }
+    w.close();
+    const std::string hist = readAll(h), old = readAll(h + ".old");
+    std::printf("  start-up timeout: legacy=%llu -> history=%llu old=%llu\n", (unsigned long long)big.size(),
+                (unsigned long long)hist.size(), (unsigned long long)old.size());
+    expect(w.legacyTrimmedFrom() == big.size(), "start-up timeout: legacy trim runs on the first lock taken later");
+    expect(old.size() <= cap && old.size() > cap - 200 &&
+               old.find(lineN(last) + "\n") == old.size() - lineN(last).size() - 1,
+           "start-up timeout: .old keeps only the newest ~cap bytes, not the whole file");
+    expect(hist == "log.history_trimmed old_bytes=" + std::to_string(big.size()) + EOL +
+                       "log.lock_timeout failures=2 dropped_chunks=0 dropped_bytes=0" + EOL + "after start" + EOL,
+           "start-up timeout: new history = trim note, lock note, deferred line");
+}
+
+// ViewerLog stops within one overall deadline while another viewer keeps
+// the history lock, with ~4 MB queued.
+static void testShutdownDeadline(const std::string& d) {
+    const std::string s = d + "shutdown-session.log", h = d + "shutdown-history.log";
+    DeleteFileA(s.c_str());
+    DeleteFileA(h.c_str());
+    DeleteFileA((h + ".old").c_str());
+    LockHolder holder(h);
+    const std::string pad(200, 'x');
+    uint64_t total = 0;
+    double ms = 0;
+    uint64_t dropped = 0, pendingAfter = 1;
+    {
+        jl::ViewerLog log;
+        log.start(s, h, 1ull << 30, 64ull << 20);
+        const int n = 20000;
+        for (int i = 0; i < n; ++i) {
+            const std::string l = "shutdown " + std::to_string(i) + " " + pad;
+            total += l.size() + 2;
+            log.line(l);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        log.stop();
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        dropped = log.historyDroppedBytes();
+        pendingAfter = log.historyPendingBytes();
+    }
+    holder.let();
+    const std::string sess = readAll(s);
+    std::printf("  shutdown with the history lock held: queued=%llu B, stop() took %.0f ms (budget 2000), "
+                "history dropped=%llu B\n",
+                (unsigned long long)total, ms, (unsigned long long)dropped);
+    expect(ms < 3000, "shutdown: stop() returns within the 2 s deadline (+1 s margin) while the lock is held");
+    expect(pendingAfter == 0 && dropped == total, "shutdown: finish() ran, everything left is dropped and counted");
+    expect(sizeOf(h) == 0, "shutdown: history untouched without the lock");
+    expect(sess.size() == total && sess.find("shutdown 19999 ") != std::string::npos,
+           "shutdown: the session log (lock free) still gets every line");
+}
+
 static double pct(std::vector<double> v, double p) {
     std::sort(v.begin(), v.end());
     return v[std::min(v.size() - 1, static_cast<size_t>(p * (v.size() - 1) + 0.5))];
@@ -590,6 +703,9 @@ int main(int argc, char** argv) {
     testCheckWriteGap(d);
     testLockTimeoutDefers(d);
     testLockTimeoutOverflow(d);
+    testMutexCreateFails(d);
+    testStartupTimeoutLegacy(d);
+    testShutdownDeadline(d);
     testTwoWriterProcesses(d);
     testCallerCost(d);
     std::printf("%d PASS, %d FAIL\n", gPass, gFail);

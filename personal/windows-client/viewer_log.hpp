@@ -20,11 +20,17 @@
 // cap is checked against the real file size, not against what this process
 // wrote. Only the writer thread takes the lock, never the caller.
 //
-// If the lock cannot be taken (another viewer stuck holding it), nothing is
-// changed on disk: the data stays pending and is written on the next try.
-// Pending data has its own cap; past it the oldest pending chunks are
-// dropped and counted, and a "log.lock_timeout" line reports them once the
-// lock is taken again.
+// If the lock cannot be taken (another viewer stuck holding it, or the
+// mutex could not be created), nothing is changed on disk: the data stays
+// pending and is written on the next try. That includes the start-up work
+// (session truncate, trim of an oversized legacy history): it runs on the
+// first lock this writer gets, before anything else is written. Pending
+// data has its own cap; past it the oldest pending chunks are dropped and
+// counted, and a "log.lock_timeout" line reports them once the lock is
+// taken again.
+//
+// Shutdown has one overall deadline (2 s by default) for every lock wait
+// left; whatever cannot be written by then is dropped and counted.
 //
 // Lines end in CRLF, as the old std::ofstream (text mode) wrote them.
 //
@@ -33,6 +39,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -66,7 +73,8 @@ public:
         keepOld_ = keepOld;
         truncateAtOpen_ = truncateAtOpen;
         if (mutex_) CloseHandle(mutex_);
-        mutex_ = CreateMutexA(nullptr, FALSE, mutexName(path_).c_str());
+        mutex_ = nullptr;  // created on the first lock attempt
+        setupDone_ = false;
     }
 
     // Test only: false restores the per-process size count without a lock
@@ -74,13 +82,23 @@ public:
     // coordination fixes.
     void setCoordinated(bool on) { coordinated_ = on; }
 
+    // Start-up work (truncate the session, trim an oversized legacy
+    // history, open the handle) under the lock. Returns false if the lock
+    // was not taken: then the file is not touched (not even created) and
+    // the work runs on the first lock taken later, before any data.
     bool open() {
-        if (!coordinated_) return openUnlocked(true);
-        CapLock lk(mutex_, lockTimeoutMs_);
-        if (!lk.held()) ++lockFailures_;
-        // Without the lock, open without changing the file: no truncate at
-        // start and no legacy trim (that runs on a later start).
-        return openUnlocked(lk.held());
+        setupDone_ = false;
+        if (!coordinated_) {
+            setupLocked();
+            return h_ != INVALID_HANDLE_VALUE;
+        }
+        CapLock lk(lockMutex(), lockTimeoutMs_, deadlineMs_.load());
+        if (!lk.held()) {
+            ++lockFailures_;
+            return false;
+        }
+        setupLocked();
+        return h_ != INVALID_HANDLE_VALUE;
     }
 
     // Queues data and writes everything pending to the file under the lock.
@@ -94,6 +112,7 @@ public:
     bool flushPending() {
         if (pending_.empty()) return true;
         if (!coordinated_) {
+            if (!setupDone_) setupLocked();
             for (const auto& c : pending_) {
                 if (h_ == INVALID_HANDLE_VALUE) break;
                 if (size_ > 0 && size_ + c.size() > cap_) capReached();
@@ -102,12 +121,15 @@ public:
             clearPending();
             return true;
         }
-        CapLock lk(mutex_, lockTimeoutMs_);
+        CapLock lk(lockMutex(), lockTimeoutMs_, deadlineMs_.load());
         if (!lk.held()) {
             ++lockFailures_;
             return false;
         }
-        syncWithPath();
+        if (!setupDone_)
+            setupLocked();  // first lock this writer got: start-up work first
+        else
+            syncWithPath();
         if (lockFailures_ != reportedFailures_ || droppedChunks_ != reportedDroppedChunks_) {
             writeLocked("log.lock_timeout failures=" + std::to_string(lockFailures_ - reportedFailures_) +
                         " dropped_chunks=" + std::to_string(droppedChunks_ - reportedDroppedChunks_) +
@@ -137,8 +159,17 @@ public:
         h_ = INVALID_HANDLE_VALUE;
     }
 
+    // Every lock wait from now on ends by this time (steady clock), whatever
+    // the per-try timeout. Set from another thread by ViewerLog::stop().
+    void setDeadline(std::chrono::steady_clock::time_point t) {
+        deadlineMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count());
+    }
+
     // Test knobs.
     void setLockTimeoutMs(DWORD ms) { lockTimeoutMs_ = ms; }
+    // Makes CreateMutex "fail" (no mutex), as when the name cannot be
+    // created.
+    void setMutexCreateFailsForTest(bool on) { mutexCreateFails_ = on; }
     void setPendingCap(uint64_t bytes) { pendingCap_ = bytes; }
     // Called on the writer thread with "checked" (cap checked, any rotation
     // done, about to write) and "written"; in coordinated mode both run
@@ -177,44 +208,68 @@ public:
     }
 
 private:
-    // Holds the per-path mutex. held() is false if the wait timed out or
-    // failed: the caller must then leave the files alone. No mutex at all
-    // (CreateMutex failed) counts as held: there is nothing to coordinate on.
+    static int64_t nowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    // Holds the per-path mutex. held() is false if there is no mutex
+    // (CreateMutex failed), or the wait timed out, failed or ran into the
+    // deadline: the caller must then leave the files alone. The wait runs
+    // in short slices so a deadline set while waiting is noticed.
     class CapLock {
     public:
-        CapLock(HANDLE m, DWORD timeoutMs) : m_(m) {
-            if (!m_) return;
-            const DWORD r = WaitForSingleObject(m_, timeoutMs);
-            if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
-                m_ = nullptr;
-                held_ = false;
+        CapLock(HANDLE m, DWORD timeoutMs, int64_t deadlineMs) {
+            if (!m) return;
+            const int64_t end = nowMs() + timeoutMs;
+            for (;;) {
+                const int64_t now = nowMs();
+                const int64_t left = (end < deadlineMs ? end : deadlineMs) - now;
+                const DWORD slice = left <= 0 ? 0 : static_cast<DWORD>(left < 50 ? left : 50);
+                const DWORD r = WaitForSingleObject(m, slice);
+                if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
+                    m_ = m;
+                    return;
+                }
+                if (r != WAIT_TIMEOUT || left <= static_cast<int64_t>(slice)) return;
             }
         }
         ~CapLock() {
             if (m_) ReleaseMutex(m_);
         }
-        bool held() const { return held_; }
+        bool held() const { return m_ != nullptr; }
         CapLock(const CapLock&) = delete;
         CapLock& operator=(const CapLock&) = delete;
 
     private:
-        HANDLE m_;
-        bool held_ = true;
+        HANDLE m_ = nullptr;
     };
 
-    bool openUnlocked(bool mayChange) {
-        if (truncateAtOpen_ && mayChange) {
+    // The per-path mutex, created on first use; retried on every attempt
+    // if creating it failed.
+    HANDLE lockMutex() {
+        if (!mutex_ && !mutexCreateFails_) mutex_ = CreateMutexA(nullptr, FALSE, mutexName(path_).c_str());
+        return mutexCreateFails_ ? nullptr : mutex_;
+    }
+
+    // Lock held (or uncoordinated test mode): the start-up work.
+    void setupLocked() {
+        setupDone_ = true;
+        close();
+        if (truncateAtOpen_) {
             h_ = openHandle(CREATE_ALWAYS);
             size_ = 0;
-            return h_ != INVALID_HANDLE_VALUE;
+            return;
         }
-        if (keepOld_ && mayChange) {
+        if (keepOld_) {
             const uint64_t existing = fileSize(path_);
             if (existing >= cap_) rotateLegacy(existing);
         }
         h_ = openHandle(OPEN_ALWAYS);
         size_ = h_ != INVALID_HANDLE_VALUE ? fileSize(h_) : 0;
-        return h_ != INVALID_HANDLE_VALUE;
+        if (legacyTrimmedFrom_)
+            writeLocked("log.history_trimmed old_bytes=" + std::to_string(legacyTrimmedFrom_) + kLogEol);
     }
 
     void defer(const std::string& data) {
@@ -366,9 +421,12 @@ private:
     bool keepOld_ = false;
     bool truncateAtOpen_ = false;
     bool coordinated_ = true;
+    bool setupDone_ = false;
+    bool mutexCreateFails_ = false;
     HANDLE h_ = INVALID_HANDLE_VALUE;
     HANDLE mutex_ = nullptr;
     DWORD lockTimeoutMs_ = 2000;
+    std::atomic<int64_t> deadlineMs_{INT64_MAX};
     uint64_t size_ = 0;
     uint64_t rotations_ = 0;
     uint64_t reopens_ = 0;
@@ -414,13 +472,19 @@ public:
         cv_.notify_one();
     }
 
-    // Writes everything queued so far, then stops the thread.
+    // Writes everything queued so far, then stops the thread. All lock
+    // waits left share one deadline (shutdownBudgetMs from now); what a
+    // locked file cannot take by then is dropped and counted, so stop()
+    // returns in about that time even if another viewer holds a lock.
     void stop() {
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (!running_) return;
             stopping_ = true;
         }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(shutdownBudgetMs_);
+        session_.setDeadline(deadline);
+        history_.setDeadline(deadline);
         cv_.notify_one();
         if (thread_.joinable()) thread_.join();
         std::lock_guard<std::mutex> lk(mu_);
@@ -439,6 +503,11 @@ public:
     uint64_t historyReopens() const { return history_.reopens(); }
     uint64_t historyLockFailures() const { return history_.lockFailures(); }
     uint64_t historyDroppedChunks() const { return history_.droppedChunks(); }
+    uint64_t historyDroppedBytes() const { return history_.droppedBytes(); }
+    uint64_t historyPendingBytes() const { return history_.pendingBytes(); }
+
+    // Total time stop() may spend waiting for locks. Call before stop().
+    void setShutdownBudgetMs(DWORD ms) { shutdownBudgetMs_ = ms; }
     uint64_t sessionTruncations() const { return session_.rotations(); }
     uint64_t legacyTrimmedFrom() const { return history_.legacyTrimmedFrom(); }
 
@@ -449,12 +518,7 @@ private:
     void run() {
         session_.open();
         history_.open();
-        if (history_.legacyTrimmedFrom()) {
-            const std::string note = "log.history_trimmed old_bytes=" +
-                                     std::to_string(history_.legacyTrimmedFrom()) + kLogEol;
-            session_.write(note);
-            history_.write(note);
-        }
+        noteTrimInSession();
         std::deque<std::string> batch;
         for (;;) {
             {
@@ -489,6 +553,7 @@ private:
                 session_.flushPending();
                 history_.flushPending();
             }
+            noteTrimInSession();
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 written_ += batch.size();
@@ -503,6 +568,17 @@ private:
         drained_.notify_all();
     }
 
+    // The history writes its own trim note when the trim runs (at start, or
+    // on its first lock if the start-up lock timed out); the session log
+    // records it too, once.
+    void noteTrimInSession() {
+        if (trimNoted_ || !history_.legacyTrimmedFrom()) return;
+        trimNoted_ = true;
+        session_.write("log.history_trimmed old_bytes=" + std::to_string(history_.legacyTrimmedFrom()) + kLogEol);
+    }
+
+    bool trimNoted_ = false;
+    DWORD shutdownBudgetMs_ = 2000;
     std::mutex mu_;
     std::condition_variable cv_;
     std::condition_variable drained_;
