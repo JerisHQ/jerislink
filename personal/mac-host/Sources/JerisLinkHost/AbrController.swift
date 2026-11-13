@@ -17,7 +17,9 @@ struct ReceiverReport: Equatable {
     var slope01Ms: Int16 = 0
     var rttMs: UInt16 = 0
 
-    /// Parses the bytes after the 10-byte MRM1 header check. nil when short.
+    /// Parses the bytes after the 10-byte MRM1 header check. nil when short or
+    /// inconsistent: window_ms 0, or not lost_after_nack <= lost_raw <= expected
+    /// (the viewer's counters always satisfy that).
     static func parse(_ b: [UInt8]) -> ReceiverReport? {
         guard b.count >= minBytes else { return nil }
         func u16(_ i: Int) -> UInt16 { UInt16(b[i]) << 8 | UInt16(b[i + 1]) }
@@ -30,6 +32,7 @@ struct ReceiverReport: Equatable {
         r.lostAfterNack = u32(21)
         r.slope01Ms = Int16(bitPattern: u16(25))
         r.rttMs = u16(27)
+        guard r.windowMs > 0, r.lostAfterNack <= r.lostRaw, r.lostRaw <= r.expected else { return nil }
         return r
     }
 }
@@ -60,7 +63,10 @@ struct AbrChange: Equatable {
 ///   (at most one step down per 500 ms, never below the floor)
 ///   clear:     loss after NACK < 0.5%, slope <= 1 ms, no over budget; after
 ///              3 s clear, +5% of the ceiling per 1 s up to the ceiling.
-/// Loss counts only with at least 30 expected packets in the report.
+/// Loss is judged on at least 30 expected packets: smaller reports are summed
+/// until they reach 30. Until then loss is unknown: such a report can still
+/// step down for delay, queue or NACK budget, but never counts as clear (the
+/// clear timer is kept as it is and there is no step up).
 struct AbrController {
     let ceilingKbps: Int
     private(set) var currentKbps: Int
@@ -72,6 +78,9 @@ struct AbrController {
     private var lastDownMs: UInt64?
     private var lastUpMs: UInt64?
     private var clearSinceMs: UInt64?
+    private var accExpected: UInt64 = 0
+    private var accRaw: UInt64 = 0
+    private var accAfter: UInt64 = 0
 
     init(ceilingKbps: Int) {
         self.ceilingKbps = max(1, ceilingKbps)
@@ -84,12 +93,17 @@ struct AbrController {
         currentKbps = ceilingKbps
         slopeStreak = 0; budgetStreak = 0; queueStreak = 0
         lastDownMs = nil; lastUpMs = nil; clearSinceMs = nil
+        accExpected = 0; accRaw = 0; accAfter = 0
     }
 
     mutating func onReport(_ i: AbrInput) -> AbrChange? {
-        let lossKnown = i.expected >= 30
-        let afterBp = lossKnown ? UInt64(i.lostAfterNack) * 10000 / UInt64(i.expected) : 0
-        let rawBp = lossKnown ? UInt64(i.lostRaw) * 10000 / UInt64(i.expected) : 0
+        accExpected &+= UInt64(i.expected)
+        accRaw &+= UInt64(i.lostRaw)
+        accAfter &+= UInt64(i.lostAfterNack)
+        let lossKnown = accExpected >= 30
+        let afterBp = lossKnown ? accAfter * 10000 / accExpected : 0
+        let rawBp = lossKnown ? accRaw * 10000 / accExpected : 0
+        if lossKnown { accExpected = 0; accRaw = 0; accAfter = 0 }
         slopeStreak = (i.slopeValid && i.slope01Ms > 40) ? slopeStreak + 1 : 0
         budgetStreak = i.overBudgetDelta > 0 ? budgetStreak + 1 : 0
         // One IDR alone queues about 3 frames at the pacer (250 packets at
@@ -117,6 +131,7 @@ struct AbrController {
         }
         let clear = afterBp < 50 && !(i.slopeValid && i.slope01Ms > 10) && i.overBudgetDelta == 0
         guard clear else { clearSinceMs = nil; return nil }
+        guard lossKnown else { return nil }  // loss unknown: not clear, timer kept
         if clearSinceMs == nil { clearSinceMs = i.nowMs }
         guard currentKbps < ceilingKbps, let since = clearSinceMs, i.nowMs &- since >= 3000 else { return nil }
         if let last = lastUpMs, i.nowMs &- last < 1000 { return nil }

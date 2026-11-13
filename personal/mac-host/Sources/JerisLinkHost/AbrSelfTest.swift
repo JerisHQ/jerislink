@@ -30,7 +30,9 @@ enum AbrSelfTest {
             (input(6750, 400, 0, 0, true, 0, 1, 0), 6000),
             (input(7000, 400, 24, 0, true, 0, 0, 0), 6000),
             (input(7250, 20, 10, 10, false, 0, 0, 0), 6000),
-            (input(10250, 400, 0, 0, false, 0, 0, 0), 6900),
+            (input(10250, 400, 0, 0, false, 0, 0, 0), 6000),
+            (input(10500, 400, 0, 0, false, 0, 0, 0), 6000),
+            (input(13500, 400, 0, 0, false, 0, 0, 0), 6900),
         ]
         var c = AbrController(ceilingKbps: 18000)
         expect(c.currentKbps == 18000 && c.floorKbps == 6000, "abr: starts at the ceiling, floor 6 Mbps")
@@ -54,6 +56,37 @@ enum AbrSelfTest {
         expect(low.onReport(input(500, 400, 100, 100, true, 0, 0, 0)) == nil && low.currentKbps == 4000,
                "abr: ceiling below 6 Mbps never steps down")
 
+        // Loss unknown (under 30 expected in total) is never "clear".
+        func toFloor(_ c: inout AbrController) {
+            _ = c.onReport(input(250, 400, 100, 100, true, 0, 0, 0))
+            _ = c.onReport(input(750, 400, 100, 100, true, 0, 0, 0))
+        }
+        var lowLoss = AbrController(ceilingKbps: 18000)
+        toFloor(&lowLoss)
+        var held = lowLoss.currentKbps == 6000
+        for t in stride(from: UInt64(1000), through: 11000, by: 250) {
+            _ = lowLoss.onReport(input(t, 20, 10, 10, false, 0, 0, 0))
+            held = held && lowLoss.currentKbps == 6000
+        }
+        expect(held && lowLoss.ups == 0, "abr: low traffic with 50% loss never steps up")
+        var lowHeavy = AbrController(ceilingKbps: 18000)
+        let first = lowHeavy.onReport(input(250, 20, 10, 10, false, 0, 0, 0))
+        let second = lowHeavy.onReport(input(500, 20, 10, 10, false, 0, 0, 0))
+        expect(first == nil && second == AbrChange(fromKbps: 18000, toKbps: 9000, reason: "heavy_loss"),
+               "abr: small reports are summed to 30 expected, then judged")
+        var idle = AbrController(ceilingKbps: 18000)
+        toFloor(&idle)
+        var idleHeld = idle.currentKbps == 6000
+        for t in stride(from: UInt64(1000), through: 11000, by: 250) {
+            _ = idle.onReport(input(t, 0, 0, 0, false, 0, 0, 0))
+            idleHeld = idleHeld && idle.currentKbps == 6000
+        }
+        expect(idleHeld && idle.ups == 0, "abr: zero-sample reports never step up")
+        let c1 = idle.onReport(input(12000, 400, 0, 0, true, 0, 0, 0))
+        let c2 = idle.onReport(input(13500, 0, 0, 0, false, 0, 0, 0))
+        let c3 = idle.onReport(input(15000, 400, 0, 0, true, 0, 0, 0))
+        expect(c1 == nil && c2 == nil && c3?.toKbps == 6900, "abr: zero-sample reports keep a clear period")
+
         // 0x42 parse: same bytes as testReceiverReportEncoding in C++.
         let bytes: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x42, 0x0A, 0x0B, 0x0C, 0x0D, 0x01, 0x00, 0xFA,
                               0x01, 0x02, 0x03, 0x04, 0, 0, 0, 7, 0, 0, 0, 2, 0xFF, 0x85, 0x00, 61]
@@ -63,6 +96,20 @@ enum AbrSelfTest {
         expect(ReceiverReport.parse(bytes) == want, "report: parses the C++ encoding")
         expect(ReceiverReport.parse(bytes + [9, 9]) == want, "report: trailing bytes ignored")
         expect(ReceiverReport.parse(Array(bytes.dropLast())) == nil, "report: short packet rejected")
+        func report(_ window: UInt16, _ expected: UInt32, _ raw: UInt32, _ after: UInt32) -> [UInt8] {
+            var b: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x42, 0, 0, 0, 1, 0]
+            b += [UInt8(window >> 8), UInt8(window & 0xff)]
+            for v in [expected, raw, after] { b += [UInt8(v >> 24), UInt8((v >> 16) & 0xff), UInt8((v >> 8) & 0xff), UInt8(v & 0xff)] }
+            b += [0, 0, 0, 0]
+            return b
+        }
+        expect(ReceiverReport.parse(report(250, 30, 3, 3)) != nil && ReceiverReport.parse(report(250, 30, 30, 0)) != nil
+               && ReceiverReport.parse(report(250, 0, 0, 0)) != nil, "report: consistent counts accepted")
+        expect(ReceiverReport.parse(report(0, 30, 0, 0)) == nil, "report: window 0 rejected")
+        expect(ReceiverReport.parse(report(0, 30, 0, UInt32.max)) == nil
+               && ReceiverReport.parse(report(250, 30, 0, UInt32.max)) == nil
+               && ReceiverReport.parse(report(250, 30, 2, 3)) == nil, "report: after > raw rejected")
+        expect(ReceiverReport.parse(report(250, 30, 31, 0)) == nil, "report: raw > expected rejected")
 
         // AbrHost: off ignores reports, on counts over-budget as a delta.
         let off = AbrHost(enabled: false, ceilingMbps: 18)

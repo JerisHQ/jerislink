@@ -50,6 +50,26 @@ inline std::vector<uint8_t> encodeReceiverReport(uint32_t seq, const ReceiverRep
     return p;
 }
 
+// Host-side decode with the same checks as the Swift ReceiverReport.parse:
+// false when short, window_ms is 0, or not lost_after_nack <= lost_raw <=
+// expected (the viewer's counters always satisfy that).
+inline bool decodeReceiverReport(const uint8_t* b, size_t n, ReceiverReport& out) {
+    if (n < kReceiverReportBytes) return false;
+    auto u16 = [&](size_t i) { return uint16_t(uint16_t(b[i]) << 8 | b[i + 1]); };
+    auto u32 = [&](size_t i) { return uint32_t(u16(i)) << 16 | u16(i + 2); };
+    ReceiverReport r;
+    r.slopeValid = (b[10] & 0x01) != 0;
+    r.windowMs = u16(11);
+    r.expected = u32(13);
+    r.lostRaw = u32(17);
+    r.lostAfterNack = u32(21);
+    r.slope01Ms = int16_t(u16(25));
+    r.rttMs = u16(27);
+    if (r.windowMs == 0 || r.lostAfterNack > r.lostRaw || r.lostRaw > r.expected) return false;
+    out = r;
+    return true;
+}
+
 inline int16_t abrSlopeTo01Ms(double ms) {
     const double v = std::clamp(ms * 10.0, -32767.0, 32767.0);
     return int16_t(v < 0 ? v - 0.5 : v + 0.5);
@@ -125,6 +145,7 @@ public:
         current_ = ceiling_;
         slopeStreak_ = budgetStreak_ = queueStreak_ = 0;
         haveDown_ = haveUp_ = haveClear_ = false;
+        accExpected_ = accRaw_ = accAfter_ = 0;
     }
     uint32_t current() const { return current_; }
     uint32_t ceiling() const { return ceiling_; }
@@ -134,9 +155,15 @@ public:
 
     // Returns true and fills `out` when the bitrate changes.
     bool onReport(const AbrInput& in, AbrChange& out) {
-        const bool lossKnown = in.expected >= 30;
-        const uint64_t afterBp = lossKnown ? uint64_t(in.lostAfterNack) * 10000 / in.expected : 0;
-        const uint64_t rawBp = lossKnown ? uint64_t(in.lostRaw) * 10000 / in.expected : 0;
+        // Loss is judged on at least 30 expected packets; smaller reports are
+        // summed until then. Unknown loss never counts as clear.
+        accExpected_ += in.expected;
+        accRaw_ += in.lostRaw;
+        accAfter_ += in.lostAfterNack;
+        const bool lossKnown = accExpected_ >= 30;
+        const uint64_t afterBp = lossKnown ? accAfter_ * 10000 / accExpected_ : 0;
+        const uint64_t rawBp = lossKnown ? accRaw_ * 10000 / accExpected_ : 0;
+        if (lossKnown) accExpected_ = accRaw_ = accAfter_ = 0;
         slopeStreak_ = (in.slopeValid && in.slope01Ms > 40) ? slopeStreak_ + 1 : 0;
         budgetStreak_ = in.overBudgetDelta > 0 ? budgetStreak_ + 1 : 0;
         // One IDR alone queues about 3 frames at the pacer (250 packets at
@@ -166,6 +193,7 @@ public:
         }
         const bool clear = afterBp < 50 && !(in.slopeValid && in.slope01Ms > 10) && in.overBudgetDelta == 0;
         if (!clear) { haveClear_ = false; return false; }
+        if (!lossKnown) return false;  // loss unknown: not clear, timer kept
         if (!haveClear_) { haveClear_ = true; clearSinceMs_ = in.nowMs; }
         if (current_ >= ceiling_ || in.nowMs - clearSinceMs_ < 3000) return false;
         if (haveUp_ && in.nowMs - lastUpMs_ < 1000) return false;
@@ -184,6 +212,7 @@ private:
     int slopeStreak_ = 0, budgetStreak_ = 0, queueStreak_ = 0;
     bool haveDown_ = false, haveUp_ = false, haveClear_ = false;
     uint64_t lastDownMs_ = 0, lastUpMs_ = 0, clearSinceMs_ = 0;
+    uint64_t accExpected_ = 0, accRaw_ = 0, accAfter_ = 0;
     uint64_t downs_ = 0, ups_ = 0;
 };
 

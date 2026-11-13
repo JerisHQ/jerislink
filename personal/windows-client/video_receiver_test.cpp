@@ -853,17 +853,21 @@ private:
     // Viewer, every 250 ms: loss deltas (finalized frames) and the slope.
     void viewerReport() {
         const auto& st = rx_->stats();
-        ReceiverReport rep;
-        rep.windowMs = uint16_t(kReceiverReportIntervalMs);
-        rep.expected = uint32_t(st.lossExpected - prevExp_);
-        rep.lostRaw = uint32_t(st.lossRaw - prevRaw_);
-        rep.lostAfterNack = uint32_t(st.lossAfterNack - prevAfter_);
+        ReceiverReport sent;
+        sent.windowMs = uint16_t(kReceiverReportIntervalMs);
+        sent.expected = uint32_t(st.lossExpected - prevExp_);
+        sent.lostRaw = uint32_t(st.lossRaw - prevRaw_);
+        sent.lostAfterNack = uint32_t(st.lossAfterNack - prevAfter_);
         prevExp_ = st.lossExpected; prevRaw_ = st.lossRaw; prevAfter_ = st.lossAfterNack;
         const auto w = slope_.take();
-        rep.slopeValid = w.valid;
-        rep.slope01Ms = abrSlopeTo01Ms(w.slopeMs);
-        rep.rttMs = uint16_t(2 * c_.oneWayMs);
-        CHECK(encodeReceiverReport(++seq_, rep).size() == kReceiverReportBytes);
+        sent.slopeValid = w.valid;
+        sent.slope01Ms = abrSlopeTo01Ms(w.slopeMs);
+        sent.rttMs = uint16_t(2 * c_.oneWayMs);
+        // Round trip through the wire format: the host decode must accept
+        // every report a real viewer sends.
+        const auto wire = encodeReceiverReport(++seq_, sent);
+        ReceiverReport rep;
+        CHECK(wire.size() == kReceiverReportBytes && decodeReceiverReport(wire.data(), wire.size(), rep));
         sendUp([this, rep] { hostReport(rep); });
     }
 
@@ -997,6 +1001,70 @@ static void testReceiverReportEncoding() {
     CHECK(abrSlopeTo01Ms(1.26) == 13);
     CHECK(abrSlopeTo01Ms(-1.26) == -13);
     CHECK(abrSlopeTo01Ms(1e9) == 32767);
+    ReceiverReport d;
+    CHECK(decodeReceiverReport(p.data(), p.size(), d) && d.windowMs == 250 && d.expected == 0x01020304 &&
+          d.lostRaw == 7 && d.lostAfterNack == 2 && d.slope01Ms == -123 && d.rttMs == 61 && d.slopeValid);
+}
+
+// Malformed 0x42 reports are rejected (same cases as the Swift self-test).
+static void testReceiverReportRejectsMalformed() {
+    auto bytes = [](uint16_t window, uint32_t expected, uint32_t raw, uint32_t after) {
+        ReceiverReport r;
+        r.windowMs = window;
+        r.expected = expected;
+        r.lostRaw = raw;
+        r.lostAfterNack = after;
+        return encodeReceiverReport(1, r);
+    };
+    ReceiverReport d;
+    auto ok = [&](const std::vector<uint8_t>& p) { return decodeReceiverReport(p.data(), p.size(), d); };
+    CHECK(ok(bytes(250, 30, 3, 3)));                    // after == raw: fine
+    CHECK(ok(bytes(250, 30, 30, 0)));                   // raw == expected, all repaired: fine
+    CHECK(ok(bytes(250, 0, 0, 0)));                     // nothing sent this window: fine
+    CHECK(!ok(bytes(0, 30, 0, 0)));                     // window 0
+    CHECK(!ok(bytes(0, 30, 0, 0xFFFFFFFFu)));           // Pepper's report
+    CHECK(!ok(bytes(250, 30, 0, 0xFFFFFFFFu)));         // after > raw
+    CHECK(!ok(bytes(250, 30, 2, 3)));                   // after > raw
+    CHECK(!ok(bytes(250, 30, 31, 0)));                  // raw > expected
+    auto good = bytes(250, 30, 3, 3);
+    CHECK(!decodeReceiverReport(good.data(), good.size() - 1, d));  // short
+}
+
+// Loss unknown (under 30 expected in total) is never "clear".
+static void testAbrLowSampleNeverClear() {
+    auto toFloor = [](AbrController& c) {
+        AbrChange ch;
+        c.onReport({250, 400, 100, 100, true, 0, 0, 0}, ch);  // 25%: x0.5 -> 9000
+        c.onReport({750, 400, 100, 100, true, 0, 0, 0}, ch);  // -> 6000
+        CHECK(c.current() == 6000);
+    };
+    // Pepper's case: 20 expected, 10 lost per report (50% loss) for 10 s.
+    AbrController a(18000);
+    toFloor(a);
+    for (uint64_t t = 1000; t <= 11000; t += 250) {
+        AbrChange ch;
+        a.onReport({t, 20, 10, 10, false, 0, 0, 0}, ch);
+        CHECK(a.current() == 6000);
+    }
+    CHECK(a.ups() == 0);
+    // 50% at low rate from the ceiling: two reports make 40 expected -> heavy.
+    AbrController h(18000);
+    AbrChange ch;
+    CHECK(!h.onReport({250, 20, 10, 10, false, 0, 0, 0}, ch) && h.current() == 18000);
+    CHECK(h.onReport({500, 20, 10, 10, false, 0, 0, 0}, ch) && h.current() == 9000 && ch.reason == "heavy_loss");
+    // Zero-sample reports (nothing sent) for 10 s: no step up.
+    AbrController z(18000);
+    toFloor(z);
+    for (uint64_t t = 1000; t <= 11000; t += 250) {
+        AbrChange c2;
+        z.onReport({t, 0, 0, 0, false, 0, 0, 0}, c2);
+        CHECK(z.current() == 6000);
+    }
+    CHECK(z.ups() == 0);
+    // They do not reset a clear period either: clear, idle, clear 3 s later -> up.
+    CHECK(!z.onReport({12000, 400, 0, 0, true, 0, 0, 0}, ch));
+    CHECK(!z.onReport({13500, 0, 0, 0, false, 0, 0, 0}, ch));
+    CHECK(z.onReport({15000, 400, 0, 0, true, 0, 0, 0}, ch) && z.current() == 6900);
 }
 
 static void testArrivalSlope() {
@@ -1053,8 +1121,10 @@ static const AbrGolden kAbrGolden[] = {
     {{6500, 400, 0, 0, true, 0, 1, 0}, 7800},        // NACK over budget once: hold
     {{6750, 400, 0, 0, true, 0, 1, 0}, 6000},        // twice: heavy x0.5 -> floor
     {{7000, 400, 24, 0, true, 0, 0, 0}, 6000},       // raw 6%, within 500 ms
-    {{7250, 20, 10, 10, false, 0, 0, 0}, 6000},      // under 30 expected: loss unknown, clear
-    {{10250, 400, 0, 0, false, 0, 0, 0}, 6900},
+    {{7250, 20, 10, 10, false, 0, 0, 0}, 6000},      // under 30 expected: loss unknown, held over
+    {{10250, 400, 0, 0, false, 0, 0, 0}, 6000},      // 10 of 420 (2.4%): loss, already at floor
+    {{10500, 400, 0, 0, false, 0, 0, 0}, 6000},      // clear starts
+    {{13500, 400, 0, 0, false, 0, 0, 0}, 6900},      // clear 3 s: +5% of ceiling
 };
 
 static void testAbrControllerGolden() {
@@ -1165,6 +1235,8 @@ int main() {
     testReceiverReportEncoding();
     testArrivalSlope();
     testAbrControllerGolden();
+    testReceiverReportRejectsMalformed();
+    testAbrLowSampleNeverClear();
     runSimulation();
     runAbrSimulation();
     if (gFailures) {
