@@ -14,7 +14,7 @@ v0.0.9.5 hotfix
 
 v0.0.9.5 defaults
 ---------------
-Remote host: required; --source-ip or JERISLINK_SOURCE_IP (Mac's Tailscale IPv4)
+Remote host: saved in Settings (first start asks), or --source-ip / JERISLINK_SOURCE_IP
 Video UDP:   38402
 Control TCP: 38400
 Mouse UDP:   38412
@@ -29,7 +29,7 @@ The title bar shows the effective negotiated video mode, for example:
 JerisLink — HEVC · 18 Mbps
 
 Use the visible menu bar:
-- Settings > Video Settings...
+- Settings > Connection Settings...
 - Connection > Connection Info...
 
 Connection Info shows configured versus effective codec/bandwidth, remote
@@ -59,10 +59,26 @@ hard-coded startup resolution to match the Mac display.
 
 Startup
 -------
-Set the Mac host address once (Command Prompt):
-  setx JERISLINK_SOURCE_IP <mac-tailscale-ipv4>
-Then double-click Jerislink.exe.
-Jerislink automatically selects an active local Tailscale IPv4 address in the Tailscale CGNAT range.
+Double-click Jerislink.exe. No command line is needed.
+
+First start: a JerisLink Settings window opens. Enter the Mac host's
+Tailscale IPv4 address, pick the codec and bitrate, and press Connect.
+The settings are saved for this Windows user and used on every later start.
+
+Change settings later:
+- hold Shift while starting Jerislink.exe, or
+- in the running viewer: Settings > Connection Settings... (applies on the next start), or
+- start it once with: Jerislink.exe --settings
+
+"This PC's address" can stay empty: Jerislink then uses this PC's active
+Tailscale IPv4 address (100.64.0.0/10). Fill it in only to force one address.
+
+Saved values (HKCU\Software\Jeris\Jerislink): HostIp, BindIp, VideoCodec,
+VideoBitrateMbps. Priority per value: command line > saved setting >
+JERISLINK_SOURCE_IP (host only) / automatic Tailscale address (this PC only).
+
+Check what a start would use, without connecting:
+  Jerislink.exe --print-config %TEMP%\jerislink-config.txt
 
 Advanced command line overrides
 -------------------------------
