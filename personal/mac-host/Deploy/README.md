@@ -22,10 +22,10 @@ The app registers its agents itself with `SMAppService` (macOS 13+; the app requ
 | Agent label | Runs | Replaces |
 |---|---|---|
 | `org.jeris.jerislink.agent.input-helper` | `Contents/Helpers/JerisLink Input Helper.app/Contents/MacOS/JerisLinkInputHelper` | `input-helper-watchdog.zsh` + `org.jeris.jerislink.input-helper-watchdog` |
-| `org.jeris.jerislink.agent.control` | `JerisLinkHost --control-only --bind-ip 127.0.0.1 --control-port 38411 --control-client-ip 127.0.0.1 --control-inject` | `org.jeris.jerislink.control` |
+| `org.jeris.jerislink.agent.control` | `JerisLinkHost --service control --control-inject` | `org.jeris.jerislink.control` |
 | `org.jeris.jerislink.agent.video` | `JerisLinkHost --service video` | `video-watchdog.zsh` + `org.jeris.jerislink.video-watchdog` |
 
-`JerisLinkHost --service video` does what the video watchdog did: it reads `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `~/Library/Application Support/JerisLink/network.conf` (or the environment), waits until the bind address is up on a local interface, reads codec, bitrate, `fps` (30 or 60) and `keepDisplayAwake` from `video-settings.plist`, and runs the video host. At 60 fps it uses ScreenCaptureKit queue depth 5, at 30 fps depth 2. With `keepDisplayAwake` true it holds a display-sleep assertion while it runs. `JerisLinkHost --video-config` prints what it will use. When the control service changes codec or bitrate it restarts the video agent with `launchctl kickstart -k`.
+`JerisLinkHost --service video` does what the video watchdog did: it takes its addresses from the listen endpoint (see "Listen endpoint" below), waits until the bind address is up on this Mac, reads codec, bitrate, `fps` (30 or 60) and `keepDisplayAwake` from `video-settings.plist`, and runs the video host. At 60 fps it uses ScreenCaptureKit queue depth 5, at 30 fps depth 2. With `keepDisplayAwake` true it holds a display-sleep assertion while it runs. `JerisLinkHost --video-config` prints what it will use. When the control service changes codec or bitrate it restarts the video agent with `launchctl kickstart -k`.
 
 Host commands:
 
@@ -38,12 +38,41 @@ JerisLink.app/Contents/MacOS/JerisLinkHost --version
 
 Opening `JerisLink.app` from Finder (no arguments) does the same as `--register`, asks for Screen Recording, and shows the agent status with a button to the right System Settings page.
 
-## Ports (unchanged)
+## Listen endpoint
 
-- control endpoint 38400 (Tailscale proxy) -> localhost 38411
+Video, mouse UDP and control all use one endpoint, so the screen and the input always listen on the same interface.
+
+- `~/Library/Application Support/JerisLink/listen.plist`, when present, decides it:
+  - `mode` = `tailnet`: bind this Mac's tailnet address (the `utun` IPv4 in 100.64.0.0/10, or `bindIP` if set), allow only `clientIP` (a 100.64.0.0/10 address).
+  - `mode` = `loopback`: bind and allow 127.0.0.1 only.
+  - Any other mode (for example `lan`) is refused; the services log "not configured" and do not listen.
+- Without listen.plist, `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `network.conf` (or the environment) are used as before.
+- Interface gone, or the settings changed: both services stop within about 4 s, launchd starts them again, and they wait for the endpoint. They never fall back to another interface.
+
+```xml
+<dict>
+  <key>mode</key><string>tailnet</string>
+  <key>clientIP</key><string>100.64.0.16</string>
+</dict>
+```
+
+## Ports
+
+- control TCP 38400, bound directly on the endpoint address. Only `clientIP` is accepted; any other peer is logged (`Control reject peer=…`) and closed. No `tailscale serve` forward is used.
+- control relay localhost 38411 (`--relay-port`), for the video service's mouse relay only; accepts 127.0.0.1.
 - input helper localhost 38410
 - video UDP 38402
-- mouse/cursor-state UDP side-channel 38412
+- mouse/cursor-state UDP side-channel 38412, on the endpoint address, `clientIP` only
+
+### Moving from the `tailscale serve` setup
+
+Older builds ran control on 127.0.0.1:38411 behind `tailscale serve --tcp 38400 tcp://127.0.0.1:38411`, so every tailnet device could reach it. With this build, turn that forward off after installing, so 38400 reaches the host's own socket:
+
+```sh
+tailscale serve --tcp 38400 off
+```
+
+Until then the forward still delivers to the 38411 relay, which accepts input but refuses settings changes (unverified peer).
 
 The Windows viewer and the wire protocol are unchanged.
 

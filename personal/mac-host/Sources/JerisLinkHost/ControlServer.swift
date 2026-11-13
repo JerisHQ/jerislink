@@ -26,13 +26,26 @@ final class ControlServer: @unchecked Sendable {
     private(set) var clipboardSent: UInt64 = 0
     private(set) var clipboardReceived: UInt64 = 0
     private(set) var rejectedClients: UInt64 = 0
+    private(set) var settingsRejected: UInt64 = 0
+    /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
+    /// read for every request so a network.conf change applies at once.
+    private let settingsClientIP: () -> String?
+    /// Read PROXY headers from loopback peers (legacy `tailscale serve`
+    /// forward). Off for `--service control`, whose sockets see real peers.
+    private let acceptProxy: Bool
     private static let maxClipboardBytes = 60 * 1024
 
-    init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool) {
+    init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
+         settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
+         acceptProxy: Bool = true,
+         inputHelper: InputHelperClient? = nil) {
         self.bindIP = bindIP
+        self.inputHelper = inputHelper
+        self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
         self.port = port
         self.injectRequested = inject
+        self.settingsClientIP = settingsClientIP
     }
 
     func start() throws {
@@ -78,7 +91,9 @@ final class ControlServer: @unchecked Sendable {
             // Keep the client object even when the Helper is not reachable yet.
             // InputHelperClient reconnects lazily on send, which removes the
             // boot-order dependency where the Host had to start after the app.
-            let helper = InputHelperClient()
+            // A caller running several servers passes one shared client: the
+            // helper serves a single connection at a time.
+            let helper = inputHelper ?? InputHelperClient()
             inputHelper = helper
             helperOK = helper.ping()
         }
@@ -105,7 +120,7 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected)"
     }
 
     private func acceptLoop() {
@@ -135,7 +150,7 @@ final class ControlServer: @unchecked Sendable {
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             if let allowedClientIP, peerIP != allowedClientIP {
                 rejectedClients += 1
-                print("Control reject client \(peerIP), expected \(allowedClientIP)")
+                print("Control reject peer=\(peerIP) expected=\(allowedClientIP) on \(bindIP):\(port); connection closed")
                 Darwin.close(c)
                 continue
             }
@@ -148,7 +163,7 @@ final class ControlServer: @unchecked Sendable {
                     Darwin.close(c)
                     return
                 }
-                self.handleClient(c)
+                self.handleClient(c, tcpPeerIP: peerIP)
                 self.lock.lock()
                 self.clientFDs.remove(c)
                 self.lock.unlock()
@@ -158,9 +173,31 @@ final class ControlServer: @unchecked Sendable {
         }
     }
 
-    private func handleClient(_ fd: Int32) {
+    private func handleClient(_ fd: Int32, tcpPeerIP: String) {
+        guard var pending = recvExact(fd, count: 8) else { return }
+        var peer = ControlPeer(ip: tcpPeerIP, verified: !ControlPeer.isLoopback(tcpPeerIP))
+        // Only a local forwarder (tailscale serve --proxy-protocol) may name
+        // another address; a remote client cannot claim one.
+        if acceptProxy && ControlPeer.isLoopback(tcpPeerIP) {
+            switch ProxyProtocol.parse(first: pending, read: { self.recvExact(fd, count: $0) }) {
+            case .notProxy:
+                break
+            case .proxy(let source):
+                if let source { peer = ControlPeer(ip: source, verified: true) }
+                print("Control PROXY peer=\(source ?? "local") via=\(tcpPeerIP)")
+                guard let next = recvExact(fd, count: 8) else { return }
+                pending = next
+            case .invalid(let reason):
+                print("Control bad PROXY header (\(reason)) via=\(tcpPeerIP)")
+                return
+            }
+        }
+        var firstHeader: [UInt8]? = pending
         while true {
-            guard let header = recvExact(fd, count: 8) else { return }
+            let next: [UInt8]?
+            if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8) }
+            firstHeader = nil
+            guard let header = next else { return }
             guard header[0] == 0x4d, header[1] == 0x52, header[2] == 0x43, header[3] == 0x31, header[4] == 1 else {
                 print("Control bad header")
                 return
@@ -182,7 +219,16 @@ final class ControlServer: @unchecked Sendable {
                     _ = sendPacket(fd, type: 0x02, payload: payload)
                 }
             case 0x40: // VIDEO_CONFIG_SET v1
-                let ack = videoSettings.apply(request: payload)
+                let clientIP = settingsClientIP()
+                let ack: VideoSettingsAck
+                switch SettingsAuthority.check(peer: peer, clientIP: clientIP) {
+                case .allow:
+                    ack = videoSettings.apply(request: payload)
+                case .reject(let reason):
+                    settingsRejected += 1
+                    print("Video config reject peer=\(peer.ip) verified=\(peer.verified) expected=\(clientIP ?? "unset") reason=\(reason); settings unchanged")
+                    ack = videoSettings.currentAck(ignored: true)
+                }
                 _ = sendPacket(fd, type: 0x41, payload: ack.payload)
                 print("Video config ACK status=\(ack.status) codec=\(ack.codec) bitrate_mbps=\(ack.bitrateMbps) flags=0x\(String(ack.flags, radix: 16)) remote_size=\(ack.framebufferWidth)x\(ack.framebufferHeight)")
             case 0x10: // KEY
