@@ -11,7 +11,7 @@ FONT 9, "Segoe UI"
 BEGIN
     LTEXT           "Mac host address:", -1, 14, 16, 70, 10
     EDITTEXT        IDC_HOST_IP, 90, 13, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "The Mac's Tailscale IPv4 address, e.g. 100.64.0.25.", -1, 90, 30, 150, 10
+    LTEXT           "The Mac's Tailscale IPv4 address, e.g. 100.64.0.10.", -1, 90, 30, 150, 10
     LTEXT           "This PC's address:", -1, 14, 50, 70, 10
     EDITTEXT        IDC_BIND_IP, 90, 47, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
     LTEXT           "", IDC_BIND_HINT, 90, 64, 150, 18

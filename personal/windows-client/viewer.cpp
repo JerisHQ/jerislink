@@ -677,7 +677,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                     " bitrate=" + std::to_string(bitrate));
             if (!jl::isIPv4(host)) {
                 MessageBoxW(dlg,
-                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.64.0.25.",
+                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.64.0.10.",
                     L"JerisLink Settings", MB_OK | MB_ICONWARNING);
                 SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
                 return TRUE;
