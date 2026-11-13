@@ -147,15 +147,25 @@ static void testMrm1Wake() {
         CHECK(mrm1.drain() == 1);  // the pong was there all along
     }
 
-    // Reset + drain: no spurious wake afterwards (no busy loop).
+    // Reset + drain: no busy loop. Draining two datagrams re-posts FD_READ
+    // once (data was still queued after the first recv), so the loop may
+    // wake one more time; that pass reads nothing, and then it sleeps.
     {
         UdpPair mrm1;
         LoopWait w;
         w.add(mrm1.ev, LoopWait::Mrm1);
         mrm1.send();
         mrm1.send();
+        Sleep(20);  // both datagrams queued
         CHECK(w.wait(500) == LoopWait::Mrm1);
         CHECK(mrm1.drain() == 2);
+        int extraWakes = 0;
+        while (extraWakes < 5 && w.wait(50) == LoopWait::Mrm1) {
+            ++extraWakes;
+            CHECK(mrm1.drain() == 0);
+        }
+        std::printf("mrm1: extra wakes after draining a burst of 2: %d\n", extraWakes);
+        CHECK(extraWakes <= 1);
         CHECK(w.wait(50) == LoopWait::Timeout);
     }
 
