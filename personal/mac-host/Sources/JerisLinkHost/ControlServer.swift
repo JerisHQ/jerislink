@@ -460,7 +460,6 @@ final class ControlServer: @unchecked Sendable {
         // was active, do not leak synthetic Shift into an input method.
         if capsAlphaMode, Self.currentInputSourceID() != Self.usInputSourceID {
             capsAlphaMode = false
-            print("Control CapsLock alpha mode reset after input-source change")
         }
 
         let cg = Self.macKeyCode(semantic)

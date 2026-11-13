@@ -58,11 +58,15 @@ enum LogFiles {
     static func secure(fd: Int32, maxBytes: off_t) -> Bool {
         var st = stat()
         guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return false }
+        // launchd may open the file without O_APPEND, and every writer shares
+        // that open file description. Set O_APPEND on it first, every time:
+        // then each later write goes to the current end, so a write racing
+        // the truncate below cannot land at the old offset and leave a hole.
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 && flags & O_APPEND == 0 { _ = fcntl(fd, F_SETFL, flags | O_APPEND) }
         if st.st_mode & 0o777 != 0o600 { _ = fchmod(fd, 0o600) }
         guard st.st_size > maxBytes else { return false }
         guard ftruncate(fd, 0) == 0 else { return false }
-        // launchd may open the file without O_APPEND: rewind as well.
-        _ = lseek(fd, 0, SEEK_SET)
         let note = "log emptied at \(st.st_size) bytes (cap \(maxBytes))\n"
         _ = note.withCString { Darwin.write(fd, $0, strlen($0)) }
         return true
@@ -136,10 +140,61 @@ enum LogHygieneSelfTest {
             close(fds[0]); close(fds[1])
         }
 
+        raceTest(dir: dir, expect: expect)
+
         expect(H264AnnexBWriter.discards(URL(fileURLWithPath: "/dev/null")), "log: no Annex B writer for /dev/null")
         expect(!H264AnnexBWriter.discards(big), "log: Annex B writer for a real output file")
 
         print(failures == 0 ? "LOG SELFTEST OK" : "LOG SELFTEST FAILED failures=\(failures)")
         return Int32(failures)
     }
+
+    /// The truncate races a writer that shares the open file description, as
+    /// launchd's stdout does: no O_APPEND at open, a second thread writing.
+    /// Without O_APPEND the writer's next write lands at its old offset and
+    /// leaves a zero-filled hole the size of the old file.
+    private static func raceTest(dir: URL, expect: (Bool, String) -> Void) {
+        let url = dir.appendingPathComponent("race.log")
+        let cap: off_t = 64 * 1024
+        let line = [UInt8](repeating: 0x42, count: 511) + [0x0a]
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { expect(false, "log race: open test file"); return }
+        defer { close(fd) }
+        let writerFD = dup(fd) // same open file description, like stdout/stderr
+        let state = RaceWriterState()
+        Thread.detachNewThread {
+            while !state.shouldStop {
+                _ = line.withUnsafeBytes { Darwin.write(writerFD, $0.baseAddress!, line.count) }
+                state.count()
+            }
+            close(writerFD)
+            state.finished.signal()
+        }
+        // Let the file grow past the cap with the writer running.
+        var st = stat()
+        let growDeadline = Date().addingTimeInterval(5)
+        while Date() < growDeadline, fstat(fd, &st) == 0, st.st_size <= cap * 2 { usleep(1_000) }
+        let emptied = LogFiles.secure(fd: fd, maxBytes: cap)
+        state.stop()
+        let joined = state.finished.wait(timeout: .now() + 5) == .success
+        let appendSet = fcntl(fd, F_GETFL) & O_APPEND != 0
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        let hasZero = data.contains(0)
+        expect(joined && emptied && state.writes > 0, "log race: file emptied while a second thread writes")
+        expect(appendSet, "log race: secure() sets O_APPEND on the shared description")
+        expect(data.count < Int(cap) + line.count, "log race: size \(data.count) is below the cap plus one write")
+        expect(!hasZero, "log race: no zero bytes (no sparse hole)")
+    }
+}
+
+private final class RaceWriterState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopping = false
+    private var n = 0
+    let finished = DispatchSemaphore(value: 0)
+
+    var shouldStop: Bool { lock.lock(); defer { lock.unlock() }; return stopping }
+    var writes: Int { lock.lock(); defer { lock.unlock() }; return n }
+    func stop() { lock.lock(); stopping = true; lock.unlock() }
+    func count() { lock.lock(); n += 1; lock.unlock() }
 }
