@@ -203,7 +203,10 @@ final class ControlServer: @unchecked Sendable {
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
         // are. One bool test per message, one helper message per session edge.
         // A START that did not reach the helper (helper down) is retried on
-        // the next input message; END is sent only for a started session.
+        // the next input message, and the input message that failed it is
+        // dropped: input reaches the helper only inside a session it knows.
+        // END is sent only for a started session. The relay listener has no
+        // lifecycle and forwards as before.
         let sessionID = Self.sessionIDs.next()
         var sessionStarted = false
         defer { if sessionStarted { endInputSession(sessionID) } }
@@ -221,8 +224,9 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
-            if !sessionStarted && Self.isInputMessage(type) {
+            if !sessionStarted && announceInputSessions && Self.isInputMessage(type) {
                 sessionStarted = startInputSession(sessionID)
+                if !sessionStarted { continue }
             }
 
             switch type {
