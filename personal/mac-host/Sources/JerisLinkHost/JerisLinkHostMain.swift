@@ -316,7 +316,8 @@ struct JerisLinkHostMain {
                                             pacing: UDPPacing(mbps: o.udpPaceMbps,
                                                               burstBytes: o.udpPaceBurstKB * 1024),
                                             retransmit: o.nackEnabled,
-                                            videoBitrateMbps: o.bitrateMbps)
+                                            videoBitrateMbps: o.bitrateMbps,
+                                            nominalFps: Int(o.fps))
                 if let mouseUDPPort = o.mouseUDPPort {
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
@@ -392,7 +393,7 @@ struct JerisLinkHostMain {
                         guard let nackSender else { return }
                         let window = nackSender.abrWindow()
                         if let change = abr.onReport(report, overBudgetTotal: window.overBudgetTotal,
-                                                     queueMax: window.queueMax) {
+                                                     queueMax: window.queueMax, sendSlope: window.sendSlope) {
                             applyAbr(change)
                         }
                     }
@@ -420,7 +421,10 @@ struct JerisLinkHostMain {
                 if sessionIndex > 1 {
                     // Restart after a display change: the viewer keeps the same
                     // UDP stream, so make it resync on the new size at once.
-                    nackSender?.clearRetransmitCache()
+                    // Frame ids restart at 1: reset the send-cadence slope and
+                    // the ABR jitter history with the retransmit cache.
+                    nackSender?.captureRestarted()
+                    abr.captureRestarted()
                     encoder.requestKeyframe()
                     keyframeGate.markForced()
                 }

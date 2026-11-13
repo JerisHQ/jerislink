@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -101,6 +103,10 @@ public:
         last_ = fid;
         at_ = nowMs;
     }
+    // Capture restart on the host: frame ids start again at 1, which the
+    // 120-frame rule above does not see when the old id was small. Forget
+    // the baseline and the open window.
+    void reset() { have_ = false; last_ = 0; at_ = 0; sum_ = 0; n_ = 0; }
 
     struct Window { bool valid = false; double slopeMs = 0; int samples = 0; };
     Window take() {
@@ -124,6 +130,84 @@ private:
     uint64_t skipped_ = 0;
 };
 
+// Host send-cadence compensation (host only, no wire change). The viewer
+// measures arrival gaps against the nominal 1000/fps, so a host that hands
+// frames to the sender slower than that (encode or capture bound: ~50 fps
+// with a 60 fps setting) reads as delay growing by 15 x (gap - T) per 250 ms
+// while no queue grows. The host runs the same ArrivalSlope over the times
+// the encoder hands it frames and subtracts its own slope. When the host
+// window has too few in-range gaps (e.g. a 30 fps cadence) the viewer slope
+// is left out as unknown; loss, send queue and NACK budget still apply.
+struct SlopeEstimate {
+    bool valid = false;  // slope01Ms is a measurement the controller uses
+    int slope01Ms = 0;
+    bool flat = false;   // gated: within the jitter, no sustained growth
+};
+inline SlopeEstimate compensateSlope(bool viewerValid, int viewer01Ms, const ArrivalSlope::Window& host) {
+    if (!viewerValid || !host.valid) return {};
+    return {true, viewer01Ms - int(abrSlopeTo01Ms(host.slopeMs))};
+}
+
+// Host-side delay signal for the controller: compensateSlope, then a jitter
+// gate. Over a relay (DERP) the compensated slope still moves by ~8 ms from
+// one 250 ms window to the next, twice the 4 ms delay threshold, and would
+// never stay under the 1 ms "clear" limit. The noise is the median |change|
+// between consecutive compensated slopes over the last 16 reports (4 s); a
+// slope within 2x that noise is "flat within noise": no delay step-down, and
+// it counts as clear. Each slope is the delay change over its 250 ms window,
+// so the sum of the last 16 is the delay added over ~4 s. When that sum is
+// above 30 ms the gate does not apply: the slope is reported as their mean
+// (the trend), so a queue that grows under heavy jitter is still seen.
+// A side with no measurement is unknown: neither delay nor clear. Direct
+// paths have almost no noise and behave as before. Swift: AbrController.swift
+// SlopeFilter, same rules and test vectors.
+class SlopeFilter {
+public:
+    static constexpr size_t kHistory = 16;
+    static constexpr size_t kMinDiffs = 4;
+    static constexpr int kDriftLimit01Ms = 300;  // 30 ms added over the last 16 reports
+
+    SlopeEstimate onReport(bool viewerValid, int viewer01Ms, const ArrivalSlope::Window& host) {
+        SlopeEstimate e = compensateSlope(viewerValid, viewer01Ms, host);
+        if (!e.valid) { haveLast_ = false; return e; }
+        if (haveLast_) {
+            diffs_.push_back(std::abs(e.slope01Ms - last_));
+            if (diffs_.size() > kHistory) diffs_.pop_front();
+        }
+        haveLast_ = true;
+        last_ = e.slope01Ms;
+        slopes_.push_back(e.slope01Ms);
+        if (slopes_.size() > kHistory) slopes_.pop_front();
+        const int n = noise01Ms();
+        if (n > 0 && std::abs(e.slope01Ms) <= 2 * n) {
+            if (drift01Ms() > kDriftLimit01Ms) e.slope01Ms = trend01Ms();  // sustained growth
+            else { e.valid = false; e.flat = true; }
+        }
+        return e;
+    }
+    // Delay added over the last 16 compensated slopes (0.1 ms), and their mean.
+    int drift01Ms() const {
+        int s = 0;
+        for (int v : slopes_) s += v;
+        return s;
+    }
+    int trend01Ms() const { return slopes_.empty() ? 0 : drift01Ms() / int(slopes_.size()); }
+    // Median |change| between consecutive compensated slopes (0.1 ms), 0 until 4 changes.
+    int noise01Ms() const {
+        if (diffs_.size() < kMinDiffs) return 0;
+        std::vector<int> d(diffs_.begin(), diffs_.end());
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        return d[d.size() / 2];
+    }
+    void reset() { diffs_.clear(); slopes_.clear(); haveLast_ = false; last_ = 0; }
+
+private:
+    std::deque<int> diffs_;
+    std::deque<int> slopes_;
+    bool haveLast_ = false;
+    int last_ = 0;
+};
+
 // Host controller, design 2.2 (D5 A: bitrate only). Integer kbps; the Swift
 // AbrController must give the same output for the same inputs (golden test).
 struct AbrInput {
@@ -133,6 +217,9 @@ struct AbrInput {
     int slope01Ms = 0;
     uint64_t overBudgetDelta = 0;  // host nack_over_budget since the last report
     int queueMax = 0;              // host send queue max since the last report
+    // Slope state: slopeValid = measured (slope01Ms); slopeFlat = within the
+    // relay jitter (SlopeFilter gate), counts as clear; neither = unknown.
+    bool slopeFlat = false;
 };
 
 struct AbrChange { uint32_t fromKbps = 0, toKbps = 0; std::string reason; };
@@ -146,6 +233,7 @@ public:
         slopeStreak_ = budgetStreak_ = queueStreak_ = 0;
         haveDown_ = haveUp_ = haveClear_ = false;
         accExpected_ = accRaw_ = accAfter_ = 0;
+        clearMs_ = lastReportMs_ = 0;
     }
     uint32_t current() const { return current_; }
     uint32_t ceiling() const { return ceiling_; }
@@ -155,6 +243,8 @@ public:
 
     // Returns true and fills `out` when the bitrate changes.
     bool onReport(const AbrInput& in, AbrChange& out) {
+        const uint64_t sincePrev = in.nowMs - lastReportMs_;
+        lastReportMs_ = in.nowMs;
         // Loss is judged on at least 30 expected packets; smaller reports are
         // summed until then. Unknown loss never counts as clear.
         accExpected_ += in.expected;
@@ -193,9 +283,12 @@ public:
         }
         const bool clear = afterBp < 50 && !(in.slopeValid && in.slope01Ms > 10) && in.overBudgetDelta == 0;
         if (!clear) { haveClear_ = false; return false; }
-        if (!lossKnown) return false;  // loss unknown: not clear, timer kept
-        if (!haveClear_) { haveClear_ = true; clearSinceMs_ = in.nowMs; }
-        if (current_ >= ceiling_ || in.nowMs - clearSinceMs_ < 3000) return false;
+        // Loss or slope unknown: not clear. The clear time so far is kept but
+        // does not grow; only reports with both known count towards the 3 s.
+        if (!lossKnown || !(in.slopeValid || in.slopeFlat)) return false;
+        if (!haveClear_) { haveClear_ = true; clearMs_ = 0; }
+        else clearMs_ += sincePrev;
+        if (current_ >= ceiling_ || clearMs_ < 3000) return false;
         if (haveUp_ && in.nowMs - lastUpMs_ < 1000) return false;
         const uint32_t next = std::min(ceiling_, current_ + std::max<uint32_t>(1, ceiling_ / 20));
         haveUp_ = true;
@@ -211,7 +304,7 @@ private:
     uint32_t current_ = 0;
     int slopeStreak_ = 0, budgetStreak_ = 0, queueStreak_ = 0;
     bool haveDown_ = false, haveUp_ = false, haveClear_ = false;
-    uint64_t lastDownMs_ = 0, lastUpMs_ = 0, clearSinceMs_ = 0;
+    uint64_t lastDownMs_ = 0, lastUpMs_ = 0, clearMs_ = 0, lastReportMs_ = 0;
     uint64_t accExpected_ = 0, accRaw_ = 0, accAfter_ = 0;
     uint64_t downs_ = 0, ups_ = 0;
 };

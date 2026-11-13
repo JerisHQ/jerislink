@@ -193,6 +193,8 @@ final class UDPFrameSender: @unchecked Sendable {
     private var nackOverBudget: UInt64 = 0
     // ABR window: send queue max since the last abrWindow() call (lock).
     private var abrWindowQueueMax = 0
+    // Send-cadence slope since the last abrWindow() call (lock).
+    private var sendSlope: ArrivalSlope
     private var abrPaceMbps = 0
     private var statsSuffix: (() -> String)?
 
@@ -201,7 +203,8 @@ final class UDPFrameSender: @unchecked Sendable {
     private let maxQueuedBeforeFlush = 4
 
     init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int,
-         pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20) throws {
+         pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20,
+         nominalFps: Int = 60) throws {
         guard packetBytes > headerBytes + 64 && packetBytes <= 1400 else {
             throw NSError(domain: "JerisLink.UDP", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "packetBytes must be between 85 and 1400"])
@@ -215,6 +218,7 @@ final class UDPFrameSender: @unchecked Sendable {
         self.lastRefillNanos = DispatchTime.now().uptimeNanoseconds
         self.retransmitEnabled = retransmit
         self.budget = RetransmitBudget(videoBitrateMbps: videoBitrateMbps)
+        self.sendSlope = ArrivalSlope(nominalFrameMs: 1000.0 / Double(max(1, nominalFps)))
 
         socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard socketFD >= 0 else {
@@ -268,6 +272,7 @@ final class UDPFrameSender: @unchecked Sendable {
             return
         }
 
+        noteFrameCadence(frameID, nowMs: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000)
         lock.lock()
         maxPacketsPerFrame = max(maxPacketsPerFrame, UInt64(packetCount))
         maxFrameBytes = max(maxFrameBytes, UInt64(data.count))
@@ -386,13 +391,14 @@ final class UDPFrameSender: @unchecked Sendable {
     }
 
     /// ABR input for one receiver report: the most frames queued at the pacer
-    /// since the previous call (then reset to the current depth), and the
-    /// cumulative NACK over-budget count.
-    func abrWindow() -> (queueMax: Int, overBudgetTotal: UInt64) {
+    /// since the previous call (then reset to the current depth), the
+    /// cumulative NACK over-budget count, and the send-cadence slope since
+    /// the previous call (frames as the encoder handed them over).
+    func abrWindow() -> (queueMax: Int, overBudgetTotal: UInt64, sendSlope: ArrivalSlope.Window) {
         lock.lock(); defer { lock.unlock() }
         let q = abrWindowQueueMax
         abrWindowQueueMax = queuedFrames
-        return (q, nackOverBudget)
+        return (q, nackOverBudget, sendSlope.take())
     }
 
     /// ABR changed the encoder bitrate: the NACK budget follows it, and so
@@ -406,11 +412,31 @@ final class UDPFrameSender: @unchecked Sendable {
         if mbps > 0 { sendQueue.async { [self] in paceMbpsLive = mbps } }
     }
 
-    /// New viewer session or capture restart: old frames can no longer be asked for.
+    /// New viewer session: old frames can no longer be asked for.
     func clearRetransmitCache() {
         lock.lock()
         cache.removeAll()
         pendingRetransmit.removeAll()
+        lock.unlock()
+    }
+
+    /// Capture restart (display change): the new capture numbers frames from
+    /// 1 again. Clear the cache as for a new session, and start the
+    /// send-cadence slope again, so the first frames of the new capture are
+    /// measured instead of ignored as "old" ids (ABR v1 review P3).
+    func captureRestarted() {
+        lock.lock()
+        cache.removeAll()
+        pendingRetransmit.removeAll()
+        sendSlope.reset()
+        lock.unlock()
+    }
+
+    /// The encoder handed over frame `frameID` at `nowMs` (send() calls it;
+    /// self-tests call it with fixed times).
+    func noteFrameCadence(_ frameID: UInt64, nowMs: Double) {
+        lock.lock()
+        sendSlope.onFrame(frameID, nowMs: nowMs)
         lock.unlock()
     }
 
