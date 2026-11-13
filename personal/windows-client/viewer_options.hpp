@@ -38,6 +38,7 @@ struct Options {
     std::string presentMode = "nowait";
     std::string lossRecovery = "strict";
     std::string nack = "on";  // on: use NACK when the host supports it (strict only)
+    std::string abr = "on";   // on: send MRM1 0x42 receiver reports when the host supports ABR
     int idleTimeoutMs = 8000;
     int startupTimeoutMs = 180000;
     uint32_t width = 3712;
@@ -134,6 +135,7 @@ inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
             else if (k == "--present-mode") o.presentMode = v;
             else if (k == "--loss-recovery") o.lossRecovery = v;
             else if (k == "--nack") o.nack = v;
+            else if (k == "--abr") o.abr = v;
             else if (k == "--mouse-move-transport") o.mouseMoveTransport = v;
             else if (k == "--scroll-scale") o.scrollScale = std::stod(v);
             else return invalid("unknown argument " + k);
@@ -149,6 +151,7 @@ inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
     if (o.bitrateMbps != 0 && (o.bitrateMbps < 4 || o.bitrateMbps > 100)) return invalid("bad --bitrate-mbps");
     if (o.lossRecovery != "legacy" && o.lossRecovery != "strict") return invalid("bad --loss-recovery");
     if (o.nack != "on" && o.nack != "off") return invalid("bad --nack");
+    if (o.abr != "on" && o.abr != "off") return invalid("bad --abr");
     if (o.mouseMoveTransport != "tcp" && o.mouseMoveTransport != "udp") return invalid("bad --mouse-move-transport");
     if (o.scrollScale <= 0.0 || o.scrollScale > 8.0) return invalid("bad --scroll-scale");
     if (o.widthExplicit != o.heightExplicit) return invalid("--width and --height go together");

@@ -180,6 +180,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var keyframeRequestHandler: (() -> Void)?
     private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
     private var newSessionHandler: (() -> Void)?
+    private var receiverReportHandler: ((ReceiverReport) -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
     private var cursorSequence: UInt32 = 0
@@ -199,6 +200,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var cursorUpdateDrops: UInt64 = 0
     private(set) var nackRx: UInt64 = 0
     private(set) var pingRx: UInt64 = 0
+    private(set) var receiverReportRx: UInt64 = 0
+    private(set) var receiverReportRejected: UInt64 = 0  // short or inconsistent 0x42
     private(set) var pongDrops: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16) {
@@ -277,6 +280,13 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Called on the receive queue for each MRM1 0x42 receiver report (ABR).
+    func setReceiverReportHandler(_ handler: @escaping (ReceiverReport) -> Void) {
+        lock.lock()
+        receiverReportHandler = handler
+        lock.unlock()
+    }
+
     func stop() {
         lock.lock()
         stopping = true
@@ -284,6 +294,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         fd = -1
         keyframeRequestHandler = nil
         nackHandler = nil
+        receiverReportHandler = nil
         newSessionHandler = nil
         lastPeerAddress = nil
         cursorProbePending = false
@@ -296,7 +307,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops)"
+        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected)"
     }
 
     /// Coalesce cursor-shape checks onto a separate queue. There is no periodic
@@ -488,6 +499,17 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 lock.unlock()
                 nackRx &+= 1
                 handler?(parsed.0, parsed.1)
+            case 0x42:
+                guard let report = ReceiverReport.parse(Array(buffer[0..<n])) else {
+                    badPackets &+= 1
+                    receiverReportRejected &+= 1
+                    continue
+                }
+                lock.lock()
+                let handler = receiverReportHandler
+                lock.unlock()
+                receiverReportRx &+= 1
+                handler?(report)
             case 0x43:
                 guard n == 18 else {
                     badPackets &+= 1

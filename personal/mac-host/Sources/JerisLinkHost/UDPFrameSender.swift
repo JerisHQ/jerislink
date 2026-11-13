@@ -92,7 +92,7 @@ struct RetransmitFrameCache {
 /// caller falls back to a gated keyframe.
 struct RetransmitBudget {
     static let windowNanos: UInt64 = 100_000_000
-    let bytesPerWindow: Int
+    private(set) var bytesPerWindow: Int
     private var sends: [(at: UInt64, bytes: Int)] = []
     private var head = 0
     private(set) var used = 0
@@ -100,6 +100,11 @@ struct RetransmitBudget {
     init(videoBitrateMbps: Int) {
         // bitrate/8 bytes per second, /10 per 100 ms, 20% of that.
         bytesPerWindow = max(1, videoBitrateMbps) * 1_000_000 / 8 / 10 / 5
+    }
+
+    /// ABR: the budget follows the live bitrate (same 20% per 100 ms).
+    mutating func setVideoBitrate(kbps: Int) {
+        bytesPerWindow = max(1, max(1, kbps) * 1000 / 8 / 10 / 5)
     }
 
     mutating func take(_ bytes: Int, now: UInt64) -> Bool {
@@ -156,6 +161,7 @@ final class UDPFrameSender: @unchecked Sendable {
     private var maxBytesPer1ms = 0
 
     // Token bucket, touched only on `sendQueue`.
+    private var paceMbpsLive: Int = 0
     private var tokens: Double = 0
     private var lastRefillNanos: UInt64 = 0
 
@@ -185,6 +191,10 @@ final class UDPFrameSender: @unchecked Sendable {
     private var nackBytes: UInt64 = 0
     private var nackMiss: UInt64 = 0
     private var nackOverBudget: UInt64 = 0
+    // ABR window: send queue max since the last abrWindow() call (lock).
+    private var abrWindowQueueMax = 0
+    private var abrPaceMbps = 0
+    private var statsSuffix: (() -> String)?
 
     /// A frame that would wait behind this many queued frames goes out without
     /// pacing, so a too-low rate cannot build latency without bound.
@@ -200,6 +210,7 @@ final class UDPFrameSender: @unchecked Sendable {
         var p = pacing
         if p.enabled { p.burstBytes = max(p.burstBytes, packetBytes) }
         self.pacing = p
+        self.paceMbpsLive = p.mbps
         self.tokens = Double(p.burstBytes)
         self.lastRefillNanos = DispatchTime.now().uptimeNanoseconds
         self.retransmitEnabled = retransmit
@@ -279,6 +290,7 @@ final class UDPFrameSender: @unchecked Sendable {
         if flush { queueOverflowFrames &+= 1 }
         queuedFrames += 1
         maxQueuedFrames = max(maxQueuedFrames, queuedFrames)
+        abrWindowQueueMax = max(abrWindowQueueMax, queuedFrames)
         lock.unlock()
 
         sendQueue.async { [self] in
@@ -366,6 +378,32 @@ final class UDPFrameSender: @unchecked Sendable {
             for packet in packets { _ = sendCounted(packet) }
         }
         return .sent(packets: packets.count)
+    }
+
+    /// Extra fields at the end of statsLine() (the ABR state).
+    func setStatsSuffix(_ suffix: @escaping () -> String) {
+        lock.lock(); statsSuffix = suffix; lock.unlock()
+    }
+
+    /// ABR input for one receiver report: the most frames queued at the pacer
+    /// since the previous call (then reset to the current depth), and the
+    /// cumulative NACK over-budget count.
+    func abrWindow() -> (queueMax: Int, overBudgetTotal: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        let q = abrWindowQueueMax
+        abrWindowQueueMax = queuedFrames
+        return (q, nackOverBudget)
+    }
+
+    /// ABR changed the encoder bitrate: the NACK budget follows it, and so
+    /// does the pace rate when it is automatic (UDPPacing.autoMbps).
+    func setVideoBitrate(kbps: Int, paceFollows: Bool) {
+        lock.lock()
+        budget.setVideoBitrate(kbps: kbps)
+        let mbps = paceFollows && pacing.enabled ? UDPPacing.autoMbps(bitrateMbps: max(1, (kbps + 999) / 1000)) : 0
+        if mbps > 0 { abrPaceMbps = mbps }
+        lock.unlock()
+        if mbps > 0 { sendQueue.async { [self] in paceMbpsLive = mbps } }
     }
 
     /// New viewer session or capture restart: old frames can no longer be asked for.
@@ -458,7 +496,7 @@ final class UDPFrameSender: @unchecked Sendable {
     /// until `bytes` are available. Returns the nanoseconds slept (0 = none).
     /// Sleep overshoot only adds tokens, so the next packets catch up.
     private func takeTokens(_ bytes: Int) -> UInt64 {
-        let bytesPerNano = Double(pacing.mbps) * 1_000_000 / 8 / 1_000_000_000
+        let bytesPerNano = Double(paceMbpsLive) * 1_000_000 / 8 / 1_000_000_000
         var now = DispatchTime.now().uptimeNanoseconds
         tokens = min(Double(pacing.burstBytes), tokens + Double(now &- lastRefillNanos) * bytesPerNano)
         lastRefillNanos = now
@@ -505,7 +543,7 @@ final class UDPFrameSender: @unchecked Sendable {
         // packet leaving (includes queue wait and pacing). max_kb_per_1ms: the
         // most bytes sent within any 1 ms (cumulative max).
         return "udp_frames=\(sentFrames) udp_packets=\(sentPackets) udp_bytes=\(sentBytes) udp_errors=\(sendErrors) keyframes=\(keyFrames) max_packets_per_frame=\(maxPacketsPerFrame) max_frame_bytes=\(maxFrameBytes) "
-            + "\(pacing.summary) "
+            + "\(pacing.summary)\(abrPaceMbps > 0 ? " pace_live=\(abrPaceMbps)Mbps" : "") "
             + String(format: "frame_send_avg=%.2fms frame_send_max=%.2fms ", sendAvgMS, Double(frameSendMaxNanos) / 1_000_000)
             + "pace_waits=\(paceWaits) pace_wait_total_ms=\(paceWaitNanos / 1_000_000) "
             + "send_queue_max=\(maxQueuedFrames) pace_overflow=\(queueOverflowFrames) "
@@ -513,6 +551,7 @@ final class UDPFrameSender: @unchecked Sendable {
             + "nack=\(retransmitEnabled ? "on" : "off") nack_rx=\(nackRequests) nack_packets_resent=\(nackPacketsResent) "
             + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) "
             + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
+            + (statsSuffix.map { " " + $0() } ?? "")
     }
 
     private static func posixError(_ operation: String) -> NSError {

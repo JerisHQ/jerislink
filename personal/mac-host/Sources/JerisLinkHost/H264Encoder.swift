@@ -22,6 +22,7 @@ final class H264Encoder: FrameEncoder {
     private var session: VTCompressionSession?
     private let writer: H264AnnexBWriter
     private let fps: Int32
+    private let rateTarget = EncoderRateTarget()
     private let udpSender: UDPFrameSender?
     private var frameID: UInt64 = 0
     private var encodedFrames: UInt64 = 0
@@ -169,6 +170,7 @@ final class H264Encoder: FrameEncoder {
         let forceKeyframe = forceKeyframePending
         if forceKeyframe { forceKeyframePending = false }
         keyframeRequestLock.unlock()
+        rateTarget.applyPending(to: session, fps: fps)
 
         frameID &+= 1
         let context = FrameContext(
@@ -231,8 +233,12 @@ final class H264Encoder: FrameEncoder {
         )
         let capture = " " + captureEncodeWindow.fields("cap_enc") + " " + captureEncodeSession.fields("cap_enc_all")
         captureEncodeWindow.reset()
-        if let udpSender { return base + capture + " " + udpSender.statsLine() }
+        if let udpSender { return base + capture + " " + rateTarget.statsFields + " " + udpSender.statsLine() }
         return base + capture
+    }
+
+    func setRateTarget(bitrateBps: Int, idrCapFrames: Int) {
+        rateTarget.request(bitrateBps: bitrateBps, idrCapFrames: idrCapFrames)
     }
 
     private func setProperty(_ key: CFString, _ value: CFTypeRef) throws {

@@ -25,6 +25,11 @@ struct Options {
     var udpPaceBurstKB: Int = UDPPacing.defaultBurstKB
     /// NACK retransmit (MRM1 0x41) with a 250 ms / 4 MiB / 32-frame cache.
     var nackEnabled = true
+    /// ABR v1 (MRM1 0x42 receiver reports): bitrate between 6 Mbps and
+    /// bitrateMbps. Only acts when a viewer sends reports.
+    var abrEnabled = true
+    /// The pace rate came from UDPPacing.autoMbps, so it follows the ABR bitrate.
+    var udpPaceAuto = false
     var controlPort: UInt16 = 38400
     /// `--service control`: loopback listener for the video service's mouse
     /// relay (MouseMoveUDPServer -> 127.0.0.1:38411). 0 = off.
@@ -151,6 +156,8 @@ struct Options {
                 if let parsed = Int(value), parsed > 0 { o.udpPaceBurstKB = parsed }
             case "--nack":
                 if value == "on" { o.nackEnabled = true } else if value == "off" { o.nackEnabled = false }
+            case "--abr":
+                if value == "on" { o.abrEnabled = true } else if value == "off" { o.abrEnabled = false }
             case "--control-port": o.controlPort = UInt16(value) ?? o.controlPort
             case "--mouse-udp-port": o.mouseUDPPort = UInt16(value)
             case "--relay-port": o.relayPort = UInt16(value) ?? o.relayPort
@@ -184,7 +191,8 @@ struct JerisLinkHostMain {
             let listen = ListenConfigSelfTest.run()
             let control = ControlServiceSelfTest.run()
             let nack = RetransmitSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 ? 0 : 1)
+            let abr = AbrSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -324,6 +332,9 @@ struct JerisLinkHostMain {
             }
             defer { control?.stop() }
             defer { mouseUDP?.stop() }
+            let abr = AbrHost(enabled: o.abrEnabled && sender != nil && mouseUDP != nil, ceilingMbps: o.bitrateMbps)
+            sender?.setStatsSuffix { abr.statsFields() }
+            print("ABR: \(abr.enabled ? "on ceiling=\(o.bitrateMbps)Mbps floor=\(min(6, o.bitrateMbps))Mbps idr_cap=\(AbrHost.idrCapFrames)x pace_follows=\(o.udpPaceAuto)" : "off")")
 
             let deadline = Date().addingTimeInterval(o.durationSeconds)
             let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
@@ -367,6 +378,25 @@ struct JerisLinkHostMain {
                     if keyframeGate.allow() { encoder.requestKeyframe() }
                 }
                 let nackSender = sender
+                // ABR: the encoder of this capture session starts at the current
+                // ABR bitrate (and with the IDR cap) and follows every change.
+                let applyAbr: (AbrChange) -> Void = { change in
+                    encoder.setRateTarget(bitrateBps: change.toKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
+                    nackSender?.setVideoBitrate(kbps: change.toKbps, paceFollows: o.udpPaceAuto)
+                    print("abr.\(change.toKbps < change.fromKbps ? "down" : "up") from=\(change.fromKbps)kbps to=\(change.toKbps)kbps reason=\(change.reason)")
+                    fflush(stdout)
+                }
+                if abr.enabled {
+                    encoder.setRateTarget(bitrateBps: abr.currentKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
+                    mouseUDP?.setReceiverReportHandler { report in
+                        guard let nackSender else { return }
+                        let window = nackSender.abrWindow()
+                        if let change = abr.onReport(report, overBudgetTotal: window.overBudgetTotal,
+                                                     queueMax: window.queueMax) {
+                            applyAbr(change)
+                        }
+                    }
+                }
                 mouseUDP?.setNackHandler { frameID, ranges in
                     guard let nackSender else { return }
                     switch nackSender.retransmit(frameID: frameID, ranges: ranges) {
@@ -382,6 +412,7 @@ struct JerisLinkHostMain {
                     // A viewer connected or reconnected: send it an IDR now
                     // instead of waiting up to 10 s for the periodic one.
                     print("video.viewer_new_session forcing keyframe")
+                    if let change = abr.reset() { applyAbr(change) }
                     nackSender?.clearRetransmitCache()
                     encoder.requestKeyframe()
                     keyframeGate.markForced()

@@ -48,6 +48,9 @@ struct PersistedVideoSettings: Equatable {
     /// nack: missing = on. Off makes the host drop NACKs and leave ACK flag
     /// 0x20 clear, so the viewer falls back to keyframe requests only.
     var nack = true
+    /// abr: missing = on. Off leaves ACK flag 0x40 clear, so the viewer sends
+    /// no receiver reports and the bitrate stays at bitrateMbps (as before).
+    var abr = true
 
     /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
     /// BetterDisplay 4K virtual screen stops delivering frames after the first
@@ -64,6 +67,7 @@ struct PersistedVideoSettings: Equatable {
         if let pace = Self.int(dict["udpPaceMbps"]), (0...1000).contains(pace) { udpPaceMbps = pace }
         if let burst = Self.int(dict["udpPaceBurstKB"]), (2...1024).contains(burst) { udpPaceBurstKB = burst }
         nack = Self.bool(dict["nack"]) ?? true
+        abr = Self.bool(dict["abr"]) ?? true
     }
 
     var pacing: UDPPacing {
@@ -80,7 +84,7 @@ struct PersistedVideoSettings: Equatable {
     }
 
     var summary: String {
-        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary) nack=\(nack ? "on" : "off")"
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary) nack=\(nack ? "on" : "off") abr=\(abr ? "on" : "off")"
     }
 
     private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
@@ -139,6 +143,7 @@ final class VideoSettingsController: @unchecked Sendable {
         if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
         if ignored { flags |= 0x10 }
         if nackEnabled() { flags |= 0x20 } // host retransmits on NACK
+        if abrEnabled() { flags |= 0x40 }  // host takes MRM1 0x42 receiver reports
         return VideoSettingsAck(
             status: 0,
             codec: current.codec == "hevc" ? 2 : 1,
@@ -235,6 +240,7 @@ final class VideoSettingsController: @unchecked Sendable {
             if fallback { flags |= 0x04 }
             if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
             if nackEnabled() { flags |= 0x20 }
+            if abrEnabled() { flags |= 0x40 }
 
             if changed {
                 requestVideoRestart()
@@ -263,6 +269,11 @@ final class VideoSettingsController: @unchecked Sendable {
     /// ACK flag 0x20: the video service answers MRM1 0x41 NACKs (plist `nack`).
     private func nackEnabled() -> Bool {
         PersistedVideoSettings.load(from: fileURL).nack
+    }
+
+    /// ACK flag 0x40: the video service runs ABR on MRM1 0x42 reports (plist `abr`).
+    private func abrEnabled() -> Bool {
+        PersistedVideoSettings.load(from: fileURL).abr
     }
 
     private func persist(codec: String, bitrateMbps: Int) throws {

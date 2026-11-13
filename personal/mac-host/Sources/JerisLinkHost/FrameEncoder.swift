@@ -1,6 +1,8 @@
 import CoreMedia
 import Darwin
 import CoreVideo
+import Foundation
+import VideoToolbox
 
 enum VideoCodec: String {
     case h264
@@ -13,10 +15,57 @@ protocol FrameEncoder: AnyObject {
     func requestKeyframe()
     func finish()
     func statsLine() -> String
+    /// ABR: new average bitrate, applied on the encode thread before the next
+    /// frame. idrCapFrames > 0 also sets DataRateLimits so one frame (an IDR)
+    /// is at most that many times the average frame size.
+    func setRateTarget(bitrateBps: Int, idrCapFrames: Int)
 }
 
 extension FrameEncoder {
     func requestKeyframe() {}
+    func setRateTarget(bitrateBps: Int, idrCapFrames: Int) {}
+}
+
+/// Pending ABR rate change for a VT session (set from any thread, applied on
+/// the encode thread). A failed VTSessionSetProperty is logged and counted,
+/// never fatal: the stream keeps the previous rate.
+final class EncoderRateTarget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (bps: Int, cap: Int)?
+    private var applied: UInt64 = 0
+    private var errors: UInt64 = 0
+
+    func request(bitrateBps: Int, idrCapFrames: Int) {
+        lock.lock(); pending = (bitrateBps, idrCapFrames); lock.unlock()
+    }
+
+    func applyPending(to session: VTCompressionSession, fps: Int32) {
+        lock.lock()
+        let p = pending
+        pending = nil
+        lock.unlock()
+        guard let p else { return }
+        let rateStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                                              value: p.bps as CFNumber)
+        var limitStatus: OSStatus = noErr
+        var capBytes = 0
+        if p.cap > 0 {
+            let frameSeconds = 1.0 / Double(max(1, fps))
+            capBytes = max(1, p.bps / 8 / Int(max(1, fps))) * p.cap
+            let limits = [NSNumber(value: capBytes), NSNumber(value: frameSeconds)] as CFArray
+            limitStatus = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
+        }
+        lock.lock()
+        if rateStatus == noErr && limitStatus == noErr { applied &+= 1 } else { errors &+= 1 }
+        lock.unlock()
+        print("encoder.rate bitrate=\(p.bps) frame_cap_bytes=\(capBytes) status=\(rateStatus) limit_status=\(limitStatus)")
+        fflush(stdout)
+    }
+
+    var statsFields: String {
+        lock.lock(); defer { lock.unlock() }
+        return "rate_set=\(applied) rate_set_errors=\(errors)"
+    }
 }
 
 /// Capture-to-encoded latency in 0.1 ms buckets up to 200 ms (one overflow
