@@ -56,8 +56,11 @@ enum VideoService {
         return (pick("JERISLINK_BIND_IP"), pick("JERISLINK_CLIENT_IP"))
     }
 
+    // ISO8601DateFormatter is thread-safe; make it once, not per line.
+    nonisolated(unsafe) private static let stampFormatter = ISO8601DateFormatter()
+
     static func log(_ message: String) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
+        let stamp = stampFormatter.string(from: Date())
         print("\(stamp) video-service: \(message)")
         fflush(stdout)
     }
@@ -66,6 +69,7 @@ enum VideoService {
     /// else network.conf), then returns the production video options. Video,
     /// mouse UDP and the control service all use this same endpoint.
     static func resolveOptions(base: Options) async -> Options {
+        LogFiles.startCapping()
         let endpoint = await ListenConfig.waitForEndpoint(log: log)
         let bindIP = endpoint.bindIP
         let clientIP = endpoint.clientIP

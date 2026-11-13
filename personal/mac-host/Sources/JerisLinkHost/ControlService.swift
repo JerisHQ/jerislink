@@ -22,8 +22,11 @@ enum ControlService {
     /// Keeps the running servers alive for the life of the process.
     nonisolated(unsafe) private static var running: [ControlServer] = []
 
+    // ISO8601DateFormatter is thread-safe; make it once, not per line.
+    nonisolated(unsafe) private static let stampFormatter = ISO8601DateFormatter()
+
     static func log(_ message: String) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
+        let stamp = stampFormatter.string(from: Date())
         print("\(stamp) control-service: \(message)")
         fflush(stdout)
     }
@@ -59,8 +62,9 @@ enum ControlService {
 
     static func run(_ o: Options) async -> Never {
         // stdout is a file under launchd: flush every line so ControlServer's
-        // print() output (connects, keys, warnings) reaches the log promptly.
+        // print() output (connects, warnings) reaches the log promptly.
         setvbuf(stdout, nil, _IOLBF, 0)
+        LogFiles.startCapping()
         let endpoint = await ListenConfig.waitForEndpoint(log: log)
         log("starting control \(endpoint.summary) port=\(o.controlPort) relay=\(o.relayPort == 0 ? "off" : "127.0.0.1:\(o.relayPort)")")
         do {

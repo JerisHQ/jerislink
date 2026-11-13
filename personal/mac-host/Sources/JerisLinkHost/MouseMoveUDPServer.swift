@@ -486,8 +486,6 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 let handler = keyframeRequestHandler
                 lock.unlock()
                 keyframeRequests &+= 1
-                print("video.keyframe_request_rx seq=\(seq) total=\(keyframeRequests)")
-                fflush(stdout)
                 handler?()
             case 0x41:
                 guard let parsed = Self.parseNack(buffer, length: n) else {
