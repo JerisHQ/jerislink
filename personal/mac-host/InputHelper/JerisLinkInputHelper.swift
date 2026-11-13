@@ -57,6 +57,15 @@ private let statusDirURL: URL = {
     return dir
 }()
 
+/// MRI1 session lifecycle (loopback only, empty payload). The control
+/// service sends SESSION_START once when a viewer connection sends its first
+/// key or mouse message, and SESSION_END when that connection closes. Never
+/// per event. Older control services never send them.
+enum MRI1Session {
+    static let start: UInt8 = 0x50
+    static let end: UInt8 = 0x51
+}
+
 final class InputHelper {
     private let host = "127.0.0.1"
     private let port: UInt16 = 38410
@@ -76,9 +85,36 @@ final class InputHelper {
     private var postEventAccess = false
     private var statusThrottle = StatusThrottle()
     private var displayBounds = DisplayBoundsCache()
+    /// Viewer input sessions announced with SESSION_START and not yet ended.
+    private(set) var activeSessions = 0
+    /// `clientConnected=true` or `clientClosed=true`, kept on every status
+    /// line until the next lifecycle message.
+    private var lifecycleNote = ""
+    private(set) var preflightCalls = 0
+    private(set) var statusWrites = 0
+    private(set) var lastStatus = ""
 
-    // Created once (the directory is made when this is first used).
-    private let statusURL = statusDirURL.appendingPathComponent("input-helper-status.txt")
+    private let preflight: () -> Bool
+    private let postEvent: (CGEvent) -> Void
+    private let mouseLocation: () -> CGPoint?
+    /// nil: keep the status in `lastStatus` only (self-test).
+    private let statusURL: URL?
+
+    init(preflight: @escaping () -> Bool = { CGPreflightPostEventAccess() },
+         postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
+         mouseLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
+         statusURL: URL? = statusDirURL.appendingPathComponent("input-helper-status.txt")) {
+        self.preflight = preflight
+        self.postEvent = postEvent
+        self.mouseLocation = mouseLocation
+        self.statusURL = statusURL
+    }
+
+    var shiftHeld: Bool { shiftDown }
+    var leftButtonHeld: Bool { leftDown }
+    var anyHeld: Bool {
+        controlDown || optionDown || commandDown || shiftDown || leftDown || rightDown || middleDown
+    }
 
     private func currentFlags() -> CGEventFlags {
         var f: CGEventFlags = []
@@ -94,20 +130,60 @@ final class InputHelper {
     private func updateStatus(extra: @autoclosure () -> String? = nil, force: Bool = false) {
         guard statusThrottle.shouldWrite(nowNs: monotonicNs(), force: force) else { return }
         var s = "listening 127.0.0.1:38410 postEvent=\(postEventAccess) keyEvents=\(keyEvents) mouseEvents=\(mouseEvents)"
-        s += " flags=0x\(String(currentFlags().rawValue, radix: 16))"
+        s += " flags=0x\(String(currentFlags().rawValue, radix: 16)) activeSessions=\(activeSessions)"
+        if !lifecycleNote.isEmpty { s += " \(lifecycleNote)" }
         if let extra = extra() { s += " \(extra)" }
         s += "\n"
-        try? s.write(to: statusURL, atomically: true, encoding: .utf8)
+        statusWrites += 1
+        lastStatus = s
+        if let statusURL { try? s.write(to: statusURL, atomically: true, encoding: .utf8) }
     }
 
-    /// One permission check per viewer connection (not per event).
-    private func checkAccessOnConnect() {
-        postEventAccess = CGPreflightPostEventAccess()
+    /// SESSION_START: one permission check per viewer input session (not per
+    /// event) and a forced status write. Held keys and buttons are kept: a
+    /// second viewer joining must not break a drag or a held Shift.
+    private func sessionStarted() {
+        activeSessions += 1
+        preflightCalls += 1
+        postEventAccess = preflight()
         if !postEventAccess {
             FileHandle.standardError.write(Data("input helper: post-event (Accessibility) access is not granted; input from the viewer is dropped by macOS until it is\n".utf8))
         }
         displayBounds.invalidate()
-        updateStatus(extra: postEventAccess ? "clientConnected=true" : "clientConnected=true postEventDenied=true", force: true)
+        lifecycleNote = postEventAccess ? "clientConnected=true" : "clientConnected=true postEventDenied=true"
+        updateStatus(force: true)
+    }
+
+    /// SESSION_END: forced status write. Held keys and buttons are released
+    /// only when the last session ends, so nothing stays stuck after the last
+    /// viewer leaves while another viewer's drag survives.
+    private func sessionEnded() {
+        activeSessions = max(0, activeSessions - 1)
+        if activeSessions == 0 && anyHeld { releaseHeld() }
+        lifecycleNote = "clientClosed=true"
+        updateStatus(force: true)
+    }
+
+    /// Post key-up for held modifiers and button-up for held mouse buttons.
+    private func releaseHeld() {
+        let modifiers: [(Bool, CGKeyCode)] = [(controlDown, 59), (optionDown, 58), (commandDown, 55), (shiftDown, 56)]
+        controlDown = false; optionDown = false; commandDown = false; shiftDown = false
+        for (held, key) in modifiers where held {
+            if let e = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) {
+                e.flags = currentFlags()
+                postEvent(e)
+            }
+        }
+        let buttons: [(Bool, CGEventType, CGMouseButton)] = [(leftDown, .leftMouseUp, .left),
+                                                             (rightDown, .rightMouseUp, .right),
+                                                             (middleDown, .otherMouseUp, .center)]
+        leftDown = false; rightDown = false; middleDown = false
+        let pos = mouseLocation() ?? .zero
+        for (held, type, button) in buttons where held {
+            if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
+                postEvent(e)
+            }
+        }
     }
 
     private func mainDisplayBounds() -> CGRect {
@@ -171,7 +247,7 @@ final class InputHelper {
                            virtualKey: CGKeyCode(cg),
                            keyDown: down) {
             e.flags = flags
-            e.post(tap: .cghidEventTap)
+            postEvent(e)
         }
 
         updateStatus()
@@ -185,7 +261,7 @@ final class InputHelper {
 
     private func postMouseMove(dx: Int16, dy: Int16) {
         mouseEvents += 1
-        guard let base = CGEvent(source: nil)?.location else {
+        guard let base = mouseLocation() else {
             updateStatus(extra: "mouseLocationUnavailable=true")
             return
         }
@@ -223,13 +299,13 @@ final class InputHelper {
         else if rightDown { type = .rightMouseDragged; button = .right }
         else { type = .mouseMoved; button = .left }
         if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target, mouseButton: button) {
-            e.post(tap: .cghidEventTap)
+            postEvent(e)
         }
     }
 
     private func postMouseButton(button code: UInt8, down: Bool, clickCount: UInt8 = 1) {
         mouseEvents += 1
-        guard let pos = CGEvent(source: nil)?.location else { return }
+        guard let pos = mouseLocation() else { return }
         let type: CGEventType
         let button: CGMouseButton
         switch code {
@@ -245,7 +321,7 @@ final class InputHelper {
         }
         if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
             e.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, clickCount)))
-            e.post(tap: .cghidEventTap)
+            postEvent(e)
         }
         updateStatus()
     }
@@ -258,7 +334,7 @@ final class InputHelper {
                            wheel1: Int32(dy),
                            wheel2: Int32(dx),
                            wheel3: 0) {
-            e.post(tap: .cghidEventTap)
+            postEvent(e)
         }
         updateStatus()
     }
@@ -268,43 +344,52 @@ final class InputHelper {
         while true {
             guard let h = recvExact(fd, 8) else { return }
             guard h[0] == 0x4d, h[1] == 0x52, h[2] == 0x49, h[3] == 0x31, h[4] == 1 else { return }
-            let type = h[5]
             let len = Int(UInt16(h[6]) << 8 | UInt16(h[7]))
             guard len <= 4096, let p = recvExact(fd, len) else { return }
-            switch type {
-            case 0x01:
-                _ = sendAll(fd, packet(type: 0x02, payload: p))
-            case 0x10:
-                guard p.count == 3 else { continue }
-                let down = p[0] != 0
-                let cg = UInt16(p[1]) << 8 | UInt16(p[2])
-                postKey(cg: cg, down: down)
-            case 0x20:
-                guard p.count == 4 else { continue }
-                postMouseMove(dx: decodeInt16(p, 0), dy: decodeInt16(p, 2))
-            case 0x21:
-                guard p.count == 2 else { continue }
-                postMouseButton(button: p[0], down: p[1] != 0)
-            case 0x25:
-                guard p.count == 3 else { continue }
-                postMouseButton(button: p[0], down: p[1] != 0, clickCount: p[2])
-            case 0x22:
-                guard p.count == 4 else { continue }
-                postScroll(dx: decodeInt16(p, 0), dy: decodeInt16(p, 2))
-            case 0x23:
-                guard p.count == 4 else { continue }
-                let x = UInt16(p[0]) << 8 | UInt16(p[1])
-                let y = UInt16(p[2]) << 8 | UInt16(p[3])
-                postMouseMoveAbsolute(x: x, y: y)
-            case 0x24:
-                guard p.count == 4 else { continue }
-                let nx = UInt16(p[0]) << 8 | UInt16(p[1])
-                let ny = UInt16(p[2]) << 8 | UInt16(p[3])
-                postMouseMoveNormalized(nx: nx, ny: ny)
-            default:
-                continue
-            }
+            if let reply = handle(type: h[5], payload: p) { _ = sendAll(fd, reply) }
         }
+    }
+
+    /// One MRI1 message. Returns the reply to send, if any.
+    func handle(type: UInt8, payload p: [UInt8]) -> [UInt8]? {
+        switch type {
+        case 0x01:
+            return packet(type: 0x02, payload: p)
+        case MRI1Session.start:
+            sessionStarted()
+        case MRI1Session.end:
+            sessionEnded()
+        case 0x10:
+            guard p.count == 3 else { return nil }
+            let down = p[0] != 0
+            let cg = UInt16(p[1]) << 8 | UInt16(p[2])
+            postKey(cg: cg, down: down)
+        case 0x20:
+            guard p.count == 4 else { return nil }
+            postMouseMove(dx: decodeInt16(p, 0), dy: decodeInt16(p, 2))
+        case 0x21:
+            guard p.count == 2 else { return nil }
+            postMouseButton(button: p[0], down: p[1] != 0)
+        case 0x25:
+            guard p.count == 3 else { return nil }
+            postMouseButton(button: p[0], down: p[1] != 0, clickCount: p[2])
+        case 0x22:
+            guard p.count == 4 else { return nil }
+            postScroll(dx: decodeInt16(p, 0), dy: decodeInt16(p, 2))
+        case 0x23:
+            guard p.count == 4 else { return nil }
+            let x = UInt16(p[0]) << 8 | UInt16(p[1])
+            let y = UInt16(p[2]) << 8 | UInt16(p[3])
+            postMouseMoveAbsolute(x: x, y: y)
+        case 0x24:
+            guard p.count == 4 else { return nil }
+            let nx = UInt16(p[0]) << 8 | UInt16(p[1])
+            let ny = UInt16(p[2]) << 8 | UInt16(p[3])
+            postMouseMoveNormalized(nx: nx, ny: ny)
+        default:
+            break
+        }
+        return nil
     }
 
     func run() throws {
@@ -325,7 +410,7 @@ final class InputHelper {
         guard brc == 0 else { Darwin.close(s); throw NSError(domain: "MRI1", code: 2) }
         guard Darwin.listen(s, 4) == 0 else { Darwin.close(s); throw NSError(domain: "MRI1", code: 3) }
         listenFD = s
-        postEventAccess = CGPreflightPostEventAccess()
+        postEventAccess = preflight()
         updateStatus(force: true)
 
         while true {
@@ -333,7 +418,9 @@ final class InputHelper {
             if c < 0 { continue }
             var noSigPipe: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-            checkAccessOnConnect()
+            // Access is checked per viewer session (SESSION_START), not here:
+            // the control service keeps this connection for its lifetime.
+            displayBounds.invalidate()
             handleClient(c)
             Darwin.close(c)
             controlDown = false
@@ -343,13 +430,16 @@ final class InputHelper {
             leftDown = false
             rightDown = false
             middleDown = false
-            updateStatus(extra: "clientClosed=true", force: true)
+            activeSessions = 0
+            lifecycleNote = "clientClosed=true"
+            updateStatus(force: true)
         }
     }
 }
 
-/// `JerisLinkInputHelper --self-test`: status throttle and display bounds
-/// cache. Pure; posts no events and writes no files.
+/// `JerisLinkInputHelper --self-test`: status throttle, display bounds cache
+/// and the session lifecycle. Posts no events (a recording closure stands in
+/// for posting) and writes no files.
 func inputHelperSelfTest() -> Bool {
     var ok = true
     func check(_ cond: Bool, _ what: String) {
@@ -383,6 +473,54 @@ func inputHelperSelfTest() -> Bool {
     current = a
     check(c.get(nowNs: s + 500_000_001, read: { reads += 1; return current }) == a, "invalidate forces a re-read")
     check(reads == 3, "three reads in total (got \(reads))")
+
+    // Session lifecycle (MRI1 SESSION_START / SESSION_END).
+    var posted: [CGEvent] = []
+    var preflights = 0
+    let h = InputHelper(preflight: { preflights += 1; return true },
+                        postEvent: { posted.append($0) },
+                        mouseLocation: { CGPoint(x: 10, y: 10) },
+                        statusURL: nil)
+    _ = h.handle(type: MRI1Session.start, payload: [])
+    check(preflights == 1 && h.preflightCalls == 1, "SESSION_START runs one preflight (got \(preflights))")
+    check(h.lastStatus.contains("activeSessions=1 clientConnected=true"), "SESSION_START writes clientConnected (\(h.lastStatus))")
+    _ = h.handle(type: 0x10, payload: [1, 0, 56])   // Shift down
+    _ = h.handle(type: 0x21, payload: [0, 1])       // left button down: a drag starts
+    for _ in 0..<100 { _ = h.handle(type: 0x20, payload: [0, 1, 0, 1]) }
+    check(preflights == 1, "(c) no preflight per event (a key, a button, 100 moves; got \(preflights))")
+    check(h.shiftHeld && h.leftButtonHeld, "Shift and left button are held")
+    let postedBefore = posted.count
+    // (a) A clipboard session sends the helper nothing; non-input traffic
+    // (ping) in the meantime keeps the held state.
+    check(h.handle(type: 0x01, payload: [1, 2, 3, 4]) != nil, "ping answered")
+    check(h.shiftHeld && h.leftButtonHeld && posted.count == postedBefore && preflights == 1,
+          "(a) non-input traffic keeps the drag and Shift, posts nothing, no preflight")
+    // (b) Two input sessions.
+    _ = h.handle(type: MRI1Session.start, payload: [])
+    check(preflights == 2 && h.activeSessions == 2, "(c) second SESSION_START: exactly one more preflight")
+    _ = h.handle(type: MRI1Session.end, payload: [])
+    check(h.activeSessions == 1 && h.shiftHeld && h.leftButtonHeld && posted.count == postedBefore,
+          "(b) first session ends: drag and Shift kept, nothing posted")
+    check(h.lastStatus.contains("activeSessions=1 clientClosed=true"), "(d) SESSION_END writes clientClosed (\(h.lastStatus))")
+    let writes = h.statusWrites
+    _ = h.handle(type: MRI1Session.end, payload: [])
+    check(h.statusWrites == writes + 1, "(d) SESSION_END forces a status write inside the throttle window")
+    check(h.activeSessions == 0 && !h.anyHeld, "(b) last session ends: held state released")
+    check(posted.count == postedBefore + 2
+          && posted[postedBefore].getIntegerValueField(.keyboardEventKeycode) == 56
+          && !posted[postedBefore].flags.contains(.maskShift)
+          && posted[postedBefore + 1].type == .leftMouseUp,
+          "(b) last session ends: one Shift key-up and one left button-up posted")
+    check(h.lastStatus.contains("activeSessions=0 clientClosed=true"), "(d) status says clientClosed activeSessions=0")
+    _ = h.handle(type: 0x01, payload: [1, 2, 3, 4])
+    check(h.statusWrites == writes + 1 && h.lastStatus.contains("clientClosed=true") && preflights == 2,
+          "(d) clientClosed is not overwritten and no access check follows SESSION_END")
+    _ = h.handle(type: MRI1Session.end, payload: [])
+    check(h.activeSessions == 0 && posted.count == postedBefore + 2, "stray SESSION_END floors at 0 and posts nothing")
+    let denied = InputHelper(preflight: { false }, postEvent: { _ in }, mouseLocation: { .zero }, statusURL: nil)
+    _ = denied.handle(type: MRI1Session.start, payload: [])
+    check(denied.lastStatus.contains("postEventDenied=true"), "denied access is reported in the status")
+
     print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
     return ok
 }

@@ -33,20 +33,20 @@ final class ControlServer: @unchecked Sendable {
     /// Read PROXY headers from loopback peers (legacy `tailscale serve`
     /// forward). Off for `--service control`, whose sockets see real peers.
     private let acceptProxy: Bool
-    /// Reconnect the input helper when a client connects and when it
-    /// disconnects, so the helper checks post-event access once per viewer
-    /// session and writes its status. On for viewer-facing listeners; off for
-    /// the loopback relay, whose client is the long-lived video service.
-    private let reconnectHelperOnClient: Bool
+    /// Tell the input helper when a viewer input session starts and ends
+    /// (MRI1 SESSION_START / SESSION_END). On for viewer-facing listeners;
+    /// off for the loopback relay, whose client is the long-lived video
+    /// service.
+    private let announceInputSessions: Bool
     private static let maxClipboardBytes = 60 * 1024
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
          acceptProxy: Bool = true,
          inputHelper: InputHelperClient? = nil,
-         reconnectHelperOnClient: Bool = true) {
+         announceInputSessions: Bool = true) {
         self.bindIP = bindIP
-        self.reconnectHelperOnClient = reconnectHelperOnClient
+        self.announceInputSessions = announceInputSessions
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -170,23 +170,14 @@ final class ControlServer: @unchecked Sendable {
                     Darwin.close(c)
                     return
                 }
-                self.reconnectHelperForSession()
                 self.handleClient(c, tcpPeerIP: peerIP)
                 self.lock.lock()
                 self.clientFDs.remove(c)
                 self.lock.unlock()
                 Darwin.close(c)
-                self.reconnectHelperForSession()
                 print("Control client disconnected: \(peerIP):\(peerPort)")
             }
         }
-    }
-
-    /// One helper reconnect per viewer connect or disconnect (see
-    /// `reconnectHelperOnClient`). Not on the event path.
-    private func reconnectHelperForSession() {
-        guard reconnectHelperOnClient, let helper = inputHelper else { return }
-        helper.reconnect()
     }
 
     private func handleClient(_ fd: Int32, tcpPeerIP: String) {
@@ -208,6 +199,12 @@ final class ControlServer: @unchecked Sendable {
                 return
             }
         }
+        // A connection is an input session only once it sends its first key
+        // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
+        // are. One bool test per message, one helper message per session edge.
+        var inputSeen = false
+        var sessionStarted = false
+        defer { if sessionStarted { endInputSession() } }
         var firstHeader: [UInt8]? = pending
         while true {
             let next: [UInt8]?
@@ -222,6 +219,10 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
+            if !inputSeen && Self.isInputMessage(type) {
+                inputSeen = true
+                sessionStarted = startInputSession()
+            }
 
             switch type {
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
@@ -289,6 +290,25 @@ final class ControlServer: @unchecked Sendable {
                 print("Control unknown type=\(type) len=\(length)")
             }
         }
+    }
+
+    private static func isInputMessage(_ type: UInt8) -> Bool {
+        switch type {
+        case 0x10, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25: return true
+        default: return false
+        }
+    }
+
+    /// Returns true when SESSION_START reached the helper, so SESSION_END is
+    /// sent only for a session the helper knows about.
+    private func startInputSession() -> Bool {
+        guard announceInputSessions, injectRequested, let helper = inputHelper else { return false }
+        return helper.sendSessionStart()
+    }
+
+    private func endInputSession() {
+        guard let helper = inputHelper else { return }
+        _ = helper.sendSessionEnd()
     }
 
     private struct ClipboardSnapshot {

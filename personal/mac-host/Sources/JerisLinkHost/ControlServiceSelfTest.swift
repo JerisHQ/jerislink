@@ -89,35 +89,45 @@ enum ControlServiceSelfTest {
         }
         expect(helper.maxConcurrentConnections == 1, "control e2e: one helper connection for both listeners")
 
-        // F3: the helper checks access once per viewer session. A viewer
-        // connect and a viewer disconnect each reopen the helper connection
-        // once; events and relay clients do not.
-        let beforeViewer = helper.acceptedConnections
-        let viewer2 = MRC1Client(port: directPort)
-        expect(viewer2 != nil && helper.waitAccepted(beforeViewer + 1),
-               "control e2e: viewer connect reopens the helper connection (access check)")
+        // F3 session lifecycle: one SESSION_START before a viewer connection's
+        // first key or mouse message, one SESSION_END when it closes. Nothing
+        // per event; nothing for relay, clipboard or ping-only connections.
+        let start = InputHelperClient.sessionStartType
+        let end = InputHelperClient.sessionEndType
+        expect(helper.count(type: start) == 1, "control e2e: one SESSION_START for the viewer, none for the relay clients")
+        if let s = helper.firstIndex(of: .init(type: start, payload: [])),
+           let k = helper.firstIndex(of: .init(type: 0x10, payload: [1, 0, 0])) {
+            expect(s < k, "control e2e: SESSION_START reaches the helper before the viewer's first event")
+        } else {
+            expect(false, "control e2e: SESSION_START reaches the helper before the viewer's first event")
+        }
         let marker = FakeInputHelper.Event(type: 0x24, payload: [0x00, 0x07, 0x00, 0x09])
-        for _ in 0..<50 { _ = viewer2?.send(type: 0x24, payload: marker.payload) }
+        for _ in 0..<50 { _ = direct?.send(type: 0x24, payload: marker.payload) }
         let markerDeadline = Date().addingTimeInterval(5)
         while Date() < markerDeadline, !helper.received(marker) { usleep(20_000) }
-        expect(helper.received(marker), "control e2e: events after the reconnect reach the helper")
-        usleep(200_000)
-        expect(helper.acceptedConnections == beforeViewer + 1, "control e2e: no helper reconnect per event (50 events)")
-        viewer2?.close()
-        expect(helper.waitAccepted(beforeViewer + 2),
-               "control e2e: viewer disconnect reopens the helper connection (status write)")
-        let beforeRelay = helper.acceptedConnections
-        let relay2 = MRC1Client(port: relayPort)
-        usleep(300_000)
-        relay2?.close()
-        usleep(300_000)
-        expect(relay2 != nil && helper.acceptedConnections == beforeRelay,
-               "control e2e: relay client connect/disconnect does not reopen the helper connection")
-        expect(helper.maxConcurrentConnections == 1, "control e2e: still one helper connection at a time after reconnects")
+        expect(helper.received(marker) && helper.count(type: start) == 1 && helper.count(type: end) == 0,
+               "control e2e: no lifecycle message per event (50 events)")
 
-        direct?.close()
+        let clipboard = MRC1Client(port: directPort)
+        _ = clipboard?.send(type: 0x30, payload: [])                 // CLIPBOARD_HELLO
+        let pingOnly = MRC1Client(port: directPort)
+        _ = pingOnly?.send(type: 0x01, payload: [1, 2, 3, 4])        // PING
+        usleep(300_000)
+        clipboard?.close()
+        pingOnly?.close()
         relayKey?.close()
         relayMouse.closeConnection()
+        usleep(500_000)
+        expect(clipboard != nil && pingOnly != nil && helper.count(type: start) == 1 && helper.count(type: end) == 0,
+               "control e2e: clipboard, ping-only and relay connections send no SESSION_START/END")
+
+        direct?.close()
+        let endDeadline = Date().addingTimeInterval(5)
+        while Date() < endDeadline, helper.count(type: end) < 1 { usleep(20_000) }
+        usleep(200_000)
+        expect(helper.count(type: end) == 1 && helper.count(type: start) == 1,
+               "control e2e: viewer disconnect sends exactly one SESSION_END")
+        expect(helper.maxConcurrentConnections == 1, "control e2e: still one helper connection (no reconnect per session)")
         return failures == 0 ? 0 : 1
     }
 
@@ -194,21 +204,6 @@ private final class FakeInputHelper: @unchecked Sendable {
     private var events: [Event] = []
     private var active = 0
     private(set) var maxConcurrentConnections = 0
-    private var accepted = 0
-
-    var acceptedConnections: Int {
-        lock.lock(); defer { lock.unlock() }
-        return accepted
-    }
-
-    /// Wait up to 5 s until at least `count` connections were accepted.
-    func waitAccepted(_ count: Int) -> Bool {
-        for _ in 0..<250 {
-            if acceptedConnections >= count { return true }
-            usleep(20_000)
-        }
-        return false
-    }
     private var stopping = false
 
     private init(fd: Int32, port: UInt16) {
@@ -244,6 +239,16 @@ private final class FakeInputHelper: @unchecked Sendable {
         return events.contains(event)
     }
 
+    func count(type: UInt8) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return events.filter { $0.type == type }.count
+    }
+
+    func firstIndex(of event: Event) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return events.firstIndex(of: event)
+    }
+
     /// Wait until no client is being served (after the root-cause probe).
     func waitIdle() {
         for _ in 0..<250 {
@@ -262,7 +267,6 @@ private final class FakeInputHelper: @unchecked Sendable {
                 continue
             }
             lock.lock()
-            accepted += 1
             active += 1
             maxConcurrentConnections = max(maxConcurrentConnections, active)
             lock.unlock()

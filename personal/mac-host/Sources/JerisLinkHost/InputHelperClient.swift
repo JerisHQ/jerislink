@@ -37,20 +37,6 @@ final class InputHelperClient: @unchecked Sendable {
         closeLocked()
     }
 
-    /// Close the MRI1 connection and open a fresh one. The helper serves one
-    /// connection at a time, so this makes it finish the old connection
-    /// (status write with `clientClosed=true`) and accept the new one, where
-    /// it checks post-event access once and writes its status file. Called
-    /// once per viewer connect and once per viewer disconnect, never per
-    /// event. Returns false when the helper is not reachable; the next event
-    /// then reconnects lazily as before.
-    @discardableResult
-    func reconnect() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        closeLocked()
-        return ensureConnected()
-    }
-
     /// Send one packet, reconnecting once if the connection dropped.
     private func deliver(_ bytes: [UInt8]) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -126,6 +112,20 @@ final class InputHelperClient: @unchecked Sendable {
         guard h[0] == 0x4d, h[1] == 0x52, h[2] == 0x49, h[3] == 0x31, h[4] == 1, h[5] == 0x02,
               let p = recvExact(len) else { return false }
         return p == payload
+    }
+
+    /// MRI1 SESSION_START (0x50) and SESSION_END (0x51), empty payload. Sent
+    /// once per viewer input session by `ControlServer`, never per event. The
+    /// helper checks post-event access on START and writes its status on both.
+    static let sessionStartType: UInt8 = 0x50
+    static let sessionEndType: UInt8 = 0x51
+
+    func sendSessionStart() -> Bool {
+        deliver(packet(type: Self.sessionStartType, payload: []))
+    }
+
+    func sendSessionEnd() -> Bool {
+        deliver(packet(type: Self.sessionEndType, payload: []))
     }
 
     func sendKey(cgCode: UInt16, down: Bool) -> Bool {
