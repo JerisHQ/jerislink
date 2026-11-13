@@ -21,3 +21,5 @@ jobs:
       - name: Verify bundle layout, signature and both executables
         working-directory: personal/mac-host
         run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"
+      - name: Host self-test (control peer, settings policy)
+        run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/MacOS/JerisLinkHost" --self-test'

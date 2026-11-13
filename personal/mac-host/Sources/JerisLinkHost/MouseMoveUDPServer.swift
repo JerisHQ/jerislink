@@ -66,10 +66,14 @@ private final class CursorShapeDetector {
     }
 }
 
-private final class LocalControlMouseClient {
+/// The video service's mouse relay into the control service's loopback
+/// listener (127.0.0.1:38411). Internal so the control self-test drives it.
+final class LocalControlMouseClient {
     private let host = "127.0.0.1"
-    private let port: UInt16 = 38411
+    private let port: UInt16
     private var fd: Int32 = -1
+
+    init(port: UInt16 = 38411) { self.port = port }
 
     deinit { closeConnection() }
 
@@ -168,6 +172,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var lastSequence: UInt32?
     private var lastPeerPort: UInt16?
     private var keyframeRequestHandler: (() -> Void)?
+    private var newSessionHandler: (() -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
     private var cursorSequence: UInt32 = 0
@@ -241,6 +246,14 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         queue.async { [weak self] in self?.receiveLoop() }
     }
 
+    /// Called when a new viewer session appears (first packet, or a new
+    /// source port after the viewer restarted or reconnected).
+    func setNewSessionHandler(_ handler: @escaping () -> Void) {
+        lock.lock()
+        newSessionHandler = handler
+        lock.unlock()
+    }
+
     func setKeyframeRequestHandler(_ handler: @escaping () -> Void) {
         lock.lock()
         keyframeRequestHandler = handler
@@ -253,6 +266,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         let s = fd
         fd = -1
         keyframeRequestHandler = nil
+        newSessionHandler = nil
         lastPeerAddress = nil
         cursorProbePending = false
         lock.unlock()
@@ -399,8 +413,11 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 lock.lock()
                 lastPeerAddress = peer
                 lastCursorShape = nil
+                let sessionHandler = newSessionHandler
                 lock.unlock()
                 print("MouseMove UDP new session peer=\(peerIP):\(peerPort)")
+                fflush(stdout)
+                sessionHandler?()
             }
             guard n >= 10,
                   buffer[0] == 0x4d, buffer[1] == 0x52, buffer[2] == 0x4d, buffer[3] == 0x31,

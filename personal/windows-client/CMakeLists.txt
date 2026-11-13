@@ -46,3 +46,6 @@ if(JERISLINK_BUILD_DIAGNOSTICS)
     target_compile_definitions(JerislinkControlProbe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(JerislinkControlProbe PRIVATE ws2_32)
 endif()
+
+# Console unit test for the launch-config rules (viewer_options.hpp).
+add_executable(JerislinkOptionsTest viewer_options_test.cpp)

@@ -4,19 +4,25 @@
 
 IDI_JERISLINK ICON "jerislink.ico"
 
-IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 250, 126
-STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "JerisLink Video Settings"
+IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 260, 196
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "JerisLink Settings"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Codec:", -1, 14, 16, 62, 10
-    COMBOBOX        IDC_VIDEO_CODEC, 82, 13, 148, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Bitrate (Mbps):", -1, 14, 45, 62, 10
-    EDITTEXT        IDC_VIDEO_BITRATE, 82, 42, 60, 14, ES_NUMBER | WS_TABSTOP
-    LTEXT           "0 = Auto. Manual range: 4-100 Mbps.", -1, 82, 60, 148, 18
-    LTEXT           "Changes apply on the next JerisLink connection.", -1, 14, 84, 216, 10
-    DEFPUSHBUTTON   "Save", IDOK, 126, 102, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 180, 102, 50, 14
+    LTEXT           "Mac host address:", -1, 14, 16, 70, 10
+    EDITTEXT        IDC_HOST_IP, 90, 13, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "The Mac's Tailscale IPv4 address, e.g. 100.64.0.25.", -1, 90, 30, 150, 10
+    LTEXT           "This PC's address:", -1, 14, 50, 70, 10
+    EDITTEXT        IDC_BIND_IP, 90, 47, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_BIND_HINT, 90, 64, 150, 18
+    LTEXT           "Codec:", -1, 14, 92, 70, 10
+    COMBOBOX        IDC_VIDEO_CODEC, 90, 89, 150, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Bitrate (Mbps):", -1, 14, 118, 70, 10
+    EDITTEXT        IDC_VIDEO_BITRATE, 90, 115, 60, 14, ES_NUMBER | WS_TABSTOP
+    LTEXT           "0 = Auto. Manual range: 4-100 Mbps.", -1, 90, 132, 150, 10
+    LTEXT           "Changes apply the next time JerisLink starts.", IDC_APPLY_NOTE, 14, 152, 232, 18
+    DEFPUSHBUTTON   "Save", IDOK, 136, 174, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 190, 174, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

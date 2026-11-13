@@ -20,6 +20,7 @@
 #include "clipboard_channel.hpp"
 #include "hardware_video_pipeline.hpp"
 #include "resource.h"
+#include "viewer_options.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -505,10 +506,7 @@ static constexpr UINT IDM_VIDEO_SETTINGS = 0x1F10;
 static constexpr UINT IDM_CONNECTION_INFO = 0x1F11;
 static constexpr wchar_t kJerislinkSettingsKey[] = L"Software\\Jeris\\Jerislink";
 
-struct SavedVideoSettings {
-    std::string codec = "h264";
-    uint16_t bitrateMbps = 25;
-};
+using SavedSettings = jl::SavedSettings;
 
 static std::string savedCodecName(DWORD value) {
     if (value == 0) return "auto";
@@ -522,8 +520,40 @@ static DWORD savedCodecValue(const std::string& codec) {
     return 1;
 }
 
-static SavedVideoSettings loadSavedVideoSettings() {
-    SavedVideoSettings settings;
+// IPv4 text is ASCII; anything else is dropped (and then fails jl::isIPv4).
+static std::string asciiFromWide(const std::wstring& text) {
+    std::string out;
+    for (wchar_t c : text) {
+        if (c == L' ' || c == L'\t') continue;
+        if (c > 0x7f) return {};
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+static std::wstring wideFromAscii(const std::string& text) {
+    return std::wstring(text.begin(), text.end());
+}
+
+static std::string readRegString(HKEY key, const wchar_t* name) {
+    wchar_t buffer[64]{};
+    DWORD size = sizeof(buffer);
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, buffer, &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    return asciiFromWide(buffer);
+}
+
+static LONG writeRegString(HKEY key, const wchar_t* name, const std::string& value) {
+    const std::wstring wide = wideFromAscii(value);
+    return RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(wide.c_str()),
+                          static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t)));
+}
+
+// Per-user settings in HKCU\Software\Jeris\Jerislink:
+//   HostIp (REG_SZ), BindIp (REG_SZ, empty = auto), VideoCodec, VideoBitrateMbps (REG_DWORD).
+static SavedSettings loadSavedSettings() {
+    SavedSettings settings;
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return settings;
@@ -542,13 +572,15 @@ static SavedVideoSettings loadSavedVideoSettings() {
         (bitrate != 0 && (bitrate < 4 || bitrate > 100))) {
         bitrate = 25;
     }
+    settings.hostIp = readRegString(key, L"HostIp");
+    settings.bindIp = readRegString(key, L"BindIp");
     RegCloseKey(key);
     settings.codec = savedCodecName(codec);
     settings.bitrateMbps = static_cast<uint16_t>(bitrate);
     return settings;
 }
 
-static bool saveVideoSettings(const SavedVideoSettings& settings) {
+static bool saveSettings(const SavedSettings& settings) {
     HKEY key = nullptr;
     DWORD disposition = 0;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, nullptr, 0,
@@ -563,11 +595,25 @@ static bool saveVideoSettings(const SavedVideoSettings& settings) {
     const LONG bitrateResult = RegSetValueExW(
         key, L"VideoBitrateMbps", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&bitrate), sizeof(bitrate));
+    const LONG hostResult = writeRegString(key, L"HostIp", settings.hostIp);
+    const LONG bindResult = writeRegString(key, L"BindIp", settings.bindIp);
     RegCloseKey(key);
-    return codecResult == ERROR_SUCCESS && bitrateResult == ERROR_SUCCESS;
+    return codecResult == ERROR_SUCCESS && bitrateResult == ERROR_SUCCESS &&
+           hostResult == ERROR_SUCCESS && bindResult == ERROR_SUCCESS;
 }
 
-static INT_PTR CALLBACK VideoSettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM) {
+// lParam of the dialog: kSettingsDialogConnect when shown before connecting
+// (button says "Connect"), kSettingsDialogSave from the running viewer.
+static constexpr LPARAM kSettingsDialogSave = 0;
+static constexpr LPARAM kSettingsDialogConnect = 1;
+
+static std::wstring dialogText(HWND dlg, int id) {
+    wchar_t text[64]{};
+    GetDlgItemTextW(dlg, id, text, static_cast<int>(std::size(text)));
+    return text;
+}
+
+static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_INITDIALOG: {
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_ADDSTRING, 0,
@@ -576,12 +622,30 @@ static INT_PTR CALLBACK VideoSettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, 
                             reinterpret_cast<LPARAM>(L"H.264"));
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_ADDSTRING, 0,
                             reinterpret_cast<LPARAM>(L"HEVC (H.265)"));
-        const auto settings = loadSavedVideoSettings();
+        const auto settings = loadSavedSettings();
         int index = 1;
         if (settings.codec == "auto") index = 0;
         else if (settings.codec == "hevc") index = 2;
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_SETCURSEL, index, 0);
         SetDlgItemInt(dlg, IDC_VIDEO_BITRATE, settings.bitrateMbps, FALSE);
+        SetDlgItemTextW(dlg, IDC_HOST_IP, wideFromAscii(settings.hostIp).c_str());
+        SetDlgItemTextW(dlg, IDC_BIND_IP, wideFromAscii(settings.bindIp).c_str());
+        const auto detected = detectTailscaleIPv4();
+        const std::wstring hint = detected
+            ? L"Leave empty to use this PC's Tailscale address (now " +
+                  wideFromAscii(*detected) + L")."
+            : std::wstring(L"Leave empty to use this PC's Tailscale address (none found now).");
+        SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
+        if (lParam == kSettingsDialogConnect) {
+            SetDlgItemTextW(dlg, IDOK, L"Connect");
+            SetDlgItemTextW(dlg, IDC_APPLY_NOTE,
+                            L"Saved for next time. Hold Shift while starting JerisLink to change them.");
+        }
+        SetForegroundWindow(dlg);
+        if (settings.hostIp.empty()) {
+            SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
+            return FALSE;  // focus set manually
+        }
         return TRUE;
     }
     case WM_COMMAND:
@@ -590,46 +654,62 @@ static INT_PTR CALLBACK VideoSettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, 
             return TRUE;
         }
         if (LOWORD(wParam) == IDOK) {
+            const std::string host = asciiFromWide(dialogText(dlg, IDC_HOST_IP));
+            const std::string bind = asciiFromWide(dialogText(dlg, IDC_BIND_IP));
             const LRESULT selected = SendDlgItemMessageW(
                 dlg, IDC_VIDEO_CODEC, CB_GETCURSEL, 0, 0);
-            wchar_t bitrateText[32]{};
-            const int bitrateChars = GetDlgItemTextW(
-                dlg, IDC_VIDEO_BITRATE, bitrateText,
-                static_cast<int>(std::size(bitrateText)));
-            bool bitrateValid = bitrateChars > 0;
+            const std::wstring bitrateText = dialogText(dlg, IDC_VIDEO_BITRATE);
+            bool bitrateValid = !bitrateText.empty();
             unsigned long bitrateValue = 0;
             if (bitrateValid) {
                 try {
                     size_t consumed = 0;
-                    const std::wstring text(bitrateText);
-                    bitrateValue = std::stoul(text, &consumed, 10);
-                    bitrateValid = consumed == text.size() && bitrateValue <= 100;
+                    bitrateValue = std::stoul(bitrateText, &consumed, 10);
+                    bitrateValid = consumed == bitrateText.size() && bitrateValue <= 100;
                 } catch (...) {
                     bitrateValid = false;
                 }
             }
             const UINT bitrate = bitrateValid ? static_cast<UINT>(bitrateValue) : 0;
-            logLine("video.settings.save_attempt selected=" +
-                    std::to_string(selected) +
+            logLine("settings.save_attempt host=" + host + " bind=" + bind +
+                    " selected=" + std::to_string(selected) +
                     " valid_bitrate=" + (bitrateValid ? "yes" : "no") +
                     " bitrate=" + std::to_string(bitrate));
+            if (!jl::isIPv4(host)) {
+                MessageBoxW(dlg,
+                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.64.0.25.",
+                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
+                return TRUE;
+            }
+            if (!bind.empty() && !jl::isIPv4(bind)) {
+                MessageBoxW(dlg,
+                    L"This PC's address must be an IPv4 address, or empty for automatic.",
+                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, IDC_BIND_IP));
+                return TRUE;
+            }
             if (selected == CB_ERR || !bitrateValid ||
                 (bitrate != 0 && (bitrate < 4 || bitrate > 100))) {
                 MessageBoxW(dlg,
                     L"Bitrate must be 0 (Auto) or a value from 4 to 100 Mbps.",
-                    L"JerisLink Video Settings", MB_OK | MB_ICONWARNING);
+                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
-            SavedVideoSettings settings;
+            SavedSettings settings;
+            settings.hostIp = host;
+            settings.bindIp = bind;
             settings.codec = selected == 0 ? "auto" : (selected == 2 ? "hevc" : "h264");
             settings.bitrateMbps = static_cast<uint16_t>(bitrate);
-            if (!saveVideoSettings(settings)) {
-                logLine("video.settings.save_failed");
-                MessageBoxW(dlg, L"Could not save JerisLink video settings.",
+            if (!saveSettings(settings)) {
+                logLine("settings.save_failed");
+                MessageBoxW(dlg, L"Could not save JerisLink settings.",
                             L"JerisLink", MB_OK | MB_ICONERROR);
                 return TRUE;
             }
-            logLine("video.settings.saved codec=" + settings.codec +
+            logLine("settings.saved host=" + settings.hostIp +
+                    " bind=" + (settings.bindIp.empty() ? std::string("auto") : settings.bindIp) +
+                    " codec=" + settings.codec +
                     " bitrate_mbps=" + std::to_string(settings.bitrateMbps));
             EndDialog(dlg, IDOK);
             return TRUE;
@@ -639,18 +719,20 @@ static INT_PTR CALLBACK VideoSettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, 
     return FALSE;
 }
 
-static void showVideoSettings(HWND owner) {
+static INT_PTR runSettingsDialog(HWND owner, LPARAM mode) {
     const INT_PTR result = DialogBoxParamW(
         GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_VIDEO_SETTINGS),
-        owner, VideoSettingsDlgProc, 0);
+        owner, SettingsDlgProc, mode);
     if (result == -1) {
-        logLine("video.settings.dialog_create_failed error=" +
-                std::to_string(GetLastError()));
-        return;
+        logLine("settings.dialog_create_failed error=" + std::to_string(GetLastError()));
     }
-    if (result == IDOK) {
+    return result;
+}
+
+static void showVideoSettings(HWND owner) {
+    if (runSettingsDialog(owner, kSettingsDialogSave) == IDOK) {
         MessageBoxW(owner,
-            L"Video settings saved. They will apply the next time JerisLink connects.",
+            L"Settings saved. They apply the next time JerisLink starts.",
             L"JerisLink", MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -719,31 +801,7 @@ static void showConnectionInfo(HWND owner) {
     logLine("connection.info.opened");
 }
 
-struct Options {
-    std::string bindIp;
-    std::string sourceIp;
-    uint16_t port = 38402;
-    uint16_t controlPort = 38400;
-    uint16_t mouseUdpPort = 38412;
-    bool controlEnabled = true;
-    std::string mouseMoveTransport = "udp";
-    double scrollScale = 1.0;
-    std::string videoBackend = "auto";
-    std::string codec = "h264";
-    uint16_t bitrateMbps = 25;
-    std::string presentMode = "nowait";
-    std::string lossRecovery = "strict";
-    int idleTimeoutMs = 8000;
-    int startupTimeoutMs = 180000;
-    UINT32 width = 3712;
-    UINT32 height = 2088;
-    bool widthExplicit = false;
-    bool heightExplicit = false;
-    UINT32 fps = 60;
-    UINT32 windowWidth = 1280;
-    UINT32 windowHeight = 720;
-    bool startMaximized = true;
-};
+using jl::Options;
 
 static std::string envValue(const char* name) {
     char* value = nullptr;
@@ -752,72 +810,6 @@ static std::string envValue(const char* name) {
     std::string out(value);
     free(value);
     return out;
-}
-
-static std::optional<Options> parseArgs(int argc, char** argv) {
-    Options o;
-    {
-        const auto saved = loadSavedVideoSettings();
-        o.codec = saved.codec;
-        o.bitrateMbps = saved.bitrateMbps;
-    }
-    for (int i = 1; i < argc; ++i) {
-        std::string k = argv[i];
-        if (k == "--no-control") {
-            o.controlEnabled = false;
-            continue;
-        }
-        if (k == "--start-maximized") {
-            o.startMaximized = true;
-            continue;
-        }
-        if (i + 1 >= argc) return std::nullopt;
-        std::string v = argv[++i];
-        if (k == "--bind-ip") o.bindIp = v;
-        else if (k == "--source-ip") o.sourceIp = v;
-        else if (k == "--port") o.port = static_cast<uint16_t>(std::stoi(v));
-        else if (k == "--control-port") o.controlPort = static_cast<uint16_t>(std::stoi(v));
-        else if (k == "--mouse-udp-port") o.mouseUdpPort = static_cast<uint16_t>(std::stoi(v));
-        else if (k == "--idle-timeout-ms") o.idleTimeoutMs = std::stoi(v);
-        else if (k == "--startup-timeout-ms") o.startupTimeoutMs = std::stoi(v);
-        else if (k == "--width") {
-            o.width = static_cast<UINT32>(std::stoul(v));
-            o.widthExplicit = true;
-        }
-        else if (k == "--height") {
-            o.height = static_cast<UINT32>(std::stoul(v));
-            o.heightExplicit = true;
-        }
-        else if (k == "--fps") o.fps = static_cast<UINT32>(std::stoul(v));
-        else if (k == "--window-width") o.windowWidth = static_cast<UINT32>(std::stoul(v));
-        else if (k == "--window-height") o.windowHeight = static_cast<UINT32>(std::stoul(v));
-        else if (k == "--video-backend") o.videoBackend = v;
-        else if (k == "--codec") o.codec = v;
-        else if (k == "--bitrate-mbps") o.bitrateMbps = static_cast<uint16_t>(std::stoul(v));
-        else if (k == "--present-mode") o.presentMode = v;
-        else if (k == "--loss-recovery") o.lossRecovery = v;
-        else if (k == "--mouse-move-transport") o.mouseMoveTransport = v;
-        else if (k == "--scroll-scale") o.scrollScale = std::stod(v);
-        else return std::nullopt;
-    }
-    if (o.bindIp.empty()) {
-        auto detected = detectTailscaleIPv4();
-        if (!detected) return std::nullopt;
-        o.bindIp = *detected;
-    }
-    if (o.sourceIp.empty()) o.sourceIp = envValue("JERISLINK_SOURCE_IP");
-    if (o.sourceIp.empty()) return std::nullopt;
-    if (o.presentMode != "waitable" && o.presentMode != "nowait") return std::nullopt;
-    if (o.videoBackend != "auto" && o.videoBackend != "hardware" && o.videoBackend != "cpu") {
-        return std::nullopt;
-    }
-    if (o.codec != "auto" && o.codec != "h264" && o.codec != "hevc") return std::nullopt;
-    if (o.bitrateMbps != 0 && (o.bitrateMbps < 4 || o.bitrateMbps > 100)) return std::nullopt;
-    if (o.lossRecovery != "legacy" && o.lossRecovery != "strict") return std::nullopt;
-    if (o.mouseMoveTransport != "tcp" && o.mouseMoveTransport != "udp") return std::nullopt;
-    if (o.scrollScale <= 0.0 || o.scrollScale > 8.0) return std::nullopt;
-    if (o.widthExplicit != o.heightExplicit) return std::nullopt;
-    return o;
 }
 
 static uint16_t be16(const uint8_t* p) {
@@ -1154,7 +1146,7 @@ static HMENU createViewerMenu() {
 
     const bool ok =
         AppendMenuW(connectionMenu, MF_STRING, IDM_CONNECTION_INFO, L"&Connection Info...") &&
-        AppendMenuW(settingsMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"&Video Settings...") &&
+        AppendMenuW(settingsMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"&Connection Settings...") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(connectionMenu), L"&Connection") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(settingsMenu), L"&Settings");
     if (!ok) {
@@ -1200,7 +1192,7 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
         : "viewer.menu unavailable");
     if (HMENU systemMenu = GetSystemMenu(hwnd, FALSE)) {
         AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(systemMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"Video Settings...");
+        AppendMenuW(systemMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"Connection Settings...");
     }
     applyModernWindowChrome(hwnd);
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
@@ -1867,16 +1859,67 @@ private:
     double hardwarePresentMaxSaved_ = 0.0;
 };
 
+static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return jl::resolveLaunch(args, loadSavedSettings(), envValue("JERISLINK_SOURCE_IP"),
+                             detectTailscaleIPv4());
+}
+
 static int appMain(int argc, char** argv) {
     std::remove(kLogPath.c_str());
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
-    auto parsed = parseArgs(argc, argv);
-    if (!parsed) {
-        logLine("usage error: no host address, no active Tailscale IPv4 address or invalid arguments");
-        MessageBoxW(nullptr, L"JerisLink needs the Mac host address (--source-ip or the JERISLINK_SOURCE_IP environment variable) and an active Tailscale IPv4 address, or the command-line arguments are invalid.\n\nSet JERISLINK_SOURCE_IP to your Mac's Tailscale IPv4 address, connect Tailscale and try again.", L"JerisLink", MB_OK | MB_ICONERROR);
+    auto request = resolveLaunchFromSystem(argc, argv);
+
+    // --print-config PATH: write the resolved connection and exit. Never shows UI.
+    if (!request.printConfigPath.empty()) {
+        std::ofstream out(request.printConfigPath, std::ios::trunc);
+        out << jl::describeLaunch(request);
+        return out ? (request.status == jl::LaunchStatus::Ok ? 0 : 3) : 4;
+    }
+    if (request.status == jl::LaunchStatus::InvalidArgs) {
+        logLine("usage error: " + request.error);
+        const std::wstring message =
+            L"JerisLink could not read its command-line arguments (" +
+            wideFromAscii(request.error) +
+            L").\n\nStart JerisLink without arguments to use the saved settings.";
+        MessageBoxW(nullptr, message.c_str(), L"JerisLink", MB_OK | MB_ICONERROR);
         return 2;
     }
-    Options o = *parsed;
+
+    // First run (no host anywhere), --settings, or Shift held while starting:
+    // show the settings dialog, then connect with what was saved.
+    const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (request.status == jl::LaunchStatus::NeedsSetup || request.openSettings || shiftHeld) {
+        logLine(std::string("settings.startup_dialog reason=") +
+                (request.status == jl::LaunchStatus::NeedsSetup ? "no-host"
+                 : request.openSettings ? "flag" : "shift"));
+        if (runSettingsDialog(nullptr, kSettingsDialogConnect) != IDOK) {
+            logLine("settings.startup_dialog cancelled");
+            return 0;
+        }
+        request = resolveLaunchFromSystem(argc, argv);
+    }
+    if (request.status == jl::LaunchStatus::NeedsSetup) {
+        logLine("usage error: no host address");
+        MessageBoxW(nullptr, L"JerisLink needs the Mac host address. Start JerisLink again and enter it.",
+                    L"JerisLink", MB_OK | MB_ICONERROR);
+        return 2;
+    }
+    if (request.status == jl::LaunchStatus::NoTailnet) {
+        logLine("usage error: no active Tailscale IPv4 address");
+        MessageBoxW(nullptr,
+            L"This PC has no active Tailscale address (100.64.x.x).\n\n"
+            L"Connect Tailscale and start JerisLink again, or hold Shift while starting "
+            L"JerisLink and enter this PC's address.",
+            L"JerisLink", MB_OK | MB_ICONERROR);
+        return 2;
+    }
+    logLine("launch.config host=" + request.options.sourceIp +
+            " host_source=" + request.hostSource +
+            " bind=" + request.options.bindIp +
+            " bind_source=" + request.bindSource);
+    Options o = request.options;
     gConnectionInfo = ConnectionInfoState{};
     gConnectionInfo.configuredCodec = o.codec;
     gConnectionInfo.configuredBitrateMbps = o.bitrateMbps;
