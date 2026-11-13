@@ -23,6 +23,8 @@
 #include "viewer_options.hpp"
 #include "video_receiver.hpp"
 #include "abr.hpp"
+#include "loop_wait.hpp"
+#include "viewer_log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -67,6 +69,9 @@ static std::string tempLogPath(const char* filename) {
 }
 static const std::string kLogPath = tempLogPath("jerislink-viewer.log");
 static const std::string kHistoryLogPath = tempLogPath("jerislink-viewer-history.log");
+// Both logs are written by one background thread through handles kept
+// open for the run; each is capped at 10 MB (history keeps one .old).
+static jl::ViewerLog gLog;
 extern "C" const char* __asan_default_options() {
     return "log_path=shader-asan:abort_on_error=1";
 }
@@ -106,11 +111,23 @@ public:
             closesocket(s_); s_ = INVALID_SOCKET;
             throw std::runtime_error("mouse UDP nonblocking failed");
         }
+        // FD_READ event so the receive loop wakes for pongs and cursor
+        // shapes as they arrive. If it cannot be set up the channel still
+        // works: the loop polls it once per iteration as before.
+        event_ = WSACreateEvent();
+        if (event_ != WSA_INVALID_EVENT && WSAEventSelect(s_, event_, FD_READ) != 0) {
+            WSACloseEvent(event_);
+            event_ = WSA_INVALID_EVENT;
+        }
     }
 
     ~MouseMoveUdpChannel() {
         if (s_ != INVALID_SOCKET) closesocket(s_);
+        if (event_ != WSA_INVALID_EVENT) WSACloseEvent(event_);
     }
+
+    // Signalled when an MRM1 datagram (pong, cursor shape) is waiting.
+    HANDLE readEvent() const { return event_ == WSA_INVALID_EVENT ? nullptr : event_; }
 
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
@@ -200,6 +217,9 @@ public:
 
     bool pollCursorShape(uint8_t& shape) {
         if (s_ == INVALID_SOCKET) return false;
+        // Reset before draining: a datagram that arrives after the last
+        // read sets the event again.
+        if (event_ != WSA_INVALID_EVENT) WSAResetEvent(event_);
         bool updated = false;
         for (;;) {
             uint8_t p[64]{};
@@ -263,6 +283,7 @@ public:
 
 private:
     SOCKET s_ = INVALID_SOCKET;
+    WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
     uint32_t sequence_ = 0;
     uint64_t sent_ = 0;
@@ -537,12 +558,7 @@ static void releaseRemoteModifiers() {
 }
 
 static void logLine(const std::string& s) {
-    std::ofstream f(kLogPath, std::ios::app);
-    f << s << "\n";
-    f.flush();
-    std::ofstream h(kHistoryLogPath, std::ios::app);
-    h << s << "\n";
-    h.flush();
+    gLog.line(s);
 }
 
 static void check(HRESULT hr, const char* what) {
@@ -1960,7 +1976,7 @@ static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
 }
 
 static int appMain(int argc, char** argv) {
-    std::remove(kLogPath.c_str());
+    gLog.start(kLogPath, kHistoryLogPath);
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
     auto request = resolveLaunchFromSystem(argc, argv);
 
@@ -2246,10 +2262,11 @@ static int appMain(int argc, char** argv) {
             DWORD nackTimeout = 5;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&nackTimeout), sizeof(nackTimeout));
         }
-        // The loop waits on the socket, window messages and (while a decoded
-        // frame waits for a free back buffer) the swap chain latency object,
-        // so a pending frame is presented as soon as the display frees a
-        // buffer instead of after the next packet or receive timeout.
+        // The loop waits on the socket, window messages, the MRM1 socket
+        // (pongs, cursor shapes) and (while a decoded frame waits for a free
+        // back buffer) the swap chain latency object, so a pending frame is
+        // presented as soon as the display frees a buffer instead of after
+        // the next packet or receive timeout.
         // WSAEventSelect makes the socket non-blocking.
         const DWORD loopWaitMs = (nackEnabled || abrEnabled) ? 5 : 16;
         WSAEVENT socketEvent = WSACreateEvent();
@@ -2258,6 +2275,12 @@ static int appMain(int argc, char** argv) {
             closesocket(s);
             throw std::runtime_error("WSAEventSelect failed");
         }
+        // 1 ms timer while streaming, so the 1 ms / 5 ms waits below really
+        // last 1 ms / 5 ms instead of a default ~15.6 ms tick. Released when
+        // this scope ends.
+        const jl::ScopedTimerResolution timerPeriod(1);
+        logLine(std::string("timer.period_ms=1 active=") + (timerPeriod.active() ? "yes" : "no") +
+                " mrm1_wait=" + (mouseMoveUdp && mouseMoveUdp->readEvent() ? "yes" : "no"));
 
         uint64_t rejected = 0;
         std::vector<float> decodeMs;           // per submitted frame, whole session (capped)
@@ -2406,15 +2429,18 @@ static int appMain(int argc, char** argv) {
                 int e = WSAGetLastError();
                 if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
                     // Nothing to read: sleep until a packet, a window message,
-                    // a free back buffer, or the old receive-timeout tick.
-                    HANDLE waits[2] = {socketEvent, video->presentWaitHandle()};
-                    const DWORD waitCount = waits[1] ? 2 : 1;
+                    // a free back buffer, an MRM1 pong or cursor shape, or the
+                    // old receive-timeout tick.
+                    const HANDLE presentWait = video->presentWaitHandle();
+                    jl::LoopWait waits;
+                    waits.add(socketEvent, jl::LoopWait::Video);
+                    waits.add(presentWait, jl::LoopWait::Present);
+                    waits.add(mouseMoveUdp ? mouseMoveUdp->readEvent() : nullptr, jl::LoopWait::Mrm1);
                     // Pending frame without a latency object to wait on
                     // (nowait mode, or Present() said still drawing): poll.
-                    const DWORD waitMs = (video->presentPending() && !waits[1]) ? 1 : loopWaitMs;
-                    const DWORD w = MsgWaitForMultipleObjects(waitCount, waits, FALSE, waitMs, QS_ALLINPUT);
+                    const DWORD waitMs = (video->presentPending() && !presentWait) ? 1 : loopWaitMs;
                     // A successful wait consumed the latency object's signal.
-                    if (waitCount == 2 && w == WAIT_OBJECT_0 + 1) video->onPresentWaitSignaled();
+                    if (waits.wait(waitMs) == jl::LoopWait::Present) video->onPresentWaitSignaled();
                     now = std::chrono::steady_clock::now();
                     receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
@@ -2593,5 +2619,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     LocalFree(wideArgv);
-    return appMain(argc, argv.data());
+    const int rc = appMain(argc, argv.data());
+    gLog.stop();  // write out every queued line before the process exits
+    return rc;
 }

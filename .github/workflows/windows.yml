@@ -33,6 +33,14 @@ jobs:
         run: cmake --build build --config Release --target JerislinkReceiverTest
       - name: Receiver / NACK unit test (loss simulation, NACK on vs off)
         run: build\Release\JerislinkReceiverTest.exe
+      - name: Build loop wait test
+        run: cmake --build build --config Release --target JerislinkLoopWaitTest
+      - name: Loop wait test (MRM1 wake, timer period before/after)
+        run: build\Release\JerislinkLoopWaitTest.exe
+      - name: Build viewer log test
+        run: cmake --build build --config Release --target JerislinkLogTest
+      - name: Viewer log test (order, size caps, legacy history trim, caller cost before/after)
+        run: build\Release\JerislinkLogTest.exe
       - name: Saved settings drive a launch without connection arguments
         shell: pwsh
         run: |
