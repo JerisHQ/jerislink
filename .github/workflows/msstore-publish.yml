@@ -1,22 +1,37 @@
 name: msstore-publish
 
-# Uploads an already built .msixupload (from a successful `msix` run on main)
+# Uploads the .msixupload that the `msix` workflow built for a released commit
 # to Partner Center as a DRAFT submission for Store product 9NM3VWQ9MD7N.
 #
-# - Manual only (workflow_dispatch); never runs on push, PR or tag.
-# - Runs in the `store` environment, so its secrets are only released after
-#   the environment's protection rules pass (set Required reviewers there).
+# Triggers
+# - release `released`: a GitHub release is published as a full release (or a
+#   prerelease is promoted to one). Draft releases and prereleases do not fire
+#   it. release.yml creates the release as a draft on a v* tag push; publishing
+#   that draft by hand is the release decision, and that is what starts this.
+# - workflow_dispatch (fallback): give the run id of a successful `msix` run.
+#
+# Package selection: the job never builds. It finds the successful `msix` push
+# run for exactly the released commit and downloads its jerislink-msix-store
+# artifact (the bytes CI already checked, WACK-tested and sideload-installed).
+# No matching run means the job fails; it never falls back to another commit.
+# The commit must also be in main's history.
+#
+# - Runs in the `store` environment, so its secrets are only released after the
+#   environment's reviewers approve. The environment's deployment policy must
+#   allow the tag ref (refs/tags/v*) for the release trigger to get past it.
 # - `msstore publish --noCommit` keeps the submission in draft state: nothing
 #   goes to certification or the Store until someone presses "Submit" in
 #   Partner Center by hand.
-# - Secrets reach msstore only through step env vars; they are never echoed,
-#   written to disk by this workflow, or put in the repo.
+# - Secrets reach msstore only through step env vars in the sign-in step; they
+#   are never echoed, written to disk by this workflow, or put in the repo.
 
 on:
+  release:
+    types: [released]
   workflow_dispatch:
     inputs:
       msix_run_id:
-        description: 'Run id of a successful "msix" workflow run on main (its jerislink-msix-store artifact is uploaded)'
+        description: 'Run id of a successful "msix" push run whose commit is in main (its jerislink-msix-store artifact is uploaded)'
         required: true
         type: string
 
@@ -35,7 +50,10 @@ env:
 
 jobs:
   publish-draft:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
+        && !github.event.release.draft && !github.event.release.prerelease)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
     environment: store
     timeout-minutes: 30
@@ -43,30 +61,55 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Check the source msix run (this repo, workflow msix, push to main, success)
+      - name: Find the msix run for this commit and check the commit is in main
+        id: src
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
-          if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-          Write-Host "run $($run.id): workflow=$($run.name) event=$($run.event) branch=$($run.head_branch) sha=$($run.head_sha) conclusion=$($run.conclusion)"
-          if ($run.name -ne 'msix')            { throw "run is not the msix workflow" }
-          if ($run.event -ne 'push')           { throw "run was not triggered by a push" }
-          if ($run.head_branch -ne 'main')     { throw "run is not on main" }
-          if ($run.conclusion -ne 'success')   { throw "run did not succeed" }
-          if ($run.head_repository.full_name -ne $env:GITHUB_REPOSITORY) { throw "run is from another repository" }
+          $repo = $env:GITHUB_REPOSITORY
+          if ($env:EVENT -eq 'release') {
+            if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "release tag '$env:TAG' is not vMAJOR.MINOR.PATCH" }
+            $sha = (gh api "repos/$repo/commits/$env:TAG" | ConvertFrom-Json).sha
+            if ($sha -ne $env:GITHUB_SHA) { throw "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
+            $runs = (gh api "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20" | ConvertFrom-Json).workflow_runs |
+              Where-Object { $_.head_sha -eq $sha -and $_.head_repository.full_name -eq $repo -and $_.conclusion -eq 'success' } |
+              Sort-Object { [datetime]$_.created_at } -Descending
+            if (-not $runs) { throw "no successful msix push run for $sha yet; re-run this job once it has finished" }
+            $run = @($runs)[0]
+            $version = $env:TAG.Substring(1) + '.0'
+          } else {
+            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
+            $run = gh api "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+            if ($run.name -ne 'msix')          { throw "run is not the msix workflow" }
+            if ($run.event -ne 'push')         { throw "run was not triggered by a push" }
+            if ($run.conclusion -ne 'success') { throw "run did not succeed" }
+            if ($run.head_repository.full_name -ne $repo) { throw "run is from another repository" }
+            $sha = $run.head_sha
+            $version = ''
+          }
+          Write-Host "msix run $($run.id): event=$($run.event) ref=$($run.head_branch) sha=$($run.head_sha) conclusion=$($run.conclusion)"
+          $cmp = gh api "repos/$repo/compare/$sha...main" | ConvertFrom-Json
+          Write-Host "main vs $sha : $($cmp.status)"
+          if ($cmp.status -notin @('ahead','identical')) { throw "commit $sha is not in main's history ($($cmp.status))" }
+          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
         with:
           name: jerislink-msix-store
-          run-id: ${{ inputs.msix_run_id }}
+          run-id: ${{ steps.src.outputs.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/store
 
       - name: Check the package identity and version
         id: pkg
+        env:
+          EXPECTED_VERSION: ${{ steps.src.outputs.version }}
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'store'
           $upload = @(Get-ChildItem $dir -Filter *.msixupload)
@@ -85,6 +128,7 @@ jobs:
           if ($id.Name -ne $env:EXPECTED_IDENTITY_NAME) { throw "unexpected Identity Name" }
           if ($id.Publisher -ne $env:EXPECTED_PUBLISHER) { throw "unexpected Identity Publisher" }
           if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw "Store versions must end in .0" }
+          if ($env:EXPECTED_VERSION -and $id.Version -ne $env:EXPECTED_VERSION) { throw "package version $($id.Version) does not match the release ($env:EXPECTED_VERSION)" }
           (Get-FileHash $upload[0].FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $upload[0].Name | Write-Host
           "file=$($upload[0].FullName)" >> $env:GITHUB_OUTPUT
 
