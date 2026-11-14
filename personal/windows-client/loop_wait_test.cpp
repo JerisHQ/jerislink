@@ -7,13 +7,19 @@
 // 3. Event semantics the viewer relies on: reset + drain leaves no
 //    spurious wake; a datagram left unread re-signals the event.
 // 4. Null handles are skipped and results map back to the right source.
+// 5. video_worker.hpp: a stalled decoder does not block the main loop;
+//    order, overflow -> keyframe, failure, latency wait, clean stop.
 #include "loop_wait.hpp"
+#include "video_worker.hpp"
 
 #include <ws2tcpip.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -212,6 +218,254 @@ static void testMapping() {
     CloseHandle(c);
 }
 
+// ---- video_worker.hpp: decode/present thread ----
+
+// A pipeline stand-in: records what it is asked to do, can block in
+// submit (a stalled decoder) and can throw.
+struct FakeSink : VideoWorkerSink {
+    std::mutex mu;
+    std::vector<std::string> calls;
+    DWORD stallMs = 0;
+    uint64_t stallFid = 0;
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // set when stallFid starts
+    HANDLE release = nullptr;  // if set, submit of stallFid waits for it
+    uint64_t throwFid = 0;
+    HANDLE presentHandle = nullptr;
+    bool pending = false;
+    int presentSignals = 0, repaints = 0, finishes = 0, publishes = 0;
+    HWND finishSendTo = nullptr;  // finish() SendMessage()s here (DXGI-like)
+
+    ~FakeSink() override { CloseHandle(entered); }
+    void submit(uint64_t fid, const std::vector<uint8_t>& frame, bool disc, bool key) override {
+        if (fid == throwFid) throw std::runtime_error("decoder exploded");
+        if (fid == stallFid) {
+            SetEvent(entered);
+            if (release) WaitForSingleObject(release, 5000);
+            if (stallMs) Sleep(stallMs);
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        calls.push_back("F" + std::to_string(fid) + (disc ? "d" : "") + (key ? "k" : "") +
+                        ":" + std::to_string(frame.size()));
+    }
+    void resetForNewStream() override { std::lock_guard<std::mutex> lk(mu); calls.push_back("R"); }
+    void repaint() override { std::lock_guard<std::mutex> lk(mu); ++repaints; }
+    void servicePresent() override {}
+    bool presentPending() override { return pending; }
+    HANDLE presentWaitHandle() override { return presentHandle; }
+    void onPresentWaitSignaled() override { std::lock_guard<std::mutex> lk(mu); ++presentSignals; pending = false; }
+    void published() override { std::lock_guard<std::mutex> lk(mu); ++publishes; }
+    void finish() override {
+        if (finishSendTo) SendMessageW(finishSendTo, WM_USER + 7, 0, 0);
+        std::lock_guard<std::mutex> lk(mu);
+        ++finishes;
+        calls.push_back("finish");
+    }
+    std::string joined() {
+        std::lock_guard<std::mutex> lk(mu);
+        std::string s;
+        for (const auto& c : calls) { if (!s.empty()) s += ' '; s += c; }
+        return s;
+    }
+};
+
+static std::vector<uint8_t> bytes(size_t n) { return std::vector<uint8_t>(n, 0xAB); }
+
+// The point of the thread: a decoder stuck for 500 ms (as seen in the field)
+// must not hold up the main loop. Pushing frames and handling a window
+// message stay fast while the worker is stuck; the frames are then
+// decoded in order.
+static void testWorkerInputNotBlockedByDecode() {
+    FakeSink sink;
+    sink.stallFid = 2;
+    sink.stallMs = 500;
+    VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+    w.start();
+    w.pushFrame(1, bytes(10), true, true);
+    w.pushFrame(2, bytes(10), false, false);
+    CHECK(WaitForSingleObject(sink.entered, 2000) == WAIT_OBJECT_0);  // worker is now stuck
+    double worstPushMs = 0;
+    const auto t0 = Clock::now();
+    for (uint64_t f = 3; f <= 20; ++f) {
+        const auto p0 = Clock::now();
+        w.pushFrame(f, bytes(1000), false, false);
+        worstPushMs = std::max(worstPushMs, msSince(p0));
+    }
+    // An input message posted now is seen by the main loop at once.
+    MSG m;
+    PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE);
+    PostThreadMessageW(GetCurrentThreadId(), WM_KEYDOWN, 'A', 0);
+    LoopWait lw;
+    const auto m0 = Clock::now();
+    CHECK(lw.wait(100) == LoopWait::Message);
+    const double messageMs = msSince(m0);
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {}
+    const double mainMs = msSince(t0);
+    std::printf("worker: decode stalled 500 ms; main thread: 18 pushes worst %.3f ms, "
+                "message seen after %.3f ms, total %.3f ms\n", worstPushMs, messageMs, mainMs);
+    CHECK(worstPushMs < 5.0);
+    CHECK(messageMs < 20.0);
+    CHECK(mainMs < 100.0);  // the stall is 500 ms
+    w.stopAndWait();
+    std::string want = "F1dk:10 F2:10";
+    for (int f = 3; f <= 20; ++f) want += " F" + std::to_string(f) + ":1000";
+    want += " finish";
+    CHECK(sink.joined() == want);
+    CHECK(w.framesSubmitted() == 20);
+    std::vector<float> dec, wait;
+    w.takeSamples(dec, wait);
+    CHECK(dec.size() == 20);
+    CHECK(!dec.empty() && *std::max_element(dec.begin(), dec.end()) >= 450.0f);
+    CHECK(!wait.empty() && *std::max_element(wait.begin(), wait.end()) >= 400.0f);
+    CHECK(w.overflows() == 0);
+}
+
+// Frames and stream resets keep the order the receiver produced.
+static void testWorkerOrder() {
+    FakeSink sink;
+    VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+    w.start();
+    w.pushReset();
+    w.pushFrame(1, bytes(3), true, true);
+    w.pushFrame(2, bytes(4), false, false);
+    w.pushReset();
+    w.pushFrame(9, bytes(5), true, true);
+    w.stopAndWait();
+    CHECK(sink.joined() == "R F1dk:3 F2:4 R F9dk:5 finish");
+    CHECK(sink.finishes == 1);
+    // Nothing is accepted after stop.
+    w.pushFrame(10, bytes(1), false, false);
+    w.pushReset();
+    w.stopAndWait();  // second stop is a no-op
+    CHECK(sink.joined() == "R F1dk:3 F2:4 R F9dk:5 finish");
+    CHECK(sink.finishes == 1);
+}
+
+// A stall far past the queue cap: the queue is dropped, a keyframe is
+// requested and frames are dropped until one comes; it goes in as a
+// discontinuity. Resets queued meanwhile are kept.
+static void testWorkerOverflowToKeyframe() {
+    FakeSink sink;
+    sink.stallFid = 1;
+    sink.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    int keyRequests = 0;
+    std::vector<std::string> logs;
+    VideoWorkerConfig cfg;
+    cfg.maxFrames = 4;
+    cfg.rerequestEvery = 3;
+    VideoWorker w(sink, cfg, [&] { ++keyRequests; }, [&](const std::string& s) { logs.push_back(s); });
+    w.start();
+    w.pushFrame(1, bytes(1), true, true);
+    CHECK(WaitForSingleObject(sink.entered, 2000) == WAIT_OBJECT_0);
+    for (uint64_t f = 2; f <= 5; ++f) w.pushFrame(f, bytes(1), false, false);
+    CHECK(w.queuedFrames() == 4);
+    w.pushReset();
+    w.pushFrame(6, bytes(1), false, false);  // overflow: 2..5 and 6 dropped
+    CHECK(w.overflows() == 1);
+    CHECK(keyRequests == 1);
+    CHECK(w.queuedFrames() == 0);
+    w.pushFrame(7, bytes(1), false, false);  // dropped (2 since request)
+    CHECK(keyRequests == 1);
+    w.pushFrame(8, bytes(1), false, false);  // dropped (3): asks again
+    CHECK(keyRequests == 2);
+    w.pushFrame(9, bytes(1), false, true);   // keyframe: back in, as a discontinuity
+    w.pushFrame(10, bytes(1), false, false);
+    CHECK(w.overflowDrops() == 7);
+    SetEvent(sink.release);
+    w.stopAndWait();
+    CHECK(sink.joined() == "F1dk:1 R F9dk:1 F10:1 finish");
+    CHECK(!logs.empty() && logs.front().find("video.queue_overflow dropped=4") == 0);
+    CloseHandle(sink.release);
+}
+
+// A sink exception (HEVC with no CPU fallback) ends the worker; the main
+// loop sees failed() and the message, finish() is not called, and pushes
+// after that are ignored without blocking.
+static void testWorkerFailure() {
+    FakeSink sink;
+    sink.throwFid = 3;
+    VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+    w.start();
+    for (uint64_t f = 1; f <= 5; ++f) w.pushFrame(f, bytes(2), f == 1, f == 1);
+    const auto t0 = Clock::now();
+    while (!w.failed() && msSince(t0) < 2000) Sleep(1);
+    CHECK(w.failed());
+    CHECK(w.error() == "decoder exploded");
+    w.pushFrame(6, bytes(2), false, false);
+    w.stopAndWait();
+    CHECK(sink.finishes == 0);
+    CHECK(sink.joined() == "F1dk:2 F2:2");
+}
+
+// The worker waits on the swap chain latency object and tells the sink
+// when it fired; a repaint request reaches the sink.
+static void testWorkerPresentWaitAndRepaint() {
+    FakeSink sink;
+    HANDLE latency = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    sink.presentHandle = latency;
+    sink.pending = true;
+    VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+    w.start();
+    SetEvent(latency);
+    w.requestRepaint();
+    const auto t0 = Clock::now();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(sink.mu);
+            if (sink.presentSignals >= 1 && sink.repaints >= 1) break;
+        }
+        if (msSince(t0) > 2000) break;
+        Sleep(1);
+    }
+    w.stopAndWait();
+    CHECK(sink.presentSignals >= 1);
+    CHECK(sink.repaints >= 1);
+    CHECK(sink.publishes >= 1);
+    CloseHandle(latency);
+}
+
+static int gSentToMain = 0;
+static LRESULT CALLBACK workerTestWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_USER + 7) { ++gSentToMain; return 0; }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// Shutdown while the worker needs the main thread (DXGI can send window
+// messages from Present/ResizeBuffers): stopAndWait keeps pumping, so the
+// worker's SendMessage completes instead of deadlocking.
+static void testWorkerStopPumpsMessages() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = workerTestWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"JerislinkWorkerTest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    CHECK(hwnd != nullptr);
+    FakeSink sink;
+    sink.finishSendTo = hwnd;
+    gSentToMain = 0;
+    {
+        VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+        w.start();
+        w.pushFrame(1, bytes(1), true, true);
+        const auto t0 = Clock::now();
+        w.stopAndWait();
+        std::printf("worker: stop with a SendMessage to the main thread took %.3f ms\n", msSince(t0));
+    }
+    CHECK(gSentToMain == 1);
+    CHECK(sink.finishes == 1);
+    // The destructor alone also stops cleanly (exception path in the viewer).
+    FakeSink sink2;
+    sink2.finishSendTo = hwnd;
+    {
+        VideoWorker w(sink2, VideoWorkerConfig{}, nullptr, nullptr);
+        w.start();
+        w.pushFrame(1, bytes(1), true, true);
+    }
+    CHECK(gSentToMain == 2);
+    CHECK(sink2.finishes == 1);
+    DestroyWindow(hwnd);
+}
+
 int main() {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -221,6 +475,12 @@ int main() {
     testMapping();
     testMrm1Wake();
     testTimerResolution();
+    testWorkerInputNotBlockedByDecode();
+    testWorkerOrder();
+    testWorkerOverflowToKeyframe();
+    testWorkerFailure();
+    testWorkerPresentWaitAndRepaint();
+    testWorkerStopPumpsMessages();
     WSACleanup();
     std::printf("%d PASS, %d FAIL\n", gPasses, gFailures);
     if (gFailures) return 1;

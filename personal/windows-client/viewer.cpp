@@ -26,8 +26,10 @@
 #include "loop_wait.hpp"
 #include "viewer_log.hpp"
 #include "mouse_buttons.hpp"
+#include "video_worker.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -38,6 +40,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -77,8 +80,10 @@ extern "C" const char* __asan_default_options() {
     return "log_path=shader-asan:abort_on_error=1";
 }
 class CpuPresenter;
-static CpuPresenter* gCpuPresenter = nullptr;
-static bool gHardwarePresenterActive = false;
+// Set by the presenter (on the video thread after a CPU fallback), read by
+// WM_PAINT on the main thread.
+static std::atomic<CpuPresenter*> gCpuPresenter{nullptr};
+static std::atomic<bool> gHardwarePresenterActive{false};
 // WM_PAINT on the hardware path: the main loop re-presents the newest frame
 // after pumpMessages() (never from inside the window procedure).
 static bool gHardwareRepaintRequested = false;
@@ -314,7 +319,7 @@ private:
     double rttLastMs_ = 0.0;
 };
 
-static bool gWindowClosed = false;
+static std::atomic<bool> gWindowClosed{false};  // read by the video thread too
 static ControlChannel* gControl = nullptr;
 static MouseMoveUdpChannel* gMouseMoveUdp = nullptr;
 static double gScrollScale = 1.0 / 3.0;
@@ -359,6 +364,24 @@ struct ConnectionInfoState {
 };
 
 static ConnectionInfoState gConnectionInfo;
+
+// Changes found by the video thread (decoded size, CPU fallback). The main
+// thread applies them to gRemoteWidth/Height (input mapping) and
+// gConnectionInfo, which only the main thread reads.
+struct VideoInfoMailbox {
+    std::mutex mu;
+    bool sizeChanged = false;
+    UINT32 width = 0, height = 0;
+    bool backendChanged = false;
+    std::string backend, decoder, adapter;
+};
+static VideoInfoMailbox gVideoInfo;
+
+// How long input messages waited in the queue before the main thread got to
+// them (GetTickCount - MSG::time, tick resolution). A stall of the main
+// loop shows up here. Main thread only.
+static std::vector<float> gInputQueueWindowMs;
+static std::vector<float> gInputQueueSessionMs;
 
 static HCURSOR cursorForRemoteShape(uint8_t shape) {
     LPCWSTR id = IDC_ARROW;
@@ -1292,6 +1315,14 @@ static void pumpMessages() {
     MSG m{};
     while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
         if (m.message == WM_QUIT) gWindowClosed = true;
+        const bool input = (m.message >= WM_KEYFIRST && m.message <= WM_KEYLAST) ||
+                           (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
+                           (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
+        if (input) {
+            const float waited = static_cast<float>(static_cast<DWORD>(GetTickCount() - m.time));
+            if (gInputQueueWindowMs.size() < (1u << 16)) gInputQueueWindowMs.push_back(waited);
+            if (gInputQueueSessionMs.size() < (1u << 20)) gInputQueueSessionMs.push_back(waited);
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
@@ -1359,11 +1390,16 @@ public:
         }
 
         const auto t0 = std::chrono::steady_clock::now();
-        if (presented_ == 0) logFirstFrameStats(data, curLen);
-        convertNv12ToBgra(data, stride_);
-        if (presented_ == 0) dumpFirstFrameBmp();
+        {
+            // present() runs on the video thread, paintToDc() on the main
+            // thread (WM_PAINT): bgra_ and hasFrame_ are shared.
+            std::lock_guard<std::mutex> lk(frameMu_);
+            if (presented_ == 0) logFirstFrameStats(data, curLen);
+            convertNv12ToBgra(data, stride_);
+            if (presented_ == 0) dumpFirstFrameBmp();
+            hasFrame_ = true;
+        }
         buffer->Unlock();
-        hasFrame_ = true;
         drawFrame();
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
@@ -1388,6 +1424,7 @@ public:
 
         RECT fill{0, 0, cw, ch};
         FillRect(memDC_, &fill, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        std::lock_guard<std::mutex> lk(frameMu_);
         if (hasFrame_) {
             const double srcAspect = static_cast<double>(srcW_) / srcH_;
             int dw = cw, dh = ch, dx = 0, dy = 0;
@@ -1509,9 +1546,11 @@ private:
         }
     }
 
+    // Called on the video thread: only invalidate. The main thread paints on
+    // its next message pump (UpdateWindow from here would block this thread
+    // on the main thread).
     void drawFrame() {
         InvalidateRect(hwnd_, nullptr, FALSE);
-        UpdateWindow(hwnd_);
     }
 
     HWND hwnd_ = nullptr;
@@ -1524,6 +1563,7 @@ private:
     HBITMAP oldBitmap_ = nullptr;
     int backW_ = 0;
     int backH_ = 0;
+    std::mutex frameMu_;  // bgra_ and hasFrame_
     std::vector<uint8_t> bgra_;
     bool hasFrame_ = false;
     uint64_t presented_ = 0;
@@ -1541,8 +1581,8 @@ static void paintCpuFrame(HWND hwnd) {
             // active. Validate WM_PAINT without painting over the swapchain
             // and ask the main loop to present the newest frame again.
             gHardwareRepaintRequested = true;
-        } else if (gCpuPresenter) {
-            gCpuPresenter->paintToDc(dc);
+        } else if (CpuPresenter* cpu = gCpuPresenter.load()) {
+            cpu->paintToDc(dc);
         } else {
             RECT r{};
             GetClientRect(hwnd, &r);
@@ -1760,11 +1800,16 @@ public:
                 const UINT32 activeW = hardware_->activeWidth();
                 const UINT32 activeH = hardware_->activeHeight();
                 if (activeW && activeH &&
-                    (activeW != gRemoteWidth || activeH != gRemoteHeight)) {
-                    gRemoteWidth = activeW;
-                    gRemoteHeight = activeH;
-                    gConnectionInfo.remoteWidth = activeW;
-                    gConnectionInfo.remoteHeight = activeH;
+                    (activeW != reportedW_ || activeH != reportedH_)) {
+                    reportedW_ = activeW;
+                    reportedH_ = activeH;
+                    {
+                        // Applied to gRemoteWidth/Height on the main thread.
+                        std::lock_guard<std::mutex> lk(gVideoInfo.mu);
+                        gVideoInfo.sizeChanged = true;
+                        gVideoInfo.width = activeW;
+                        gVideoInfo.height = activeH;
+                    }
                     logLine("input.remote_size=" + std::to_string(activeW) + "x" +
                             std::to_string(activeH));
                 }
@@ -1958,9 +2003,14 @@ private:
         ++fallbacks_;
         logLine("gpu.fallback=cpu-gdi reason=runtime");
         startCpu();
-        gConnectionInfo.backend = activeBackend();
-        gConnectionInfo.decoder = decoderName();
-        gConnectionInfo.adapter.clear();
+        {
+            // Applied to gConnectionInfo on the main thread.
+            std::lock_guard<std::mutex> lk(gVideoInfo.mu);
+            gVideoInfo.backendChanged = true;
+            gVideoInfo.backend = activeBackend();
+            gVideoInfo.decoder = decoderName();
+            gVideoInfo.adapter.clear();
+        }
         waitingForCpuKeyframe_ = true;
     }
 
@@ -1968,6 +2018,7 @@ private:
     UINT32 width_ = 0;
     UINT32 height_ = 0;
     UINT32 fps_ = 0;
+    UINT32 reportedW_ = width_, reportedH_ = height_;  // last size sent to the main thread
     std::string requestedBackend_;
     JerisVideoCodec codec_ = JerisVideoCodec::H264;
     std::string adapterName_;
@@ -1989,6 +2040,69 @@ private:
     double hardwarePresentMsSaved_ = 0.0;
     double hardwarePresentMaxSaved_ = 0.0;
 };
+
+// The video thread drives the pipeline through this; the main thread reads
+// the published counters for the 5 s stats line while the thread runs.
+class PipelineSink : public jl::VideoWorkerSink {
+public:
+    explicit PipelineSink(VideoPipeline& video) : video_(video) {}
+    void submit(uint64_t fid, const std::vector<uint8_t>& frame, bool discontinuity, bool keyFrame) override {
+        video_.submit(fid, frame, discontinuity, keyFrame);
+    }
+    void resetForNewStream() override { video_.resetForNewStream(); }
+    void repaint() override { video_.repaint(); }
+    void servicePresent() override { video_.servicePresent(); }
+    bool presentPending() override { return video_.presentPending(); }
+    HANDLE presentWaitHandle() override { return video_.presentWaitHandle(); }
+    void onPresentWaitSignaled() override { video_.onPresentWaitSignaled(); }
+    void finish() override { video_.finish(); }
+    void published() override {
+        decoded.store(video_.decodedFrames(), std::memory_order_relaxed);
+        presented.store(video_.presented(), std::memory_order_relaxed);
+        busyDrops.store(video_.busyDrops(), std::memory_order_relaxed);
+        busyRetries.store(video_.busyRetries(), std::memory_order_relaxed);
+    }
+
+    std::atomic<uint64_t> decoded{0}, presented{0}, busyDrops{0}, busyRetries{0};
+
+private:
+    VideoPipeline& video_;
+};
+
+// Main thread: take what the video thread found (decoded size, CPU fallback).
+static void applyVideoInfo(HWND hwnd) {
+    bool size = false, backend = false;
+    UINT32 w = 0, h = 0;
+    std::string be, dec, ad;
+    {
+        std::lock_guard<std::mutex> lk(gVideoInfo.mu);
+        if (gVideoInfo.sizeChanged) {
+            size = true;
+            w = gVideoInfo.width;
+            h = gVideoInfo.height;
+            gVideoInfo.sizeChanged = false;
+        }
+        if (gVideoInfo.backendChanged) {
+            backend = true;
+            be = gVideoInfo.backend;
+            dec = gVideoInfo.decoder;
+            ad = gVideoInfo.adapter;
+            gVideoInfo.backendChanged = false;
+        }
+    }
+    if (size) {
+        gRemoteWidth = w;
+        gRemoteHeight = h;
+        gConnectionInfo.remoteWidth = w;
+        gConnectionInfo.remoteHeight = h;
+    }
+    if (backend) {
+        gConnectionInfo.backend = be;
+        gConnectionInfo.decoder = dec;
+        gConnectionInfo.adapter = ad;
+    }
+    if (size || backend) updateViewerTitle(hwnd);
+}
 
 static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
     std::vector<std::string> args;
@@ -2307,7 +2421,30 @@ static int appMain(int argc, char** argv) {
         uint64_t rejected = 0;
         std::vector<float> decodeMs;           // per submitted frame, whole session (capped)
         std::vector<float> decodeWindowMs;     // last 5 s, for the periodic stats line
+        std::vector<float> queueWaitMs;        // frame queued -> decode starts, session (capped)
+        std::vector<float> queueWaitWindowMs;
+        std::vector<float> loopBusyWindowMs;   // main loop work per iteration (not its wait)
+        double loopBusyMaxMs = 0.0;
+        uint64_t loopStalls16 = 0, loopStalls100 = 0;
         constexpr size_t kMaxDecodeSamples = 1u << 20;
+        const auto takeVideoSamples = [&](jl::VideoWorker& w) {
+            const size_t d0 = decodeWindowMs.size(), q0 = queueWaitWindowMs.size();
+            w.takeSamples(decodeWindowMs, queueWaitWindowMs);
+            for (size_t i = d0; i < decodeWindowMs.size() && decodeMs.size() < kMaxDecodeSamples; ++i)
+                decodeMs.push_back(decodeWindowMs[i]);
+            for (size_t i = q0; i < queueWaitWindowMs.size() && queueWaitMs.size() < kMaxDecodeSamples; ++i)
+                queueWaitMs.push_back(queueWaitWindowMs[i]);
+        };
+
+        // Decode and present run on their own thread from here on: the
+        // pipeline is only touched by that thread until stopAndWait().
+        PipelineSink videoSink(*video);
+        videoSink.published();
+        jl::VideoWorker videoWorker(videoSink, jl::VideoWorkerConfig{},
+            [] { if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe(); },
+            [](const std::string& line) { logLine(line); });
+        videoWorker.start();
+        logLine("video.thread=started");
 
         jl::ReceiverConfig rcfg;
         rcfg.strict = strictLossRecovery;
@@ -2315,13 +2452,9 @@ static int appMain(int argc, char** argv) {
         if (gConnectionInfo.rttMs > 0) rcfg.defaultRttMs = gConnectionInfo.rttMs;
         jl::ReceiverHooks hooks;
         hooks.submit = [&](uint64_t fid, const std::vector<uint8_t>& frame, bool discontinuity, bool keyFrame) {
-            const auto t0 = std::chrono::steady_clock::now();
-            video->submit(fid, frame, discontinuity, keyFrame);
-            const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            if (decodeMs.size() < kMaxDecodeSamples) decodeMs.push_back(ms);
-            decodeWindowMs.push_back(ms);
+            videoWorker.pushFrame(fid, frame, discontinuity, keyFrame);
         };
-        hooks.resetForNewStream = [&] { video->resetForNewStream(); };
+        hooks.resetForNewStream = [&] { videoWorker.pushReset(); };
         hooks.requestKeyframe = [] { if (gMouseMoveUdp) gMouseMoveUdp->requestKeyframe(); };
         hooks.sendNack = [](uint64_t fid, const std::vector<jl::NackRange>& ranges) {
             if (gMouseMoveUdp) gMouseMoveUdp->sendNack(fid, ranges);
@@ -2351,7 +2484,19 @@ static int appMain(int argc, char** argv) {
         uint64_t repLossExpected = 0, repLossRaw = 0, repLossAfter = 0;
         double lastSlopeMs = 0.0;
 
+        // Main loop work per iteration, up to its wait or its next packet
+        // (a stall here delays input).
+        auto iterStart = std::chrono::steady_clock::now();
+        const auto noteLoopBusy = [&](std::chrono::steady_clock::time_point end) {
+            const double busy = std::chrono::duration<double, std::milli>(end - iterStart).count();
+            if (loopBusyWindowMs.size() < (1u << 16)) loopBusyWindowMs.push_back(static_cast<float>(busy));
+            loopBusyMaxMs = std::max(loopBusyMaxMs, busy);
+            if (busy >= 16.0) ++loopStalls16;
+            if (busy >= 100.0) ++loopStalls100;
+        };
         while (!gWindowClosed) {
+            iterStart = std::chrono::steady_clock::now();
+            if (videoWorker.failed()) throw std::runtime_error(videoWorker.error());
             if (mouseMoveUdp) {
                 uint8_t cursorShape = gRemoteCursorShape;
                 if (mouseMoveUdp->pollCursorShape(cursorShape)) {
@@ -2363,12 +2508,12 @@ static int appMain(int argc, char** argv) {
             if (gWindowClosed) break;
             if (gHardwareRepaintRequested) {
                 gHardwareRepaintRequested = false;
-                video->repaint();
+                videoWorker.requestRepaint();
             }
-            video->servicePresent();
+            applyVideoInfo(hwnd);
 
             auto now = std::chrono::steady_clock::now();
-            presentedFps.update(msSince(now), video->presented());
+            presentedFps.update(msSince(now), videoSink.presented.load());
             if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
@@ -2400,10 +2545,11 @@ static int appMain(int argc, char** argv) {
                                                                 st.lossAfterNack - prevLossAfter);
                 const double windowSec = std::max(0.001,
                     std::chrono::duration<double>(now - lastStats).count());
-                const uint64_t decodedNow = video->decodedFrames();
-                const uint64_t presentedNow = video->presented();
-                const uint64_t busyDropsNow = video->busyDrops();
-                const uint64_t busyRetriesNow = video->busyRetries();
+                takeVideoSamples(videoWorker);
+                const uint64_t decodedNow = videoSink.decoded.load();
+                const uint64_t presentedNow = videoSink.presented.load();
+                const uint64_t busyDropsNow = videoSink.busyDrops.load();
+                const uint64_t busyRetriesNow = videoSink.busyRetries.load();
                 std::ostringstream line;
                 line << std::fixed << std::setprecision(1)
                      << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
@@ -2428,9 +2574,22 @@ static int appMain(int argc, char** argv) {
                      << " loss_after_nack_pct=" << wloss.afterNackPct
                      << " held_frames=" << receiver.heldFrames()
                      << " abr_reports_tx=" << (mouseMoveUdp ? mouseMoveUdp->reportSent() : 0)
-                     << " delay_slope_ms=" << lastSlopeMs;
+                     << " delay_slope_ms=" << lastSlopeMs
+                     << std::setprecision(1)
+                     << " video_queue_max=" << videoWorker.takeWindowMaxDepth()
+                     << " video_queue_wait_ms_p95=" << jl::receiverPercentile(queueWaitWindowMs, 95)
+                     << " video_queue_wait_ms_max=" << jl::receiverPercentile(queueWaitWindowMs, 100)
+                     << " loop_busy_ms_p99=" << jl::receiverPercentile(loopBusyWindowMs, 99)
+                     << " loop_busy_ms_max=" << jl::receiverPercentile(loopBusyWindowMs, 100)
+                     << " input_queue_ms_p50=" << jl::receiverPercentile(gInputQueueWindowMs, 50)
+                     << " input_queue_ms_p99=" << jl::receiverPercentile(gInputQueueWindowMs, 99)
+                     << " input_queue_ms_max=" << jl::receiverPercentile(gInputQueueWindowMs, 100)
+                     << " input_events=" << gInputQueueWindowMs.size();
                 logLine(line.str());
                 decodeWindowMs.clear();
+                queueWaitWindowMs.clear();
+                loopBusyWindowMs.clear();
+                gInputQueueWindowMs.clear();
                 presentedFps.clearWindow();
                 prevDecoded = decodedNow;
                 prevPresented = presentedNow;
@@ -2451,18 +2610,13 @@ static int appMain(int argc, char** argv) {
                 int e = WSAGetLastError();
                 if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
                     // Nothing to read: sleep until a packet, a window message,
-                    // a free back buffer, an MRM1 pong or cursor shape, or the
-                    // old receive-timeout tick.
-                    const HANDLE presentWait = video->presentWaitHandle();
+                    // an MRM1 pong or cursor shape, or the old receive-timeout
+                    // tick. The swap chain latency wait is on the video thread.
                     jl::LoopWait waits;
                     waits.add(socketEvent, jl::LoopWait::Video);
-                    waits.add(presentWait, jl::LoopWait::Present);
                     waits.add(mouseMoveUdp ? mouseMoveUdp->readEvent() : nullptr, jl::LoopWait::Mrm1);
-                    // Pending frame without a latency object to wait on
-                    // (nowait mode, or Present() said still drawing): poll.
-                    const DWORD waitMs = (video->presentPending() && !presentWait) ? 1 : loopWaitMs;
-                    // A successful wait consumed the latency object's signal.
-                    if (waits.wait(waitMs) == jl::LoopWait::Present) video->onPresentWaitSignaled();
+                    noteLoopBusy(now);
+                    waits.wait(loopWaitMs);
                     now = std::chrono::steady_clock::now();
                     receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
@@ -2486,10 +2640,18 @@ static int appMain(int argc, char** argv) {
             }
             receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
             receiver.tick(msSince(now));
+            noteLoopBusy(std::chrono::steady_clock::now());
         }
 
         const auto loopEnd = std::chrono::steady_clock::now();
-        video->finish();
+        // Decode what is queued, finish() on the video thread, keep pumping
+        // window messages meanwhile. After this the pipeline is ours again.
+        videoWorker.stopAndWait([] { pumpMessages(); });
+        if (videoWorker.failed()) throw std::runtime_error(videoWorker.error());
+        takeVideoSamples(videoWorker);
+        logLine("video.thread=stopped queue_max=" + std::to_string(videoWorker.maxDepth()) +
+                " overflows=" + std::to_string(videoWorker.overflows()) +
+                " overflow_drops=" + std::to_string(videoWorker.overflowDrops()));
         WSACloseEvent(socketEvent);
         closesocket(s);
         pumpMessages();
@@ -2556,6 +2718,18 @@ static int appMain(int argc, char** argv) {
                 << " decode_ms_p50=" << jl::receiverPercentile(decodeMs, 50)
                 << " decode_ms_p95=" << jl::receiverPercentile(decodeMs, 95)
                 << " decode_ms_max=" << jl::receiverPercentile(decodeMs, 100)
+                << " video_queue_wait_ms_p50=" << jl::receiverPercentile(queueWaitMs, 50)
+                << " video_queue_wait_ms_p99=" << jl::receiverPercentile(queueWaitMs, 99)
+                << " video_queue_wait_ms_max=" << jl::receiverPercentile(queueWaitMs, 100)
+                << " video_queue_max=" << videoWorker.maxDepth()
+                << " video_queue_overflows=" << videoWorker.overflows()
+                << " video_queue_overflow_drops=" << videoWorker.overflowDrops()
+                << " loop_busy_ms_max=" << loopBusyMaxMs
+                << " loop_stalls_16ms=" << loopStalls16
+                << " loop_stalls_100ms=" << loopStalls100
+                << " input_queue_ms_p50=" << jl::receiverPercentile(gInputQueueSessionMs, 50)
+                << " input_queue_ms_p99=" << jl::receiverPercentile(gInputQueueSessionMs, 99)
+                << " input_queue_ms_max=" << jl::receiverPercentile(gInputQueueSessionMs, 100)
                 << " rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
                 << " rtt_max_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMaxMs() : 0.0)
                 << " rtt_samples=" << (mouseMoveUdp ? mouseMoveUdp->pongRx() : 0)
