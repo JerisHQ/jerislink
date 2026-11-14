@@ -751,6 +751,77 @@ static void testModalExcludedFromStalls() {
     CHECK(clock.events() == 1);
 }
 
+// loop.slow_iter phases: the parts plus "other" add up to the iteration,
+// and the top part is named.
+static void testIterPhases() {
+    IterPhases p;
+    p.add(IterPhase::Pre, 0.2);
+    p.add(IterPhase::Pump, 21.5);
+    p.add(IterPhase::Stats, 1.0);
+    p.add(IterPhase::Recv, 0.1);
+    p.add(IterPhase::Packet, -3.0);  // negative spans are ignored
+    CHECK(p.get(IterPhase::Packet) == 0.0);
+    CHECK(p.sum() > 22.79 && p.sum() < 22.81);
+    CHECK(p.other(25.0) > 2.19 && p.other(25.0) < 2.21);
+    CHECK(std::string(p.topName(25.0)) == "pump");
+    // Busy time shorter than the marks (clock rounding): no negative other.
+    CHECK(p.other(20.0) == 0.0);
+    // Time outside every phase can be the top part.
+    CHECK(std::string(p.topName(60.0)) == "other");
+    // Phases accumulate within an iteration and clear on reset.
+    p.add(IterPhase::Pump, 1.0);
+    CHECK(p.get(IterPhase::Pump) == 22.5);
+    p.reset();
+    CHECK(p.sum() == 0.0);
+    CHECK(std::string(iterPhaseName(IterPhase::VideoInfo)) == "video_info");
+    CHECK(std::string(iterPhaseName(IterPhase::NetTx)) == "net_tx");
+}
+
+static void testPumpDetail() {
+    PumpDetail d;
+    d.noteHook(0.4);
+    d.noteHook(1.6);
+    d.noteWndProc(0x0006, 12.0);  // WM_ACTIVATE
+    d.noteWndProc(0x0302, 3.0);   // WM_PASTE
+    d.noteWndProc(0x0100, -1.0);  // clamped to 0
+    CHECK(d.hookCalls == 2 && d.hookMs == 2.0);
+    CHECK(d.wndprocCalls == 3 && d.wndprocMs == 15.0);
+    CHECK(d.slowMsg == 0x0006 && d.slowMsgMs == 12.0);
+    d.reset();
+    CHECK(d.hookCalls == 0 && d.wndprocCalls == 0 && d.slowMsg == 0 && d.slowMsgMs == 0.0);
+}
+
+// 16 ms threshold, one line per second below 100 ms, suppressed lines
+// counted with their max for the next line.
+static void testSlowIterLimiter() {
+    SlowIterLimiter lim(16.0, 100.0, 1000.0);
+    CHECK(!lim.shouldLog(15.9, 0.0));
+    CHECK(lim.events() == 0);
+    CHECK(lim.shouldLog(16.0, 10.0));
+    CHECK(!lim.shouldLog(43.0, 20.0));    // within 1 s of the last line
+    CHECK(!lim.shouldLog(18.0, 900.0));
+    CHECK(lim.shouldLog(120.0, 950.0));   // >= 100 ms always logs
+    double maxMs = 0.0;
+    CHECK(lim.takePending(maxMs) == 2);
+    CHECK(maxMs == 43.0);
+    CHECK(lim.takePending(maxMs) == 0 && maxMs == 0.0);
+    CHECK(!lim.shouldLog(20.0, 1500.0));  // 1 s counts from the 120 ms line
+    CHECK(lim.shouldLog(20.0, 1951.0));
+    CHECK(lim.events() == 6);
+    CHECK(lim.logged() == 3);
+    CHECK(lim.suppressedTotal() == 3);
+    // Negative: the G4 limit (50 ms, shared with loop.slow) never logged
+    // the 18-43 ms iterations seen during fast focus switching.
+    SlowIterLimiter g4(50.0, 200.0, 1000.0);
+    CHECK(!g4.shouldLog(18.0, 0.0));
+    CHECK(!g4.shouldLog(43.0, 5000.0));
+    CHECK(g4.events() == 0);
+    SlowIterLimiter g5;
+    CHECK(g5.thresholdMs() == 16.0);
+    CHECK(g5.shouldLog(18.0, 0.0));
+    CHECK(g5.shouldLog(43.0, 5000.0));
+}
+
 // Same with a real window: its window procedure runs a nested 120 ms
 // message loop (as DefWindowProc does for a caption button) inside a modal
 // scope. The outer loop's iteration takes > 100 ms, but no stall counts.
@@ -795,6 +866,56 @@ static void testModalLoopRealWindow() {
     DestroyWindow(hwnd);
 }
 
+// Same flow as the viewer with a real window: a 25 ms window procedure
+// call inside the pump shows up as the pump phase, the slowest message,
+// and one loop.slow_iter candidate.
+static PumpDetail gTestPump;
+static LRESULT CALLBACK slowTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    const auto t0 = Clock::now();
+    if (msg == WM_USER + 2) Sleep(25);
+    const LRESULT r = msg == WM_USER + 2 ? 0 : DefWindowProcW(hwnd, msg, wp, lp);
+    gTestPump.noteWndProc(msg, msSince(t0));
+    return r;
+}
+
+static void testSlowIterRealWindow() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = slowTestWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"JerislinkSlowIterTest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    CHECK(hwnd != nullptr);
+    MSG m{};
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+    gTestPump.reset();
+    PostMessageW(hwnd, WM_USER + 2, 0, 0);
+    IterPhases phases;
+    const auto iterStart = Clock::now();
+    double mark = 0.0;
+    const auto markPhase = [&](IterPhase p) {
+        const double t = msSince(iterStart);
+        phases.add(p, t - mark);
+        mark = t;
+    };
+    markPhase(IterPhase::Pre);
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+    markPhase(IterPhase::Pump);
+    markPhase(IterPhase::Recv);
+    const double busy = msSince(iterStart);
+    SlowIterLimiter lim;
+    std::printf("slow iter: busy %.1f ms, pump %.1f ms, top %s, slow_msg 0x%04x %.1f ms\n",
+                busy, phases.get(IterPhase::Pump), phases.topName(busy),
+                gTestPump.slowMsg, gTestPump.slowMsgMs);
+    CHECK(busy >= 20.0);
+    CHECK(phases.get(IterPhase::Pump) >= 20.0);
+    CHECK(std::string(phases.topName(busy)) == "pump");
+    CHECK(gTestPump.slowMsg == WM_USER + 2);
+    CHECK(gTestPump.slowMsgMs >= 20.0);
+    CHECK(lim.shouldLog(busy, 0.0));
+    DestroyWindow(hwnd);
+}
+
 int main() {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -817,6 +938,10 @@ int main() {
     testInputWaitSplitRealQueue();
     testModalExcludedFromStalls();
     testModalLoopRealWindow();
+    testIterPhases();
+    testPumpDetail();
+    testSlowIterLimiter();
+    testSlowIterRealWindow();
     WSACleanup();
     std::printf("%d PASS, %d FAIL\n", gPasses, gFailures);
     if (gFailures) return 1;

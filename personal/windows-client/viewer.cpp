@@ -401,6 +401,10 @@ static uint64_t gInputSlowEvents = 0;
 // Their time is not the loop's own stall; reported as loop_modal_*.
 static jl::ModalClock gModal;
 static UINT gModalMsg = 0;  // message that opened the current modal stretch
+// Pump detail of the current loop iteration (keyboard hook, window
+// procedure, peek and dispatch time), logged in loop.slow_iter. Main thread.
+static jl::PumpDetail gIterPump;
+static int gWndProcDepth = 0;
 // Input that was queued before the main loop started (it waited behind
 // GPU / decoder setup on this thread). Kept out of the numbers above so
 // they describe the running loop; reported once as input.startup_queued.
@@ -553,7 +557,7 @@ static bool isWindowsCtrlCompatShortcut(WPARAM vk) {
     return vk == 'A' || vk == 'C' || vk == 'V' || vk == 'Z';
 }
 
-static LRESULT CALLBACK ViewerKeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
+static LRESULT viewerKeyboardHookImpl(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && gViewerHwnd && viewerHasInteractiveFocus(gViewerHwnd)) {
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
         if (k) {
@@ -611,6 +615,15 @@ static LRESULT CALLBACK ViewerKeyboardHook(int code, WPARAM wParam, LPARAM lPara
         }
     }
     return CallNextHookEx(gKeyboardHook, code, wParam, lParam);
+}
+
+// Times every hook call (including CallNextHookEx) for loop.slow_iter. The
+// hook runs on the main thread inside PeekMessage, so it lands in peek_ms.
+static LRESULT CALLBACK ViewerKeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
+    const double t0 = steadyMsNow();
+    const LRESULT r = viewerKeyboardHookImpl(code, wParam, lParam);
+    gIterPump.noteHook(steadyMsNow() - t0);
+    return r;
 }
 
 static bool sendAbsolutePointer(HWND hwnd, POINT p) {
@@ -1065,7 +1078,7 @@ static bool debugMode() {
     return on;
 }
 
-static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     const ModalScope modal(msg);
     switch (msg) {
     case WM_COMMAND:
@@ -1355,6 +1368,21 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// Times outermost window-procedure calls (posted, or sent by Windows or by
+// our own calls such as SetWindowPos) for loop.slow_iter. Nested calls are
+// part of the outer one.
+static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (gWndProcDepth > 0) return viewerWndProcImpl(hwnd, msg, wParam, lParam);
+    struct Depth {
+        Depth() { ++gWndProcDepth; }
+        ~Depth() { --gWndProcDepth; }
+    } depth;
+    const double t0 = steadyMsNow();
+    const LRESULT r = viewerWndProcImpl(hwnd, msg, wParam, lParam);
+    gIterPump.noteWndProc(msg, steadyMsNow() - t0);
+    return r;
+}
+
 static HMENU createViewerMenu() {
     HMENU menuBar = CreateMenu();
     HMENU connectionMenu = CreatePopupMenu();
@@ -1500,12 +1528,15 @@ static void pumpMessages() {
         // (cross-thread) messages, so it is timed on its own.
         const double peekStart = steadyMsNow();
         const BOOL got = PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE);
-        logLoopSlowCall("peek", got ? m.message : 0, steadyMsNow() - peekStart);
+        const double peekMs = steadyMsNow() - peekStart;
+        gIterPump.peekMs += peekMs;
+        logLoopSlowCall("peek", got ? m.message : 0, peekMs);
         if (!got) {
             gLoopResponsiveMs = steadyMsNow();  // queue drained
             break;
         }
         if (m.message == WM_QUIT) gWindowClosed = true;
+        ++gIterPump.msgs;
         const bool input = (m.message >= WM_KEYFIRST && m.message <= WM_KEYLAST) ||
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
@@ -1514,9 +1545,11 @@ static void pumpMessages() {
         const uint64_t modalEventsBefore = gModal.events();
         TranslateMessage(&m);
         DispatchMessageW(&m);
+        const double dispatchMs = steadyMsNow() - dispatchStart;
+        gIterPump.dispatchMs += dispatchMs;
         // A dispatch that ran the system modal loop is logged as loop.modal.
         if (gModal.events() == modalEventsBefore)
-            logLoopSlowCall("dispatch", m.message, steadyMsNow() - dispatchStart);
+            logLoopSlowCall("dispatch", m.message, dispatchMs);
     }
 }
 
@@ -2690,6 +2723,8 @@ static int appMain(int argc, char** argv) {
         // Busy max and stalls exclude time inside Windows modal loops
         // (caption buttons, move/size, menus), logged as loop.modal.
         jl::LoopStallCounter loopStalls;
+        // loop.slow_iter: own time >= 16 ms, one line per second below 100 ms.
+        jl::SlowIterLimiter slowIterLog(16.0, 100.0, 1000.0);
         std::vector<float> displayLatencyWindowMs;   // present -> vblank, last 5 s
         std::vector<float> displayLatencyMs;         // whole session (capped)
         constexpr size_t kMaxDecodeSamples = 1u << 20;
@@ -2755,20 +2790,42 @@ static int appMain(int argc, char** argv) {
         // Main loop work per iteration, up to its wait or its next packet
         // (a stall here delays input).
         auto iterStart = std::chrono::steady_clock::now();
-        // Where a long iteration went (logged as loop.slow_iter).
-        double iterPumpMs = 0.0, iterStatsMs = 0.0, iterRecvMs = 0.0;
+        // Where a long iteration went (logged as loop.slow_iter): each phase
+        // runs from the previous mark to markPhase().
+        jl::IterPhases iterPhases;
+        double phaseMarkMs = 0.0;
+        const auto markPhase = [&](jl::IterPhase p) {
+            const double t = steadyMsNow();
+            iterPhases.add(p, t - phaseMarkMs);
+            phaseMarkMs = t;
+        };
         const auto noteLoopBusy = [&](std::chrono::steady_clock::time_point end) {
             const double busy = std::chrono::duration<double, std::milli>(end - iterStart).count();
             const double modalMs = gModal.takeIterMs();
             const double own = loopStalls.note(busy, modalMs);
             if (loopBusyWindowMs.size() < (1u << 16)) loopBusyWindowMs.push_back(static_cast<float>(own));
-            if (loopSlowShouldLog(own)) {
-                char lb[224];
+            if (slowIterLog.shouldLog(own, steadyMsNow())) {
+                using P = jl::IterPhase;
+                const jl::PumpDetail& pd = gIterPump;
+                double suppressedMaxMs = 0.0;
+                const uint64_t suppressed = slowIterLog.takePending(suppressedMaxMs);
+                char lb[640];
                 std::snprintf(lb, sizeof(lb),
-                              "loop.slow_iter ms=%.1f modal_ms=%.1f pump_ms=%.1f stats_ms=%.1f recv_ms=%.1f focused=%d iconic=%d suppressed=%llu",
-                              own, modalMs, iterPumpMs, iterStatsMs, iterRecvMs, gViewerFocused ? 1 : 0,
-                              IsIconic(hwnd) ? 1 : 0, static_cast<unsigned long long>(gLoopSlowSuppressed));
-                gLoopSlowSuppressed = 0;
+                              "loop.slow_iter ms=%.1f busy_ms=%.1f modal_ms=%.1f top=%s"
+                              " pre_ms=%.1f pump_ms=%.1f video_info_ms=%.1f net_tx_ms=%.1f stats_ms=%.1f"
+                              " recv_ms=%.1f packet_ms=%.1f other_ms=%.1f"
+                              " peek_ms=%.1f dispatch_ms=%.1f msgs=%u hook_ms=%.1f hook_calls=%u"
+                              " wndproc_ms=%.1f wndproc_calls=%u slow_msg=0x%04x slow_msg_ms=%.1f"
+                              " focused=%d iconic=%d suppressed=%llu suppressed_max_ms=%.1f",
+                              own, busy, modalMs, iterPhases.topName(busy),
+                              iterPhases.get(P::Pre), iterPhases.get(P::Pump), iterPhases.get(P::VideoInfo),
+                              iterPhases.get(P::NetTx), iterPhases.get(P::Stats), iterPhases.get(P::Recv),
+                              iterPhases.get(P::Packet), iterPhases.other(busy),
+                              pd.peekMs, pd.dispatchMs, static_cast<unsigned>(pd.msgs), pd.hookMs,
+                              static_cast<unsigned>(pd.hookCalls), pd.wndprocMs,
+                              static_cast<unsigned>(pd.wndprocCalls), static_cast<unsigned>(pd.slowMsg),
+                              pd.slowMsgMs, gViewerFocused ? 1 : 0, IsIconic(hwnd) ? 1 : 0,
+                              static_cast<unsigned long long>(suppressed), suppressedMaxMs);
                 logLine(lb);
             }
         };
@@ -2779,7 +2836,9 @@ static int appMain(int argc, char** argv) {
         gModal.takeWindowMs();
         while (!gWindowClosed) {
             iterStart = std::chrono::steady_clock::now();
-            iterPumpMs = iterStatsMs = iterRecvMs = 0.0;
+            phaseMarkMs = steadyMsNow();
+            iterPhases.reset();
+            gIterPump.reset();
             if (videoWorker.failed()) throw std::runtime_error(videoWorker.error());
             if (mouseMoveUdp) {
                 uint8_t cursorShape = gRemoteCursorShape;
@@ -2788,17 +2847,16 @@ static int appMain(int argc, char** argv) {
                 }
                 if (mouseMoveUdp->pongRx() > 0) receiver.setRttMs(mouseMoveUdp->rttMs());
             }
-            {
-                const double p0 = steadyMsNow();
-                pumpMessages();
-                iterPumpMs = steadyMsNow() - p0;
-            }
+            markPhase(jl::IterPhase::Pre);
+            pumpMessages();
+            markPhase(jl::IterPhase::Pump);
             if (gWindowClosed) break;
             if (gHardwareRepaintRequested) {
                 gHardwareRepaintRequested = false;
                 videoWorker.requestRepaint();
             }
             applyVideoInfo(hwnd);
+            markPhase(jl::IterPhase::VideoInfo);
 
             auto now = std::chrono::steady_clock::now();
             presentedFps.update(msSince(now), videoSink.presented.load());
@@ -2826,8 +2884,8 @@ static int appMain(int argc, char** argv) {
                 repLossAfter = st.lossAfterNack;
                 lastReport = now;
             }
+            markPhase(jl::IterPhase::NetTx);
             if (now - lastStats >= std::chrono::seconds(5)) {
-                const double statsStart = steadyMsNow();
                 const auto& st = receiver.stats();
                 const jl::ReceiverLoss wloss = jl::receiverLoss(st.lossExpected - prevLossExpected,
                                                                 st.lossRaw - prevLossRaw,
@@ -2918,15 +2976,14 @@ static int appMain(int argc, char** argv) {
                 prevLossRaw = st.lossRaw;
                 prevLossAfter = st.lossAfterNack;
                 lastStats = now;
-                iterStatsMs = steadyMsNow() - statsStart;
             }
+            markPhase(jl::IterPhase::Stats);
 
             sockaddr_in peer{}; int plen = sizeof(peer);
             WSAResetEvent(socketEvent);
-            const double recvStart = steadyMsNow();
             int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                              reinterpret_cast<sockaddr*>(&peer), &plen);
-            iterRecvMs = steadyMsNow() - recvStart;
+            markPhase(jl::IterPhase::Recv);
             now = std::chrono::steady_clock::now();
             if (n == SOCKET_ERROR) {
                 int e = WSAGetLastError();
@@ -2963,6 +3020,7 @@ static int appMain(int argc, char** argv) {
             }
             receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
             receiver.tick(msSince(now));
+            markPhase(jl::IterPhase::Packet);
             noteLoopBusy(std::chrono::steady_clock::now());
         }
 
@@ -3058,6 +3116,9 @@ static int appMain(int argc, char** argv) {
                 << " loop_busy_ms_max=" << loopStalls.ownMaxMs
                 << " loop_stalls_16ms=" << loopStalls.stalls16
                 << " loop_stalls_100ms=" << loopStalls.stalls100
+                << " loop_slow_iter_events=" << slowIterLog.events()
+                << " loop_slow_iter_logged=" << slowIterLog.logged()
+                << " loop_slow_iter_suppressed=" << slowIterLog.suppressedTotal()
                 << " loop_modal_events=" << gModal.events()
                 << " loop_modal_ms_total=" << gModal.totalMs()
                 << " loop_modal_ms_max=" << gModal.maxMs()
