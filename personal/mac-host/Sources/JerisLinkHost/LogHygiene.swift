@@ -174,6 +174,7 @@ enum LogHygieneSelfTest {
         var st = stat()
         let growDeadline = Date().addingTimeInterval(5)
         while Date() < growDeadline, fstat(fd, &st) == 0, st.st_size <= cap * 2 { usleep(1_000) }
+        let writesBeforeEmpty = state.writes
         let emptied = LogFiles.secure(fd: fd, maxBytes: cap)
         state.stop()
         let joined = state.finished.wait(timeout: .now() + 5) == .success
@@ -182,7 +183,17 @@ enum LogHygieneSelfTest {
         let hasZero = data.contains(0)
         expect(joined && emptied && state.writes > 0, "log race: file emptied while a second thread writes")
         expect(appendSet, "log race: secure() sets O_APPEND on the shared description")
-        expect(data.count < Int(cap) + line.count, "log race: size \(data.count) is below the cap plus one write")
+        // The writer keeps going until it sees stop(); on a busy machine that
+        // can be many lines, so the bound counts the writer's lines instead of
+        // assuming a fixed time. Every byte left after the truncate comes from
+        // a write that returned after it, and so was counted after the count
+        // taken just before secure(); +1 is slack for that one boundary line.
+        // A hole (the bug) would leave the old size and zero bytes, checked below.
+        let writesAfter = state.writes - writesBeforeEmpty
+        let noteBytes = 128
+        let bound = noteBytes + (writesAfter + 1) * line.count
+        expect(data.count <= bound,
+               "log race: size \(data.count) is within note + \(writesAfter)+1 lines written from the empty on (\(bound))")
         expect(!hasZero, "log race: no zero bytes (no sparse hole)")
     }
 }
