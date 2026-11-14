@@ -1,0 +1,35 @@
+JerisLink MSIX sideload test package
+====================================
+
+This is a TEST build of the Microsoft Store package. It is signed with a
+throwaway self-signed certificate made by CI for this one build. The Store
+version will be signed by Microsoft instead.
+
+Files
+  Jerislink-<version>.0-x64-sideload.msix   the package
+  JerisLink-sideload-test.cer               public certificate (no private key)
+  SHA256SUMS.txt                            checksums
+
+Install (Windows 10 1809 or later, PowerShell as Administrator)
+  0. If an older JerisLink MSIX test package is installed, remove it first
+     (see "Remove" below), because Windows caches the app icons:
+       Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage
+  1. Check the files:
+       Get-FileHash .\*.msix, .\*.cer -Algorithm SHA256
+     and compare with SHA256SUMS.txt.
+  2. Trust the test certificate for package installs only:
+       Import-Certificate -FilePath .\JerisLink-sideload-test.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+  3. Install:
+       Add-AppxPackage -Path .\Jerislink-<version>.0-x64-sideload.msix
+  4. Start "JerisLink" from the Start menu.
+
+Notes
+  - Settings in the packaged app are kept apart from the normal (Inno Setup)
+    install, so it asks for the Mac host address on first start.
+  - The package adds a Windows Firewall rule for inbound UDP 38402 (video).
+  - The normal installer version can stay installed side by side.
+
+Remove
+  Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage
+  Get-ChildItem Cert:\LocalMachine\TrustedPeople |
+    Where-Object Subject -eq 'CN=89A018EB-5C52-49CB-B478-B462FA6B08DD' | Remove-Item
