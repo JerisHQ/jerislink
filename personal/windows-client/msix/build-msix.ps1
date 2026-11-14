@@ -50,6 +50,20 @@ $manifest = (Get-Content (Join-Path $here 'AppxManifest.xml.in') -Raw).Replace('
 if ($manifest -match '@[A-Z_]+@') { throw "unfilled placeholder in AppxManifest: $($Matches[0])" }
 [IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'), $manifest, (New-Object Text.UTF8Encoding $false))
 
+# The assets carry MRT qualifiers (scale-*, targetsize-*, altform-unplated), so
+# Windows resolves them through resources.pri. One PRI file for the whole
+# package: the <packaging> split into resource packs is only for bundles.
+$makepri = Find-SdkTool 'makepri.exe'
+$priConfig = Join-Path $OutDir 'priconfig.xml'
+& $makepri createconfig /cf $priConfig /dq en-US /pv 10.0.0 /o
+if ($LASTEXITCODE -ne 0) { throw "makepri createconfig failed: $LASTEXITCODE" }
+[xml]$pc = Get-Content $priConfig
+$pc.resources.SelectNodes('packaging') | ForEach-Object { [void]$pc.resources.RemoveChild($_) }
+$pc.Save($priConfig)
+& $makepri new /pr $stage /cf $priConfig /mn (Join-Path $stage 'AppxManifest.xml') /of (Join-Path $stage 'resources.pri') /o
+if ($LASTEXITCODE -ne 0) { throw "makepri new failed: $LASTEXITCODE" }
+Remove-Item $priConfig
+
 # Pack. makeappx validates the manifest against the schema.
 $base = "Jerislink-$msixVersion-x64"
 $msix = Join-Path $OutDir "$base.msix"
