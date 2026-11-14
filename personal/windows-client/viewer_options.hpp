@@ -186,4 +186,11 @@ inline std::string describeLaunch(const LaunchRequest& r) {
     return s.str();
 }
 
+// Debug mode: JERISLINK_DEBUG=1 (exactly "1") turns on debug-only
+// diagnostics, such as the CPU-decode first-frame BMP in %TEMP%. Unset or any
+// other value: off.
+inline bool debugModeEnabled(const std::string& envValue) {
+    return envValue == "1";
+}
+
 }  // namespace jl

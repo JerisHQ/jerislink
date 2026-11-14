@@ -50,10 +50,17 @@ struct DisplayBoundsCache {
     DispatchTime.now().uptimeNanoseconds
 }
 
-/// One line per injected mouse button on stderr (launchd's
-/// /tmp/jerislink-input-helper.err): UTC time with milliseconds, button,
-/// down/up, flags and click state. Never key codes. The file is emptied when
-/// it passes 10 MB.
+/// Debug mode: JERISLINK_DEBUG=1 (exactly "1") in the helper's environment.
+/// Off by default; read once at start.
+enum DebugMode {
+    static func enabled(_ env: [String: String]) -> Bool { env["JERISLINK_DEBUG"] == "1" }
+    static let current = enabled(ProcessInfo.processInfo.environment)
+}
+
+/// Debug mode only (`DebugMode`): one line per injected mouse button on
+/// stderr (launchd's /tmp/jerislink-input-helper.err): UTC time with
+/// milliseconds, button, down/up, flags and click state. Never key codes. The
+/// file is emptied when it passes 10 MB.
 enum ButtonLog {
     static let maxBytes: off_t = 10 * 1024 * 1024
     nonisolated(unsafe) private static var linesSinceCheck = 0
@@ -150,14 +157,17 @@ final class InputHelper {
     private let mouseLocation: () -> CGPoint?
     /// nil: keep the status in `lastStatus` only (self-test).
     private let statusURL: URL?
-    /// Receives one line per injected button (see ButtonLog).
+    /// Receives one line per injected button (see ButtonLog); debug mode only.
     private let log: (String) -> Void
+    private let debug: Bool
 
     init(preflight: @escaping () -> Bool = { CGPreflightPostEventAccess() },
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          mouseLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
          statusURL: URL? = statusDirURL.appendingPathComponent("input-helper-status.txt"),
-         log: @escaping (String) -> Void = { ButtonLog.writeStderr($0) }) {
+         log: @escaping (String) -> Void = { ButtonLog.writeStderr($0) },
+         debug: Bool = DebugMode.current) {
+        self.debug = debug
         self.preflight = preflight
         self.postEvent = postEvent
         self.mouseLocation = mouseLocation
@@ -241,8 +251,10 @@ final class InputHelper {
                 let flags = currentFlags()
                 e.flags = flags
                 postEvent(e)
-                log(ButtonLog.line(button: button, down: false, flags: flags, clickState: 1,
-                                   source: "release reason=\(reason)"))
+                if debug {
+                    log(ButtonLog.line(button: button, down: false, flags: flags, clickState: 1,
+                                       source: "release reason=\(reason)"))
+                }
             }
         }
     }
@@ -388,7 +400,9 @@ final class InputHelper {
             let flags = currentFlags()
             e.flags = flags
             postEvent(e)
-            log(ButtonLog.line(button: button, down: down, flags: flags, clickState: clickState, source: "viewer"))
+            if debug {
+                log(ButtonLog.line(button: button, down: down, flags: flags, clickState: clickState, source: "viewer"))
+            }
         }
         updateStatus()
     }
@@ -665,7 +679,7 @@ func inputHelperSelfTest() -> Bool {
     var bLog: [String] = []
     let bh = InputHelper(preflight: { true }, postEvent: { bPosted.append($0) },
                          mouseLocation: { CGPoint(x: 10, y: 10) }, statusURL: nil,
-                         log: { bLog.append($0) })
+                         log: { bLog.append($0) }, debug: true)
     let modMask: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand, .maskShift]
     _ = bh.handle(type: MRI1Session.start, payload: sid(1))
     _ = bh.handle(type: 0x10, payload: [1, 0, 59])                 // Control down
@@ -713,6 +727,29 @@ func inputHelperSelfTest() -> Bool {
     check(bPosted.count == cAfter, "connectionClosed with nothing held posts nothing")
     check(ButtonLog.timestamp(Date(timeIntervalSince1970: 1_794_624_440.123)).hasSuffix(".123Z"),
           "log timestamp is UTC with milliseconds (\(ButtonLog.timestamp(Date(timeIntervalSince1970: 1_794_624_440.123))))")
+
+    // Debug mode gate: JERISLINK_DEBUG=1 only. Default (debug off): the same
+    // clicks and a release post their events but log no button lines.
+    check(!DebugMode.enabled([:]), "debug mode off without JERISLINK_DEBUG")
+    check(DebugMode.enabled(["JERISLINK_DEBUG": "1"]), "debug mode on with JERISLINK_DEBUG=1")
+    check(!DebugMode.enabled(["JERISLINK_DEBUG": "0"]) && !DebugMode.enabled(["JERISLINK_DEBUG": "true"]),
+          "debug mode off for any value other than 1")
+    var qPosted: [CGEvent] = []
+    var qLog: [String] = []
+    let qh = InputHelper(preflight: { true }, postEvent: { qPosted.append($0) },
+                         mouseLocation: { CGPoint(x: 10, y: 10) }, statusURL: nil,
+                         log: { qLog.append($0) }, debug: false)
+    _ = qh.handle(type: MRI1Session.start, payload: sid(1))
+    _ = qh.handle(type: 0x25, payload: [0, 1, 1])                  // left down
+    _ = qh.handle(type: 0x25, payload: [0, 0, 1])                  // left up
+    _ = qh.handle(type: 0x21, payload: [1, 1])                     // right down
+    _ = qh.handle(type: 0x21, payload: [1, 0])                     // right up
+    _ = qh.handle(type: 0x25, payload: [0, 1, 1])                  // left down, then drop
+    qh.connectionClosed()
+    check(qPosted.filter { [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp].contains($0.type) }.count == 6,
+          "debug off: all six button events still posted (got \(qPosted.count))")
+    check(qLog.isEmpty, "debug off: no button log lines (got \(qLog.count))")
+    print("input helper debug mode: \(DebugMode.current ? "on" : "off")")
 
     print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
     return ok
