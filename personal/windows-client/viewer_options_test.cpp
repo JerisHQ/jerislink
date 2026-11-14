@@ -144,6 +144,16 @@ int main() {
         CHECK(d.find("host_source=saved\n") != std::string::npos);
     }
 
+    // Debug mode (JERISLINK_DEBUG): off unless exactly "1".
+    {
+        CHECK(!debugModeEnabled(""));
+        CHECK(debugModeEnabled("1"));
+        CHECK(!debugModeEnabled("0"));
+        CHECK(!debugModeEnabled("true"));
+        CHECK(!debugModeEnabled(" 1"));
+        CHECK(!debugModeEnabled("1 "));
+    }
+
     std::printf("viewer_options_test: %d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }
