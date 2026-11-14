@@ -1,0 +1,119 @@
+name: msstore-publish
+
+# Uploads an already built .msixupload (from a successful `msix` run on main)
+# to Partner Center as a DRAFT submission for Store product 9NM3VWQ9MD7N.
+#
+# - Manual only (workflow_dispatch); never runs on push, PR or tag.
+# - Runs in the `store` environment, so its secrets are only released after
+#   the environment's protection rules pass (set Required reviewers there).
+# - `msstore publish --noCommit` keeps the submission in draft state: nothing
+#   goes to certification or the Store until someone presses "Submit" in
+#   Partner Center by hand.
+# - Secrets reach msstore only through step env vars; they are never echoed,
+#   written to disk by this workflow, or put in the repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      msix_run_id:
+        description: 'Run id of a successful "msix" workflow run on main (its jerislink-msix-store artifact is uploaded)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: msstore-publish
+  cancel-in-progress: false
+
+env:
+  STORE_PRODUCT_ID: 9NM3VWQ9MD7N
+  EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
+  EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
+
+jobs:
+  publish-draft:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    environment: store
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check the source msix run (this repo, workflow msix, push to main, success)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.msix_run_id }}
+        run: |
+          if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+          Write-Host "run $($run.id): workflow=$($run.name) event=$($run.event) branch=$($run.head_branch) sha=$($run.head_sha) conclusion=$($run.conclusion)"
+          if ($run.name -ne 'msix')            { throw "run is not the msix workflow" }
+          if ($run.event -ne 'push')           { throw "run was not triggered by a push" }
+          if ($run.head_branch -ne 'main')     { throw "run is not on main" }
+          if ($run.conclusion -ne 'success')   { throw "run did not succeed" }
+          if ($run.head_repository.full_name -ne $env:GITHUB_REPOSITORY) { throw "run is from another repository" }
+
+      - name: Download the Store package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jerislink-msix-store
+          run-id: ${{ inputs.msix_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/store
+
+      - name: Check the package identity and version
+        id: pkg
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'store'
+          $upload = @(Get-ChildItem $dir -Filter *.msixupload)
+          if ($upload.Count -ne 1) { throw "expected exactly one .msixupload, found $($upload.Count)" }
+          $work = Join-Path $env:RUNNER_TEMP 'inspect'
+          New-Item -ItemType Directory $work | Out-Null
+          Copy-Item $upload[0].FullName (Join-Path $work 'upload.zip')
+          Expand-Archive (Join-Path $work 'upload.zip') (Join-Path $work 'upload')
+          $msix = @(Get-ChildItem (Join-Path $work 'upload') -Filter *.msix)
+          if ($msix.Count -ne 1) { throw "expected one .msix inside the .msixupload" }
+          Copy-Item $msix[0].FullName (Join-Path $work 'pkg.zip')
+          Expand-Archive (Join-Path $work 'pkg.zip') (Join-Path $work 'pkg')
+          [xml]$m = Get-Content (Join-Path $work 'pkg\AppxManifest.xml')
+          $id = $m.Package.Identity
+          Write-Host "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version)"
+          if ($id.Name -ne $env:EXPECTED_IDENTITY_NAME) { throw "unexpected Identity Name" }
+          if ($id.Publisher -ne $env:EXPECTED_PUBLISHER) { throw "unexpected Identity Publisher" }
+          if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw "Store versions must end in .0" }
+          (Get-FileHash $upload[0].FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $upload[0].Name | Write-Host
+          "file=$($upload[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Microsoft Store Developer CLI
+        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+
+      - name: Sign in to Partner Center (Entra app client credentials)
+        env:
+          PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
+          PC_SELLER_ID: ${{ secrets.PARTNER_CENTER_SELLER_ID }}
+          PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
+          PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
+        run: |
+          foreach ($n in 'PC_TENANT_ID','PC_SELLER_ID','PC_CLIENT_ID','PC_CLIENT_SECRET') {
+            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($n))) { throw "$n is empty (store environment secret missing?)" }
+          }
+          msstore reconfigure --tenantId $env:PC_TENANT_ID --sellerId $env:PC_SELLER_ID --clientId $env:PC_CLIENT_ID --clientSecret $env:PC_CLIENT_SECRET
+          if ($LASTEXITCODE -ne 0) { throw "msstore reconfigure failed ($LASTEXITCODE)" }
+
+      - name: Upload to Partner Center as a draft submission (no commit, no Store release)
+        env:
+          PKG_FILE: ${{ steps.pkg.outputs.file }}
+        run: |
+          msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit
+          if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
+          Write-Host "Draft submission updated. Review and press Submit in Partner Center to send it to certification."
+
+      - name: Forget the Partner Center credentials on the runner
+        if: always()
+        timeout-minutes: 2
+        run: |
+          if (Get-Command msstore -ErrorAction SilentlyContinue) { msstore reconfigure --reset; exit 0 }
