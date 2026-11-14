@@ -1059,6 +1059,12 @@ static std::string envValue(const char* name) {
     return out;
 }
 
+// JERISLINK_DEBUG=1: debug-only diagnostics (first-frame BMP). Read once.
+static bool debugMode() {
+    static const bool on = jl::debugModeEnabled(envValue("JERISLINK_DEBUG"));
+    return on;
+}
+
 static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     const ModalScope modal(msg);
     switch (msg) {
@@ -1610,7 +1616,8 @@ public:
             std::lock_guard<std::mutex> lk(frameMu_);
             if (presented_ == 0) logFirstFrameStats(data, curLen);
             convertNv12ToBgra(data, stride_);
-            if (presented_ == 0) dumpFirstFrameBmp();
+            // The BMP is a picture of the Mac screen: debug mode only.
+            if (presented_ == 0 && debugMode()) dumpFirstFrameBmp();
             hasFrame_ = true;
         }
         buffer->Unlock();

@@ -92,6 +92,15 @@ Logs
 %TEMP%\jerislink-viewer.log
 %TEMP%\jerislink-viewer-history.log
 
+Debug mode
+----------
+Off by default. Set JERISLINK_DEBUG=1 before starting the viewer to turn on
+debug-only diagnostics: with CPU decoding, the first frame is also saved as
+%TEMP%\jerislink-first-frame.bmp (a picture of the Mac screen).
+
+  set JERISLINK_DEBUG=1
+  Jerislink.exe
+
 Status
 ------
 Pre-1.0 private build. MR02 transport remains frozen for regression compatibility.

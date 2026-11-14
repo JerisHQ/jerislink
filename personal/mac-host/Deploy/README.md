@@ -101,6 +101,7 @@ TCC records are tied to the code signature. Rebuilds signed with the same certif
 - App: `~/Applications/JerisLink.app`
 - Support: `~/Library/Application Support/JerisLink/` (`network.conf`, `video-settings.plist`)
 - Logs: `/tmp/jerislink-host.{log,err}`, `/tmp/jerislink-control-service.{log,err}`, `/tmp/jerislink-input-helper.{log,err}`
+- Debug mode is off by default. With `JERISLINK_DEBUG=1` the input helper also logs one line per injected mouse button (time, button, down/up, modifier flags, click state; never key codes) to `/tmp/jerislink-input-helper.err`. To turn it on for one session: `launchctl setenv JERISLINK_DEBUG 1` and `launchctl kickstart -k gui/$(id -u)/org.jeris.jerislink.agent.input-helper`. To turn it off: `launchctl unsetenv JERISLINK_DEBUG` and kick the agent again.
 
 ## Build
 
