@@ -10,6 +10,10 @@
 //   returns DXGI_ERROR_WAS_STILL_DRAWING) leaves the frame pending. The
 //   receive loop calls service() again on its next pass; nothing blocks.
 // - A repaint (WM_PAINT, resize) draws the newest frame again.
+// - While the window is hidden (minimized, zero client area, or Present()
+//   reported DXGI_STATUS_OCCLUDED) nothing is rendered or presented. The
+//   newest frame stays pending and is shown when the window is visible
+//   again; frames replaced meanwhile count as hiddenDrops, not busyDrops.
 #include <cstdint>
 #include <functional>
 #include <utility>
@@ -39,6 +43,7 @@ struct PresentCounters {
     uint64_t busyDrops = 0;        // decoded frames replaced before they were shown
     uint64_t busyRetries = 0;      // service() calls that found the present busy
     uint64_t latencyTimeouts = 0;  // latency gate skipped after kLatencyWaitCapMs
+    uint64_t hiddenDrops = 0;      // decoded frames replaced while the window was hidden
 };
 
 class LatestFramePresenter {
@@ -52,7 +57,10 @@ public:
     // A new decoded frame is now the newest one.
     void onDecoded() {
         ++c_.decoded;
-        if (pending_ && !pendingIsRepaint_) ++c_.busyDrops;
+        if (pending_ && !pendingIsRepaint_) {
+            if (hidden_) ++c_.hiddenDrops;
+            else ++c_.busyDrops;
+        }
         pending_ = true;
         pendingIsRepaint_ = false;
         rendered_ = false;
@@ -92,10 +100,22 @@ public:
         waitStartMs_ = -1.0;
     }
 
+    // The window is hidden (true) or visible again (false). While hidden,
+    // service() does nothing and the newest frame waits.
+    void setHidden(bool hidden) {
+        if (hidden_ == hidden) return;
+        hidden_ = hidden;
+        // Do not carry a half-finished latency wait across the gap.
+        waitStartMs_ = -1.0;
+        // The back buffer may have been resized or discarded meanwhile.
+        rendered_ = false;
+    }
+
     // Try to put the pending frame on screen. Never blocks.
     // Returns true while a frame is still pending afterwards.
     bool service() {
         if (!pending_) return false;
+        if (hidden_) return true;
         if (!latencyAcquired_) {
             const bool ready = !ops_.latencyReady || ops_.latencyReady();
             if (ready) {
@@ -132,9 +152,13 @@ public:
     }
 
     bool pending() const { return pending_; }
+    bool hidden() const { return hidden_; }
+    // True when service() could make progress now (a frame is pending and
+    // the window is visible). Callers poll or wait only while this is true.
+    bool wantsService() const { return pending_ && !hidden_; }
     // True when the next service() would ask the latency object first, so
     // the caller may wait on that object instead of polling.
-    bool waitingForLatency() const { return pending_ && !latencyAcquired_; }
+    bool waitingForLatency() const { return pending_ && !hidden_ && !latencyAcquired_; }
     const PresentCounters& counters() const { return c_; }
 
 private:
@@ -144,6 +168,7 @@ private:
     bool pendingIsRepaint_ = false;
     bool rendered_ = false;
     bool haveFrame_ = false;
+    bool hidden_ = false;
     bool latencyAcquired_ = false;
     double waitStartMs_ = -1.0;
 };
