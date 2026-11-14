@@ -52,3 +52,7 @@ add_executable(JerislinkOptionsTest viewer_options_test.cpp)
 
 # Console unit test for the MR02 receive / NACK logic (video_receiver.hpp).
 add_executable(JerislinkReceiverTest video_receiver_test.cpp)
+
+# Console test for the receive-loop wait set and timer period (loop_wait.hpp).
+add_executable(JerislinkLoopWaitTest loop_wait_test.cpp)
+target_compile_definitions(JerislinkLoopWaitTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
