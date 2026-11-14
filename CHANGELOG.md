@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
+
+Smoother streaming, a Microsoft Store package, and one signed macOS host app.
+
+Streaming and input:
+
+- Lost video packets are retransmitted (NACK), and the bitrate follows the viewer's receiver reports (ABR).
+- Windows viewer: video decode and present run on their own thread, a ready frame is presented before the next decoded one, busy frames wait instead of being dropped, and input waits and modal loops no longer stall the stream.
+- Every mouse button down gets its matching up; click flags follow the held modifiers.
+- macOS host: display changes are followed by callback (no more 24 h restart), no main-thread hop per clipboard poll or key, and a stricter Input Helper session lifecycle.
+
+Windows:
+
+- MSIX package for the Microsoft Store (package version is `VERSION` + `.0`).
+- Viewer logs are written in the background with 10 MB caps. The first-frame BMP and the per-click log are written only with `JERISLINK_DEBUG=1`.
+- New v2.0 JerisLink icon on macOS and Windows.
+- Privacy policy in `PRIVACY.md`.
 
 macOS host: one app, and Developer ID signing.
 
