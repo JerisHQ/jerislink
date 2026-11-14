@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(Jerislink LANGUAGES CXX RC)
+
+# The Microsoft Store (MSIX) build links the C runtime statically, so the package
+# needs no VCLibs framework dependency. The normal and Inno Setup builds keep the
+# default dynamic runtime (/MD).
+option(JERISLINK_STATIC_CRT "Link the MSVC runtime statically (/MT); used by the MSIX build" OFF)
+if(JERISLINK_STATIC_CRT)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

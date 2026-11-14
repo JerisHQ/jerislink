@@ -1,0 +1,98 @@
+name: msix
+
+# Builds the Microsoft Store (MSIX) package of the Windows viewer.
+# Produces artifacts only. It never uploads to Partner Center or the Store.
+# The sideload test package is signed with a self-signed certificate that is
+# created inside this run and deleted before the job ends (no secrets used).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msix:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: personal/windows-client
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (static CRT for the Store build)
+        run: cmake -S . -B build-msix -A x64 -DJERISLINK_STATIC_CRT=ON
+      - name: Build viewer (Release x64)
+        run: cmake --build build-msix --config Release --target Jerislink
+      - name: Check the exe does not need the VC++ runtime DLLs
+        run: |
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents build-msix\Release\Jerislink.exe
+          $deps | Write-Host
+          if ($deps -match '(?i)(vcruntime|msvcp)\d+\.dll|api-ms-win-crt-') { throw 'Jerislink.exe still links the dynamic CRT' }
+      - name: Package MSIX + sideload test package
+        run: ./msix/build-msix.ps1 -ExePath build-msix\Release\Jerislink.exe -OutDir "$env:RUNNER_TEMP\msix" -SideloadTest
+      - name: Install and remove the sideload test package
+        run: |
+          $side = Join-Path $env:RUNNER_TEMP 'msix\sideload'
+          $cer = Join-Path $side 'JerisLink-sideload-test.cer'
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          $pkg = Get-ChildItem $side -Filter *.msix | Select-Object -First 1
+          Add-AppxPackage -Path $pkg.FullName
+          $installed = Get-AppxPackage -Name 'jerisHQ.JerisLink'
+          if (-not $installed) { throw 'package did not install' }
+          $installed | Format-List Name, Publisher, Version, PackageFamilyName, InstallLocation, SignatureKind
+          if ($installed.PackageFamilyName -ne 'jerisHQ.JerisLink_1cbzj2979sfxw') { throw "unexpected PFN $($installed.PackageFamilyName)" }
+          $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -like '*jerisHQ.JerisLink*' -or $_.DisplayName -like '*JerisLink*' }
+          $rules | Format-Table DisplayName, Direction, Action, Enabled, Profile -AutoSize | Out-String | Write-Host
+          $rules | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue | Format-Table Protocol, LocalPort -AutoSize | Out-String | Write-Host
+          Remove-AppxPackage -Package $installed.PackageFullName
+      - name: Windows App Certification Kit (best effort)
+        id: wack
+        continue-on-error: true
+        run: |
+          $appcert = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\App Certification Kit\appcert.exe'
+          if (-not (Test-Path $appcert)) { Write-Host "::warning::WACK not installed on this runner ($appcert)"; exit 1 }
+          $pkg = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'msix\sideload') -Filter *.msix | Select-Object -First 1
+          $report = Join-Path $env:RUNNER_TEMP 'msix\wack-report.xml'
+          & $appcert reset
+          & $appcert test -appxpackagepath $pkg.FullName -reportoutputpath $report
+          Write-Host "appcert exit: $LASTEXITCODE"
+          if (Test-Path $report) {
+            [xml]$x = Get-Content $report
+            Write-Host "OVERALL_RESULT=$($x.REPORT.OVERALL_RESULT)"
+            $x.REPORT.REQUIREMENTS.REQUIREMENT | ForEach-Object {
+              $r = $_; $r.TEST | ForEach-Object { Write-Host ("{0} | {1} | {2}" -f $r.TITLE, $_.NAME, $_.RESULT.'#cdata-section') }
+            }
+          }
+          exit $LASTEXITCODE
+      - name: Checksums
+        run: |
+          Get-ChildItem "$env:RUNNER_TEMP\msix" -Recurse -File -Include *.msix, *.msixupload, *.cer |
+            Get-FileHash -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Tee-Object "$env:RUNNER_TEMP\msix\SHA256SUMS.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-msix-store
+          path: |
+            ${{ runner.temp }}/msix/*.msix
+            ${{ runner.temp }}/msix/*.msixupload
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-msix-sideload-test
+          path: |
+            ${{ runner.temp }}/msix/sideload/*
+            ${{ runner.temp }}/msix/SHA256SUMS.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jerislink-msix-wack-report
+          path: ${{ runner.temp }}/msix/wack-report.xml
+          if-no-files-found: ignore
