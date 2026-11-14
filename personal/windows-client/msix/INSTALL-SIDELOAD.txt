@@ -11,6 +11,9 @@ Files
   SHA256SUMS.txt                            checksums
 
 Install (Windows 10 1809 or later, PowerShell as Administrator)
+  0. If an older JerisLink MSIX test package is installed, remove it first
+     (see "Remove" below), because Windows caches the app icons:
+       Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage
   1. Check the files:
        Get-FileHash .\*.msix, .\*.cer -Algorithm SHA256
      and compare with SHA256SUMS.txt.
