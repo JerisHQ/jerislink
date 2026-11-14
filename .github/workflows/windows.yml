@@ -37,6 +37,10 @@ jobs:
         run: cmake --build build --config Release --target JerislinkLoopWaitTest
       - name: Loop wait test (MRM1 wake, timer period before/after)
         run: build\Release\JerislinkLoopWaitTest.exe
+      - name: Build viewer log test
+        run: cmake --build build --config Release --target JerislinkLogTest
+      - name: Viewer log test (order, size caps, legacy history trim, caller cost before/after)
+        run: build\Release\JerislinkLogTest.exe
       - name: Build mouse button parity test
         run: cmake --build build --config Release --target JerislinkMouseButtonsTest
       - name: Mouse button parity test (every down gets one up; focus kill, capture lost)
