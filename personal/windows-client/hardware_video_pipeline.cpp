@@ -34,6 +34,11 @@ void checkHr(HRESULT hr, const char* what) {
     }
 }
 
+double steadyNowMs() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 std::string wideToUtf8(const wchar_t* text) {
     if (!text || !*text) return {};
     int count = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
@@ -101,6 +106,34 @@ struct HardwareVideoPipeline::Impl {
     uint64_t presentCalls = 0;
     double presentMsTotal = 0.0;
     double presentMsMax = 0.0;
+    UINT maxFrameLatency = 0;  // 0 = no waitable object
+
+    // Hidden window (minimized, empty client area, DXGI_STATUS_OCCLUDED):
+    // no render, no present, no ResizeBuffers to 1x1. Occlusion is
+    // re-tested with DXGI_PRESENT_TEST at most every kOcclusionRetestMs.
+    static constexpr double kOcclusionRetestMs = 100.0;
+    bool occluded = false;
+    double occlusionTestMs = 0.0;
+    double hiddenSinceMs = 0.0;
+    uint64_t hiddenDropsAtStart = 0;
+    uint64_t occludedPresents = 0;
+    uint64_t hiddenPeriods = 0;
+
+    // Slow GPU / decoder calls (>= kSlowCallMs) are logged with the step
+    // name, so a stall in the stats line can be tied to one call.
+    static constexpr double kSlowCallMs = 50.0;
+    double lastSlowLogMs = -1e9;
+    uint64_t slowSuppressed = 0;
+
+    // Present -> vblank time from GetFrameStatistics (flip model). This is
+    // the time a presented frame waited in the swap chain queue before it
+    // reached the screen; max frame latency 2 can add up to one refresh.
+    struct PresentStamp { UINT id = 0; LONGLONG qpc = 0; bool valid = false; };
+    PresentStamp presentStamps[16];
+    UINT lastStatsPresentCount = 0;
+    LONGLONG qpcFreq = 0;
+    bool frameStatsFailLogged = false;
+    std::vector<float> displaySamples;  // taken by the owner (worker thread)
 
     Impl(HWND inHwnd, UINT32 inW, UINT32 inH, UINT32 inFps,
          JerisVideoCodec inCodec, Logger inLogger, std::string inPresentMode)
@@ -112,12 +145,15 @@ struct HardwareVideoPipeline::Impl {
         ops.latencyReady = [this] {
             return !latencyHandle || WaitForSingleObjectEx(latencyHandle, 0, FALSE) == WAIT_OBJECT_0;
         };
-        ops.render = [this] { renderLastSample(); };
-        ops.present = [this] { return presentBackBuffer(); };
-        ops.nowMs = [] {
-            return std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
+        ops.render = [this] {
+            const double t0 = steadyNowMs();
+            renderLastSample();
+            noteSlow("render", steadyNowMs() - t0);
         };
+        ops.present = [this] { return presentBackBuffer(); };
+        ops.nowMs = [] { return steadyNowMs(); };
+        LARGE_INTEGER freq{};
+        if (QueryPerformanceFrequency(&freq)) qpcFreq = freq.QuadPart;
         presenter = std::make_unique<jl::LatestFramePresenter>(std::move(ops));
         try {
             createD3D();
@@ -164,6 +200,27 @@ struct HardwareVideoPipeline::Impl {
 
     void log(const std::string& message) {
         if (logger) logger(message);
+    }
+
+    // Log one slow call. At most one line per second, except calls of
+    // 200 ms or more, which are always logged.
+    void noteSlow(const char* step, double ms) {
+        if (ms < kSlowCallMs) return;
+        const double now = steadyNowMs();
+        if (ms < 200.0 && now - lastSlowLogMs < 1000.0) {
+            ++slowSuppressed;
+            return;
+        }
+        lastSlowLogMs = now;
+        std::ostringstream os;
+        os.setf(std::ios::fixed);
+        os.precision(1);
+        os << "video.slow step=" << step << " ms=" << ms
+           << " hidden=" << (presenter && presenter->hidden() ? 1 : 0)
+           << " iconic=" << (IsIconic(hwnd) ? 1 : 0)
+           << " suppressed=" << slowSuppressed;
+        slowSuppressed = 0;
+        log(os.str());
     }
 
     void createD3D() {
@@ -246,10 +303,16 @@ struct HardwareVideoPipeline::Impl {
         checkHr(createHr, "CreateSwapChainForHwnd");
         swapFlags = sd.Flags;
         if (swapFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+            // Latency 2 (default): two frames may be queued for the screen,
+            // so a burst of two decoded frames inside one refresh (network
+            // jitter at 50-60 fps content) is shown instead of replacing
+            // the first one. "waitable1" keeps the G2 behaviour (latency 1).
+            const UINT wantLatency = presentMode == "waitable1" ? 1 : 2;
             ComPtr<IDXGISwapChain2> swapChain2;
             if (SUCCEEDED(swapChain.As(&swapChain2)) &&
-                SUCCEEDED(swapChain2->SetMaximumFrameLatency(1))) {
+                SUCCEEDED(swapChain2->SetMaximumFrameLatency(wantLatency))) {
                 latencyHandle = swapChain2->GetFrameLatencyWaitableObject();
+                if (latencyHandle) maxFrameLatency = wantLatency;
             }
             if (!latencyHandle) log("present.waitable=unavailable fallback=nowait");
         }
@@ -261,7 +324,7 @@ struct HardwareVideoPipeline::Impl {
         {
             std::ostringstream os;
             os << "present.swapchain buffers=3 mode=" << (latencyHandle ? "waitable" : "nowait")
-               << " max_frame_latency=" << (latencyHandle ? 1 : 0)
+               << " max_frame_latency=" << maxFrameLatency
                << " requested=" << presentMode;
             log(os.str());
         }
@@ -325,6 +388,8 @@ struct HardwareVideoPipeline::Impl {
 
         const bool inputChanged = processorInputW != inputW || processorInputH != inputH;
         if (outW != swapW || outH != swapH) {
+            const double t0 = steadyNowMs();
+            const UINT fromW = swapW, fromH = swapH;
             outputView.Reset();
             renderTarget.Reset();
             backBuffer.Reset();
@@ -337,6 +402,13 @@ struct HardwareVideoPipeline::Impl {
             processorInputW = inputW;
             processorInputH = inputH;
             rebuildOutputResources(outW, outH);
+            const double ms = steadyNowMs() - t0;
+            std::ostringstream os;
+            os.setf(std::ios::fixed);
+            os.precision(1);
+            os << "present.resize from=" << fromW << "x" << fromH << " to=" << outW << "x" << outH
+               << " ms=" << ms << " iconic=" << (IsIconic(hwnd) ? 1 : 0);
+            log(os.str());
         } else if (inputChanged || !videoProcessor || !outputView) {
             processorInputW = inputW;
             processorInputH = inputH;
@@ -376,6 +448,7 @@ struct HardwareVideoPipeline::Impl {
         if (!IsWindow(hwnd) || !swapChain) return;
         validateSample(sample);
         lastSample = sample;  // AddRef; the previous newest frame is released
+        updateHidden();
         presenter->onDecoded();
     }
 
@@ -387,8 +460,49 @@ struct HardwareVideoPipeline::Impl {
         return outW != swapW || outH != swapH;
     }
 
+    // Minimized / empty client area / occluded: stop rendering and
+    // presenting until the window can be seen again. Cheap when visible.
+    void updateHidden() {
+        const char* reason = nullptr;
+        if (IsIconic(hwnd)) {
+            reason = "minimized";
+        } else {
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            if (rc.right - rc.left <= 0 || rc.bottom - rc.top <= 0) reason = "empty_client";
+        }
+        const double now = steadyNowMs();
+        if (!reason && occluded) {
+            if (now - occlusionTestMs >= kOcclusionRetestMs) {
+                occlusionTestMs = now;
+                // Microsoft's pattern for leaving the occluded idle state.
+                const HRESULT hr = swapChain->Present(0, DXGI_PRESENT_TEST);
+                if (hr != DXGI_STATUS_OCCLUDED) occluded = false;
+            }
+            if (occluded) reason = "occluded";
+        }
+        const bool hidden = reason != nullptr;
+        if (hidden == presenter->hidden()) return;
+        std::ostringstream os;
+        os.setf(std::ios::fixed);
+        os.precision(1);
+        if (hidden) {
+            ++hiddenPeriods;
+            hiddenSinceMs = now;
+            hiddenDropsAtStart = presenter->counters().hiddenDrops;
+            os << "present.hidden=on reason=" << reason;
+        } else {
+            os << "present.hidden=off after_ms=" << (now - hiddenSinceMs)
+               << " frames_not_shown=" << (presenter->counters().hiddenDrops - hiddenDropsAtStart);
+        }
+        presenter->setHidden(hidden);
+        log(os.str());
+    }
+
     void servicePresent() {
-        if (!swapChain || !presenter->pending() || !IsWindow(hwnd)) return;
+        if (!swapChain || !IsWindow(hwnd)) return;
+        updateHidden();
+        if (!presenter->wantsService()) return;
         // A frame drawn before a resize must be drawn again at the new size.
         if (clientSizeChanged()) presenter->onBuffersLost();
         presenter->service();
@@ -396,6 +510,7 @@ struct HardwareVideoPipeline::Impl {
 
     void repaint() {
         if (!swapChain || !lastSample || !IsWindow(hwnd)) return;
+        updateHidden();
         presenter->onRepaint();
     }
 
@@ -478,9 +593,22 @@ struct HardwareVideoPipeline::Impl {
         checkHr(presentHr, "SwapChain Present");
         HRESULT removed = device->GetDeviceRemovedReason();
         if (FAILED(removed)) checkHr(removed, "D3D device removed");
-
-        double ms = renderMs + std::chrono::duration<double, std::milli>(
+        const double callMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
+        noteSlow("present", callMs);
+        if (presentHr == DXGI_STATUS_OCCLUDED) {
+            // Not visible: stop presenting until DXGI_PRESENT_TEST says
+            // otherwise (updateHidden).
+            ++occludedPresents;
+            if (!occluded) {
+                occluded = true;
+                occlusionTestMs = steadyNowMs();
+            }
+        } else {
+            sampleFrameStatistics();
+        }
+
+        double ms = renderMs + callMs;
         ++presentCalls;
         presentMsTotal += ms;
         presentMsMax = std::max(presentMsMax, ms);
@@ -492,6 +620,46 @@ struct HardwareVideoPipeline::Impl {
             log(os.str());
         }
         return jl::PresentResult::Ok;
+    }
+
+    // After a successful present: remember its present id and QPC time,
+    // then read the newest frame statistics. When they describe a frame we
+    // stamped, record present -> vblank in ms.
+    void sampleFrameStatistics() {
+        if (!qpcFreq) return;
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        UINT id = 0;
+        if (SUCCEEDED(swapChain->GetLastPresentCount(&id))) {
+            PresentStamp& slot = presentStamps[id % 16];
+            slot.id = id;
+            slot.qpc = now.QuadPart;
+            slot.valid = true;
+        }
+        DXGI_FRAME_STATISTICS st{};
+        const HRESULT hr = swapChain->GetFrameStatistics(&st);
+        if (FAILED(hr)) {
+            if (!frameStatsFailLogged && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+                frameStatsFailLogged = true;
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "present.frame_stats=unavailable hr=0x%08lx",
+                              static_cast<unsigned long>(hr));
+                log(buf);
+            }
+            return;
+        }
+        if (st.PresentCount == lastStatsPresentCount) return;
+        lastStatsPresentCount = st.PresentCount;
+        // SyncQPCTime is the vblank of PresentRefreshCount only when the
+        // two refresh counts match.
+        if (st.SyncRefreshCount != st.PresentRefreshCount) return;
+        const PresentStamp& slot = presentStamps[st.PresentCount % 16];
+        if (!slot.valid || slot.id != st.PresentCount) return;
+        const LONGLONG delta = st.SyncQPCTime.QuadPart - slot.qpc;
+        if (delta < 0) return;
+        const double ms = static_cast<double>(delta) * 1000.0 / static_cast<double>(qpcFreq);
+        if (ms > 1000.0) return;
+        if (displaySamples.size() < (1u << 14)) displaySamples.push_back(static_cast<float>(ms));
     }
 
     void createDecoder() {
@@ -618,7 +786,9 @@ struct HardwareVideoPipeline::Impl {
             }
             MFT_OUTPUT_DATA_BUFFER out{};
             DWORD status = 0;
+            const double t0 = steadyNowMs();
             HRESULT hr = decoder->ProcessOutput(0, 1, &out, &status);
+            noteSlow("decoder_output", steadyNowMs() - t0);
             if (out.pEvents) out.pEvents->Release();
             if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
             if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
@@ -654,11 +824,15 @@ struct HardwareVideoPipeline::Impl {
         sample->SetSampleDuration(d);
         if (discontinuity) sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE);
 
+        double t0 = steadyNowMs();
         HRESULT hr = decoder->ProcessInput(0, sample.Get(), 0);
+        noteSlow("decoder_input", steadyNowMs() - t0);
         if (hr == MF_E_NOTACCEPTING) {
             ++backpressure;
             drain();
+            t0 = steadyNowMs();
             hr = decoder->ProcessInput(0, sample.Get(), 0);
+            noteSlow("decoder_input_retry", steadyNowMs() - t0);
         }
         checkHr(hr, "decoder ProcessInput");
         drain();
@@ -706,7 +880,8 @@ uint64_t HardwareVideoPipeline::decodedFrames() const { return impl_->decoded; }
 void HardwareVideoPipeline::servicePresent() { impl_->servicePresent(); }
 void HardwareVideoPipeline::repaint() { impl_->repaint(); }
 bool HardwareVideoPipeline::presentPending() const {
-    return impl_->swapChain && impl_->presenter->pending();
+    // A frame held while the window is hidden does not need polling.
+    return impl_->swapChain && impl_->presenter->wantsService();
 }
 HANDLE HardwareVideoPipeline::presentWaitHandle() const {
     if (!impl_->swapChain || !impl_->latencyHandle) return nullptr;
@@ -721,6 +896,14 @@ uint64_t HardwareVideoPipeline::busyDrops() const { return impl_->presenter->cou
 uint64_t HardwareVideoPipeline::busyRetries() const { return impl_->presenter->counters().busyRetries; }
 uint64_t HardwareVideoPipeline::repaints() const { return impl_->presenter->counters().repaints; }
 uint64_t HardwareVideoPipeline::latencyTimeouts() const { return impl_->presenter->counters().latencyTimeouts; }
+uint64_t HardwareVideoPipeline::hiddenDrops() const { return impl_->presenter->counters().hiddenDrops; }
+uint64_t HardwareVideoPipeline::occludedPresents() const { return impl_->occludedPresents; }
+uint64_t HardwareVideoPipeline::hiddenPeriods() const { return impl_->hiddenPeriods; }
+UINT HardwareVideoPipeline::maxFrameLatency() const { return impl_->maxFrameLatency; }
+void HardwareVideoPipeline::takeDisplayLatencyMs(std::vector<float>& out) {
+    out.insert(out.end(), impl_->displaySamples.begin(), impl_->displaySamples.end());
+    impl_->displaySamples.clear();
+}
 uint64_t HardwareVideoPipeline::nonDxgiDrops() const { return impl_->droppedNonDxgi; }
 uint64_t HardwareVideoPipeline::streamChanges() const { return impl_->outputChanges; }
 uint64_t HardwareVideoPipeline::inputBackpressure() const { return impl_->backpressure; }

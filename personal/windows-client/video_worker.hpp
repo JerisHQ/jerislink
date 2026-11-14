@@ -251,6 +251,12 @@ private:
                         sink_.resetForNewStream();
                         continue;
                     }
+                    // The latency object may have signalled since the last
+                    // service (while we waited on wake_, or while the previous
+                    // frame of this batch decoded). Show the pending frame
+                    // now; otherwise the decoder's next output replaces it and
+                    // it counts as a busy drop. Non-blocking.
+                    if (sink_.presentPending()) sink_.servicePresent();
                     const auto t0 = std::chrono::steady_clock::now();
                     sink_.submit(c.fid, c.data, c.disc, c.key);
                     const auto t1 = std::chrono::steady_clock::now();
