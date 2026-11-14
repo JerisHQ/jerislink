@@ -15,8 +15,9 @@ public:
     using Logger = std::function<void(const std::string&)>;
 
     // presentMode: "waitable" (default) uses the swap chain frame-latency
-    // waitable object; "nowait" skips it. Both use 3 buffers and keep a busy
-    // frame pending instead of dropping it.
+    // waitable object with max frame latency 2; "waitable1" uses latency 1
+    // (the G2 behaviour); "nowait" skips the object. All use 3 buffers and
+    // keep a busy frame pending instead of dropping it.
     HardwareVideoPipeline(HWND hwnd, UINT32 width, UINT32 height, UINT32 fps,
                           JerisVideoCodec codec, Logger logger,
                           const std::string& presentMode = "waitable");
@@ -49,6 +50,17 @@ public:
     uint64_t busyRetries() const;
     uint64_t repaints() const;
     uint64_t latencyTimeouts() const;
+    // Decoded frames replaced while the window was minimized / occluded.
+    uint64_t hiddenDrops() const;
+    // Present() calls that returned DXGI_STATUS_OCCLUDED.
+    uint64_t occludedPresents() const;
+    // Times presenting stopped because the window was hidden.
+    uint64_t hiddenPeriods() const;
+    // Max frame latency in use (0 = no waitable object).
+    UINT maxFrameLatency() const;
+    // Present -> vblank samples (ms) since the last call. Same thread as
+    // servicePresent().
+    void takeDisplayLatencyMs(std::vector<float>& out);
     uint64_t nonDxgiDrops() const;
     uint64_t streamChanges() const;
     uint64_t inputBackpressure() const;

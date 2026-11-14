@@ -382,6 +382,36 @@ static VideoInfoMailbox gVideoInfo;
 // loop shows up here. Main thread only.
 static std::vector<float> gInputQueueWindowMs;
 static std::vector<float> gInputQueueSessionMs;
+// Input that was queued before the main loop started (it waited behind
+// GPU / decoder setup on this thread). Kept out of the numbers above so
+// they describe the running loop; reported once as input.startup_queued.
+static std::vector<float> gInputQueueStartupMs;
+static DWORD gLoopStartTick = 0;
+static bool gLoopStarted = false;
+
+// Main thread: one PeekMessage / DispatchMessage call that took this long
+// is logged (loop.slow) with the message, so a long loop iteration can be
+// tied to the call. Rate-limited to one line per second below 200 ms.
+static constexpr double kLoopSlowCallMs = 50.0;
+static double gLoopSlowLastLogMs = -1e9;
+static uint64_t gLoopSlowSuppressed = 0;
+static UINT gLastSizeType = 0xFFFFFFFFu;
+
+static double steadyMsNow() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool loopSlowShouldLog(double ms) {
+    if (ms < kLoopSlowCallMs) return false;
+    const double now = steadyMsNow();
+    if (ms < 200.0 && now - gLoopSlowLastLogMs < 1000.0) {
+        ++gLoopSlowSuppressed;
+        return false;
+    }
+    gLoopSlowLastLogMs = now;
+    return true;
+}
 
 static HCURSOR cursorForRemoteShape(uint8_t shape) {
     LPCWSTR id = IDC_ARROW;
@@ -1009,7 +1039,9 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     case WM_ACTIVATE:
         gViewerFocused = LOWORD(wParam) != WA_INACTIVE;
-        logLine(gViewerFocused ? "focus.activate" : "focus.deactivate");
+        logLine(std::string(gViewerFocused ? "focus.activate" : "focus.deactivate") +
+                " minimized=" + (HIWORD(wParam) ? "1" : "0") +
+                " click=" + (LOWORD(wParam) == WA_CLICKACTIVE ? "1" : "0"));
         return 0;
     case WM_MOUSEACTIVATE:
         gViewerFocused = true;
@@ -1208,10 +1240,21 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         break;
     }
-    case WM_SIZE:
+    case WM_SIZE: {
         gHaveMouse = false;
+        // Minimize / restore / maximize (not every step of a drag resize).
+        const UINT type = static_cast<UINT>(wParam);
+        if (type != gLastSizeType) {
+            gLastSizeType = type;
+            const char* name = type == SIZE_MINIMIZED ? "minimized"
+                             : type == SIZE_MAXIMIZED ? "maximized"
+                             : type == SIZE_RESTORED ? "restored" : "other";
+            logLine(std::string("window.size type=") + name + " client=" +
+                    std::to_string(LOWORD(lParam)) + "x" + std::to_string(HIWORD(lParam)));
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
@@ -1311,21 +1354,75 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
     return hwnd;
 }
 
+static void logLoopSlowCall(const char* step, UINT msg, double ms) {
+    if (!loopSlowShouldLog(ms)) return;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "loop.slow step=%s msg=0x%04x ms=%.1f focused=%d iconic=%d suppressed=%llu",
+                  step, msg, ms, gViewerFocused ? 1 : 0,
+                  gViewerHwnd && IsIconic(gViewerHwnd) ? 1 : 0,
+                  static_cast<unsigned long long>(gLoopSlowSuppressed));
+    gLoopSlowSuppressed = 0;
+    logLine(buf);
+}
+
 static void pumpMessages() {
     MSG m{};
-    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+    for (;;) {
+        // PeekMessage also runs the low-level keyboard hook and sent
+        // (cross-thread) messages, so it is timed on its own.
+        const double peekStart = steadyMsNow();
+        const BOOL got = PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE);
+        logLoopSlowCall("peek", got ? m.message : 0, steadyMsNow() - peekStart);
+        if (!got) break;
         if (m.message == WM_QUIT) gWindowClosed = true;
         const bool input = (m.message >= WM_KEYFIRST && m.message <= WM_KEYLAST) ||
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
         if (input) {
             const float waited = static_cast<float>(static_cast<DWORD>(GetTickCount() - m.time));
-            if (gInputQueueWindowMs.size() < (1u << 16)) gInputQueueWindowMs.push_back(waited);
-            if (gInputQueueSessionMs.size() < (1u << 20)) gInputQueueSessionMs.push_back(waited);
+            // Posted before the receive loop started: startup wait, not loop latency.
+            const bool startup = !gLoopStarted ||
+                                 static_cast<LONG>(m.time - gLoopStartTick) < 0;
+            if (startup) {
+                if (gInputQueueStartupMs.size() < (1u << 12)) gInputQueueStartupMs.push_back(waited);
+            } else {
+                if (gInputQueueWindowMs.size() < (1u << 16)) gInputQueueWindowMs.push_back(waited);
+                if (gInputQueueSessionMs.size() < (1u << 20)) gInputQueueSessionMs.push_back(waited);
+            }
         }
+        const double dispatchStart = steadyMsNow();
         TranslateMessage(&m);
         DispatchMessageW(&m);
+        logLoopSlowCall("dispatch", m.message, steadyMsNow() - dispatchStart);
     }
+}
+
+// Windows 11 may slow a process whose window is in the background
+// (EcoQoS) and ignore its 1 ms timer request while the window is occluded.
+// The viewer keeps receiving video and NACK timing in the background, so
+// opt out of both. Best effort: older Windows lacks the API.
+static void optOutOfPowerThrottling() {
+    struct ThrottlingState { ULONG Version, ControlMask, StateMask; };
+    using SetInfoFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    const auto fn = k32 ? reinterpret_cast<SetInfoFn>(GetProcAddress(k32, "SetProcessInformation")) : nullptr;
+    if (!fn) {
+        logLine("process.power_throttling=unsupported");
+        return;
+    }
+    constexpr int kProcessPowerThrottling = 4;      // PROCESS_INFORMATION_CLASS
+    constexpr ULONG kExecutionSpeed = 0x1;           // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    constexpr ULONG kIgnoreTimerResolution = 0x4;    // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    ThrottlingState st{1, kExecutionSpeed | kIgnoreTimerResolution, 0};  // StateMask 0 = never throttle
+    BOOL ok = fn(GetCurrentProcess(), kProcessPowerThrottling, &st, sizeof(st));
+    if (!ok) {
+        // Windows 10 knows only the execution-speed bit.
+        st.ControlMask = kExecutionSpeed;
+        ok = fn(GetCurrentProcess(), kProcessPowerThrottling, &st, sizeof(st));
+    }
+    logLine(std::string("process.power_throttling=opt_out ok=") + (ok ? "1" : "0") +
+            " timer_bit=" + (ok && st.ControlMask != kExecutionSpeed ? "1" : "0") +
+            (ok ? "" : " error=" + std::to_string(GetLastError())));
 }
 
 class CpuPresenter {
@@ -1924,6 +2021,20 @@ public:
     uint64_t latencyTimeouts() const {
         return hardwareLatencyTimeoutsSaved_ + (hardware_ ? hardware_->latencyTimeouts() : 0);
     }
+    uint64_t hiddenDrops() const {
+        return hardwareHiddenDropsSaved_ + (hardware_ ? hardware_->hiddenDrops() : 0);
+    }
+    uint64_t occludedPresents() const {
+        return hardwareOccludedSaved_ + (hardware_ ? hardware_->occludedPresents() : 0);
+    }
+    uint64_t hiddenPeriods() const {
+        return hardwareHiddenPeriodsSaved_ + (hardware_ ? hardware_->hiddenPeriods() : 0);
+    }
+    UINT maxFrameLatency() const { return hardware_ ? hardware_->maxFrameLatency() : 0; }
+    // Worker thread (same thread as servicePresent).
+    void takeDisplayLatencyMs(std::vector<float>& out) {
+        if (hardware_) hardware_->takeDisplayLatencyMs(out);
+    }
     uint64_t nonDxgiDrops() const {
         return hardwareNonDxgiSaved_ + (hardware_ ? hardware_->nonDxgiDrops() : 0) +
                (cpuPresenter_ ? cpuPresenter_->nonDxgiDrops() : 0);
@@ -1985,6 +2096,9 @@ private:
         hardwareRetriesSaved_ += hardware_->busyRetries();
         hardwareRepaintsSaved_ += hardware_->repaints();
         hardwareLatencyTimeoutsSaved_ += hardware_->latencyTimeouts();
+        hardwareHiddenDropsSaved_ += hardware_->hiddenDrops();
+        hardwareOccludedSaved_ += hardware_->occludedPresents();
+        hardwareHiddenPeriodsSaved_ += hardware_->hiddenPeriods();
         hardwareNonDxgiSaved_ += hardware_->nonDxgiDrops();
         hardwareStreamChangesSaved_ += hardware_->streamChanges();
         hardwareBackpressureSaved_ += hardware_->inputBackpressure();
@@ -2034,6 +2148,9 @@ private:
     uint64_t hardwareRetriesSaved_ = 0;
     uint64_t hardwareRepaintsSaved_ = 0;
     uint64_t hardwareLatencyTimeoutsSaved_ = 0;
+    uint64_t hardwareHiddenDropsSaved_ = 0;
+    uint64_t hardwareOccludedSaved_ = 0;
+    uint64_t hardwareHiddenPeriodsSaved_ = 0;
     uint64_t hardwareNonDxgiSaved_ = 0;
     uint64_t hardwareStreamChangesSaved_ = 0;
     uint64_t hardwareBackpressureSaved_ = 0;
@@ -2061,12 +2178,33 @@ public:
         presented.store(video_.presented(), std::memory_order_relaxed);
         busyDrops.store(video_.busyDrops(), std::memory_order_relaxed);
         busyRetries.store(video_.busyRetries(), std::memory_order_relaxed);
+        hiddenDrops.store(video_.hiddenDrops(), std::memory_order_relaxed);
+        occludedPresents.store(video_.occludedPresents(), std::memory_order_relaxed);
+        scratch_.clear();
+        video_.takeDisplayLatencyMs(scratch_);
+        if (!scratch_.empty()) {
+            std::lock_guard<std::mutex> lk(displayMu_);
+            for (float v : scratch_) {
+                if (displayLatencyMs_.size() >= (1u << 14)) break;
+                displayLatencyMs_.push_back(v);
+            }
+        }
+    }
+    // Main thread: present -> vblank samples since the last take.
+    void takeDisplayLatencyMs(std::vector<float>& out) {
+        std::lock_guard<std::mutex> lk(displayMu_);
+        out.insert(out.end(), displayLatencyMs_.begin(), displayLatencyMs_.end());
+        displayLatencyMs_.clear();
     }
 
     std::atomic<uint64_t> decoded{0}, presented{0}, busyDrops{0}, busyRetries{0};
+    std::atomic<uint64_t> hiddenDrops{0}, occludedPresents{0};
 
 private:
     VideoPipeline& video_;
+    std::vector<float> scratch_;  // worker thread only
+    std::mutex displayMu_;
+    std::vector<float> displayLatencyMs_;
 };
 
 // Main thread: take what the video thread found (decoded size, CPU fallback).
@@ -2417,6 +2555,7 @@ static int appMain(int argc, char** argv) {
         const jl::ScopedTimerResolution timerPeriod(1);
         logLine(std::string("timer.period_ms=1 active=") + (timerPeriod.active() ? "yes" : "no") +
                 " mrm1_wait=" + (mouseMoveUdp && mouseMoveUdp->readEvent() ? "yes" : "no"));
+        optOutOfPowerThrottling();
 
         uint64_t rejected = 0;
         std::vector<float> decodeMs;           // per submitted frame, whole session (capped)
@@ -2426,6 +2565,8 @@ static int appMain(int argc, char** argv) {
         std::vector<float> loopBusyWindowMs;   // main loop work per iteration (not its wait)
         double loopBusyMaxMs = 0.0;
         uint64_t loopStalls16 = 0, loopStalls100 = 0;
+        std::vector<float> displayLatencyWindowMs;   // present -> vblank, last 5 s
+        std::vector<float> displayLatencyMs;         // whole session (capped)
         constexpr size_t kMaxDecodeSamples = 1u << 20;
         const auto takeVideoSamples = [&](jl::VideoWorker& w) {
             const size_t d0 = decodeWindowMs.size(), q0 = queueWaitWindowMs.size();
@@ -2475,6 +2616,8 @@ static int appMain(int argc, char** argv) {
         jl::PresentedFpsSampler presentedFps;
         // Present counters at the previous stats line (window deltas).
         uint64_t prevDecoded = 0, prevPresented = 0, prevBusyDrops = 0, prevBusyRetries = 0;
+        uint64_t prevHiddenDrops = 0, prevOccluded = 0;
+        bool loggedStartupInput = false;
         auto firstPacket = start;
         // Receiver loss counters at the previous stats line (window deltas).
         uint64_t prevLossExpected = 0, prevLossRaw = 0, prevLossAfter = 0;
@@ -2487,15 +2630,29 @@ static int appMain(int argc, char** argv) {
         // Main loop work per iteration, up to its wait or its next packet
         // (a stall here delays input).
         auto iterStart = std::chrono::steady_clock::now();
+        // Where a long iteration went (logged as loop.slow_iter).
+        double iterPumpMs = 0.0, iterStatsMs = 0.0, iterRecvMs = 0.0;
         const auto noteLoopBusy = [&](std::chrono::steady_clock::time_point end) {
             const double busy = std::chrono::duration<double, std::milli>(end - iterStart).count();
             if (loopBusyWindowMs.size() < (1u << 16)) loopBusyWindowMs.push_back(static_cast<float>(busy));
             loopBusyMaxMs = std::max(loopBusyMaxMs, busy);
             if (busy >= 16.0) ++loopStalls16;
             if (busy >= 100.0) ++loopStalls100;
+            if (loopSlowShouldLog(busy)) {
+                char lb[192];
+                std::snprintf(lb, sizeof(lb),
+                              "loop.slow_iter ms=%.1f pump_ms=%.1f stats_ms=%.1f recv_ms=%.1f focused=%d iconic=%d suppressed=%llu",
+                              busy, iterPumpMs, iterStatsMs, iterRecvMs, gViewerFocused ? 1 : 0,
+                              IsIconic(hwnd) ? 1 : 0, static_cast<unsigned long long>(gLoopSlowSuppressed));
+                gLoopSlowSuppressed = 0;
+                logLine(lb);
+            }
         };
+        gLoopStartTick = GetTickCount();
+        gLoopStarted = true;
         while (!gWindowClosed) {
             iterStart = std::chrono::steady_clock::now();
+            iterPumpMs = iterStatsMs = iterRecvMs = 0.0;
             if (videoWorker.failed()) throw std::runtime_error(videoWorker.error());
             if (mouseMoveUdp) {
                 uint8_t cursorShape = gRemoteCursorShape;
@@ -2504,7 +2661,11 @@ static int appMain(int argc, char** argv) {
                 }
                 if (mouseMoveUdp->pongRx() > 0) receiver.setRttMs(mouseMoveUdp->rttMs());
             }
-            pumpMessages();
+            {
+                const double p0 = steadyMsNow();
+                pumpMessages();
+                iterPumpMs = steadyMsNow() - p0;
+            }
             if (gWindowClosed) break;
             if (gHardwareRepaintRequested) {
                 gHardwareRepaintRequested = false;
@@ -2539,6 +2700,7 @@ static int appMain(int argc, char** argv) {
                 lastReport = now;
             }
             if (now - lastStats >= std::chrono::seconds(5)) {
+                const double statsStart = steadyMsNow();
                 const auto& st = receiver.stats();
                 const jl::ReceiverLoss wloss = jl::receiverLoss(st.lossExpected - prevLossExpected,
                                                                 st.lossRaw - prevLossRaw,
@@ -2550,6 +2712,23 @@ static int appMain(int argc, char** argv) {
                 const uint64_t presentedNow = videoSink.presented.load();
                 const uint64_t busyDropsNow = videoSink.busyDrops.load();
                 const uint64_t busyRetriesNow = videoSink.busyRetries.load();
+                const uint64_t hiddenDropsNow = videoSink.hiddenDrops.load();
+                const uint64_t occludedNow = videoSink.occludedPresents.load();
+                {
+                    const size_t d0 = displayLatencyWindowMs.size();
+                    videoSink.takeDisplayLatencyMs(displayLatencyWindowMs);
+                    for (size_t i = d0; i < displayLatencyWindowMs.size() && displayLatencyMs.size() < kMaxDecodeSamples; ++i)
+                        displayLatencyMs.push_back(displayLatencyWindowMs[i]);
+                }
+                if (!loggedStartupInput && !gInputQueueStartupMs.empty()) {
+                    loggedStartupInput = true;
+                    std::ostringstream su;
+                    su << std::fixed << std::setprecision(1)
+                       << "input.startup_queued events=" << gInputQueueStartupMs.size()
+                       << " max_ms=" << jl::receiverPercentile(gInputQueueStartupMs, 100)
+                       << " note=queued_before_receive_loop";
+                    logLine(su.str());
+                }
                 std::ostringstream line;
                 line << std::fixed << std::setprecision(1)
                      << "stats.5s rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
@@ -2564,6 +2743,13 @@ static int appMain(int argc, char** argv) {
                      << " presented_fps=" << static_cast<double>(presentedNow - prevPresented) / windowSec
                      << " present_busy_drops=" << (busyDropsNow - prevBusyDrops)
                      << " present_busy_retries=" << (busyRetriesNow - prevBusyRetries)
+                     << " present_hidden_drops=" << (hiddenDropsNow - prevHiddenDrops)
+                     << " present_occluded=" << (occludedNow - prevOccluded)
+                     << " present_to_vblank_ms_p50=" << jl::receiverPercentile(displayLatencyWindowMs, 50)
+                     << " present_to_vblank_ms_p95=" << jl::receiverPercentile(displayLatencyWindowMs, 95)
+                     << " present_to_vblank_ms_max=" << jl::receiverPercentile(displayLatencyWindowMs, 100)
+                     << " present_to_vblank_samples=" << displayLatencyWindowMs.size()
+                     << " focused=" << (gViewerFocused ? 1 : 0)
                      << " nack_tx=" << st.nackTx
                      << " frames_repaired=" << st.framesRepaired
                      << " nack_deadline_miss=" << st.nackDeadlineMiss
@@ -2590,6 +2776,9 @@ static int appMain(int argc, char** argv) {
                 queueWaitWindowMs.clear();
                 loopBusyWindowMs.clear();
                 gInputQueueWindowMs.clear();
+                displayLatencyWindowMs.clear();
+                prevHiddenDrops = hiddenDropsNow;
+                prevOccluded = occludedNow;
                 presentedFps.clearWindow();
                 prevDecoded = decodedNow;
                 prevPresented = presentedNow;
@@ -2599,12 +2788,15 @@ static int appMain(int argc, char** argv) {
                 prevLossRaw = st.lossRaw;
                 prevLossAfter = st.lossAfterNack;
                 lastStats = now;
+                iterStatsMs = steadyMsNow() - statsStart;
             }
 
             sockaddr_in peer{}; int plen = sizeof(peer);
             WSAResetEvent(socketEvent);
+            const double recvStart = steadyMsNow();
             int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                              reinterpret_cast<sockaddr*>(&peer), &plen);
+            iterRecvMs = steadyMsNow() - recvStart;
             now = std::chrono::steady_clock::now();
             if (n == SOCKET_ERROR) {
                 int e = WSAGetLastError();
@@ -2678,6 +2870,14 @@ static int appMain(int argc, char** argv) {
                 << " present_busy_retries=" << video->busyRetries()
                 << " present_repaints=" << video->repaints()
                 << " present_latency_timeouts=" << video->latencyTimeouts()
+                << " present_hidden_drops=" << video->hiddenDrops()
+                << " present_occluded=" << video->occludedPresents()
+                << " present_hidden_periods=" << video->hiddenPeriods()
+                << " max_frame_latency=" << video->maxFrameLatency()
+                << " present_to_vblank_ms_p50=" << jl::receiverPercentile(displayLatencyMs, 50)
+                << " present_to_vblank_ms_p95=" << jl::receiverPercentile(displayLatencyMs, 95)
+                << " present_to_vblank_ms_max=" << jl::receiverPercentile(displayLatencyMs, 100)
+                << " present_to_vblank_samples=" << displayLatencyMs.size()
                 << " decoded_fps_avg=" << sessionFps(video->decodedFrames())
                 << " presented_fps_avg=" << sessionFps(video->presented())
                 << " present_avg_ms=" << video->avgPresentMs()
@@ -2730,6 +2930,8 @@ static int appMain(int argc, char** argv) {
                 << " input_queue_ms_p50=" << jl::receiverPercentile(gInputQueueSessionMs, 50)
                 << " input_queue_ms_p99=" << jl::receiverPercentile(gInputQueueSessionMs, 99)
                 << " input_queue_ms_max=" << jl::receiverPercentile(gInputQueueSessionMs, 100)
+                << " input_queue_startup_events=" << gInputQueueStartupMs.size()
+                << " input_queue_startup_ms_max=" << jl::receiverPercentile(gInputQueueStartupMs, 100)
                 << " rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
                 << " rtt_max_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMaxMs() : 0.0)
                 << " rtt_samples=" << (mouseMoveUdp ? mouseMoveUdp->pongRx() : 0)

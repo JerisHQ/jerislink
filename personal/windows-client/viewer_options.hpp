@@ -35,7 +35,7 @@ struct Options {
     std::string videoBackend = "auto";
     std::string codec = "h264";
     uint16_t bitrateMbps = 25;
-    std::string presentMode = "waitable";  // "nowait": no frame-latency object (both keep busy frames)
+    std::string presentMode = "waitable";  // max frame latency 2; "waitable1": latency 1 (G2 behaviour); "nowait": no frame-latency object
     std::string lossRecovery = "strict";
     std::string nack = "on";  // on: use NACK when the host supports it (strict only)
     std::string abr = "on";   // on: send MRM1 0x42 receiver reports when the host supports ABR
@@ -144,7 +144,8 @@ inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
         return invalid("bad number in arguments");
     }
 
-    if (o.presentMode != "waitable" && o.presentMode != "nowait") return invalid("bad --present-mode");
+    if (o.presentMode != "waitable" && o.presentMode != "waitable1" && o.presentMode != "nowait")
+        return invalid("bad --present-mode");
     if (o.videoBackend != "auto" && o.videoBackend != "hardware" && o.videoBackend != "cpu")
         return invalid("bad --video-backend");
     if (o.codec != "auto" && o.codec != "h264" && o.codec != "hevc") return invalid("bad --codec");

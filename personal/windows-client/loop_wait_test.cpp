@@ -9,6 +9,9 @@
 // 4. Null handles are skipped and results map back to the right source.
 // 5. video_worker.hpp: a stalled decoder does not block the main loop;
 //    order, overflow -> keyframe, failure, latency wait, clean stop.
+// 6. present_scheduler.hpp: max frame latency 2 vs 1 under a jittery
+//    50 fps arrival pattern (busy drops before/after, added queue time),
+//    and a hidden window holds the newest frame without busy drops.
 #include "loop_wait.hpp"
 #include "present_scheduler.hpp"
 #include "video_worker.hpp"
@@ -16,6 +19,7 @@
 #include <ws2tcpip.h>
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -459,7 +463,7 @@ struct PresenterSink : VideoWorkerSink {
     void resetForNewStream() override { presenter.clear(); }
     void repaint() override { presenter.onRepaint(); }
     void servicePresent() override { presenter.service(); }
-    bool presentPending() override { return presenter.pending(); }
+    bool presentPending() override { return presenter.wantsService(); }  // as HardwareVideoPipeline
     HANDLE presentWaitHandle() override { return presenter.waitingForLatency() ? latency : nullptr; }
     void onPresentWaitSignaled() override { presenter.onLatencySignalled(); }
     void published() override {}
@@ -499,6 +503,133 @@ static void testWorkerServicesReadyPresentBeforeNextFrame() {
     CHECK(c.presented == 2);
     CHECK(shown == "100 1");
     CHECK(sink.presenter.pending());  // frame 2 waits for the next vblank
+}
+
+// Simulated swap chain with max frame latency N on a 60 Hz display:
+// a present is allowed while fewer than N presented frames wait for the
+// screen; every vblank shows (retires) one of them. Frames arrive at
+// 50 fps, and every 10th frame a 40 ms network hiccup delivers three
+// frames within 4 ms (a burst). Returns the counters and the average time
+// a presented frame waited for its vblank.
+struct LatencySimResult {
+    PresentCounters c;
+    double avgQueueMs = 0.0;
+    double maxQueueMs = 0.0;
+};
+static LatencySimResult simulateLatency(int maxLatency) {
+    int queued = 0;
+    std::deque<double> presentTimes;
+    double now = 0.0;
+    double queueSum = 0.0, queueMax = 0.0;
+    uint64_t shownCount = 0;
+    PresentOps ops;
+    ops.latencyReady = [&] { return queued < maxLatency; };
+    ops.render = [] {};
+    ops.present = [&] {
+        ++queued;
+        presentTimes.push_back(now);
+        return PresentResult::Ok;
+    };
+    ops.nowMs = [] { return 0.0; };  // never hit the 50 ms latency cap
+    LatestFramePresenter p(ops);
+
+    // Arrival times: every 20 ms, but frames 10k+8 and 10k+9 are late
+    // and arrive with frame 10k+10 (burst of three, 2 ms apart).
+    std::vector<double> arrivals;
+    for (int i = 0; i < 3000; ++i) {
+        double t = i * 20.0;
+        const int m = i % 10;
+        if (m == 8) t = (i + 2) * 20.0 - 4.0;
+        if (m == 9) t = (i + 1) * 20.0 - 2.0;
+        arrivals.push_back(t);
+    }
+    std::sort(arrivals.begin(), arrivals.end());
+    const double vblank = 1000.0 / 60.0;
+    double nextVblank = vblank;
+    size_t ai = 0;
+    while (ai < arrivals.size()) {
+        if (nextVblank <= arrivals[ai]) {
+            now = nextVblank;
+            if (queued > 0) {
+                --queued;
+                const double waited = now - presentTimes.front();
+                presentTimes.pop_front();
+                queueSum += waited;
+                queueMax = std::max(queueMax, waited);
+                ++shownCount;
+            }
+            p.service();
+            nextVblank += vblank;
+        } else {
+            now = arrivals[ai++];
+            p.onDecoded();
+        }
+    }
+    LatencySimResult r;
+    r.c = p.counters();
+    r.avgQueueMs = shownCount ? queueSum / static_cast<double>(shownCount) : 0.0;
+    r.maxQueueMs = queueMax;
+    return r;
+}
+
+// G2 field log: ~50 fps content, focused fullscreen, presented 41-43 fps
+// with 43-50 busy drops per 5 s. Latency 2 lets a short burst through;
+// the cost is up to one extra refresh of queue time on those frames.
+static void testPresenterLatency2AbsorbsBursts() {
+    const LatencySimResult l1 = simulateLatency(1);
+    const LatencySimResult l2 = simulateLatency(2);
+    for (int i = 0; i < 2; ++i) {
+        const LatencySimResult& r = i ? l2 : l1;
+        std::printf("presenter: max_frame_latency=%d decoded=%llu presented=%llu busy_drops=%llu "
+                    "queue_ms_avg=%.2f queue_ms_max=%.2f\n",
+                    i ? 2 : 1, static_cast<unsigned long long>(r.c.decoded),
+                    static_cast<unsigned long long>(r.c.presented),
+                    static_cast<unsigned long long>(r.c.busyDrops), r.avgQueueMs, r.maxQueueMs);
+    }
+    CHECK(l1.c.decoded == 3000 && l2.c.decoded == 3000);
+    CHECK(l1.c.busyDrops >= 100);      // a burst of three often loses one
+    CHECK(l2.c.busyDrops == 0);
+    CHECK(l2.c.presented >= 2999);     // the last frame may still be pending
+    // The extra queue time stays within one 60 Hz refresh on average.
+    CHECK(l2.avgQueueMs - l1.avgQueueMs < 1000.0 / 60.0);
+    CHECK(l2.maxQueueMs <= 2.0 * 1000.0 / 60.0 + 0.01);
+}
+
+// Minimized / occluded: nothing is rendered or presented, replaced frames
+// are hidden drops (not busy drops), the worker is not asked to poll, and
+// the newest frame is shown once the window is visible again.
+static void testPresenterHiddenHoldsNewest() {
+    int renders = 0;
+    uint64_t newest = 0;
+    std::vector<uint64_t> shown;
+    PresentOps ops;
+    ops.latencyReady = [] { return true; };
+    ops.render = [&] { ++renders; };
+    ops.present = [&] { shown.push_back(newest); return PresentResult::Ok; };
+    ops.nowMs = [] { return 0.0; };
+    LatestFramePresenter p(ops);
+    newest = 1;
+    p.onDecoded();
+    CHECK(shown.size() == 1 && renders == 1);
+    p.setHidden(true);
+    for (uint64_t f = 2; f <= 6; ++f) {
+        newest = f;
+        p.onDecoded();
+    }
+    p.onRepaint();
+    CHECK(p.service());   // still pending
+    CHECK(renders == 1);
+    CHECK(shown.size() == 1);
+    CHECK(p.counters().busyDrops == 0);
+    CHECK(p.counters().hiddenDrops == 4);  // 2..5 replaced, 6 waits
+    CHECK(p.pending() && !p.wantsService() && !p.waitingForLatency());
+    p.setHidden(false);
+    CHECK(p.wantsService());
+    CHECK(!p.service());
+    CHECK(shown.size() == 2 && shown.back() == 6);
+    CHECK(renders == 2);
+    CHECK(p.counters().presented == 2);
+    CHECK(p.counters().busyDrops == 0);
 }
 
 static int gSentToMain = 0;
@@ -559,6 +690,8 @@ int main() {
     testWorkerFailure();
     testWorkerPresentWaitAndRepaint();
     testWorkerServicesReadyPresentBeforeNextFrame();
+    testPresenterLatency2AbsorbsBursts();
+    testPresenterHiddenHoldsNewest();
     testWorkerStopPumpsMessages();
     WSACleanup();
     std::printf("%d PASS, %d FAIL\n", gPasses, gFailures);
