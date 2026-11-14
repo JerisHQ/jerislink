@@ -84,7 +84,10 @@ enum VideoService {
         }
 
         var o = base
-        o.durationSeconds = 86400
+        // Run until launchd stops the service. This used to be 86400 (a
+        // "run for a day" bench value from the A/B helper), which restarted
+        // the stream every 24 h.
+        o.durationSeconds = .infinity
         o.fps = settings.fps
         o.bitrateMbps = settings.bitrateMbps
         o.codec = codec
