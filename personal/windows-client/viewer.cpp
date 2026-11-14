@@ -28,6 +28,7 @@
 #include "viewer_log.hpp"
 #include "mouse_buttons.hpp"
 #include "video_worker.hpp"
+#include "audio_player.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -200,6 +201,24 @@ public:
         return false;
     }
 
+    // MRM1 0x45 audio request: flags 0x01 = send audio to this viewer's IP at
+    // `port` (the player's own socket); 0 = stop now. Sent from this socket
+    // on purpose: the host keys the MRM1 session on its source port.
+    bool sendAudioRequest(bool enable, uint16_t port) {
+        if (s_ == INVALID_SOCKET) return false;
+        const uint32_t seq = ++sequence_;
+        uint8_t p[13]{'M','R','M','1', 1, 0x45,
+                      uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
+                      uint8_t(enable ? 0x01 : 0x00), uint8_t(port >> 8), uint8_t(port)};
+        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
+                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        if (n == sizeof(p)) { ++audioRequestsSent_; return true; }
+        ++audioRequestDrops_;
+        return false;
+    }
+    uint64_t audioRequestsSent() const { return audioRequestsSent_; }
+    uint64_t audioRequestDrops() const { return audioRequestDrops_; }
+
     // Smoothed RTT from 0x44 echoes (EWMA 1/8), 0 until the first echo.
     // MRM1 0x42 receiver report (ABR), only when the host set ACK flag 0x40.
     bool sendReceiverReport(const jl::ReceiverReport& r) {
@@ -310,6 +329,8 @@ private:
             std::chrono::steady_clock::now().time_since_epoch()).count());
     }
     uint64_t nackSent_ = 0;
+    uint64_t audioRequestsSent_ = 0;
+    uint64_t audioRequestDrops_ = 0;
     uint64_t nackDrops_ = 0;
     uint64_t reportSent_ = 0;
     uint64_t reportDrops_ = 0;
@@ -764,6 +785,30 @@ static std::optional<std::string> detectTailscaleIPv4() {
 
 static constexpr UINT IDM_VIDEO_SETTINGS = 0x1F10;
 static constexpr UINT IDM_CONNECTION_INFO = 0x1F11;
+static constexpr UINT IDM_AUDIO_MUTE = 0x1F20;  // low 4 bits clear: also used in the system menu
+
+// Mac audio. The player lives in the session (runViewer); mute is local to
+// this viewer, kept across reconnects, and never sent to the Mac.
+static jl::audio::AudioPlayer* gAudio = nullptr;
+static bool gAudioMuted = false;
+
+static void updateAudioMuteMenus(HWND hwnd) {
+    const UINT state = MF_BYCOMMAND | (gAudioMuted ? MF_CHECKED : MF_UNCHECKED);
+    if (HMENU bar = GetMenu(hwnd)) CheckMenuItem(bar, IDM_AUDIO_MUTE, state);
+    if (HMENU sys = GetSystemMenu(hwnd, FALSE)) CheckMenuItem(sys, IDM_AUDIO_MUTE, state);
+}
+
+static void toggleAudioMute(HWND hwnd, const char* source) {
+    gAudioMuted = !gAudioMuted;
+    if (gAudio) gAudio->setMuted(gAudioMuted);
+    updateAudioMuteMenus(hwnd);
+    logLine(std::string("audio.mute=") + (gAudioMuted ? "on" : "off") + " source=" + source);
+}
+
+// Ctrl+Alt+M toggles mute on the viewer only; the M never reaches the Mac.
+static bool isAudioMuteShortcut(WPARAM vk) {
+    return vk == 'M' && physicalKeyDown(VK_CONTROL) && physicalKeyDown(VK_MENU);
+}
 static constexpr wchar_t kJerislinkSettingsKey[] = L"Software\\Jeris\\Jerislink";
 
 using SavedSettings = jl::SavedSettings;
@@ -1090,6 +1135,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case IDM_CONNECTION_INFO:
             showConnectionInfo(hwnd);
             return 0;
+        case IDM_AUDIO_MUTE:
+            toggleAudioMute(hwnd, "menu");
+            return 0;
         default:
             break;
         }
@@ -1098,6 +1146,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if ((wParam & 0xFFF0u) == IDM_VIDEO_SETTINGS) {
             logLine("video.settings.command source=system-menu");
             showVideoSettings(hwnd);
+            return 0;
+        }
+        if ((wParam & 0xFFF0u) == IDM_AUDIO_MUTE) {
+            toggleAudioMute(hwnd, "system-menu");
             return 0;
         }
         break;
@@ -1136,6 +1188,15 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return MA_ACTIVATE;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        if (viewerHasInteractiveFocus(hwnd) && isAudioMuteShortcut(wParam)) {
+            // Handled here before any forwarding; the key-up is swallowed via
+            // gSuppressedShortcutKey. Ctrl and Alt were already sent as plain
+            // modifier downs and are released normally.
+            if ((lParam & (1LL << 30)) == 0) toggleAudioMute(hwnd, "shortcut");
+            gSuppressedShortcutKey = 'M';
+            gTemporarilyReleasedModifier = 0;
+            return 0;
+        }
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         logFirstInput("keyboard");
         const bool repeat = (lParam & (1LL << 30)) != 0;
@@ -1397,6 +1458,8 @@ static HMENU createViewerMenu() {
     const bool ok =
         AppendMenuW(connectionMenu, MF_STRING, IDM_CONNECTION_INFO, L"&Connection Info...") &&
         AppendMenuW(settingsMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"&Connection Settings...") &&
+        AppendMenuW(settingsMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
+                    L"&Mute Mac Audio\tCtrl+Alt+M") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(connectionMenu), L"&Connection") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(settingsMenu), L"&Settings");
     if (!ok) {
@@ -1443,6 +1506,8 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
     if (HMENU systemMenu = GetSystemMenu(hwnd, FALSE)) {
         AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(systemMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"Connection Settings...");
+        AppendMenuW(systemMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
+                    L"Mute Mac Audio\tCtrl+Alt+M");
     }
     applyModernWindowChrome(hwnd);
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
@@ -2472,6 +2537,7 @@ static int appMain(int argc, char** argv) {
     uint16_t effectiveBitrateMbps = 25;
     bool hostSupportsNack = false;
     bool hostSupportsAbr = false;
+    bool hostSupportsAudio = false;
     gRemoteWidth = o.width;
     gRemoteHeight = o.height;
     gScrollScale = o.scrollScale;
@@ -2503,6 +2569,8 @@ static int appMain(int argc, char** argv) {
         std::unique_ptr<ControlChannel> control;
         std::unique_ptr<ClipboardChannel> clipboard;
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
+        // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
+        std::unique_ptr<jl::audio::AudioPlayer> audio;
         if (o.controlEnabled) {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
             gControl = control.get();
@@ -2528,11 +2596,12 @@ static int appMain(int argc, char** argv) {
                 gConnectionInfo.rttMs = controlRtt;
 
                 const auto videoConfig = control->negotiateVideo(
-                    o.codec, h264Supported, hevcSupported, o.bitrateMbps);
+                    o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
                 if (videoConfig.negotiated) {
                     effectiveCodec = videoConfig.codec;
                     hostSupportsNack = videoConfig.hostSupportsNack;
                     hostSupportsAbr = videoConfig.hostSupportsAbr;
+                    hostSupportsAudio = videoConfig.hostSupportsAudio;
                     effectiveBitrateMbps = videoConfig.bitrateMbps;
                     if (!o.widthExplicit &&
                         videoConfig.remoteWidth > 0 && videoConfig.remoteHeight > 0) {
@@ -2549,6 +2618,7 @@ static int appMain(int argc, char** argv) {
                         << " fallback=" << (videoConfig.codecFallback ? "yes" : "no")
                         << " host_nack=" << (videoConfig.hostSupportsNack ? "yes" : "no")
                         << " host_abr=" << (videoConfig.hostSupportsAbr ? "yes" : "no")
+                        << " host_audio=" << (videoConfig.hostSupportsAudio ? "yes" : "no")
                         << " remote_size=" << videoConfig.remoteWidth << "x"
                         << videoConfig.remoteHeight;
                     logLine(cfg.str());
@@ -2556,7 +2626,7 @@ static int appMain(int argc, char** argv) {
                         (videoConfig.remoteWidth == 0 || videoConfig.remoteHeight == 0)) {
                         logLine("video.hevc_remote_size_missing; requesting h264 fallback");
                         const auto fallbackConfig = control->negotiateVideo(
-                            "h264", true, hevcSupported, o.bitrateMbps);
+                            "h264", true, hevcSupported, o.bitrateMbps, o.audio == "on");
                         if (fallbackConfig.negotiated && fallbackConfig.codec == "h264") {
                             effectiveCodec = "h264";
                             effectiveBitrateMbps = fallbackConfig.bitrateMbps;
@@ -2630,7 +2700,7 @@ static int appMain(int argc, char** argv) {
             logLine(std::string("video.hevc_init_failed reason=") + e.what());
             logLine("video.fallback_request=h264");
             const auto fallbackConfig = control->negotiateVideo(
-                "h264", true, hevcSupported, o.bitrateMbps);
+                "h264", true, hevcSupported, o.bitrateMbps, o.audio == "on");
             if (!fallbackConfig.negotiated || fallbackConfig.codec != "h264") {
                 throw;
             }
@@ -2688,6 +2758,26 @@ static int appMain(int argc, char** argv) {
         logLine(std::string("abr=") + (abrEnabled ? "on" : "off") +
                 " requested=" + o.abr +
                 " host_abr=" + (hostSupportsAbr ? "yes" : "no"));
+        // Audio: the host said it can (ACK flag 0x80) and the MRM1 channel is
+        // up. The player has its own socket and threads; the loop below only
+        // repeats the MRM1 0x45 request naming that socket's port every second.
+        if (o.audio == "on" && hostSupportsAudio && mouseMoveUdp) {
+            audio = std::make_unique<jl::audio::AudioPlayer>([](const std::string& m) { logLine(m); });
+            std::string audioErr;
+            if (audio->start(o.bindIp, o.sourceIp, audioErr)) {
+                audio->setMuted(gAudioMuted);
+                gAudio = audio.get();
+                mouseMoveUdp->sendAudioRequest(true, audio->port());
+            } else {
+                logLine("audio.start_failed reason=" + audioErr);
+                audio.reset();
+            }
+        }
+        logLine(std::string("audio=") + (audio ? "on" : "off") +
+                " requested=" + o.audio +
+                " host_audio=" + (hostSupportsAudio ? "yes" : "no") +
+                " port=" + std::to_string(audio ? audio->port() : 0) +
+                " muted=" + (gAudioMuted ? "yes" : "no"));
         if (nackEnabled || abrEnabled) {
             // Wake up often enough for the 2 ms reorder grace and 40 ms hold.
             DWORD nackTimeout = 5;
@@ -2768,6 +2858,8 @@ static int appMain(int argc, char** argv) {
         auto start = std::chrono::steady_clock::now();
         auto lastPacket = start;
         auto lastPing = start - std::chrono::seconds(1);
+        auto lastAudioRequest = start;
+        auto lastAudioStats = start;
         auto lastStats = start;
         bool gotAny = false;
         const auto msSince = [&start](std::chrono::steady_clock::time_point t) {
@@ -2863,6 +2955,24 @@ static int appMain(int argc, char** argv) {
             if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
+            }
+            if (audio && now - lastAudioRequest >= std::chrono::seconds(1)) {
+                // Keep-alive: the host stops capturing 3 s after the last request.
+                mouseMoveUdp->sendAudioRequest(true, audio->port());
+                lastAudioRequest = now;
+            }
+            if (audio && now - lastAudioStats >= std::chrono::seconds(10)) {
+                const auto a = audio->stats();
+                std::ostringstream as;
+                as << std::fixed << std::setprecision(1)
+                   << "audio.stats rx=" << a.jb.packetsRx << " lost=" << a.jb.lost
+                   << " late=" << a.jb.late << " underruns=" << a.jb.underruns
+                   << " overflow_drops=" << a.jb.overflowDrops << " target_ms=" << a.jb.targetMs
+                   << " jitter_ms=" << a.jb.jitterMs << " buffered_ms=" << a.jb.bufferedMs
+                   << " device_ok=" << (a.deviceOk ? "yes" : "no") << " device_errors=" << a.deviceErrors
+                   << " muted=" << (a.muted ? "yes" : "no");
+                logLine(as.str());
+                lastAudioStats = now;
             }
             if (abrEnabled && now - lastReport >= std::chrono::milliseconds(250)) {
                 const auto& st = receiver.stats();
@@ -3047,6 +3157,15 @@ static int appMain(int argc, char** argv) {
         const auto sessionFps = [streamSec](uint64_t frames) {
             return streamSec > 0.5 ? static_cast<double>(frames) / streamSec : 0.0;
         };
+        // Audio: tell the host to stop now (it would also stop 10 s later),
+        // join the player threads, then report.
+        jl::audio::PlayerStats audioStats;
+        if (audio) {
+            mouseMoveUdp->sendAudioRequest(false, 0);
+            audio->stop();
+            audioStats = audio->stats();
+            gAudio = nullptr;
+        }
         std::ostringstream summary;
         summary << "SUMMARY packets=" << packets
                 << " complete_frames=" << complete
@@ -3153,6 +3272,25 @@ static int appMain(int argc, char** argv) {
                 << " clipboard_rx=" << (clipboard ? clipboard->received() : 0)
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
                 << " clipboard_oversize=" << (clipboard ? clipboard->skippedOversize() : 0)
+                << " audio=" << (audio ? "on" : "off")
+                << " audio_packets_rx=" << audioStats.jb.packetsRx
+                << " audio_lost=" << audioStats.jb.lost
+                << " audio_late=" << audioStats.jb.late
+                << " audio_duplicates=" << audioStats.jb.duplicates
+                << " audio_underruns=" << audioStats.jb.underruns
+                << " audio_overflow_drops=" << audioStats.jb.overflowDrops
+                << " audio_resets=" << audioStats.jb.resets
+                << " audio_target_ms=" << audioStats.jb.targetMs
+                << " audio_jitter_ms=" << audioStats.jb.jitterMs
+                << " audio_played_ms=" << audioStats.jb.framesPlayed / 48
+                << " audio_silence_ms=" << audioStats.jb.framesSilence / 48
+                << " audio_rx_bad_peer=" << audioStats.rxBadPeer
+                << " audio_rx_malformed=" << audioStats.rxMalformed
+                << " audio_device_opens=" << audioStats.deviceOpens
+                << " audio_device_errors=" << audioStats.deviceErrors
+                << " audio_requests_tx=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestsSent() : 0)
+                << " audio_request_drops=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestDrops() : 0)
+                << " audio_muted=" << (gAudioMuted ? "yes" : "no")
                 << " bad=" << bad << " rejected=" << rejected;
         logLine(summary.str());
         gControl = nullptr;
@@ -3175,6 +3313,7 @@ static int appMain(int argc, char** argv) {
         return 0;
     } catch (const std::exception& e) {
         gControl = nullptr;
+        gAudio = nullptr;  // the player itself was destroyed during unwinding
         logLine(std::string("FATAL ") + e.what());
         MessageBoxA(nullptr, e.what(), "JerisLink", MB_OK | MB_ICONERROR);
         if (wsaStarted) WSACleanup();

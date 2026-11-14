@@ -14,6 +14,7 @@ struct VideoConfigResult {
     bool codecFallback = false;
     bool hostSupportsNack = false;  // ACK flag 0x20: host keeps a frame cache and answers MRM1 0x41
     bool hostSupportsAbr = false;   // ACK flag 0x40: host adapts its bitrate to MRM1 0x42 reports
+    bool hostSupportsAudio = false; // ACK flag 0x80: host streams MRA1 audio on an MRM1 0x45 request
     std::string codec = "h264";
     uint16_t bitrateMbps = 25;
     uint16_t remoteWidth = 0;
@@ -103,7 +104,8 @@ public:
         const std::string& requestedCodec,
         bool clientH264,
         bool clientHevc,
-        uint16_t requestedBitrateMbps) {
+        uint16_t requestedBitrateMbps,
+        bool clientAudio = false) {
         VideoConfigResult result;
         uint8_t codec = 0;
         if (requestedCodec == "h264") codec = 1;
@@ -113,6 +115,9 @@ public:
         uint8_t caps = 0;
         if (clientH264) caps |= 0x01;
         if (clientHevc) caps |= 0x02;
+        // 0x04: this viewer wants audio. Informational for the host log; the
+        // audio itself starts with MRM1 0x45 on the video process.
+        if (clientAudio) caps |= 0x04;
         std::vector<uint8_t> payload{
             1,
             codec,
@@ -174,6 +179,7 @@ public:
         result.codecFallback = (flags & 0x04) != 0;
         result.hostSupportsNack = (flags & 0x20) != 0;
         result.hostSupportsAbr = (flags & 0x40) != 0;
+        result.hostSupportsAudio = (flags & 0x80) != 0;
         result.codec = selected == 2 ? "hevc" : "h264";
         result.bitrateMbps = bitrate;
         if (reply.size() >= 10 && (flags & 0x08) != 0) {

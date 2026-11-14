@@ -25,7 +25,7 @@ configure_file(jerislink.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/jerislink.manif
 configure_file(setup.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/setup.manifest @ONLY)
 message(STATUS "JerisLink version ${JERISLINK_VERSION}")
 
-set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32)
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt)
 
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -70,3 +70,6 @@ target_compile_definitions(JerislinkLogTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
 
 # Console test: every mouse button down sent to the host gets one up (mouse_buttons.hpp).
 add_executable(JerislinkMouseButtonsTest mouse_buttons_test.cpp)
+
+# Console unit test for the MRA1 audio jitter buffer (audio_jitter.hpp).
+add_executable(JerislinkAudioTest audio_jitter_test.cpp)

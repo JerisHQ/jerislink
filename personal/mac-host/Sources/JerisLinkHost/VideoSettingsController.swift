@@ -51,6 +51,9 @@ struct PersistedVideoSettings: Equatable {
     /// abr: missing = on. Off leaves ACK flag 0x40 clear, so the viewer sends
     /// no receiver reports and the bitrate stays at bitrateMbps (as before).
     var abr = true
+    /// audio: missing = on. Off leaves ACK flag 0x80 clear, so the viewer never
+    /// asks for MRA1 audio and the host never starts the audio capture.
+    var audio = true
 
     /// Apple's ScreenCaptureKit 60 fps sample uses queueDepth 5. With depth 2 a
     /// BetterDisplay 4K virtual screen stops delivering frames after the first
@@ -68,6 +71,7 @@ struct PersistedVideoSettings: Equatable {
         if let burst = Self.int(dict["udpPaceBurstKB"]), (2...1024).contains(burst) { udpPaceBurstKB = burst }
         nack = Self.bool(dict["nack"]) ?? true
         abr = Self.bool(dict["abr"]) ?? true
+        audio = Self.bool(dict["audio"]) ?? true
     }
 
     var pacing: UDPPacing {
@@ -84,7 +88,7 @@ struct PersistedVideoSettings: Equatable {
     }
 
     var summary: String {
-        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary) nack=\(nack ? "on" : "off") abr=\(abr ? "on" : "off")"
+        "codec=\(codec) bitrate=\(bitrateMbps) Mbps fps=\(fps) captureQueueDepth=\(captureQueueDepth) keepDisplayAwake=\(keepDisplayAwake) \(pacing.summary) nack=\(nack ? "on" : "off") abr=\(abr ? "on" : "off") audio=\(audio ? "on" : "off")"
     }
 
     private static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
@@ -144,6 +148,7 @@ final class VideoSettingsController: @unchecked Sendable {
         if ignored { flags |= 0x10 }
         if nackEnabled() { flags |= 0x20 } // host retransmits on NACK
         if abrEnabled() { flags |= 0x40 }  // host takes MRM1 0x42 receiver reports
+        if audioEnabled() { flags |= 0x80 } // host sends MRA1 audio on MRM1 0x45
         return VideoSettingsAck(
             status: 0,
             codec: current.codec == "hevc" ? 2 : 1,
@@ -180,6 +185,9 @@ final class VideoSettingsController: @unchecked Sendable {
 
         let clientH264 = (clientCaps & 0x01) != 0
         let clientHEVC = (clientCaps & 0x02) != 0
+        // Caps 0x04: the viewer wants audio. Informational only; audio itself is
+        // opted in per session by MRM1 0x45 on the video process (ACK flag 0x80).
+        print("Video settings request client_audio=\((clientCaps & 0x04) != 0 ? "on" : "off")")
         guard clientH264 else {
             return VideoSettingsAck(status: 1, codec: 1, flags: 0, bitrateMbps: 25)
         }
@@ -241,6 +249,7 @@ final class VideoSettingsController: @unchecked Sendable {
             if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
             if nackEnabled() { flags |= 0x20 }
             if abrEnabled() { flags |= 0x40 }
+            if audioEnabled() { flags |= 0x80 }
 
             if changed {
                 requestVideoRestart()
@@ -274,6 +283,11 @@ final class VideoSettingsController: @unchecked Sendable {
     /// ACK flag 0x40: the video service runs ABR on MRM1 0x42 reports (plist `abr`).
     private func abrEnabled() -> Bool {
         PersistedVideoSettings.load(from: fileURL).abr
+    }
+
+    /// ACK flag 0x80: the video service streams MRA1 audio on MRM1 0x45 (plist `audio`).
+    private func audioEnabled() -> Bool {
+        PersistedVideoSettings.load(from: fileURL).audio
     }
 
     private func persist(codec: String, bitrateMbps: Int) throws {

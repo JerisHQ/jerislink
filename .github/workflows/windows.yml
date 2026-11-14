@@ -45,6 +45,10 @@ jobs:
         run: cmake --build build --config Release --target JerislinkMouseButtonsTest
       - name: Mouse button parity test (every down gets one up; focus kill, capture lost)
         run: build\Release\JerislinkMouseButtonsTest.exe
+      - name: Build audio jitter test
+        run: cmake --build build --config Release --target JerislinkAudioTest
+      - name: Audio jitter test (MRA1 parse, reorder, loss, underrun, overflow, link simulation)
+        run: build\Release\JerislinkAudioTest.exe
       - name: Saved settings drive a launch without connection arguments
         shell: pwsh
         run: |
