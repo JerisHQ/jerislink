@@ -10,6 +10,7 @@
 // 5. video_worker.hpp: a stalled decoder does not block the main loop;
 //    order, overflow -> keyframe, failure, latency wait, clean stop.
 #include "loop_wait.hpp"
+#include "present_scheduler.hpp"
 #include "video_worker.hpp"
 
 #include <ws2tcpip.h>
@@ -423,6 +424,83 @@ static void testWorkerPresentWaitAndRepaint() {
     CloseHandle(latency);
 }
 
+// A sink that drives the real LatestFramePresenter, with an auto-reset event
+// standing in for the swap chain's frame latency object (max latency 1).
+// Presenter state is touched only on the worker thread; the test reads it
+// after stopAndWait().
+struct PresenterSink : VideoWorkerSink {
+    HANDLE latency = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    uint64_t holdFid = 0;         // submit of this frame waits for `release`
+    uint64_t vblankAfterFid = 0;  // latency object signals right after this frame decodes
+    uint64_t newest = 0;
+    std::vector<uint64_t> shown;
+    LatestFramePresenter presenter{makeOps()};
+
+    ~PresenterSink() override { CloseHandle(latency); CloseHandle(entered); CloseHandle(release); }
+    PresentOps makeOps() {
+        PresentOps ops;
+        ops.latencyReady = [this] { return WaitForSingleObject(latency, 0) == WAIT_OBJECT_0; };
+        ops.render = [] {};
+        ops.present = [this] { shown.push_back(newest); return PresentResult::Ok; };
+        ops.nowMs = [] { return 0.0; };  // never hit the 50 ms latency cap
+        return ops;
+    }
+    void submit(uint64_t fid, const std::vector<uint8_t>&, bool, bool) override {
+        if (fid == holdFid) {
+            SetEvent(entered);
+            WaitForSingleObject(release, 5000);
+        }
+        newest = fid;
+        presenter.onDecoded();
+        if (fid == vblankAfterFid) SetEvent(latency);
+    }
+    void resetForNewStream() override { presenter.clear(); }
+    void repaint() override { presenter.onRepaint(); }
+    void servicePresent() override { presenter.service(); }
+    bool presentPending() override { return presenter.pending(); }
+    HANDLE presentWaitHandle() override { return presenter.waitingForLatency() ? latency : nullptr; }
+    void onPresentWaitSignaled() override { presenter.onLatencySignalled(); }
+    void published() override {}
+    void finish() override {}
+};
+
+// Field regression after F2 (busy drops ~10 % of decoded frames instead of
+// ~0.1 %): frame 1 waits for the latency object, the object signals, and
+// frame 2 is decoded before the worker serviced that signal. The presenter
+// then replaces frame 1 although it could have been shown. The worker must
+// service a ready present before it hands the next frame to the decoder.
+static void testWorkerServicesReadyPresentBeforeNextFrame() {
+    PresenterSink sink;
+    SetEvent(sink.latency);  // the first frame can be shown at once
+    sink.holdFid = 100;
+    sink.vblankAfterFid = 1;
+    VideoWorker w(sink, VideoWorkerConfig{}, nullptr, nullptr);
+    w.start();
+    // Frame 100 holds the worker so frames 1 and 2 are queued back to back.
+    w.pushFrame(100, bytes(1), true, true);
+    CHECK(WaitForSingleObject(sink.entered, 2000) == WAIT_OBJECT_0);
+    w.pushFrame(1, bytes(1), false, false);
+    w.pushFrame(2, bytes(1), false, false);
+    SetEvent(sink.release);
+    const auto t0 = Clock::now();
+    while (w.framesSubmitted() < 3 && msSince(t0) < 2000) Sleep(1);
+    Sleep(20);
+    w.stopAndWait();
+    const PresentCounters& c = sink.presenter.counters();
+    std::string shown;
+    for (uint64_t f : sink.shown) shown += (shown.empty() ? "" : " ") + std::to_string(f);
+    std::printf("worker: ready present before next frame: decoded=%llu presented=%llu busy_drops=%llu shown=[%s]\n",
+                static_cast<unsigned long long>(c.decoded), static_cast<unsigned long long>(c.presented),
+                static_cast<unsigned long long>(c.busyDrops), shown.c_str());
+    CHECK(c.decoded == 3);
+    CHECK(c.busyDrops == 0);
+    CHECK(c.presented == 2);
+    CHECK(shown == "100 1");
+    CHECK(sink.presenter.pending());  // frame 2 waits for the next vblank
+}
+
 static int gSentToMain = 0;
 static LRESULT CALLBACK workerTestWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_USER + 7) { ++gSentToMain; return 0; }
@@ -480,6 +558,7 @@ int main() {
     testWorkerOverflowToKeyframe();
     testWorkerFailure();
     testWorkerPresentWaitAndRepaint();
+    testWorkerServicesReadyPresentBeforeNextFrame();
     testWorkerStopPumpsMessages();
     WSACleanup();
     std::printf("%d PASS, %d FAIL\n", gPasses, gFailures);
