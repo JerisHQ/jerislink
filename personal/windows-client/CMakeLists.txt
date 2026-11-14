@@ -56,3 +56,6 @@ add_executable(JerislinkReceiverTest video_receiver_test.cpp)
 # Console test for the receive-loop wait set and timer period (loop_wait.hpp).
 add_executable(JerislinkLoopWaitTest loop_wait_test.cpp)
 target_compile_definitions(JerislinkLoopWaitTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+# Console test for the async, size-capped viewer logger (viewer_log.hpp).
+add_executable(JerislinkLogTest viewer_log_test.cpp)
+target_compile_definitions(JerislinkLogTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
