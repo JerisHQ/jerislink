@@ -59,3 +59,6 @@ target_compile_definitions(JerislinkLoopWaitTest PRIVATE WIN32_LEAN_AND_MEAN NOM
 # Console test for the async, size-capped viewer logger (viewer_log.hpp).
 add_executable(JerislinkLogTest viewer_log_test.cpp)
 target_compile_definitions(JerislinkLogTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+# Console test: every mouse button down sent to the host gets one up (mouse_buttons.hpp).
+add_executable(JerislinkMouseButtonsTest mouse_buttons_test.cpp)
