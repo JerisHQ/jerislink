@@ -51,10 +51,6 @@ On the Windows PC:
   video and network statistics, and event names (for example which shortcut
   was used, or how many bytes of clipboard text were sent). They do not
   contain clipboard text or the keys you type.
-- If the viewer falls back to software (CPU) video decoding, it saves the first
-  frame it shows as `jerislink-first-frame.bmp` in `%TEMP%`, for diagnostics.
-  This image is a picture of the Mac screen. It is overwritten on each such
-  session.
 
 On the Mac:
 
@@ -62,12 +58,23 @@ On the Mac:
   allowed viewer address, video settings, and status files).
 - Service logs in `/tmp/jerislink-*.log` and `/tmp/jerislink-*.err`, with the
   same kind of content as the Windows logs: addresses, statistics and event
-  counts, not clipboard text or typed keys. The input helper log also records
-  each mouse button press and release with a timestamp and which modifier
-  keys (Shift, Control, Option, Command) were held, to diagnose click
-  problems.
+  counts, not clipboard text or typed keys.
 
 None of these files leave your devices. You can delete them at any time.
+
+### Debug mode
+
+Debug mode is off unless you turn it on yourself by setting the environment
+variable `JERISLINK_DEBUG=1` before starting JerisLink. Only in debug mode:
+
+- the Windows viewer, when it falls back to software (CPU) video decoding,
+  saves the first frame it shows as `jerislink-first-frame.bmp` in `%TEMP%`.
+  This image is a picture of the Mac screen;
+- the Mac input helper log records each mouse button press and release with
+  a timestamp and which modifier keys (Shift, Control, Option, Command) were
+  held.
+
+These debug files also stay on your devices.
 
 ## Data shared with JerisHQ or others
 
