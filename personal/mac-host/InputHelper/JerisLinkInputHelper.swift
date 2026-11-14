@@ -50,6 +50,53 @@ struct DisplayBoundsCache {
     DispatchTime.now().uptimeNanoseconds
 }
 
+/// One line per injected mouse button on stderr (launchd's
+/// /tmp/jerislink-input-helper.err): UTC time with milliseconds, button,
+/// down/up, flags and click state. Never key codes. The file is emptied when
+/// it passes 10 MB.
+enum ButtonLog {
+    static let maxBytes: off_t = 10 * 1024 * 1024
+    nonisolated(unsafe) private static var linesSinceCheck = 0
+    nonisolated(unsafe) private static let clock: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f
+    }()
+
+    static func timestamp(_ date: Date = Date()) -> String { clock.string(from: date) }
+
+    static func line(button: CGMouseButton, down: Bool, flags: CGEventFlags, clickState: Int64,
+                     source: String) -> String {
+        let name: String
+        switch button {
+        case .left: name = "left"
+        case .right: name = "right"
+        default: name = "middle"
+        }
+        return "button=\(name) \(down ? "down" : "up") flags=0x\(String(flags.rawValue, radix: 16)) clickState=\(clickState) source=\(source)"
+    }
+
+    static func writeStderr(_ text: String) {
+        let s = "\(timestamp()) \(text)\n"
+        _ = s.withCString { Darwin.write(STDERR_FILENO, $0, strlen($0)) }
+        linesSinceCheck += 1
+        if linesSinceCheck >= 256 {
+            linesSinceCheck = 0
+            cap(fd: STDERR_FILENO)
+        }
+    }
+
+    /// Empties `fd` when it is a regular file larger than `maxBytes`.
+    static func cap(fd: Int32) {
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size > maxBytes else { return }
+        let flags = fcntl(fd, F_GETFL)
+        if flags >= 0 && flags & O_APPEND == 0 { _ = fcntl(fd, F_SETFL, flags | O_APPEND) }
+        _ = ftruncate(fd, 0)
+    }
+}
+
 private let statusDirURL: URL = {
     let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/JerisLink", isDirectory: true)
@@ -103,15 +150,19 @@ final class InputHelper {
     private let mouseLocation: () -> CGPoint?
     /// nil: keep the status in `lastStatus` only (self-test).
     private let statusURL: URL?
+    /// Receives one line per injected button (see ButtonLog).
+    private let log: (String) -> Void
 
     init(preflight: @escaping () -> Bool = { CGPreflightPostEventAccess() },
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          mouseLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
-         statusURL: URL? = statusDirURL.appendingPathComponent("input-helper-status.txt")) {
+         statusURL: URL? = statusDirURL.appendingPathComponent("input-helper-status.txt"),
+         log: @escaping (String) -> Void = { ButtonLog.writeStderr($0) }) {
         self.preflight = preflight
         self.postEvent = postEvent
         self.mouseLocation = mouseLocation
         self.statusURL = statusURL
+        self.log = log
     }
 
     var shiftHeld: Bool { shiftDown }
@@ -165,13 +216,13 @@ final class InputHelper {
     private func sessionEnded(_ id: UInt32) {
         // Unknown or stale id (started before a socket drop): ignore it.
         guard activeSessions.remove(id) != nil else { return }
-        if activeSessions.isEmpty && anyHeld { releaseHeld() }
+        if activeSessions.isEmpty && anyHeld { releaseHeld(reason: "session_end") }
         lifecycleNote = "clientClosed=true"
         updateStatus(force: true)
     }
 
     /// Post key-up for held modifiers and button-up for held mouse buttons.
-    private func releaseHeld() {
+    private func releaseHeld(reason: String) {
         let modifiers: [(Bool, CGKeyCode)] = [(controlDown, 59), (optionDown, 58), (commandDown, 55), (shiftDown, 56)]
         controlDown = false; optionDown = false; commandDown = false; shiftDown = false
         for (held, key) in modifiers where held {
@@ -187,7 +238,11 @@ final class InputHelper {
         let pos = mouseLocation() ?? .zero
         for (held, type, button) in buttons where held {
             if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
+                let flags = currentFlags()
+                e.flags = flags
                 postEvent(e)
+                log(ButtonLog.line(button: button, down: false, flags: flags, clickState: 1,
+                                   source: "release reason=\(reason)"))
             }
         }
     }
@@ -326,8 +381,14 @@ final class InputHelper {
             return
         }
         if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pos, mouseButton: button) {
-            e.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, clickCount)))
+            let clickState = Int64(max(1, clickCount))
+            e.setIntegerValueField(.mouseEventClickState, value: clickState)
+            // Only the modifiers the viewer holds: a stale modifier elsewhere in
+            // the system state must not turn a left click into a Control-click.
+            let flags = currentFlags()
+            e.flags = flags
             postEvent(e)
+            log(ButtonLog.line(button: button, down: down, flags: flags, clickState: clickState, source: "viewer"))
         }
         updateStatus()
     }
@@ -361,9 +422,11 @@ final class InputHelper {
         return UInt32(p[0]) << 24 | UInt32(p[1]) << 16 | UInt32(p[2]) << 8 | UInt32(p[3])
     }
 
-    /// The MRI1 socket closed: forget held state and every session. The
+    /// The MRI1 socket closed: release held keys and buttons (post the ups,
+    /// so macOS does not keep them down), then forget every session. The
     /// control service re-announces live sessions when it reconnects.
     func connectionClosed() {
+        if anyHeld { releaseHeld(reason: "connection_closed") }
         controlDown = false
         optionDown = false
         commandDown = false
@@ -596,6 +659,60 @@ func inputHelperSelfTest() -> Bool {
     _ = late.handle(type: MRI1Session.end, payload: sid(3))
     check(lPreflights == 1 && late.lastStatus.contains("activeSessions=0 clientClosed=true"),
           "(b) late START: one preflight, END closes the session")
+
+    // Mouse button flags and the per-button log (recording postEvent and log).
+    var bPosted: [CGEvent] = []
+    var bLog: [String] = []
+    let bh = InputHelper(preflight: { true }, postEvent: { bPosted.append($0) },
+                         mouseLocation: { CGPoint(x: 10, y: 10) }, statusURL: nil,
+                         log: { bLog.append($0) })
+    let modMask: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand, .maskShift]
+    _ = bh.handle(type: MRI1Session.start, payload: sid(1))
+    _ = bh.handle(type: 0x10, payload: [1, 0, 59])                 // Control down
+    _ = bh.handle(type: 0x25, payload: [0, 1, 1])                  // left down, clickState 1
+    check(bPosted.last?.type == .leftMouseDown && bPosted.last?.flags.intersection(modMask) == .maskControl,
+          "left click while viewer holds Control carries Control only")
+    check(bLog.last == "button=left down flags=0x40000 clickState=1 source=viewer",
+          "button log line for left down (\(bLog.last ?? "none"))")
+    _ = bh.handle(type: 0x25, payload: [0, 0, 1])                  // left up
+    _ = bh.handle(type: 0x10, payload: [0, 0, 59])                 // Control up
+    _ = bh.handle(type: 0x25, payload: [0, 1, 2])                  // left down, double click
+    check(bPosted.last?.type == .leftMouseDown && bPosted.last?.flags.intersection(modMask) == [],
+          "left click after Control up carries no modifier")
+    check(bPosted.last?.getIntegerValueField(.mouseEventClickState) == 2, "click state 2 kept on a double click")
+    check(bLog.last == "button=left down flags=0x0 clickState=2 source=viewer",
+          "button log line for double-click down (\(bLog.last ?? "none"))")
+    _ = bh.handle(type: 0x25, payload: [0, 0, 2])
+    _ = bh.handle(type: 0x21, payload: [1, 1])                     // right down
+    _ = bh.handle(type: 0x21, payload: [1, 0])                     // right up
+    check(bLog.suffix(2) == ["button=right down flags=0x0 clickState=1 source=viewer",
+                             "button=right up flags=0x0 clickState=1 source=viewer"],
+          "one log line per right down and up")
+    check(bLog.count == 6, "six button lines for six button events (got \(bLog.count))")
+    check(!bLog.joined().contains("key"), "button log carries no key codes")
+
+    // MRI1 socket drop while Control and the left button are held: the ups
+    // are posted, not just forgotten.
+    _ = bh.handle(type: 0x10, payload: [1, 0, 59])
+    _ = bh.handle(type: 0x25, payload: [0, 1, 1])
+    let cBefore = bPosted.count
+    bh.connectionClosed()
+    let released = Array(bPosted[cBefore...])
+    check(released.count == 2
+          // a modifier key-up is created as flagsChanged
+          && (released[0].type == .flagsChanged || released[0].type == .keyUp)
+          && released[0].getIntegerValueField(.keyboardEventKeycode) == 59
+          && released[0].flags.intersection(modMask) == []
+          && released[1].type == .leftMouseUp && released[1].flags.intersection(modMask) == [],
+          "connectionClosed posts Control key-up and left button-up (posted \(released.map { "\($0.type.rawValue)/\($0.getIntegerValueField(.keyboardEventKeycode))/0x\(String($0.flags.rawValue, radix: 16))" }))")
+    check(!bh.anyHeld && bh.activeSessions.isEmpty, "connectionClosed leaves nothing held")
+    check(bLog.last == "button=left up flags=0x0 clickState=1 source=release reason=connection_closed",
+          "release logged with its reason (\(bLog.last ?? "none"))")
+    let cAfter = bPosted.count
+    bh.connectionClosed()
+    check(bPosted.count == cAfter, "connectionClosed with nothing held posts nothing")
+    check(ButtonLog.timestamp(Date(timeIntervalSince1970: 1_794_624_440.123)).hasSuffix(".123Z"),
+          "log timestamp is UTC with milliseconds (\(ButtonLog.timestamp(Date(timeIntervalSince1970: 1_794_624_440.123))))")
 
     print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
     return ok

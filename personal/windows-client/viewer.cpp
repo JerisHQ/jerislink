@@ -24,6 +24,7 @@
 #include "video_receiver.hpp"
 #include "abr.hpp"
 #include "loop_wait.hpp"
+#include "mouse_buttons.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -333,6 +334,8 @@ static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static WPARAM gSuppressedShortcutKey = 0;
 static uint16_t gTemporarilyReleasedModifier = 0;
 static uint8_t gLeftClickCount = 1;
+// Buttons sent down to the host and not yet up: every down gets one up.
+static RemoteButtons gRemoteButtons;
 static uint8_t gRemoteCursorShape = 0;
 static HCURSOR gRemoteCursor = nullptr;
 
@@ -553,12 +556,39 @@ static void releaseRemoteModifiers() {
     for (uint16_t k = 1; k <= 4; ++k) gControl->sendKey(false, k);
 }
 
+static void sendRemoteButtonUp(uint8_t button) {
+    if (!gControl) return;
+    if (button == 0) gControl->sendMouseButtonExtended(0, false, gLeftClickCount);
+    else gControl->sendMouseButton(button, false);
+}
+
+// Sends an up for every button still held on the host (focus moved, capture
+// taken by another window, window closing) and logs which ones.
+static void releaseRemoteButtons(const char* reason) {
+    const uint8_t mask = gRemoteButtons.releaseAll(sendRemoteButtonUp);
+    if (!mask) return;
+    gLeftClickCount = 1;
+    logLine(std::string("input.buttons_released reason=") + reason + " mask=" + std::to_string(mask));
+}
+
+// UTC wall clock with milliseconds, e.g. 2026-11-14T02:47:20.123Z, so viewer
+// lines can be matched against host logs.
+static std::string logTimestamp() {
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+                  t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    return buf;
+}
+
 static void logLine(const std::string& s) {
+    const std::string line = logTimestamp() + " " + s + "\n";
     std::ofstream f(kLogPath, std::ios::app);
-    f << s << "\n";
+    f << line;
     f.flush();
     std::ofstream h(kHistoryLogPath, std::ios::app);
-    h << s << "\n";
+    h << line;
     h.flush();
 }
 
@@ -946,8 +976,14 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         gHookCapsDown = false;
         gSuppressedShortcutKey = 0;
         gTemporarilyReleasedModifier = 0;
+        releaseRemoteButtons("focus_kill");
         releaseRemoteModifiers();
         logLine("focus.kill");
+        return 0;
+    case WM_CAPTURECHANGED:
+        // Another window took the mouse capture while a button was held: the
+        // WM_*BUTTONUP will not come here, so send the ups now.
+        if (reinterpret_cast<HWND>(lParam) != hwnd) releaseRemoteButtons("capture_changed");
         return 0;
     case WM_ACTIVATE:
         gViewerFocused = LOWORD(wParam) != WA_INACTIVE;
@@ -1090,63 +1126,48 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     }
     case WM_LBUTTONDOWN:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-            sendAbsolutePointer(hwnd, p);
-            gLeftClickCount = 1;
-            SetCapture(hwnd);
-            gControl->sendMouseButtonExtended(0, true, gLeftClickCount);
-            return 0;
-        }
-        break;
     case WM_LBUTTONDBLCLK:
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
-            gLeftClickCount = 2;
+            gLeftClickCount = msg == WM_LBUTTONDBLCLK ? 2 : 1;
             SetCapture(hwnd);
             gControl->sendMouseButtonExtended(0, true, gLeftClickCount);
-            return 0;
-        }
-        break;
-    case WM_LBUTTONUP:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-            sendAbsolutePointer(hwnd, p);
-            gControl->sendMouseButtonExtended(0, false, gLeftClickCount);
-            if (gLeftClickCount >= 2) gLeftClickCount = 1;
-            ReleaseCapture();
+            gRemoteButtons.down(0);
             return 0;
         }
         break;
     case WM_RBUTTONDOWN:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-            sendAbsolutePointer(hwnd, p);
-            SetCapture(hwnd); gControl->sendMouseButton(1, true); return 0;
-        }
-        break;
-    case WM_RBUTTONUP:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-            sendAbsolutePointer(hwnd, p);
-            gControl->sendMouseButton(1, false); ReleaseCapture(); return 0;
-        }
-        break;
     case WM_MBUTTONDOWN:
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
+            const uint8_t button = msg == WM_RBUTTONDOWN ? 1 : 2;
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
-            SetCapture(hwnd); gControl->sendMouseButton(2, true); return 0;
+            SetCapture(hwnd);
+            gControl->sendMouseButton(button, true);
+            gRemoteButtons.down(button);
+            return 0;
         }
         break;
-    case WM_MBUTTONUP:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-            sendAbsolutePointer(hwnd, p);
-            gControl->sendMouseButton(2, false); ReleaseCapture(); return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP: {
+        // No focus gate: a down that was sent always gets its up, even when
+        // focus moved while the button was held.
+        const uint8_t button = msg == WM_LBUTTONUP ? 0 : (msg == WM_RBUTTONUP ? 1 : 2);
+        if (!gRemoteButtons.up(button)) break;
+        if (gControl) {
+            if (viewerHasInteractiveFocus(hwnd)) {
+                POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+                sendAbsolutePointer(hwnd, p);
+            }
+            sendRemoteButtonUp(button);
         }
-        break;
+        if (button == 0 && gLeftClickCount >= 2) gLeftClickCount = 1;
+        // Keep the capture while another button is still held.
+        if (!gRemoteButtons.anyHeld() && GetCapture() == hwnd) ReleaseCapture();
+        return 0;
+    }
     case WM_MOUSEWHEEL: {
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             int delta = static_cast<short>(HIWORD(wParam));
@@ -1176,6 +1197,7 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     case WM_CLOSE:
         gWindowClosed = true;
+        releaseRemoteButtons("close");
         releaseRemoteModifiers();
         DestroyWindow(hwnd);
         return 0;
