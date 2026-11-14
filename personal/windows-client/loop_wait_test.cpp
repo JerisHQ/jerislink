@@ -12,6 +12,9 @@
 // 6. present_scheduler.hpp: max frame latency 2 vs 1 under a jittery
 //    50 fps arrival pattern (busy drops before/after, added queue time),
 //    and a hidden window holds the newest frame without busy drops.
+// 7. loop_accounting.hpp: input age splits into loop wait and delivery
+//    delay; time in a Windows modal loop is not a loop stall (before/after).
+#include "loop_accounting.hpp"
 #include "loop_wait.hpp"
 #include "present_scheduler.hpp"
 #include "video_worker.hpp"
@@ -675,6 +678,123 @@ static void testWorkerStopPumpsMessages() {
     DestroyWindow(hwnd);
 }
 
+// loop_accounting.hpp, input: an input message's age splits into the part
+// our loop caused (time since it last drained its queue or woke) and the
+// part before the message reached our queue (G3: 62 ms age while the loop
+// was busy 2.4 ms).
+static void testInputWaitSplit() {
+    // Loop busy 40 ms, event 40 ms old: all of it is ours.
+    InputWaitSplit a = splitInputWait(40.0, 45.0);
+    CHECK(a.loopMs == 40.0);
+    CHECK(a.deliveryMs == 0.0);
+    // G3 case: 62 ms old, loop responsive 2.4 ms ago -> 2.4 ours, rest upstream.
+    InputWaitSplit b = splitInputWait(62.0, 2.4);
+    CHECK(b.loopMs == 2.4);
+    CHECK(b.deliveryMs > 59.5 && b.deliveryMs < 59.7);
+    // Negative: the old metric (raw age) fails the 16 ms bar for the same event.
+    CHECK(62.0 > 16.0);
+    CHECK(b.loopMs <= 16.0);
+    // Clock skew (tick count is coarse): never negative.
+    InputWaitSplit c = splitInputWait(-3.0, 5.0);
+    CHECK(c.loopMs == 0.0 && c.deliveryMs == 0.0);
+    InputWaitSplit d = splitInputWait(10.0, -1.0);
+    CHECK(d.loopMs == 0.0 && d.deliveryMs == 10.0);
+}
+
+// Real queue: a message posted while the loop is busy 50 ms is counted as
+// loop wait (stall case is caught, not hidden in "delivery").
+static void testInputWaitSplitRealQueue() {
+    MSG m{};
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {}
+    const auto t0 = Clock::now();  // queue drained: loop responsive here
+    PostThreadMessageW(GetCurrentThreadId(), WM_USER + 7, 0, 0);
+    Sleep(50);  // loop busy, message waits in our queue
+    CHECK(PeekMessageW(&m, nullptr, WM_USER + 7, WM_USER + 7, PM_REMOVE) != FALSE);
+    const double age = static_cast<double>(static_cast<DWORD>(GetTickCount() - m.time));
+    const InputWaitSplit s = splitInputWait(age, msSince(t0));
+    std::printf("input split: age %.0f ms -> loop %.1f ms, delivery %.1f ms\n",
+                age, s.loopMs, s.deliveryMs);
+    CHECK(s.loopMs >= 30.0);        // the stall shows up as ours
+    CHECK(s.deliveryMs <= 16.0);    // tick count granularity only
+}
+
+// loop_accounting.hpp, modal: time in a Windows modal loop (caption button,
+// move/size) is not a loop stall. G3: 108.6 ms during WM_NCLBUTTONDOWN.
+static void testModalExcludedFromStalls() {
+    ModalClock clock;
+    LoopStallCounter withModal, without;
+    // Nested scopes count once.
+    clock.enter(0.0);
+    clock.enter(10.0);
+    CHECK(clock.exit(50.0) == 0.0);
+    CHECK(clock.active());
+    CHECK(clock.exit(108.6) == 108.6);
+    CHECK(!clock.active());
+    CHECK(clock.events() == 1);
+    // A 110 ms iteration with 108.6 ms modal: own work 1.4 ms, no stall.
+    const double modal = clock.takeIterMs();
+    CHECK(modal == 108.6);
+    CHECK(clock.takeIterMs() == 0.0);
+    const double own = withModal.note(110.0, modal);
+    CHECK(own > 1.3 && own < 1.5);
+    CHECK(withModal.stalls100 == 0 && withModal.stalls16 == 0);
+    // Negative: without modal accounting the same iteration is a stall.
+    without.note(110.0, 0.0);
+    CHECK(without.stalls100 == 1 && without.stalls16 == 1);
+    // Our own 120 ms of work around a 50 ms modal still counts.
+    withModal.note(170.0, 50.0);
+    CHECK(withModal.stalls100 == 1);
+    CHECK(clock.takeWindowMs() == 108.6);
+    CHECK(clock.totalMs() == 108.6 && clock.maxMs() == 108.6);
+    // exit without enter is ignored.
+    CHECK(clock.exit(200.0) == 0.0);
+    CHECK(clock.events() == 1);
+}
+
+// Same with a real window: its window procedure runs a nested 120 ms
+// message loop (as DefWindowProc does for a caption button) inside a modal
+// scope. The outer loop's iteration takes > 100 ms, but no stall counts.
+static ModalClock gTestModal;
+static LRESULT CALLBACK modalTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_USER + 1) {
+        gTestModal.enter(msSince(Clock::time_point{}));
+        const auto t0 = Clock::now();
+        MSG m{};
+        while (msSince(t0) < 120.0) {
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+            Sleep(1);
+        }
+        gTestModal.exit(msSince(Clock::time_point{}));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void testModalLoopRealWindow() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = modalTestWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"JerislinkModalTest";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    CHECK(hwnd != nullptr);
+    PostMessageW(hwnd, WM_USER + 1, 0, 0);
+    LoopStallCounter withModal, without;
+    const auto iterStart = Clock::now();
+    MSG m{};
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+    const double busy = msSince(iterStart);
+    const double modal = gTestModal.takeIterMs();
+    const double own = withModal.note(busy, modal);
+    without.note(busy, 0.0);
+    std::printf("modal loop: iteration %.1f ms, modal %.1f ms, own %.1f ms\n", busy, modal, own);
+    CHECK(busy >= 100.0);
+    CHECK(modal >= 100.0);
+    CHECK(withModal.stalls100 == 0);
+    CHECK(without.stalls100 == 1);  // negative: old accounting counts it
+    DestroyWindow(hwnd);
+}
+
 int main() {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -693,6 +813,10 @@ int main() {
     testPresenterLatency2AbsorbsBursts();
     testPresenterHiddenHoldsNewest();
     testWorkerStopPumpsMessages();
+    testInputWaitSplit();
+    testInputWaitSplitRealQueue();
+    testModalExcludedFromStalls();
+    testModalLoopRealWindow();
     WSACleanup();
     std::printf("%d PASS, %d FAIL\n", gPasses, gFailures);
     if (gFailures) return 1;

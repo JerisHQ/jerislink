@@ -24,6 +24,7 @@
 #include "video_receiver.hpp"
 #include "abr.hpp"
 #include "loop_wait.hpp"
+#include "loop_accounting.hpp"
 #include "viewer_log.hpp"
 #include "mouse_buttons.hpp"
 #include "video_worker.hpp"
@@ -377,11 +378,29 @@ struct VideoInfoMailbox {
 };
 static VideoInfoMailbox gVideoInfo;
 
-// How long input messages waited in the queue before the main thread got to
-// them (GetTickCount - MSG::time, tick resolution). A stall of the main
+// How long input messages waited in our queue while the main loop was busy
+// (jl::splitInputWait: the message's age, GetTickCount - MSG::time, capped
+// by the time since the loop was last responsive). A stall of the main
 // loop shows up here. Main thread only.
 static std::vector<float> gInputQueueWindowMs;
 static std::vector<float> gInputQueueSessionMs;
+// The rest of the age: the event was already that old when it reached our
+// queue (delivery outside the loop, or a stale timestamp).
+static double gInputDeliveryWindowMaxMs = 0.0;
+static double gInputDeliverySessionMaxMs = 0.0;
+static uint64_t gInputDeliveryLateEvents = 0;  // delivery part > 16 ms
+// steady ms when the loop last could take a message at once: the pump
+// drained the queue, or the loop wait (QS_ALLINPUT) returned.
+static double gLoopResponsiveMs = 0.0;
+// Any input older than this is logged (input.slow), one line per second.
+static constexpr double kInputSlowMs = 16.0;
+static double gInputSlowLastLogMs = -1e9;
+static uint64_t gInputSlowSuppressed = 0;
+static uint64_t gInputSlowEvents = 0;
+// Windows modal loops (caption buttons, move/size, menus, our dialogs).
+// Their time is not the loop's own stall; reported as loop_modal_*.
+static jl::ModalClock gModal;
+static UINT gModalMsg = 0;  // message that opened the current modal stretch
 // Input that was queued before the main loop started (it waited behind
 // GPU / decoder setup on this thread). Kept out of the numbers above so
 // they describe the running loop; reported once as input.startup_queued.
@@ -412,6 +431,54 @@ static bool loopSlowShouldLog(double ms) {
     gLoopSlowLastLogMs = now;
     return true;
 }
+
+// Messages whose default handling can run a Windows modal loop (caption
+// button tracking, move/size, system and window menus) or that open our own
+// modal dialogs. WM_ENTERSIZEMOVE / WM_ENTERMENULOOP arrive inside these.
+static bool mayRunModalLoop(UINT msg) {
+    switch (msg) {
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+    case WM_NCRBUTTONDOWN:
+    case WM_NCRBUTTONUP:
+    case WM_CONTEXTMENU:
+    case WM_SYSCOMMAND:
+    case WM_COMMAND:
+    case WM_ENTERSIZEMOVE:
+    case WM_ENTERMENULOOP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Times one window-procedure call as modal (outermost scope only). While
+// Windows runs the modal loop it dispatches our messages itself, so the
+// loop counts as responsive again when the stretch ends.
+struct ModalScope {
+    const bool on;
+    explicit ModalScope(UINT msg) : on(mayRunModalLoop(msg)) {
+        if (!on) return;
+        if (!gModal.active()) gModalMsg = msg;
+        gModal.enter(steadyMsNow());
+    }
+    ~ModalScope() {
+        if (!on) return;
+        const double now = steadyMsNow();
+        const double ms = gModal.exit(now);
+        if (gModal.active()) return;
+        gLoopResponsiveMs = now;
+        if (ms >= kLoopSlowCallMs) {
+            char buf[112];
+            std::snprintf(buf, sizeof(buf), "loop.modal msg=0x%04x ms=%.1f focused=%d iconic=%d",
+                          gModalMsg, ms, gViewerFocused ? 1 : 0,
+                          gViewerHwnd && IsIconic(gViewerHwnd) ? 1 : 0);
+            logLine(buf);
+        }
+    }
+    ModalScope(const ModalScope&) = delete;
+    ModalScope& operator=(const ModalScope&) = delete;
+};
 
 static HCURSOR cursorForRemoteShape(uint8_t shape) {
     LPCWSTR id = IDC_ARROW;
@@ -993,6 +1060,7 @@ static std::string envValue(const char* name) {
 }
 
 static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const ModalScope modal(msg);
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -1365,6 +1433,60 @@ static void logLoopSlowCall(const char* step, UINT msg, double ms) {
     logLine(buf);
 }
 
+// Classifies where an input message came from, for input.slow. Pen and touch
+// promoted mouse messages carry the 0xFF5157xx signature in their extra info.
+static const char* inputSourceName(UINT msg) {
+    if (msg >= WM_MR_WIN_C && msg <= WM_MR_CAPS_LOCK) return "posted";
+    const LPARAM extra = GetMessageExtraInfo();
+    if ((static_cast<ULONG_PTR>(extra) & 0xFFFFFF00u) == 0xFF515700u) return "pen_touch";
+    return "hw";
+}
+
+// Splits an input message's age into the part our loop could have caused
+// (time since the loop last drained its queue or woke from its wait) and the
+// part that happened before the message reached our queue. The queue is
+// drained to empty every pump and the wait wakes on QS_ALLINPUT, so a message
+// cannot sit with us longer than the time since we were last responsive.
+static void noteInputAge(const MSG& m) {
+    const DWORD nowTick = GetTickCount();
+    const double age = static_cast<double>(static_cast<DWORD>(nowTick - m.time));
+    const double now = steadyMsNow();
+    const double sinceResponsive = now - gLoopResponsiveMs;
+    const jl::InputWaitSplit split = jl::splitInputWait(age, sinceResponsive);
+    const float loopMs = static_cast<float>(split.loopMs);
+    // Posted before the receive loop started: startup wait, not loop latency.
+    const bool startup = !gLoopStarted ||
+                         static_cast<LONG>(m.time - gLoopStartTick) < 0;
+    if (startup) {
+        if (gInputQueueStartupMs.size() < (1u << 12)) gInputQueueStartupMs.push_back(static_cast<float>(age));
+        return;
+    }
+    if (gInputQueueWindowMs.size() < (1u << 16)) gInputQueueWindowMs.push_back(loopMs);
+    if (gInputQueueSessionMs.size() < (1u << 20)) gInputQueueSessionMs.push_back(loopMs);
+    gInputDeliveryWindowMaxMs = std::max(gInputDeliveryWindowMaxMs, split.deliveryMs);
+    gInputDeliverySessionMaxMs = std::max(gInputDeliverySessionMaxMs, split.deliveryMs);
+    if (split.deliveryMs > kInputSlowMs) ++gInputDeliveryLateEvents;
+    if (age <= kInputSlowMs) return;
+    ++gInputSlowEvents;
+    if (now - gInputSlowLastLogMs < 1000.0) {
+        ++gInputSlowSuppressed;
+        return;
+    }
+    gInputSlowLastLogMs = now;
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "input.slow msg=0x%04x src=%s age_ms=%.0f loop_ms=%.1f delivery_ms=%.1f "
+                  "since_responsive_ms=%.1f event_tick=%lu now_tick=%lu modal=%d focused=%d iconic=%d "
+                  "suppressed=%llu",
+                  m.message, inputSourceName(m.message), age, split.loopMs, split.deliveryMs,
+                  sinceResponsive, static_cast<unsigned long>(m.time),
+                  static_cast<unsigned long>(nowTick), gModal.active() ? 1 : 0,
+                  gViewerFocused ? 1 : 0, gViewerHwnd && IsIconic(gViewerHwnd) ? 1 : 0,
+                  static_cast<unsigned long long>(gInputSlowSuppressed));
+    gInputSlowSuppressed = 0;
+    logLine(buf);
+}
+
 static void pumpMessages() {
     MSG m{};
     for (;;) {
@@ -1373,27 +1495,22 @@ static void pumpMessages() {
         const double peekStart = steadyMsNow();
         const BOOL got = PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE);
         logLoopSlowCall("peek", got ? m.message : 0, steadyMsNow() - peekStart);
-        if (!got) break;
+        if (!got) {
+            gLoopResponsiveMs = steadyMsNow();  // queue drained
+            break;
+        }
         if (m.message == WM_QUIT) gWindowClosed = true;
         const bool input = (m.message >= WM_KEYFIRST && m.message <= WM_KEYLAST) ||
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
-        if (input) {
-            const float waited = static_cast<float>(static_cast<DWORD>(GetTickCount() - m.time));
-            // Posted before the receive loop started: startup wait, not loop latency.
-            const bool startup = !gLoopStarted ||
-                                 static_cast<LONG>(m.time - gLoopStartTick) < 0;
-            if (startup) {
-                if (gInputQueueStartupMs.size() < (1u << 12)) gInputQueueStartupMs.push_back(waited);
-            } else {
-                if (gInputQueueWindowMs.size() < (1u << 16)) gInputQueueWindowMs.push_back(waited);
-                if (gInputQueueSessionMs.size() < (1u << 20)) gInputQueueSessionMs.push_back(waited);
-            }
-        }
+        if (input) noteInputAge(m);
         const double dispatchStart = steadyMsNow();
+        const uint64_t modalEventsBefore = gModal.events();
         TranslateMessage(&m);
         DispatchMessageW(&m);
-        logLoopSlowCall("dispatch", m.message, steadyMsNow() - dispatchStart);
+        // A dispatch that ran the system modal loop is logged as loop.modal.
+        if (gModal.events() == modalEventsBefore)
+            logLoopSlowCall("dispatch", m.message, steadyMsNow() - dispatchStart);
     }
 }
 
@@ -2563,8 +2680,9 @@ static int appMain(int argc, char** argv) {
         std::vector<float> queueWaitMs;        // frame queued -> decode starts, session (capped)
         std::vector<float> queueWaitWindowMs;
         std::vector<float> loopBusyWindowMs;   // main loop work per iteration (not its wait)
-        double loopBusyMaxMs = 0.0;
-        uint64_t loopStalls16 = 0, loopStalls100 = 0;
+        // Busy max and stalls exclude time inside Windows modal loops
+        // (caption buttons, move/size, menus), logged as loop.modal.
+        jl::LoopStallCounter loopStalls;
         std::vector<float> displayLatencyWindowMs;   // present -> vblank, last 5 s
         std::vector<float> displayLatencyMs;         // whole session (capped)
         constexpr size_t kMaxDecodeSamples = 1u << 20;
@@ -2634,15 +2752,14 @@ static int appMain(int argc, char** argv) {
         double iterPumpMs = 0.0, iterStatsMs = 0.0, iterRecvMs = 0.0;
         const auto noteLoopBusy = [&](std::chrono::steady_clock::time_point end) {
             const double busy = std::chrono::duration<double, std::milli>(end - iterStart).count();
-            if (loopBusyWindowMs.size() < (1u << 16)) loopBusyWindowMs.push_back(static_cast<float>(busy));
-            loopBusyMaxMs = std::max(loopBusyMaxMs, busy);
-            if (busy >= 16.0) ++loopStalls16;
-            if (busy >= 100.0) ++loopStalls100;
-            if (loopSlowShouldLog(busy)) {
-                char lb[192];
+            const double modalMs = gModal.takeIterMs();
+            const double own = loopStalls.note(busy, modalMs);
+            if (loopBusyWindowMs.size() < (1u << 16)) loopBusyWindowMs.push_back(static_cast<float>(own));
+            if (loopSlowShouldLog(own)) {
+                char lb[224];
                 std::snprintf(lb, sizeof(lb),
-                              "loop.slow_iter ms=%.1f pump_ms=%.1f stats_ms=%.1f recv_ms=%.1f focused=%d iconic=%d suppressed=%llu",
-                              busy, iterPumpMs, iterStatsMs, iterRecvMs, gViewerFocused ? 1 : 0,
+                              "loop.slow_iter ms=%.1f modal_ms=%.1f pump_ms=%.1f stats_ms=%.1f recv_ms=%.1f focused=%d iconic=%d suppressed=%llu",
+                              own, modalMs, iterPumpMs, iterStatsMs, iterRecvMs, gViewerFocused ? 1 : 0,
                               IsIconic(hwnd) ? 1 : 0, static_cast<unsigned long long>(gLoopSlowSuppressed));
                 gLoopSlowSuppressed = 0;
                 logLine(lb);
@@ -2650,6 +2767,9 @@ static int appMain(int argc, char** argv) {
         };
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
+        gLoopResponsiveMs = steadyMsNow();
+        gModal.takeIterMs();
+        gModal.takeWindowMs();
         while (!gWindowClosed) {
             iterStart = std::chrono::steady_clock::now();
             iterPumpMs = iterStatsMs = iterRecvMs = 0.0;
@@ -2770,8 +2890,11 @@ static int appMain(int argc, char** argv) {
                      << " input_queue_ms_p50=" << jl::receiverPercentile(gInputQueueWindowMs, 50)
                      << " input_queue_ms_p99=" << jl::receiverPercentile(gInputQueueWindowMs, 99)
                      << " input_queue_ms_max=" << jl::receiverPercentile(gInputQueueWindowMs, 100)
-                     << " input_events=" << gInputQueueWindowMs.size();
+                     << " input_events=" << gInputQueueWindowMs.size()
+                     << " input_delivery_ms_max=" << gInputDeliveryWindowMaxMs
+                     << " loop_modal_ms=" << gModal.takeWindowMs();
                 logLine(line.str());
+                gInputDeliveryWindowMaxMs = 0.0;
                 decodeWindowMs.clear();
                 queueWaitWindowMs.clear();
                 loopBusyWindowMs.clear();
@@ -2809,6 +2932,7 @@ static int appMain(int argc, char** argv) {
                     waits.add(mouseMoveUdp ? mouseMoveUdp->readEvent() : nullptr, jl::LoopWait::Mrm1);
                     noteLoopBusy(now);
                     waits.wait(loopWaitMs);
+                    gLoopResponsiveMs = steadyMsNow();  // woke: input is taken next pump
                     now = std::chrono::steady_clock::now();
                     receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
@@ -2924,14 +3048,20 @@ static int appMain(int argc, char** argv) {
                 << " video_queue_max=" << videoWorker.maxDepth()
                 << " video_queue_overflows=" << videoWorker.overflows()
                 << " video_queue_overflow_drops=" << videoWorker.overflowDrops()
-                << " loop_busy_ms_max=" << loopBusyMaxMs
-                << " loop_stalls_16ms=" << loopStalls16
-                << " loop_stalls_100ms=" << loopStalls100
+                << " loop_busy_ms_max=" << loopStalls.ownMaxMs
+                << " loop_stalls_16ms=" << loopStalls.stalls16
+                << " loop_stalls_100ms=" << loopStalls.stalls100
+                << " loop_modal_events=" << gModal.events()
+                << " loop_modal_ms_total=" << gModal.totalMs()
+                << " loop_modal_ms_max=" << gModal.maxMs()
                 << " input_queue_ms_p50=" << jl::receiverPercentile(gInputQueueSessionMs, 50)
                 << " input_queue_ms_p99=" << jl::receiverPercentile(gInputQueueSessionMs, 99)
                 << " input_queue_ms_max=" << jl::receiverPercentile(gInputQueueSessionMs, 100)
                 << " input_queue_startup_events=" << gInputQueueStartupMs.size()
                 << " input_queue_startup_ms_max=" << jl::receiverPercentile(gInputQueueStartupMs, 100)
+                << " input_delivery_ms_max=" << gInputDeliverySessionMaxMs
+                << " input_delivery_late_events=" << gInputDeliveryLateEvents
+                << " input_slow_events=" << gInputSlowEvents
                 << " rtt_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMs() : 0.0)
                 << " rtt_max_ms=" << (mouseMoveUdp ? mouseMoveUdp->rttMaxMs() : 0.0)
                 << " rtt_samples=" << (mouseMoveUdp ? mouseMoveUdp->pongRx() : 0)

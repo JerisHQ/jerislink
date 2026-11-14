@@ -123,6 +123,7 @@ struct HardwareVideoPipeline::Impl {
     // name, so a stall in the stats line can be tied to one call.
     static constexpr double kSlowCallMs = 50.0;
     double lastSlowLogMs = -1e9;
+    double lastPresentDoneMs = 0.0;  // steady ms when the last Present returned
     uint64_t slowSuppressed = 0;
 
     // Present -> vblank time from GetFrameStatistics (flip model). This is
@@ -204,7 +205,7 @@ struct HardwareVideoPipeline::Impl {
 
     // Log one slow call. At most one line per second, except calls of
     // 200 ms or more, which are always logged.
-    void noteSlow(const char* step, double ms) {
+    void noteSlow(const char* step, double ms, const std::string& extra = std::string()) {
         if (ms < kSlowCallMs) return;
         const double now = steadyNowMs();
         if (ms < 200.0 && now - lastSlowLogMs < 1000.0) {
@@ -217,8 +218,9 @@ struct HardwareVideoPipeline::Impl {
         os.precision(1);
         os << "video.slow step=" << step << " ms=" << ms
            << " hidden=" << (presenter && presenter->hidden() ? 1 : 0)
-           << " iconic=" << (IsIconic(hwnd) ? 1 : 0)
-           << " suppressed=" << slowSuppressed;
+           << " iconic=" << (IsIconic(hwnd) ? 1 : 0);
+        if (!extra.empty()) os << " " << extra;
+        os << " suppressed=" << slowSuppressed;
         slowSuppressed = 0;
         log(os.str());
     }
@@ -587,15 +589,30 @@ struct HardwareVideoPipeline::Impl {
 
     // Non-blocking present of the rendered back buffer.
     jl::PresentResult presentBackBuffer() {
-        auto t0 = std::chrono::steady_clock::now();
+        // Present() first submits the context's queued work (the video
+        // processor blt) to the driver. Flush explicitly so a slow present
+        // shows whether the time went to that submit or to Present itself.
+        const double t0 = steadyNowMs();
+        context->Flush();
+        const double t1 = steadyNowMs();
         HRESULT presentHr = swapChain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+        const double t2 = steadyNowMs();
         if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) return jl::PresentResult::Busy;
         checkHr(presentHr, "SwapChain Present");
         HRESULT removed = device->GetDeviceRemovedReason();
         if (FAILED(removed)) checkHr(removed, "D3D device removed");
-        const double callMs = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t0).count();
-        noteSlow("present", callMs);
+        const double callMs = steadyNowMs() - t0;
+        if (callMs >= kSlowCallMs) {
+            std::ostringstream ex;
+            ex.setf(std::ios::fixed);
+            ex.precision(1);
+            ex << "flush_ms=" << (t1 - t0) << " call_ms=" << (t2 - t1)
+               << " render_ms=" << renderMs
+               << " since_prev_present_ms=" << (lastPresentDoneMs > 0.0 ? t0 - lastPresentDoneMs : 0.0)
+               << " hr=0x" << std::hex << static_cast<unsigned long>(presentHr) << std::dec;
+            noteSlow("present", callMs, ex.str());
+        }
+        lastPresentDoneMs = t2;
         if (presentHr == DXGI_STATUS_OCCLUDED) {
             // Not visible: stop presenting until DXGI_PRESENT_TEST says
             // otherwise (updateHidden).
