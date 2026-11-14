@@ -138,6 +138,9 @@ enum ControlServiceSelfTest {
         failures += helperRecovers(expect)
         failures += eofMonitor(expect)
         failures += recoveryWindow(expect)
+        failures += clipboardPollReadsOnlyChangeCount(expect)
+        failures += capsUsesInputSourceCache(expect)
+        failures += mainThreadHopCounter(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -341,6 +344,167 @@ enum ControlServiceSelfTest {
         return 0
     }
 
+    // MARK: PR-E: main-thread hops
+
+    /// Run the main run loop briefly while waiting: the self-test runs on the
+    /// main thread, and distributed notifications and main-queue work are
+    /// delivered there.
+    private static func spinMain(until cond: () -> Bool, seconds: Double = 5) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !cond() {
+            _ = CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.02, false)
+        }
+    }
+
+    private static func startServer(inject: Bool, helperPort: UInt16?, clipboard: ClipboardBackend,
+                                    inputSources: InputSourceCache) -> (ControlServer, UInt16)? {
+        guard let port = freeLoopbackPort() else { return nil }
+        let server = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
+                                   port: port, inject: inject,
+                                   settingsClientIP: { ListenConfig.loopbackIP }, acceptProxy: false,
+                                   inputHelper: helperPort.map { InputHelperClient(port: $0) },
+                                   clipboard: clipboard, inputSources: inputSources)
+        do { try server.start() } catch { return nil }
+        return (server, port)
+    }
+
+    /// Clipboard poll: every 100 ms only the change count is read; contents
+    /// are read only when it moved. Both directions behave as before: a local
+    /// copy is sent to the viewer, a viewer copy is applied and not echoed.
+    private static func clipboardPollReadsOnlyChangeCount(_ expect: (Bool, String) -> Void) -> Int {
+        let board = FakeClipboard(text: "before-session")
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.clipboard.\(getpid())")
+        guard let (server, port) = startServer(inject: false, helperPort: nil, clipboard: board, inputSources: cache),
+              let viewer = MRC1Client(port: port) else {
+            expect(false, "clipboard poll: server and viewer start")
+            return 0
+        }
+        defer { viewer.close(); server.stop() }
+        _ = viewer.send(type: 0x30, payload: [])                     // CLIPBOARD_HELLO
+        wait(until: { board.counts.changeCountReads >= 2 })
+        let startReads = board.counts.textReads
+        let polls0 = board.counts.changeCountReads
+        usleep(1_000_000)
+        let idle = board.counts
+        let idlePolls = idle.changeCountReads - polls0
+        print("clipboard poll: idle 1.0 s -> \(idlePolls) change-count polls, \(idle.textReads - startReads) content reads")
+        expect(idlePolls >= 5 && idle.textReads == startReads,
+               "clipboard poll: idle polls read only the change count (\(idlePolls) polls, \(idle.textReads - startReads) content reads)")
+
+        board.localCopy("local-1")
+        let tx1 = viewer.receive(timeout: 2)
+        expect(tx1?.type == 0x31 && tx1.map { String(decoding: $0.payload, as: UTF8.self) } == "local-1",
+               "clipboard poll: local copy is sent to the viewer")
+        expect(board.counts.textReads == startReads + 1, "clipboard poll: one content read for one local change")
+
+        _ = viewer.send(type: 0x31, payload: Array("remote-1".utf8))
+        wait(until: { board.writes.contains("remote-1") })
+        expect(board.writes == ["remote-1"], "clipboard poll: viewer copy is applied to the pasteboard")
+        let echo = viewer.receive(timeout: 0.6)
+        expect(echo == nil, "clipboard poll: applied viewer copy is not echoed back")
+        let afterRX = board.counts.textReads
+        usleep(500_000)
+        expect(board.counts.textReads == afterRX, "clipboard poll: no content reads after the viewer copy while idle")
+
+        _ = viewer.send(type: 0x31, payload: Array("remote-1".utf8))  // same text again: no rewrite
+        usleep(300_000)
+        expect(board.writes == ["remote-1"], "clipboard poll: unchanged viewer copy is not written again")
+
+        board.localCopy("local-2")
+        let tx2 = viewer.receive(timeout: 2)
+        expect(tx2.map { String(decoding: $0.payload, as: UTF8.self) } == "local-2",
+               "clipboard poll: a later local copy is still sent")
+        return 0
+    }
+
+    /// Caps Lock alpha mode: the per-key input-source check reads the cache;
+    /// the cache follows the change notification. TIS (and the main thread)
+    /// is asked once per Caps press, never per key.
+    private static func capsUsesInputSourceCache(_ expect: (Bool, String) -> Void) -> Int {
+        guard let helper = FakeInputHelper.start() else {
+            expect(false, "caps cache: fake input helper listens")
+            return 0
+        }
+        defer { helper.stop() }
+        let us = "com.apple.keylayout.US"
+        let cangjie = "com.apple.inputmethod.TCIM.Cangjie"
+        let source = FakeInputSource(id: us)
+        let note = "io.jerislink.selftest.inputsource.\(getpid())"
+        let cache = InputSourceCache(backend: source, notification: note)
+        guard let (server, port) = startServer(inject: true, helperPort: helper.port,
+                                               clipboard: FakeClipboard(text: nil), inputSources: cache),
+              let viewer = MRC1Client(port: port) else {
+            expect(false, "caps cache: server and viewer start")
+            return 0
+        }
+        defer { viewer.close(); server.stop() }
+        spinMain(until: { cache.refreshes >= 1 })
+        expect(cache.current == us, "caps cache: first value read on the main thread at start")
+
+        func key(_ semantic: UInt8, _ down: Bool) { _ = viewer.send(type: 0x10, payload: [down ? 1 : 0, 0, semantic]) }
+        let shiftDown = FakeInputHelper.Event(type: 0x10, payload: [1, 0, 56])
+        let readsBefore = source.counts.current
+
+        key(20, true); key(20, false)                                 // Caps Lock: alpha mode on
+        for _ in 0..<10 { key(65, true); key(65, false) }             // 10 x 'A'
+        let aUp = FakeInputHelper.Event(type: 0x10, payload: [0, 0, 0])
+        wait(until: { helper.snapshot().filter { $0 == aUp }.count >= 10 })
+        let wrapped = helper.snapshot().filter { $0 == shiftDown }.count
+        expect(wrapped == 20, "caps cache: alpha mode wraps each 'A' down/up in synthetic Shift (\(wrapped)/20)")
+        let perKeyReads = source.counts.current - readsBefore
+        expect(perKeyReads == 1, "caps cache: one TIS read for the Caps press, none for 20 key events (got \(perKeyReads))")
+
+        source.set(cangjie)                                           // user switches input source on the Mac
+        let refreshed = cache.refreshes
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDistributedCenter(),
+                                             CFNotificationName(note as CFString), nil, nil, true)
+        spinMain(until: { cache.refreshes > refreshed && cache.current == cangjie })
+        expect(cache.current == cangjie, "caps cache: input-source notification updates the cache")
+
+        key(66, true); key(66, false)                                 // 'B' after the switch
+        let bUp = FakeInputHelper.Event(type: 0x10, payload: [0, 0, 11])
+        wait(until: { helper.received(bUp) })
+        usleep(100_000)
+        expect(helper.received(bUp) && helper.snapshot().filter { $0 == shiftDown }.count == 20,
+               "caps cache: after the switch no synthetic Shift reaches the input method")
+
+        source.set(us)                                                // back to U.S.: alpha mode stays off
+        let refreshed2 = cache.refreshes
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDistributedCenter(),
+                                             CFNotificationName(note as CFString), nil, nil, true)
+        spinMain(until: { cache.refreshes > refreshed2 })
+        key(67, true); key(67, false)                                 // 'C'
+        let cUp = FakeInputHelper.Event(type: 0x10, payload: [0, 0, 8])
+        wait(until: { helper.received(cUp) })
+        usleep(100_000)
+        expect(helper.received(cUp) && helper.snapshot().filter { $0 == shiftDown }.count == 20,
+               "caps cache: alpha mode was reset by the switch, as before")
+        expect(source.counts.current - readsBefore == 1 && source.counts.selects == 0,
+               "caps cache: still one TIS read in total, no input-source selects")
+        return 0
+    }
+
+    /// The hop counter behind `main_hops=`: SystemClipboard.changeCount() from
+    /// a socket thread does not hop; a content read does (read-only, the
+    /// test never writes the real pasteboard).
+    private static func mainThreadHopCounter(_ expect: (Bool, String) -> Void) -> Int {
+        let before = MainThreadHops.total
+        let done = DispatchSemaphore(value: 0)
+        let box = HopBox()
+        Thread.detachNewThread {
+            for _ in 0..<100 { _ = SystemClipboard.shared.changeCount() }
+            box.afterCounts = MainThreadHops.total
+            _ = SystemClipboard.shared.readText()
+            box.afterRead = MainThreadHops.total
+            done.signal()
+        }
+        spinMain(until: { done.wait(timeout: .now()) == .success }, seconds: 5)
+        expect(box.afterCounts == before, "main hops: 100 change-count reads off the main thread make 0 hops")
+        expect(box.afterRead == before + 1, "main hops: one content read off the main thread makes 1 hop")
+        return 0
+    }
+
     private static func freeLoopbackPort() -> UInt16? {
         let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return nil }
@@ -396,7 +560,108 @@ private final class MRC1Client {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
     }
 
+    /// Next MRC1 packet from the host, or nil after `timeout` seconds.
+    func receive(timeout: Double) -> (type: UInt8, payload: [UInt8])? {
+        guard let header = recvExact(8, timeout: timeout), header[0] == 0x4d, header[3] == 0x31 else { return nil }
+        let len = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
+        guard let payload = recvExact(len, timeout: 2) else { return nil }
+        return (header[5], payload)
+    }
+
+    private func recvExact(_ count: Int, timeout: Double) -> [UInt8]? {
+        if count == 0 { return [] }
+        var out = [UInt8](repeating: 0, count: count)
+        var off = 0
+        let deadline = Date().addingTimeInterval(timeout)
+        while off < count {
+            let left = Int32(max(0, deadline.timeIntervalSinceNow) * 1000)
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            guard Darwin.poll(&pfd, 1, left) > 0 else { return nil }
+            let n = out.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: off), count - off, 0) }
+            if n <= 0 { return nil }
+            off += n
+        }
+        return out
+    }
+
     deinit { close() }
+}
+
+/// Pasteboard stand-in: counts change-count and content reads.
+private final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
+    struct Counts { var changeCountReads = 0; var textReads = 0 }
+    private let lock = NSLock()
+    private var count = 1
+    private var text: String?
+    private var c = Counts()
+    private var written: [String] = []
+
+    init(text: String?) { self.text = text }
+
+    var counts: Counts { lock.lock(); defer { lock.unlock() }; return c }
+    var writes: [String] { lock.lock(); defer { lock.unlock() }; return written }
+
+    /// A copy made on the Mac itself.
+    func localCopy(_ value: String) {
+        lock.lock(); count += 1; text = value; lock.unlock()
+    }
+
+    func changeCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        c.changeCountReads += 1
+        return count
+    }
+
+    func readText() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        c.textReads += 1
+        return text
+    }
+
+    func writeText(_ value: String) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        written.append(value)
+        count += 1
+        text = value
+        return count
+    }
+}
+
+/// Text Input Sources stand-in: counts reads and selects; never touches TIS.
+private final class FakeInputSource: InputSourceBackend, @unchecked Sendable {
+    struct Counts { var current = 0; var selects = 0 }
+    private let lock = NSLock()
+    private var id: String?
+    private var c = Counts()
+
+    init(id: String?) { self.id = id }
+
+    var counts: Counts { lock.lock(); defer { lock.unlock() }; return c }
+    func set(_ value: String?) { lock.lock(); id = value; lock.unlock() }
+
+    func currentID() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        c.current += 1
+        return id
+    }
+
+    /// The cache's notification refresh: not a per-key read, not counted.
+    func currentIDOnMain() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return id
+    }
+
+    func select(id value: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        c.selects += 1
+        id = value
+        return true
+    }
+}
+
+private final class HopBox: @unchecked Sendable {
+    var afterCounts: UInt64 = 0
+    var afterRead: UInt64 = 0
 }
 
 /// Stand-in for JerisLink Input Helper: MRI1 on a free loopback port, one

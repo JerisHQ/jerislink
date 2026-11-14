@@ -42,13 +42,22 @@ final class ControlServer: @unchecked Sendable {
     /// service.
     private let announceInputSessions: Bool
     private static let maxClipboardBytes = 60 * 1024
+    /// Pasteboard access for clipboard sessions (a fake in the self-test).
+    private let clipboard: ClipboardBackend
+    /// Current keyboard input source, cached from the system notification so
+    /// the per-key Caps check never asks TIS on the main thread.
+    private let inputSources: InputSourceCache
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
          acceptProxy: Bool = true,
          inputHelper: InputHelperClient? = nil,
-         announceInputSessions: Bool = true) {
+         announceInputSessions: Bool = true,
+         clipboard: ClipboardBackend = SystemClipboard.shared,
+         inputSources: InputSourceCache = .shared) {
         self.bindIP = bindIP
+        self.clipboard = clipboard
+        self.inputSources = inputSources
         self.announceInputSessions = announceInputSessions
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
@@ -95,6 +104,8 @@ final class ControlServer: @unchecked Sendable {
         serverFD = fd
         stopping = false
         lock.unlock()
+
+        inputSources.start()
 
         var helperOK = false
         if injectRequested {
@@ -145,7 +156,7 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) helper_send_failures=\(helperSendFailures)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
     }
 
     private func acceptLoop() {
@@ -348,35 +359,11 @@ final class ControlServer: @unchecked Sendable {
     }
     private static let sessionIDs = SessionIDCounter()
 
-    private struct ClipboardSnapshot {
-        let changeCount: Int
-        let text: String?
-    }
-
-    private static func clipboardSnapshot() -> ClipboardSnapshot {
-        let read = {
-            let pasteboard = NSPasteboard.general
-            return ClipboardSnapshot(changeCount: pasteboard.changeCount,
-                                     text: pasteboard.string(forType: .string))
-        }
-        return Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read)
-    }
-
-    private static func setClipboardText(_ text: String) -> ClipboardSnapshot? {
-        let write = {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            guard pasteboard.setString(text, forType: .string) else { return nil as ClipboardSnapshot? }
-            return ClipboardSnapshot(changeCount: pasteboard.changeCount,
-                                     text: pasteboard.string(forType: .string))
-        }
-        return Thread.isMainThread ? write() : DispatchQueue.main.sync(execute: write)
-    }
-
     private func handleClipboardSession(_ fd: Int32) {
-        var snapshot = Self.clipboardSnapshot()
-        var lastChangeCount = snapshot.changeCount
-        var lastSentText = snapshot.text
+        // Each 100 ms poll reads only the change count, on this thread. The
+        // contents are read (on the main thread) only when the count moved.
+        var lastChangeCount = clipboard.changeCount()
+        var lastSentText = clipboard.readText()
         var lastRemoteApplied: String?
 
         while true {
@@ -405,17 +392,15 @@ final class ControlServer: @unchecked Sendable {
                             print("Clipboard rejected invalid UTF-8")
                             continue
                         }
-                        let current = Self.clipboardSnapshot()
-                        if current.text != text {
-                            guard let updated = Self.setClipboardText(text) else {
+                        if clipboard.readText() != text {
+                            guard let updated = clipboard.writeText(text) else {
                                 print("Clipboard remote apply failed")
                                 continue
                             }
-                            snapshot = updated
+                            lastChangeCount = updated
                         } else {
-                            snapshot = current
+                            lastChangeCount = clipboard.changeCount()
                         }
-                        lastChangeCount = snapshot.changeCount
                         lastRemoteApplied = text
                         lastSentText = text
                         clipboardReceived += 1
@@ -426,10 +411,10 @@ final class ControlServer: @unchecked Sendable {
                 }
             }
 
-            snapshot = Self.clipboardSnapshot()
-            if snapshot.changeCount == lastChangeCount { continue }
-            lastChangeCount = snapshot.changeCount
-            guard let text = snapshot.text else { continue }
+            let changeCount = clipboard.changeCount()
+            if changeCount == lastChangeCount { continue }
+            lastChangeCount = changeCount
+            guard let text = clipboard.readText() else { continue }
             let payload = Array(text.utf8)
             if payload.count > Self.maxClipboardBytes {
                 print("Clipboard skip oversize bytes=\(payload.count)")
@@ -448,40 +433,19 @@ final class ControlServer: @unchecked Sendable {
         }
     }
 
-    private static func inputSourceString(_ source: TISInputSource, _ key: CFString) -> String? {
-        guard let property = TISGetInputSourceProperty(source, key) else { return nil }
-        return Unmanaged<CFString>.fromOpaque(property).takeUnretainedValue() as String
-    }
-
-    private static func currentInputSourceID() -> String? {
-        let read = {
-            guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return nil as String? }
-            return inputSourceString(source, kTISPropertyInputSourceID)
-        }
-        return Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read)
-    }
-
-    private static func selectInputSource(id: String) -> Bool {
-        let select = {
-            guard let sources = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
-                return false
-            }
-            guard let source = sources.first(where: { inputSourceString($0, kTISPropertyInputSourceID) == id }) else {
-                return false
-            }
-            return TISSelectInputSource(source) == noErr
-        }
-        return Thread.isMainThread ? select() : DispatchQueue.main.sync(execute: select)
-    }
-
     private func handleCapsLock(down: Bool) {
         // Caps Lock is a latch/status key, so one key-down toggles the remote
         // state and the matching key-up carries no additional action.
         guard down else { return }
-        let current = Self.currentInputSourceID()
+        // One fresh TIS read per Caps press (not per key); it also refreshes
+        // the cache in case the change notification has not arrived yet.
+        let backend = inputSources.backend
+        let current = backend.currentID()
+        inputSources.store(current)
 
         if let saved = capsTemporaryInputSourceID {
-            if current == Self.usInputSourceID && Self.selectInputSource(id: saved) {
+            if current == Self.usInputSourceID && backend.select(id: saved) {
+                inputSources.store(saved)
                 capsTemporaryInputSourceID = nil
                 capsAlphaMode = false
                 return
@@ -492,7 +456,8 @@ final class ControlServer: @unchecked Sendable {
         }
 
         if let current, current != Self.usInputSourceID {
-            if Self.selectInputSource(id: Self.usInputSourceID) {
+            if backend.select(id: Self.usInputSourceID) {
+                inputSources.store(Self.usInputSourceID)
                 capsTemporaryInputSourceID = current
                 capsAlphaMode = false
                 return
@@ -512,8 +477,10 @@ final class ControlServer: @unchecked Sendable {
         }
 
         // If an external shortcut changed away from U.S. while alpha Caps mode
-        // was active, do not leak synthetic Shift into an input method.
-        if capsAlphaMode, Self.currentInputSourceID() != Self.usInputSourceID {
+        // was active, do not leak synthetic Shift into an input method. The
+        // cache follows the system's input-source notification; no TIS call
+        // and no main-thread hop per key.
+        if capsAlphaMode, inputSources.current != Self.usInputSourceID {
             capsAlphaMode = false
         }
 
