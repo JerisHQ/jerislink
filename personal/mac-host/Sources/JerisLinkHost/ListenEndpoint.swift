@@ -154,6 +154,10 @@ enum ListenConfig {
         return VideoService.loadAddresses().clientIP
     }
 
+    /// How often `waitForEndpoint` re-checks: Tailscale coming up or the
+    /// viewer address being saved is picked up within this.
+    static let endpointWaitInterval: Duration = .milliseconds(500)
+
     /// Blocks until the endpoint is ready. Logs each new reason once.
     static func waitForEndpoint(log: (String) -> Void) async -> ListenEndpoint {
         var lastReason: String?
@@ -163,10 +167,10 @@ enum ListenConfig {
                 return ep
             case .notConfigured(let reason):
                 if reason != lastReason { log("not configured: \(reason) (\(plistURL.path))"); lastReason = reason }
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: endpointWaitInterval)
             case .waiting(let reason):
                 if reason != lastReason { log("waiting: \(reason); not listening on any other interface"); lastReason = reason }
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: endpointWaitInterval)
             }
         }
     }

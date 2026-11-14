@@ -193,7 +193,8 @@ struct JerisLinkHostMain {
             let nack = RetransmitSelfTest.run()
             let abr = AbrSelfTest.run()
             let logs = LogHygieneSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 ? 0 : 1)
+            let display = await DisplayFollowerSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && display == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -338,11 +339,16 @@ struct JerisLinkHostMain {
             sender?.setStatsSuffix { abr.statsFields() }
             print("ABR: \(abr.enabled ? "on ceiling=\(o.bitrateMbps)Mbps floor=\(min(6, o.bitrateMbps))Mbps idr_cap=\(AbrHost.idrCapFrames)x pace_follows=\(o.udpPaceAuto)" : "off")")
 
-            let deadline = Date().addingTimeInterval(o.durationSeconds)
+            // nil: run until stopped (the video service). A finite --duration
+            // is for benches.
+            let deadline: Date? = o.durationSeconds.isFinite ? Date().addingTimeInterval(o.durationSeconds) : nil
+            let displayEvents = DisplayChangeMonitor.shared.register()
+            print("Display changes: \(displayEvents ? "CoreGraphics reconfiguration callback" : "callback not registered; capture will not follow display changes")")
             let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
             var sessionIndex = 0
-            while Date() < deadline {
+            while deadline.map({ Date() < $0 }) ?? true {
                 sessionIndex += 1
+                let displayGeneration = DisplayChangeMonitor.shared.currentGeneration
                 let target = try await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID)
                 // Capture follows the native framebuffer; ScreenCaptureKit scales
                 // it down to the encoded size when it is over the ceiling.
@@ -435,31 +441,20 @@ struct JerisLinkHostMain {
                                         queueDepth: o.captureQueueDepth)
                 print("Capture started. Move windows around to create motion.")
 
-                // Watch for display changes: a display added or removed, the main
-                // display changing, or a resolution change. The CoreGraphics layout
-                // is cheap and stays current, so poll it every 500 ms and look up
-                // ScreenCaptureKit again when it changes; also re-check
-                // ScreenCaptureKit every 5 s, since a display mode that appeared
-                // after start is not visible through CoreGraphics here.
-                var changedTarget: CaptureTarget?
-                var layout = DisplayLayoutFingerprint.current()
-                var ticks = 0
-                while Date() < deadline {
-                    try await Task.sleep(for: .milliseconds(500))
-                    ticks += 1
-                    let currentLayout = DisplayLayoutFingerprint.current()
-                    guard currentLayout != layout || ticks % 10 == 0 else { continue }
-                    layout = currentLayout
-                    guard let current = try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) else { continue }
-                    if current.displayID != target.displayID ||
-                        (autoResolution && !current.sameCapture(as: target)) {
-                        changedTarget = current
-                        break
-                    }
-                }
+                // Follow display changes (a display added or removed, the main
+                // display changing, a resolution or HiDPI change). Sleeps until
+                // CoreGraphics reports a reconfiguration, with no timer, then
+                // looks up ScreenCaptureKit a few times while it settles.
+                let changedTarget: CaptureTarget? = await DisplayFollower.waitForChange(
+                    monitor: .shared, since: displayGeneration, deadline: deadline,
+                    query: { try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) },
+                    isChange: { current in
+                        current.displayID != target.displayID ||
+                            (autoResolution && !current.sameCapture(as: target))
+                    })
 
                 await capture.stop()
-                print("Capture session \(sessionIndex) complete: \(encoder.statsLine()) seconds=\(String(format: "%.1f", Date().timeIntervalSince(sessionStart))) \(keyframeGate.statsLine())")
+                print("Capture session \(sessionIndex) complete: \(encoder.statsLine()) seconds=\(String(format: "%.1f", Date().timeIntervalSince(sessionStart))) \(keyframeGate.statsLine()) display_reconfigurations=\(DisplayChangeMonitor.shared.reconfigurationCount)")
 
                 if let changedTarget {
                     print("Display changed: \(target.summary) -> \(changedTarget.summary); restarting capture at native framebuffer size")

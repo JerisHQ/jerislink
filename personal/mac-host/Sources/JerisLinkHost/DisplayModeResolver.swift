@@ -135,31 +135,6 @@ struct CaptureTarget {
     }
 }
 
-/// Cheap CoreGraphics view of the display layout, polled often. These values
-/// stay current in a long-running process (the display mode does not), so a
-/// change here triggers a fresh ScreenCaptureKit lookup.
-struct DisplayLayoutFingerprint: Equatable {
-    let mainDisplayID: CGDirectDisplayID
-    let onlineDisplayIDs: [CGDirectDisplayID]
-    let bounds: [CGRect]
-    let modePixels: [Int]
-
-    static func current() -> DisplayLayoutFingerprint {
-        var count: UInt32 = 0
-        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
-        if CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) != .success { count = 0 }
-        let online = Array(ids.prefix(Int(count))).sorted()
-        return DisplayLayoutFingerprint(
-            mainDisplayID: CGMainDisplayID(),
-            onlineDisplayIDs: online,
-            bounds: online.map { CGDisplayBounds($0) },
-            modePixels: online.flatMap { id -> [Int] in
-                let mode = CGDisplayCopyDisplayMode(id)
-                return [mode?.pixelWidth ?? 0, mode?.pixelHeight ?? 0]
-            }
-        )
-    }
-}
 
 extension DisplayModeResolver {
     /// Picks the display to capture and its native framebuffer size.
