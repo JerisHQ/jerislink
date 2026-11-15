@@ -1024,7 +1024,7 @@ static void applyThemeFonts(HWND dlg) {
         case TextRole::Value: font = td->theme.label; break;
         case TextRole::Subtitle:
         case TextRole::Hint:
-        case TextRole::Note: font = td->theme.small; break;
+        case TextRole::Note: font = td->theme.smallText; break;
         default: break;
         }
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);

@@ -108,7 +108,7 @@ struct DialogTheme {
     HFONT section = nullptr;  // CONNECTION / VIDEO / AUDIO
     HFONT label = nullptr;    // field labels, values
     HFONT text = nullptr;     // inputs, buttons, checkboxes
-    HFONT small = nullptr;    // hints, footer note
+    HFONT smallText = nullptr;    // hints, footer note
 
     void build(HWND dlg, int titlePt) {
         release();
@@ -120,14 +120,14 @@ struct DialogTheme {
         section = makeFont(8, FW_BOLD);
         label = makeFont(9, FW_SEMIBOLD);
         text = makeFont(9, FW_NORMAL);
-        small = makeFont(8, FW_NORMAL);
+        smallText = makeFont(8, FW_NORMAL);
     }
 
     void release() {
         for (HGDIOBJ* o : {reinterpret_cast<HGDIOBJ*>(&body), reinterpret_cast<HGDIOBJ*>(&footer),
                            reinterpret_cast<HGDIOBJ*>(&field), reinterpret_cast<HGDIOBJ*>(&title),
                            reinterpret_cast<HGDIOBJ*>(&section), reinterpret_cast<HGDIOBJ*>(&label),
-                           reinterpret_cast<HGDIOBJ*>(&text), reinterpret_cast<HGDIOBJ*>(&small)}) {
+                           reinterpret_cast<HGDIOBJ*>(&text), reinterpret_cast<HGDIOBJ*>(&smallText)}) {
             if (*o) DeleteObject(*o);
             *o = nullptr;
         }
