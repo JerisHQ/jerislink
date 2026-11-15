@@ -2,7 +2,8 @@
 // 1. MRA1 parse: layout, malformed packets.
 // 2. Jitter buffer scripted cases: prebuffer to 20 ms, in-order playback,
 //    reorder, loss concealment, late and duplicate drops, underrun growth,
-//    overflow trim, restart flag, sequence wrap, target shrink.
+//    overflow trim, output gaps (device switch / startup: idle drops and a
+//    live-edge resume), restart flag, sequence wrap, target shrink.
 // 3. Opus (MRA1 v2): encode/decode round trip, PLC and in-band FEC under
 //    loss, codec switch.
 // 4. Drift control: a slow or fast host clock keeps the depth steady.
@@ -10,6 +11,7 @@
 //    control) over links with jitter, loss, 20 ms capture bursts and clock
 //    drift, pulled in 10 ms device periods.
 #include "audio_jitter.hpp"
+#include "audio_volume.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -155,6 +157,66 @@ static void testOverflowTrim() {
         CHECK(v == prev + 1);
         prev = v;
     }
+}
+
+// The output device goes away for 200 ms (default output switch) while the
+// host keeps sending: the gap is dropped as idle, not overflow, and the new
+// device starts at the live edge with normal latency.
+static void testOutputGap() {
+    JitterBuffer jb;
+    uint32_t seq = 0;
+    uint64_t t = 0;
+    for (; seq < 4; ++seq, t += 5000) push(jb, pkt(seq, int16_t(seq + 1)), t);
+    CHECK(pull5(jb) == 1);
+    CHECK(pull5(jb) == 2);
+    jb.setOutputActive(false);
+    CHECK(!jb.outputActive());
+    for (int i = 0; i < 40; ++i, ++seq, t += 5000) push(jb, pkt(seq, int16_t(seq + 1)), t);
+    auto st = jb.stats();
+    CHECK(st.overflowDrops == 0);
+    CHECK(st.idleDrops > 0);
+    CHECK(st.bufferedMs <= st.targetMs + 1e-9);
+    jb.setOutputActive(true);
+    CHECK(jb.prebuffering());
+    CHECK(jb.stats().bufferedMs <= jb.stats().targetMs + 1e-9);
+    push(jb, pkt(seq, int16_t(seq + 1)), t);
+    ++seq;
+    t += 5000;
+    // Live edge: the first sample played is from the newest target-worth of
+    // audio, and playback then continues in order.
+    const int16_t first = pull5(jb);
+    const int newestWindow = int(jb.stats().targetMs / 5.0) + 2;
+    CHECK(first > int(seq) - newestWindow);
+    int16_t prev = first;
+    for (int i = 0; i < 3; ++i) {
+        const int16_t v = pull5(jb);
+        CHECK(v == prev + 1);
+        prev = v;
+    }
+    st = jb.stats();
+    CHECK(st.overflowDrops == 0 && st.underruns == 0 && st.lost == 0 && st.resets == 0);
+    // Repeated activation is a no-op.
+    const uint64_t drops = st.idleDrops;
+    jb.setOutputActive(true);
+    CHECK(jb.stats().idleDrops == drops && !jb.prebuffering());
+}
+
+// Packets that arrive before the first device opens are idle drops too, and
+// a buffer that never started is untouched by activation.
+static void testOutputGapAtStartup() {
+    JitterBuffer jb;
+    jb.setOutputActive(false);
+    jb.setOutputActive(true);
+    CHECK(jb.stats().packetsRx == 0 && jb.prebuffering());
+    jb.setOutputActive(false);
+    for (uint32_t i = 0; i < 20; ++i) push(jb, pkt(i, int16_t(i + 1)), i * 5000);
+    auto st = jb.stats();
+    CHECK(st.overflowDrops == 0 && st.idleDrops > 0);
+    jb.setOutputActive(true);
+    push(jb, pkt(20, 21), 100000);
+    const int16_t first = pull5(jb);
+    CHECK(first > 1);
+    CHECK(pull5(jb) == first + 1);
 }
 
 static void testRestartAndWrap() {
@@ -422,6 +484,28 @@ static void testCodecSwitch() {
 
 // ---------------------------------------------------------------- drift
 
+// An Opus stream across an output gap: the decoder is reset at the
+// discontinuity, nothing fails to decode, and the audio after the gap still
+// matches the source (no stale decoder state smeared into it).
+static void testOpusOutputGap() {
+    const int frames = kSampleRate * 2;
+    const auto in = musicSignal(frames);
+    const auto packets = opusEncode(in, 128000, 0);
+    JitterBuffer jb;
+    std::vector<int16_t> block(size_t(kOpusFramesPerPacket) * kChannels);
+    const size_t gapFrom = 50, gapTo = 70;  // 200 ms with no device
+    for (size_t i = 0; i < packets.size(); ++i) {
+        if (i == gapFrom) jb.setOutputActive(false);
+        if (i == gapTo) jb.setOutputActive(true);
+        push(jb, opusPkt(uint32_t(i), packets[i]), uint64_t(i) * 10000);
+        if (i >= 3 && (i < gapFrom || i >= gapTo)) jb.pull(block.data(), kOpusFramesPerPacket);
+    }
+    const auto st = jb.stats();
+    CHECK(st.decodeErrors == 0 && st.overflowDrops == 0 && st.lost == 0);
+    CHECK(st.idleDrops >= (gapTo - gapFrom) - 4);
+    CHECK(st.framesPlayed > 0);
+}
+
 static void testDriftControl() {
     // Perfectly paced 10 ms Opus packets from a host whose clock runs 1000 ppm
     // slow: without control the depth falls ~1 ms/s; with control it holds.
@@ -572,20 +656,43 @@ static void testSimulation() {
     }
 }
 
+// Saved viewer volume: missing/corrupt -> 100%, clamp to 0-100, linear level.
+static void testVolumeSettings() {
+    using namespace jl::audio;
+    CHECK(volumePercentFromSaved(false, 0) == 100);
+    CHECK(volumePercentFromSaved(false, 42) == 100);
+    CHECK(volumePercentFromSaved(true, 0) == 0);
+    CHECK(volumePercentFromSaved(true, 37) == 37);
+    CHECK(volumePercentFromSaved(true, 100) == 100);
+    CHECK(volumePercentFromSaved(true, 101) == 100);
+    CHECK(volumePercentFromSaved(true, 0xFFFFFFFFu) == 100);
+    CHECK(clampVolumePercent(-5) == 0);
+    CHECK(clampVolumePercent(55) == 55);
+    CHECK(clampVolumePercent(150) == 100);
+    CHECK(volumeScalar(0) == 0.0f);
+    CHECK(volumeScalar(100) == 1.0f);
+    CHECK(volumeScalar(50) > 0.499f && volumeScalar(50) < 0.501f);
+    CHECK(volumeScalar(250) == 1.0f);
+}
+
 int main() {
     testParse();
     testPrebufferAndOrder();
     testReorderLossLateDuplicate();
     testUnderrunGrowsTarget();
     testOverflowTrim();
+    testOutputGap();
+    testOutputGapAtStartup();
     testRestartAndWrap();
     testShrinkWhenSteady();
     testOpusRoundTrip();
     testOpusPlc();
     testOpusFec();
     testCodecSwitch();
+    testOpusOutputGap();
     testDriftControl();
     testSimulation();
+    testVolumeSettings();
     if (gFailures) {
         std::printf("audio jitter test: %d FAILURES\n", gFailures);
         return 1;

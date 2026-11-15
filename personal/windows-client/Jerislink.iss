@@ -40,6 +40,7 @@ VersionInfoCopyright=Copyright 2026 jeris.org
 [Files]
 Source: "build\Release\Jerislink.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README-Windows.txt"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+Source: "..\third_party\opus\COPYING"; DestDir: "{app}"; DestName: "COPYING-opus.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Jerislink"; Filename: "{app}\{#MyAppExeName}"

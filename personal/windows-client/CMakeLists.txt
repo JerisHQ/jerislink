@@ -44,7 +44,7 @@ set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iph
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(Jerislink PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS} opus)
+target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS} opus comctl32)
 if(MSVC)
     target_link_options(Jerislink PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_BINARY_DIR}/jerislink.manifest")
 endif()

@@ -12,6 +12,7 @@ plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null; }
 
 [[ -x "$APP/Contents/MacOS/JerisLinkHost" ]] || fail "missing host executable"
 [[ -x "$HELPER/Contents/MacOS/JerisLinkInputHelper" ]] || fail "missing input helper executable"
+grep -q "Redistribution and use in source and binary forms" "$APP/Contents/Resources/COPYING-opus.txt" 2>/dev/null || fail "missing libopus licence (COPYING-opus.txt)"
 ok "executables present"
 
 [[ "$(plist_value "$APP/Contents/Info.plist" CFBundleIdentifier)" == "org.jeris.jerislink.host" ]] || fail "app bundle id"

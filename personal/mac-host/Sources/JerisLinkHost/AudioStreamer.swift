@@ -236,6 +236,73 @@ enum AudioConvert {
     }
 }
 
+/// Restart pacing for the capture stream. Attempts are at least 2 s apart;
+/// each failure doubles the wait up to 30 s, and the first audio buffer
+/// after a start resets it.
+struct CaptureBackoff {
+    static let firstNs: UInt64 = 2_000_000_000
+    static let maxNs: UInt64 = 30_000_000_000
+    private(set) var failures: UInt64 = 0
+
+    var delayNs: UInt64 {
+        guard failures > 1 else { return Self.firstNs }
+        return min(Self.firstNs << min(failures - 1, 5), Self.maxNs)
+    }
+    mutating func failed() { failures &+= 1 }
+    mutating func succeeded() { failures = 0 }
+}
+
+/// Keeps a repeating failure from flooding the log: logs the first one, any
+/// change of reason, and then the 2nd, 4th, 8th ... repeat of the same reason.
+struct RepeatLogGate {
+    private var lastKey: String?
+    private(set) var repeats: UInt64 = 0
+
+    mutating func shouldLog(_ key: String) -> Bool {
+        if key != lastKey {
+            lastKey = key
+            repeats = 0
+            return true
+        }
+        repeats &+= 1
+        return repeats & (repeats - 1) == 0  // power of two
+    }
+    mutating func reset() { lastKey = nil; repeats = 0 }
+}
+
+enum CaptureWatchdog {
+    /// ScreenCaptureKit keeps delivering (silent) audio buffers while the Mac
+    /// is quiet, so a running stream with no buffer for this long is stuck.
+    static let stallNs: UInt64 = 3_000_000_000
+
+    static func isStalled(nowNs: UInt64, startedNs: UInt64, lastBufferNs: UInt64) -> Bool {
+        let since = max(startedNs, lastBufferNs)
+        return nowNs > since && nowNs - since >= stallNs
+    }
+}
+
+/// The parts of an audio format that matter for conversion; logged whenever
+/// ScreenCaptureKit changes it.
+struct CaptureFormat: Equatable {
+    var sampleRate: Double
+    var bitsPerChannel: UInt32
+    var channels: UInt32
+    var flags: AudioFormatFlags
+
+    init(_ asbd: AudioStreamBasicDescription) {
+        sampleRate = asbd.mSampleRate
+        bitsPerChannel = asbd.mBitsPerChannel
+        channels = asbd.mChannelsPerFrame
+        flags = asbd.mFormatFlags
+    }
+
+    var summary: String {
+        let float = flags & kAudioFormatFlagIsFloat != 0 ? "float" : "int"
+        let layout = flags & kAudioFormatFlagIsNonInterleaved != 0 ? "planar" : "interleaved"
+        return "rate=\(Int(sampleRate)) bits=\(bitsPerChannel) channels=\(channels) \(float) \(layout) flags=\(flags)"
+    }
+}
+
 /// Audio-only ScreenCaptureKit stream, separate from the video stream, that
 /// runs only while a viewer asks for audio (MRM1 0x45 at least every 10 s;
 /// the viewer sends one per second, the slack covers a viewer main loop held
@@ -256,6 +323,9 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var lastStartAttemptNs: UInt64 = 0
     private var timer: DispatchSourceTimer?
     private var lastLogNs: UInt64 = 0
+    private var streamStartedNs: UInt64 = 0
+    private var backoff = CaptureBackoff()
+    private var failureLog = RepeatLogGate()
 
     // `lock`.
     private var port: UInt16 = 0
@@ -273,12 +343,15 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var payloadBytes: UInt64 = 0
     private var windowPayloadBytes: UInt64 = 0
     private var windowStartNs: UInt64 = DispatchTime.now().uptimeNanoseconds
-    private var formatLogged = false
+    private var format: CaptureFormat?
+    private var formatChanges: UInt64 = 0
+    private var lastBufferNs: UInt64 = 0
 
     private(set) var requests: UInt64 = 0
     private var starts: UInt64 = 0
     private var stops: UInt64 = 0
     private var startFailures: UInt64 = 0
+    private var stalls: UInt64 = 0
 
     init(send: @escaping (Data, UInt16) -> Bool) {
         self.send = send
@@ -360,6 +433,8 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             if now > requestedUntilNs {
                 Self.log("viewer stopped asking for audio; stopping capture")
                 stopStream()
+            } else if stream != nil, checkStall(now) {
+                return
             } else if now - lastLogNs >= Self.logIntervalNs {
                 lastLogNs = now
                 logLevels()
@@ -369,6 +444,26 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         } else {
             timer?.cancel(); timer = nil
         }
+    }
+
+    /// `state` queue. Restarts a running stream that stopped delivering
+    /// buffers; resets the backoff once buffers flow after a start.
+    /// Returns true when it stopped the stream.
+    private func checkStall(_ now: UInt64) -> Bool {
+        lock.lock()
+        let last = lastBufferNs
+        lock.unlock()
+        if last > streamStartedNs { backoff.succeeded(); failureLog.reset() }
+        guard CaptureWatchdog.isStalled(nowNs: now, startedNs: streamStartedNs, lastBufferNs: last) else { return false }
+        stalls &+= 1
+        backoff.failed()
+        let quiet = Double(now &- max(streamStartedNs, last)) / 1e9
+        if failureLog.shouldLog("stall") {
+            Self.log(String(format: "no audio buffers from ScreenCaptureKit for %.1f s; restarting capture (stalls=%llu, next attempt in %.0f s)",
+                            quiet, stalls, Double(backoff.delayNs) / 1e9))
+        }
+        stopStream()
+        return true
     }
 
     private func logLevels() {
@@ -389,7 +484,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private func startIfNeeded() {
         guard stream == nil, !starting else { return }
         let now = DispatchTime.now().uptimeNanoseconds
-        if lastStartAttemptNs != 0 && now - lastStartAttemptNs < 2_000_000_000 { return }
+        if lastStartAttemptNs != 0 && now - lastStartAttemptNs < backoff.delayNs { return }
         lastStartAttemptNs = now
         starting = true
         lock.lock()
@@ -428,13 +523,19 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                     }
                     stream = s
                     lastLogNs = DispatchTime.now().uptimeNanoseconds
+                    streamStartedNs = lastLogNs
                     Self.log("capture started (ScreenCaptureKit system audio, 48 kHz stereo, own process excluded; output device untouched)")
                 }
             } catch {
                 state.async { [self] in
                     starting = false
                     startFailures &+= 1
-                    Self.log("capture start failed: \(error.localizedDescription)")
+                    backoff.failed()
+                    let reason = error.localizedDescription
+                    if failureLog.shouldLog("start:" + reason) {
+                        Self.log(String(format: "capture start failed: %@ (failures=%llu, next attempt in %.0f s)",
+                                        reason, backoff.failures, Double(backoff.delayNs) / 1e9))
+                    }
                 }
             }
         }
@@ -451,7 +552,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     func statsLine() -> String {
         lock.lock(); defer { lock.unlock() }
-        return "audio_requests=\(requests) audio_starts=\(starts) audio_stops=\(stops) audio_start_failures=\(startFailures) audio_packets_sent=\(packetsSent) audio_send_errors=\(sendErrors) audio_format_errors=\(formatErrors) audio_codec=\(opus ? "opus" : "pcm") audio_encode_errors=\(encodeErrors) audio_payload_bytes=\(payloadBytes)"
+        return "audio_requests=\(requests) audio_starts=\(starts) audio_stops=\(stops) audio_start_failures=\(startFailures) audio_stalls=\(stalls) audio_format_changes=\(formatChanges) audio_packets_sent=\(packetsSent) audio_send_errors=\(sendErrors) audio_format_errors=\(formatErrors) audio_codec=\(opus ? "opus" : "pcm") audio_encode_errors=\(encodeErrors) audio_payload_bytes=\(payloadBytes)"
     }
 
     // MARK: SCStreamDelegate
@@ -460,8 +561,15 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         state.async { [self] in
             guard self.stream === stream else { return }
             self.stream = nil
-            lastStartAttemptNs = 0
-            Self.log("capture stopped by ScreenCaptureKit: \(error.localizedDescription); restarting while the viewer asks")
+            stops &+= 1
+            // First stop: restart on the next tick. Repeated stops back off.
+            backoff.failed()
+            if backoff.failures == 1 { lastStartAttemptNs = 0 }
+            let reason = error.localizedDescription
+            if failureLog.shouldLog("stopped:" + reason) {
+                Self.log(String(format: "capture stopped by ScreenCaptureKit: %@; restarting while the viewer asks (next attempt in %.0f s)",
+                                reason, backoff.failures == 1 ? 1.0 : Double(backoff.delayNs) / 1e9))
+            }
         }
     }
 
@@ -481,16 +589,28 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 converted = AudioConvert.toStereoInt16(abl, asbd: asbd)
             }
         }
+        let fmt = CaptureFormat(asbd)
         lock.lock()
         buffers &+= 1
+        lastBufferNs = DispatchTime.now().uptimeNanoseconds
+        var formatLine: String?
+        if fmt != format {
+            // First buffer, or ScreenCaptureKit switched format (for example
+            // after the system output device changed).
+            if format != nil { formatChanges &+= 1 }
+            format = fmt
+            formatLine = "capture format " + fmt.summary + (converted == nil ? " (unsupported; dropping audio)" : "") +
+                " format_changes=\(formatChanges)"
+            if converted != nil, formatChanges > 0 {
+                // Samples on either side of the switch do not belong together.
+                chunker.reset()
+                nextFlags = MRA1.flagRestart
+            }
+        }
         guard let samples = converted else {
             formatErrors &+= 1
-            let first = !formatLogged
-            formatLogged = true
             lock.unlock()
-            if first {
-                Self.log("unsupported audio format rate=\(asbd.mSampleRate) bits=\(asbd.mBitsPerChannel) channels=\(asbd.mChannelsPerFrame) flags=\(asbd.mFormatFlags)")
-            }
+            if let formatLine { Self.log(formatLine) }
             return
         }
         meter.add(samples)
@@ -520,6 +640,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             nextFlags = 0
         }
         lock.unlock()
+        if let formatLine { Self.log(formatLine) }
         var sent: UInt64 = 0, errors: UInt64 = 0
         for p in packets {
             if send(p, port) { sent &+= 1 } else { errors &+= 1 }
@@ -592,6 +713,8 @@ enum AudioSelfTest {
         expect(abs(lv.rms - (-6.02)) < 0.1 && abs(lv.peak - (-6.02)) < 0.1 && lv.frames == 240, "meter: half scale = -6 dBFS")
         expect(m.take().rms == -120, "meter: silence after reset is -120 dBFS")
 
+        captureRecoveryTests(expect)
+
         opusRoundTrip(expect)
 
         expect(MouseMoveUDPServer.parseAudioRequest([0x4d, 0x52, 0x4d, 0x31, 1, 0x45, 0, 0, 0, 9, 1, 0x95, 0x02], length: 13).map { $0.port == 38146 && !$0.opus } == true,
@@ -603,6 +726,48 @@ enum AudioSelfTest {
         expect(MouseMoveUDPServer.parseAudioRequest([0x4d, 0x52, 0x4d, 0x31, 1, 0x45, 0, 0, 0, 9, 0, 0, 0], length: 13)?.enable == false,
                "mrm1 0x45: stop request")
         return failures == 0 ? 0 : 1
+    }
+
+    /// Restart pacing, log rate limiting, the stall watchdog and format
+    /// change detection: the device-change hardening, without a live stream.
+    private static func captureRecoveryTests(_ expect: (Bool, String) -> Void) {
+        var b = CaptureBackoff()
+        var delays: [UInt64] = [b.delayNs]
+        for _ in 0..<7 { b.failed(); delays.append(b.delayNs / 1_000_000_000) }
+        expect(delays == [2_000_000_000, 2, 4, 8, 16, 30, 30, 30], "backoff: 2 s, then doubling to a 30 s cap")
+        b.succeeded()
+        expect(b.failures == 0 && b.delayNs == CaptureBackoff.firstNs, "backoff: success resets to 2 s")
+
+        var g = RepeatLogGate()
+        let logged = (0..<9).map { _ in g.shouldLog("start:denied") }
+        expect(logged == [true, true, true, false, true, false, false, false, true],
+               "log gate: first, then 2nd/4th/8th repeat")
+        expect(g.shouldLog("start:other"), "log gate: new reason logs at once")
+        g.reset()
+        expect(g.shouldLog("start:other"), "log gate: reset logs again")
+
+        let s: UInt64 = 10_000_000_000
+        expect(!CaptureWatchdog.isStalled(nowNs: s + 2_900_000_000, startedNs: s, lastBufferNs: 0),
+               "watchdog: 2.9 s after start without buffers is not a stall")
+        expect(CaptureWatchdog.isStalled(nowNs: s + 3_000_000_000, startedNs: s, lastBufferNs: 0),
+               "watchdog: 3 s after start without buffers is a stall")
+        expect(!CaptureWatchdog.isStalled(nowNs: s + 5_000_000_000, startedNs: s, lastBufferNs: s + 4_000_000_000),
+               "watchdog: a recent buffer keeps the stream alive")
+        expect(CaptureWatchdog.isStalled(nowNs: s + 8_000_000_000, startedNs: s, lastBufferNs: s + 4_000_000_000),
+               "watchdog: buffers stopped 4 s ago is a stall")
+        expect(!CaptureWatchdog.isStalled(nowNs: s, startedNs: s + 1, lastBufferNs: 0),
+               "watchdog: clock before start is not a stall")
+
+        let planar = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
+                                                 mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved | kAudioFormatFlagIsPacked,
+                                                 mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+                                                 mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
+        var resampled = planar
+        resampled.mSampleRate = 44100
+        expect(CaptureFormat(planar) == CaptureFormat(planar) && CaptureFormat(planar) != CaptureFormat(resampled),
+               "format: a rate change is detected")
+        expect(CaptureFormat(planar).summary.hasPrefix("rate=48000 bits=32 channels=2 float planar"),
+               "format: summary names rate, bits, channels, layout")
     }
 
     /// Encodes 1 s of a two-tone stereo signal, checks the MRA1 v2 layout and
