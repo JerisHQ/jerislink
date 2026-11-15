@@ -2068,11 +2068,12 @@ static void runSessionModalTick() {
 }
 
 // ---- In-session overlay (B1) ----------------------------------------------
-// A thin bar at the bottom-left of the viewer: status, mute, volume, Info,
+// A thin bar at the top centre of the viewer: status, mute, volume, Info,
 // Settings, Disconnect. A non-activating owned popup: it never takes the
-// keyboard from the viewer and never runs a modal loop. Ctrl+Alt+O opens it
-// for the keyboard; holding the pointer in the bottom-left corner for 2 s
-// opens it for the mouse.
+// keyboard from the viewer and never runs a modal loop. It is a layered
+// window at ov::kOverlayAlpha opacity, so the video shows through. Ctrl+Alt+O
+// opens it for the keyboard; holding the pointer at the top centre of the
+// viewer for 2 s opens it for the mouse.
 namespace ov = jl::overlay;
 
 static HWND gOverlay = nullptr;
@@ -2446,7 +2447,7 @@ static void paintOverlay(HWND hwnd) {
     overlayText(dc,
                 gOverlayKeyboard
                     ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
-                    : L"Ctrl+Alt+O, or hold the pointer in this corner for 2 s",
+                    : L"Ctrl+Alt+O, or hold the pointer at the top centre for 2 s",
                 toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
 
     BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -2558,12 +2559,17 @@ static void overlayCreate(HWND viewer) {
         wc.lpszClassName = L"JerislinkOverlay";
         registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
     }
-    gOverlay = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"JerislinkOverlay",
+    gOverlay = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                               L"JerislinkOverlay",
                                L"JerisLink controls", WS_POPUP, 0, 0, 1, 1, viewer, nullptr, hi,
                                nullptr);
     if (!gOverlay) {
         logLine("overlay.create_failed error=" + std::to_string(GetLastError()));
         return;
+    }
+    // Whole-window alpha: GDI painting stays as it is (no per-pixel alpha).
+    if (!SetLayeredWindowAttributes(gOverlay, 0, ov::kOverlayAlpha, LWA_ALPHA)) {
+        logLine("overlay.alpha_failed error=" + std::to_string(GetLastError()));
     }
     // Rounded on Windows 11; Windows 10 keeps square corners.
     DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
@@ -2587,7 +2593,7 @@ static void overlayDestroy() {
     gOverlaySwallowUp.reset();
 }
 
-// Every 100 ms: the corner hover fallback and the auto-hide.
+// Every 100 ms: the top-centre hover fallback and the auto-hide.
 static void overlayHoverTick() {
     if (!gOverlay || !gViewerHwnd) return;
     const double now = steadyMsNow();
@@ -2607,7 +2613,10 @@ static void overlayHoverTick() {
             ScreenToClient(gViewerHwnd, &cp);
             RECT c{};
             GetClientRect(gViewerHwnd, &c);
-            inZone = ov::inCornerZone(cp.x, cp.y, c.right, c.bottom, ov::scale(48, overlayDpi()));
+            const UINT dpi = overlayDpi();
+            inZone = ov::inTopCentreZone(cp.x, cp.y, c.right, c.bottom,
+                                         ov::scale(ov::kHoverZoneW, dpi),
+                                         ov::scale(ov::kHoverZoneH, dpi));
         }
     }
     if (gOverlayDwell.update(inZone, now) && !overlayVisible()) overlayShow(false, "hover", 0);
@@ -3361,7 +3370,24 @@ static void paintCpuFrame(HWND hwnd) {
         } else {
             RECT r{};
             GetClientRect(hwnd, &r);
+#ifdef JERISLINK_UI_SNAPSHOT
+            // CI snapshots: coloured bars stand in for video, so the
+            // overlay's translucency shows in the PNGs.
+            static const COLORREF kBars[] = {RGB(200, 200, 200), RGB(200, 200, 0),
+                                             RGB(0, 200, 200),   RGB(0, 200, 0),
+                                             RGB(200, 0, 200),   RGB(200, 0, 0),
+                                             RGB(0, 0, 200),     RGB(16, 16, 16)};
+            const LONG n = static_cast<LONG>(sizeof(kBars) / sizeof(kBars[0]));
+            for (LONG i = 0; i < n; ++i) {
+                RECT b{r.left + (r.right - r.left) * i / n, r.top,
+                       r.left + (r.right - r.left) * (i + 1) / n, r.bottom};
+                HBRUSH br = CreateSolidBrush(kBars[i]);
+                FillRect(dc, &b, br);
+                DeleteObject(br);
+            }
+#else
             FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+#endif
         }
         EndPaint(hwnd, &ps);
     }
@@ -5503,9 +5529,34 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     gConnectionInfo.decoder = "hardware";
     gConnectionInfo.adapter = "Sample GPU";
     overlayCreate(viewer);
+    overlayShow(false, "snapshot", 0);
+    snapshotWindow(viewer, dir, L"overlay-open-mouse");
     overlayShow(true, "snapshot", 0);
     snapshotWindow(viewer, dir, L"overlay-open");
     const bool overlayShown = overlayVisible();
+    // Placement and translucency: top centre of the client area, a layered
+    // window at ov::kOverlayAlpha.
+    bool overlayPlaced = false;
+    BYTE overlayAlpha = 0;
+    DWORD alphaFlags = 0;
+    const bool layered =
+        gOverlay && (GetWindowLongPtrW(gOverlay, GWL_EXSTYLE) & WS_EX_LAYERED) != 0 &&
+        GetLayeredWindowAttributes(gOverlay, nullptr, &overlayAlpha, &alphaFlags) &&
+        (alphaFlags & LWA_ALPHA) != 0 && overlayAlpha == ov::kOverlayAlpha;
+    if (gOverlay) {
+        RECT c{}, o{};
+        GetClientRect(viewer, &c);
+        MapWindowPoints(viewer, nullptr, reinterpret_cast<POINT*>(&c), 2);
+        GetWindowRect(gOverlay, &o);
+        const LONG gapL = o.left - c.left, gapR = c.right - o.right;
+        const LONG topGap = o.top - c.top;
+        overlayPlaced = gapL >= 0 && gapR >= 0 && std::abs(gapL - gapR) <= 1 &&
+                        topGap == ov::scale(16, overlayDpi());
+        std::wcout << L"overlay_place=" << (overlayPlaced ? L"top-centre" : L"FAIL")
+                   << L" gap_l=" << gapL << L" gap_r=" << gapR << L" top=" << topGap
+                   << L" layered=" << layered
+                   << L" alpha=" << static_cast<int>(overlayAlpha) << L"\n";
+    }
     overlayHide("snapshot");
     snapshotWindow(viewer, dir, L"overlay-hidden");
 
@@ -5612,7 +5663,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     if (!oneDialog) return 5;
     if (!bindGreyed || !stillOpen) return 6;
     if (!noMenu) return 7;
-    if (!actionsOk || !noModal || !overlayShown) return 8;
+    if (!actionsOk || !noModal || !overlayShown || !overlayPlaced || !layered) return 8;
     if (!tickOk) return 10;
     if (!codeTabBlocks || !launchError) return 11;
     if (!accentSaved) return 12;

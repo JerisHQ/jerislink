@@ -1,7 +1,7 @@
 #pragma once
 
-// In-session overlay (B1): a thin bar at the bottom-left of the viewer with
-// the connection status, mute, volume, Info, Settings and Disconnect.
+// In-session overlay (B1): a thin translucent bar at the top centre of the
+// viewer with the connection status, mute, volume, Info, Settings and Disconnect.
 // Layout, hit-testing, keyboard focus order, slider maths and the hover
 // fallback live here without Win32 so ui_overlay_test.cpp can check them.
 // viewer.cpp paints and drives the real window.
@@ -105,11 +105,21 @@ inline int sliderKnobX(const Rect& slider, int value, unsigned dpi) {
 // Left / Right on the focused volume item: 5% steps, clamped.
 inline int volumeStep(int value, int dir) { return std::clamp(value + 5 * dir, 0, 100); }
 
-// Hover fallback: the pointer rests in the bottom-left corner of the viewer's
-// client area (zone x zone pixels).
-inline bool inCornerZone(int x, int y, int clientW, int clientH, int zone) {
-    return x >= 0 && y < clientH && x < std::min(zone, clientW) && y >= clientH - zone;
+// Hover fallback: the pointer rests in a small zone at the middle of the
+// top edge of the viewer's client area (zoneW wide, zoneH tall, centred).
+inline bool inTopCentreZone(int x, int y, int clientW, int clientH, int zoneW, int zoneH) {
+    const int w = std::min(zoneW, clientW);
+    const int left = (clientW - w) / 2;
+    return x >= left && x < left + w && y >= 0 && y < std::min(zoneH, clientH);
 }
+
+// Hover zone size in logical pixels (scaled with the dpi).
+constexpr int kHoverZoneW = 160;
+constexpr int kHoverZoneH = 24;
+
+// Whole-window opacity of the overlay (layered window, LWA_ALPHA): 224/255
+// is about 88%, so the video shows through while text stays readable.
+constexpr unsigned char kOverlayAlpha = 224;
 
 // Fires once when `on` has held for `ms` without a break; resets when it
 // stops holding.
@@ -143,16 +153,17 @@ private:
     bool fired_ = false;
 };
 
-// Top-left of the overlay in screen coordinates: bottom-left of the viewer's
-// client area with a margin, kept inside the client area when it is small.
+// Top-left of the overlay in screen coordinates: horizontally centred in the
+// viewer's client area, `margin` below its top edge, kept inside the client
+// area when it is small (then pinned to the left).
 struct Point {
     int x = 0, y = 0;
 };
 
 inline Point placeInClient(const Rect& client, int w, int h, int margin) {
-    Point p{client.left + margin, client.bottom - margin - h};
+    Point p{client.left + (client.width() - w) / 2, client.top + margin};
     p.x = std::max(client.left, std::min(p.x, client.right - w));
-    p.y = std::max(client.top, p.y);
+    p.y = std::max(client.top, std::min(p.y, client.bottom - h));
     return p;
 }
 
