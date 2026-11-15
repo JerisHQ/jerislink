@@ -25,6 +25,45 @@ jobs:
         with:
           name: jerislink-windows-unsigned
           path: personal/windows-client/build/Release/Jerislink.exe
+      - name: Build settings UI snapshot (CI only, not packaged)
+        run: cmake --build build --config Release --target JerislinkUiSnapshot
+      - name: Settings and volume window snapshots
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $key = 'HKCU:\Software\Jeris\Jerislink'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name HostIp -Value '100.64.0.10' -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $key -Name VideoCodec -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $key -Name VideoBitrateMbps -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $key -Name AudioVolumePercent -Value 70 -PropertyType DWord -Force | Out-Null
+          $root = Join-Path $env:RUNNER_TEMP 'ui-snapshots'
+          $codes = @{}
+          foreach ($accent in 'green', 'green-b', 'blue') {
+            $dir = Join-Path $root $accent
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $log = Join-Path $dir 'snapshot.txt'
+            $p = Start-Process build\Release\JerislinkUiSnapshot.exe -ArgumentList $dir, $accent -PassThru -RedirectStandardOutput $log
+            if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "snapshot $accent did not exit" }
+            Get-Content $log -ErrorAction SilentlyContinue
+            $codes[$accent] = $p.ExitCode
+          }
+          Remove-Item -Path $key -Recurse -Force
+          Add-Type -AssemblyName System.Drawing
+          Get-ChildItem $root -Recurse -Filter *.bmp | ForEach-Object {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $img.Save(($_.FullName -replace '\.bmp$', '.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Host "$($_.Directory.Name)/$($_.Name) $($img.Width)x$($img.Height)"
+            $img.Dispose()
+            Remove-Item $_.FullName
+          }
+          foreach ($accent in $codes.Keys) {
+            if ($codes[$accent] -ne 0) { throw "snapshot $accent exit $($codes[$accent])" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-ui-snapshots
+          path: ${{ runner.temp }}/ui-snapshots
       - name: Build launch-config unit test
         run: cmake --build build --config Release --target JerislinkOptionsTest
       - name: Launch-config unit test
