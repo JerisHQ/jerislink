@@ -28,6 +28,9 @@ struct Options {
     /// ABR v1 (MRM1 0x42 receiver reports): bitrate between 6 Mbps and
     /// bitrateMbps. Only acts when a viewer sends reports.
     var abrEnabled = true
+    /// Audio (MRA1): an audio-only ScreenCaptureKit stream that runs only while
+    /// a viewer sends MRM1 0x45 requests. Never touches the Mac output device.
+    var audioEnabled = true
     /// The pace rate came from UDPPacing.autoMbps, so it follows the ABR bitrate.
     var udpPaceAuto = false
     var controlPort: UInt16 = 38400
@@ -193,8 +196,9 @@ struct JerisLinkHostMain {
             let nack = RetransmitSelfTest.run()
             let abr = AbrSelfTest.run()
             let logs = LogHygieneSelfTest.run()
+            let audio = AudioSelfTest.run()
             let display = await DisplayFollowerSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && display == 0 ? 0 : 1)
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 ? 0 : 1)
         }
         var o = Options.parse()
         let hostVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -335,6 +339,14 @@ struct JerisLinkHostMain {
             }
             defer { control?.stop() }
             defer { mouseUDP?.stop() }
+            var audio: AudioStreamer?
+            if o.audioEnabled, let audioSender = sender, let mouseUDP {
+                let streamer = AudioStreamer(send: { packet, port in audioSender.sendAudio(packet, port: port) })
+                mouseUDP.setAudioRequestHandler { enable, port in streamer.noteRequest(enable: enable, port: port) }
+                audio = streamer
+            }
+            defer { audio?.shutdown() }
+            print("Audio: \(audio != nil ? "on (MRA1 48 kHz stereo s16, 5 ms packets, on viewer request; Mac output device untouched)" : "off")")
             let abr = AbrHost(enabled: o.abrEnabled && sender != nil && mouseUDP != nil, ceilingMbps: o.bitrateMbps)
             sender?.setStatsSuffix { abr.statsFields() }
             print("ABR: \(abr.enabled ? "on ceiling=\(o.bitrateMbps)Mbps floor=\(min(6, o.bitrateMbps))Mbps idr_cap=\(AbrHost.idrCapFrames)x pace_follows=\(o.udpPaceAuto)" : "off")")
@@ -464,6 +476,7 @@ struct JerisLinkHostMain {
             }
             if let control { print("Control complete: \(control.statsLine())") }
             if let mouseUDP { print("Mouse UDP complete: \(mouseUDP.statsLine())") }
+            if let audio { print("Audio complete: \(audio.statsLine())") }
             print("Wrote: \(outputURL.path)")
         } catch {
             fputs("Fatal: \(error.localizedDescription)\n", stderr)

@@ -154,7 +154,7 @@ final class LocalControlMouseClient {
 ///   0..3  "MRM1"
 ///   4     version = 1
 ///   5     type (0x24 mouse move, 0x31 cursor state, 0x40 request keyframe,
-///         0x41 NACK, 0x43 ping, 0x44 pong)
+///         0x41 NACK, 0x43 ping, 0x44 pong, 0x45 audio request)
 ///   6..9  sequence, big-endian UInt32
 /// Mouse move appends nx/ny as two big-endian UInt16 values (14 bytes total).
 /// Cursor state appends one RemoteCursorShape byte (11 bytes total, Mac->Windows).
@@ -164,6 +164,9 @@ final class LocalControlMouseClient {
 /// Ping appends the viewer clock in microseconds (u64, 18 bytes total); the
 /// host echoes the same 18 bytes back with type 0x44 so the viewer can
 /// measure RTT on the live path.
+/// Audio request (13 bytes) appends flags u8 (0x01 = send audio) and the
+/// viewer UDP port u16 for MRA1. The viewer repeats it every second; the host
+/// stops audio 10 s after the last one, or at once on flags 0.
 final class MouseMoveUDPServer: @unchecked Sendable {
     private let bindIP: String
     private let allowedClientIP: String?
@@ -181,6 +184,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
     private var newSessionHandler: (() -> Void)?
     private var receiverReportHandler: ((ReceiverReport) -> Void)?
+    private var audioRequestHandler: ((Bool, UInt16) -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
     private var cursorSequence: UInt32 = 0
@@ -203,6 +207,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var receiverReportRx: UInt64 = 0
     private(set) var receiverReportRejected: UInt64 = 0  // short or inconsistent 0x42
     private(set) var pongDrops: UInt64 = 0
+    private(set) var audioRequestRx: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16) {
         self.bindIP = bindIP
@@ -287,6 +292,14 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Called on the receive queue for each valid MRM1 0x45 audio request
+    /// (enable, viewer audio port). The peer IP was already checked.
+    func setAudioRequestHandler(_ handler: @escaping (Bool, UInt16) -> Void) {
+        lock.lock()
+        audioRequestHandler = handler
+        lock.unlock()
+    }
+
     func stop() {
         lock.lock()
         stopping = true
@@ -296,6 +309,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         nackHandler = nil
         receiverReportHandler = nil
         newSessionHandler = nil
+        audioRequestHandler = nil
         lastPeerAddress = nil
         cursorProbePending = false
         lock.unlock()
@@ -307,7 +321,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected)"
+        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected) audio_requests_rx=\(audioRequestRx)"
     }
 
     /// Coalesce cursor-shape checks onto a separate queue. There is no periodic
@@ -526,6 +540,16 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                     }
                 }
                 if sent != 18 { pongDrops &+= 1 }
+            case 0x45:
+                guard let req = Self.parseAudioRequest(buffer, length: n) else {
+                    badPackets &+= 1
+                    continue
+                }
+                lock.lock()
+                let handler = audioRequestHandler
+                lock.unlock()
+                audioRequestRx &+= 1
+                handler?(req.enable, req.port)
             default:
                 badPackets &+= 1
             }
@@ -536,6 +560,15 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// newer when it is less than 2^31 steps ahead of `last`.
     static func isNewer(_ seq: UInt32, than last: UInt32) -> Bool {
         Int32(bitPattern: seq &- last) > 0
+    }
+
+    /// Parses an MRM1 0x45 audio request: flags u8, port u16 (13 bytes).
+    static func parseAudioRequest(_ b: [UInt8], length n: Int) -> (enable: Bool, port: UInt16)? {
+        guard n == 13, n <= b.count, b[5] == 0x45 else { return nil }
+        let enable = b[10] & 0x01 != 0
+        let port = UInt16(b[11]) << 8 | UInt16(b[12])
+        if enable && port == 0 { return nil }
+        return (enable, port)
     }
 
     /// Parses an MRM1 0x41 NACK. Returns nil unless the length matches the

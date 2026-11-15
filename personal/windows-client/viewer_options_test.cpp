@@ -111,6 +111,9 @@ int main() {
         CHECK(resolveLaunch({"--abr", "maybe"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({}, typicalSaved(), "", tailnet).options.abr == "on");
         CHECK(resolveLaunch({"--abr", "off"}, typicalSaved(), "", tailnet).options.abr == "off");
+        CHECK(resolveLaunch({"--audio", "loud"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
+        CHECK(resolveLaunch({}, typicalSaved(), "", tailnet).options.audio == "on");
+        CHECK(resolveLaunch({"--audio", "off"}, typicalSaved(), "", tailnet).options.audio == "off");
         CHECK(resolveLaunch({"--port", "abc"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--source-ip"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);
         CHECK(resolveLaunch({"--bogus", "1"}, typicalSaved(), "", tailnet).status == LaunchStatus::InvalidArgs);

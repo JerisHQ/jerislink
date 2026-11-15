@@ -493,6 +493,24 @@ final class UDPFrameSender: @unchecked Sendable {
         }
     }
 
+    /// MRA1 audio: same socket as the video, to the viewer IP at `port`
+    /// (the port its MRM1 0x45 request named). Not paced and not counted in
+    /// the video stats; AudioStreamer keeps its own counters.
+    func sendAudio(_ packet: Data, port: UInt16) -> Bool {
+        var dest = destination
+        dest.sin_port = port.bigEndian
+        let result: ssize_t = packet.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return -1 }
+            return withUnsafePointer(to: &dest) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.sendto(socketFD, base, packet.count, 0, sa,
+                                  socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        return result == packet.count
+    }
+
     /// Send one packet and count it. Returns false on a send error.
     private func sendCounted(_ packet: Data) -> Bool {
         var dest = destination
