@@ -98,3 +98,6 @@ add_executable(JerislinkMouseButtonsTest mouse_buttons_test.cpp)
 # Console unit test for the MRA1 audio jitter buffer (audio_jitter.hpp).
 add_executable(JerislinkAudioTest audio_jitter_test.cpp)
 target_link_libraries(JerislinkAudioTest PRIVATE opus)
+
+# Console unit test for the in-session overlay maths (ui_overlay.hpp).
+add_executable(JerislinkOverlayTest ui_overlay_test.cpp)

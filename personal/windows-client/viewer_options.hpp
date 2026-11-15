@@ -193,6 +193,42 @@ inline std::string describeLaunch(const LaunchRequest& r) {
     return s.str();
 }
 
+// The launch screen shows first unless the Mac's address came on the command
+// line (scripts, shortcuts with --source-ip); --settings or Shift held while
+// starting shows it then too. Bad arguments never reach it.
+inline bool showLaunchScreen(const LaunchRequest& r, bool shiftHeld) {
+    if (r.status == LaunchStatus::InvalidArgs || !r.printConfigPath.empty()) return false;
+    if (r.openSettings || shiftHeld) return true;
+    return r.hostSource != "cli";
+}
+
+// After the launch screen the address typed there (saved as HostIp) is the
+// one to use, so --source-ip and --settings are dropped from the arguments.
+inline std::vector<std::string> argsAfterLaunchScreen(const std::vector<std::string>& args) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--settings") continue;
+        if (args[i] == "--source-ip") {
+            ++i;  // and its value
+            continue;
+        }
+        out.push_back(args[i]);
+    }
+    return out;
+}
+
+// Arguments for the process that comes back to the launch screen after a
+// session ends (Disconnect, lost stream, error): the same arguments plus
+// --settings, once.
+inline std::vector<std::string> argsForRelaunch(const std::vector<std::string>& args) {
+    std::vector<std::string> out;
+    for (const auto& a : args) {
+        if (a != "--settings") out.push_back(a);
+    }
+    out.push_back("--settings");
+    return out;
+}
+
 // Debug mode: JERISLINK_DEBUG=1 (exactly "1") turns on debug-only
 // diagnostics, such as the CPU-decode first-frame BMP in %TEMP%. Unset or any
 // other value: off.

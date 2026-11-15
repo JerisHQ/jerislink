@@ -42,7 +42,7 @@ BEGIN
     CONTROL         "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, "Button", BS_OWNERDRAW | WS_TABSTOP, 14, 232, 110, 12
     LTEXT           "How loud the Mac's audio plays on this PC. Applies right away.", IDC_UI_HINT_VOLUME, 14, 247, 272, 9, SS_NOPREFIX
 
-    LTEXT           "Connection and video changes apply the next time JerisLink starts.", IDC_APPLY_NOTE, 14, 268, 166, 18, SS_NOPREFIX
+    LTEXT           "Volume applies now. Connection and video changes apply when you reconnect.", IDC_APPLY_NOTE, 14, 268, 166, 18, SS_NOPREFIX
     CONTROL         "Cancel", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 186, 269, 48, 16
     CONTROL         "Save", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 238, 269, 48, 16
 END
@@ -61,6 +61,61 @@ BEGIN
     RTEXT           "100%", IDC_VOLUME_VALUE, 166, 39, 34, 9, SS_NOPREFIX
     CONTROL         "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, "Button", BS_OWNERDRAW | WS_TABSTOP, 10, 55, 110, 12
     CONTROL         "Close", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 152, 75, 48, 14
+END
+
+// Launch screen (mockup A2): two columns. Left: app icon (painted), headline,
+// tagline, theme picker, ready state. Right: tabs "Host address" and "Join
+// with a code" (reserved, not built yet), the host field, Connect and the
+// Advanced settings row. Footer band from y = 238; keep kLaunchFooterTop in
+// viewer.cpp in step. The icon, column divider, tab underline, row dividers
+// and the ready dot are painted in viewer.cpp (paintLaunchExtras).
+IDD_LAUNCH DIALOGEX 0, 0, 460, 262
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN
+CAPTION "JerisLink"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Your Mac,\nwithin reach.", IDC_LAUNCH_HERO, 18, 56, 150, 46, SS_NOPREFIX
+    LTEXT           "A direct connection across your tailnet.", IDC_LAUNCH_TAGLINE, 18, 106, 150, 18, SS_NOPREFIX
+    LTEXT           "THEME", IDC_UI_SECTION_THEME, 18, 140, 150, 9, SS_NOPREFIX
+    CONTROL         "Green", IDC_THEME_GREEN, "Button", BS_OWNERDRAW | WS_TABSTOP, 18, 152, 58, 16
+    CONTROL         "Blue", IDC_THEME_BLUE, "Button", BS_OWNERDRAW | WS_TABSTOP, 80, 152, 58, 16
+    LTEXT           "READY TO CONNECT", IDC_LAUNCH_READY, 28, 218, 140, 9, SS_NOPREFIX
+
+    LTEXT           "NEW SESSION", IDC_LAUNCH_EYEBROW, 196, 18, 250, 9, SS_NOPREFIX
+    LTEXT           "Start a connection", IDC_UI_TITLE, 196, 29, 250, 16, SS_NOPREFIX
+    LTEXT           "Choose how you want to connect.", IDC_UI_SUBTITLE, 196, 47, 250, 9, SS_NOPREFIX
+    CONTROL         "Host address", IDC_TAB_HOST, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 62, 64, 16
+    CONTROL         "Join with a code", IDC_TAB_CODE, "Button", BS_OWNERDRAW | WS_TABSTOP, 264, 62, 104, 16
+
+    LTEXT           "Mac host address", IDC_UI_LABEL_HOST, 196, 90, 250, 9, SS_NOPREFIX
+    EDITTEXT        IDC_HOST_IP, 200, 105, 242, 10, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER
+    LTEXT           "Enter your Mac's Tailscale IP address, or 127.0.0.1 for Tailcat.", IDC_UI_HINT_HOST, 196, 121, 250, 9, SS_NOPREFIX
+    LTEXT           "", IDC_LAUNCH_ERROR, 196, 133, 250, 18, SS_NOPREFIX
+    CONTROL         "Connect to Mac", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 154, 250, 20
+    CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 190, 250, 24
+    LTEXT           "Joining a Mac with a pairing code is coming soon. For now, use the Mac's address on the Host address tab.", IDC_LAUNCH_CODE_NOTE, 196, 90, 250, 28, SS_NOPREFIX | NOT WS_VISIBLE
+
+    LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 246, 120, 9, SS_NOPREFIX
+    RTEXT           "Private connection over your tailnet", IDC_LAUNCH_PRIVACY, 196, 246, 250, 9, SS_NOPREFIX
+END
+
+// Modeless "Connection info" window: what was asked for, what the Mac is
+// sending, and how this PC decodes it. Refreshes every second while open;
+// video and audio keep running. Footer band from y = 172 (kInfoFooterTop).
+IDD_CONNECTION_INFO DIALOGEX 0, 0, 260, 196
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
+CAPTION "Connection Info"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Connection info", IDC_UI_TITLE, 10, 7, 240, 13, SS_NOPREFIX
+    LTEXT           "Updates every second. Video and audio keep playing.", IDC_UI_SUBTITLE, 10, 21, 240, 9, SS_NOPREFIX
+    LTEXT           "CONFIGURED", IDC_INFO_SECTION_CONFIGURED, 10, 37, 240, 9, SS_NOPREFIX
+    LTEXT           "", IDC_INFO_CONFIGURED, 10, 48, 240, 18, SS_NOPREFIX
+    LTEXT           "EFFECTIVE", IDC_INFO_SECTION_EFFECTIVE, 10, 70, 240, 9, SS_NOPREFIX
+    LTEXT           "", IDC_INFO_EFFECTIVE, 10, 81, 240, 36, SS_NOPREFIX
+    LTEXT           "DECODER", IDC_INFO_SECTION_DECODER, 10, 121, 240, 9, SS_NOPREFIX
+    LTEXT           "", IDC_INFO_DECODER, 10, 132, 240, 36, SS_NOPREFIX
+    CONTROL         "Close", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 202, 177, 48, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

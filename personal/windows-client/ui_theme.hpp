@@ -1,6 +1,7 @@
 #pragma once
 
-// Dark theme shared by the viewer window and its dialogs (settings, volume).
+// Dark theme shared by the viewer window and its windows (launch screen,
+// settings, volume, connection info, in-session overlay).
 // Plain Win32 + GDI + DWM: no UI framework, no extra runtime dependency.
 //
 // The palette starts from the viewer's title bar (caption #0C1424, border
@@ -10,8 +11,10 @@
 //   muted  #A3B1C6 on body 7.9, on footer 8.5
 //   accent #4C9AFF on body 6.0
 //   text   #F4F8FF on primary button #2563EB 4.9
+//   error  #FF8A8A on body 7.6, on footer 8.2
 //
-// Two accent palettes, picked at start-up (HKCU ...\Jerislink\UiAccent):
+// Two accent palettes, picked on the launch screen and saved as
+// HKCU ...\Jerislink\UiAccent:
 //   green (default; UiAccent empty, missing or "green") keeps the hue of the
 //         JerisLink icon ring #01DAE3 (msix/icon-src/JerisLink-v2.0-1024.png)
 //         at 88% brightness, candidate A: #01C0C8. White text on it is only
@@ -19,7 +22,6 @@
 //         (8.2:1; 6.0:1 on the pressed shade #01A3AA). Accent on body 7.7,
 //         focus ring #73DCE1 on body 10.7, text on selected item #074652 9.8.
 //   blue  (UiAccent "blue") as above.
-// Candidate B (78% brightness) is kept for the comparison snapshot only.
 // Shades: pressed = main x 0.85, focus = main mixed 45% with white,
 // selected = main mixed 70% with the field colour.
 
@@ -43,6 +45,7 @@ constexpr COLORREF kMuted = RGB(0xA3, 0xB1, 0xC6);         // hints, secondary t
 constexpr COLORREF kDisabled = RGB(0x5D, 0x6B, 0x80);      // disabled slider and text
 constexpr COLORREF kSecondary = RGB(0x18, 0x24, 0x3A);     // Cancel / Close button
 constexpr COLORREF kSecondaryDown = RGB(0x22, 0x31, 0x4C);
+constexpr COLORREF kError = RGB(0xFF, 0x8A, 0x8A);         // inline errors, Disconnect
 }  // namespace color
 
 // The colours that change with the accent choice.
@@ -61,11 +64,10 @@ constexpr AccentPalette kBlueAccent{RGB(0x4C, 0x9A, 0xFF), RGB(0x8D, 0xBB, 0xFF)
 constexpr AccentPalette kGreenAccent{RGB(0x01, 0xC0, 0xC8), RGB(0x73, 0xDC, 0xE1),
                                      RGB(0x01, 0xC0, 0xC8), RGB(0x01, 0xA3, 0xAA),
                                      RGB(0x0C, 0x14, 0x24), RGB(0x07, 0x46, 0x52)};
-constexpr AccentPalette kGreenAccentB{RGB(0x01, 0xAA, 0xB1), RGB(0x73, 0xD0, 0xD4),
-                                      RGB(0x01, 0xAA, 0xB1), RGB(0x01, 0x91, 0x96),
-                                      RGB(0x0C, 0x14, 0x24), RGB(0x07, 0x3F, 0x4C)};
 
-enum class Accent { Green, Blue, GreenCandidateB };
+// Picked on the launch screen, saved as UiAccent ("green" | "blue"). Green is
+// the default.
+enum class Accent { Green, Blue };
 
 inline AccentPalette& accentStorage() {
     static AccentPalette p = kGreenAccent;
@@ -73,9 +75,7 @@ inline AccentPalette& accentStorage() {
 }
 inline const AccentPalette& accent() { return accentStorage(); }
 inline void setAccent(Accent a) {
-    accentStorage() = a == Accent::Blue              ? kBlueAccent
-                      : a == Accent::GreenCandidateB ? kGreenAccentB
-                                                     : kGreenAccent;
+    accentStorage() = a == Accent::Blue ? kBlueAccent : kGreenAccent;
 }
 
 // The viewer's title-bar look, for any top-level window of the viewer.
@@ -149,6 +149,7 @@ struct DialogTheme {
     HFONT label = nullptr;    // field labels, values
     HFONT text = nullptr;     // inputs, buttons, checkboxes
     HFONT smallText = nullptr;    // hints, footer note
+    HFONT hero = nullptr;     // launch screen headline
 
     void build(HWND dlg, int titlePt) {
         release();
@@ -161,13 +162,15 @@ struct DialogTheme {
         label = makeFont(9, FW_SEMIBOLD);
         text = makeFont(9, FW_NORMAL);
         smallText = makeFont(8, FW_NORMAL);
+        hero = makeFont(20, FW_SEMIBOLD);
     }
 
     void release() {
         for (HGDIOBJ* o : {reinterpret_cast<HGDIOBJ*>(&body), reinterpret_cast<HGDIOBJ*>(&footer),
                            reinterpret_cast<HGDIOBJ*>(&field), reinterpret_cast<HGDIOBJ*>(&title),
                            reinterpret_cast<HGDIOBJ*>(&section), reinterpret_cast<HGDIOBJ*>(&label),
-                           reinterpret_cast<HGDIOBJ*>(&text), reinterpret_cast<HGDIOBJ*>(&smallText)}) {
+                           reinterpret_cast<HGDIOBJ*>(&text), reinterpret_cast<HGDIOBJ*>(&smallText),
+                           reinterpret_cast<HGDIOBJ*>(&hero)}) {
             if (*o) DeleteObject(*o);
             *o = nullptr;
         }
