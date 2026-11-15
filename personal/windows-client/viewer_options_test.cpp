@@ -225,6 +225,41 @@ int main() {
         CHECK(bindChoices({t, false}, "junk").size() == 2);
     }
 
+    // Launch screen: shown unless the host came on the command line.
+    {
+        auto saved = resolveLaunch({}, typicalSaved(), "", tailnet);
+        CHECK(showLaunchScreen(saved, false));
+        auto none = resolveLaunch({}, SavedSettings{}, "", tailnet);
+        CHECK(none.status == LaunchStatus::NeedsSetup && showLaunchScreen(none, false));
+        auto env = resolveLaunch({}, SavedSettings{}, "192.0.2.40", tailnet);
+        CHECK(env.hostSource == "env" && showLaunchScreen(env, false));
+        auto cli = resolveLaunch({"--source-ip", "192.0.2.30"}, typicalSaved(), "", tailnet);
+        CHECK(cli.hostSource == "cli" && !showLaunchScreen(cli, false));
+        CHECK(showLaunchScreen(cli, true));  // Shift held
+        auto cliSettings = resolveLaunch({"--source-ip", "192.0.2.30", "--settings"},
+                                         typicalSaved(), "", tailnet);
+        CHECK(showLaunchScreen(cliSettings, false));
+        auto bad = resolveLaunch({"--codec", "vp9"}, typicalSaved(), "", tailnet);
+        CHECK(!showLaunchScreen(bad, true));
+        auto print = resolveLaunch({"--print-config", "x.txt"}, typicalSaved(), "", tailnet);
+        CHECK(!showLaunchScreen(print, true));
+
+        // The address typed on the launch screen (saved) wins over --source-ip.
+        const Args args{"--source-ip", "192.0.2.30", "--settings", "--audio", "off"};
+        const Args after = argsAfterLaunchScreen(args);
+        CHECK((after == Args{"--audio", "off"}));
+        auto typed = resolveLaunch(after, typicalSaved(), "", tailnet);
+        CHECK(typed.options.sourceIp == "192.0.2.25" && typed.hostSource == "saved");
+        CHECK(typed.options.audio == "off");
+
+        // Back to the launch screen after a session: same arguments, --settings once.
+        CHECK((argsForRelaunch({}) == Args{"--settings"}));
+        CHECK((argsForRelaunch({"--audio", "off", "--settings"}) == Args{"--audio", "off", "--settings"}));
+        auto relaunch = resolveLaunch(argsForRelaunch({"--source-ip", "192.0.2.30"}),
+                                      typicalSaved(), "", tailnet);
+        CHECK(relaunch.openSettings && showLaunchScreen(relaunch, false));
+    }
+
     std::printf("viewer_options_test: %d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }
