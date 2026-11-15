@@ -342,11 +342,15 @@ struct JerisLinkHostMain {
             var audio: AudioStreamer?
             if o.audioEnabled, let audioSender = sender, let mouseUDP {
                 let streamer = AudioStreamer(send: { packet, port in audioSender.sendAudio(packet, port: port) })
-                mouseUDP.setAudioRequestHandler { enable, port in streamer.noteRequest(enable: enable, port: port) }
+                mouseUDP.setAudioRequestHandler { enable, port, opus in streamer.noteRequest(enable: enable, port: port, opus: opus) }
                 audio = streamer
             }
             defer { audio?.shutdown() }
-            print("Audio: \(audio != nil ? "on (MRA1 48 kHz stereo s16, 5 ms packets, on viewer request; Mac output device untouched)" : "off")")
+            print("Audio: \(audio != nil ? "on (MRA1 on viewer request: v2 Opus 48 kHz stereo 10 ms \(MRA1.opusBitrate / 1000) kbps FEC on, or v1 s16 PCM 5 ms for A1 viewers; video budget minus \(MRA1.opusReserveKbps) kbps; Mac output device untouched)" : "off")")
+            // Audio rides the same link: the video encoder gets the ABR (or
+            // fixed) bitrate minus the Opus reservation, never below half of it.
+            let audioReserveKbps = audio != nil ? MRA1.opusReserveKbps : 0
+            let videoBps: @Sendable (Int) -> Int = { totalKbps in max(totalKbps - audioReserveKbps, totalKbps / 2) * 1000 }
             let abr = AbrHost(enabled: o.abrEnabled && sender != nil && mouseUDP != nil, ceilingMbps: o.bitrateMbps)
             sender?.setStatsSuffix { abr.statsFields() }
             print("ABR: \(abr.enabled ? "on ceiling=\(o.bitrateMbps)Mbps floor=\(min(6, o.bitrateMbps))Mbps idr_cap=\(AbrHost.idrCapFrames)x pace_follows=\(o.udpPaceAuto)" : "off")")
@@ -376,7 +380,7 @@ struct JerisLinkHostMain {
                 switch o.codec {
                 case .h264:
                     encoder = try H264Encoder(width: targetWidth, height: targetHeight, fps: o.fps,
-                                              bitrate: o.bitrateMbps * 1_000_000,
+                                              bitrate: videoBps(o.bitrateMbps * 1000),
                                               keyframeInterval: o.keyframeInterval ?? o.fps,
                                               requestedMaxEncoderLatency: o.requestedMaxEncoderLatency,
                                               inputQueueMaxCount: o.inputQueueMaxCount,
@@ -385,7 +389,7 @@ struct JerisLinkHostMain {
                                               outputURL: outputURL, udpSender: sender)
                 case .hevc:
                     encoder = try HEVCEncoder(width: targetWidth, height: targetHeight, fps: o.fps,
-                                              bitrate: o.bitrateMbps * 1_000_000,
+                                              bitrate: videoBps(o.bitrateMbps * 1000),
                                               keyframeInterval: o.keyframeInterval ?? o.fps,
                                               outputURL: outputURL, udpSender: sender)
                 }
@@ -401,12 +405,12 @@ struct JerisLinkHostMain {
                 // ABR: the encoder of this capture session starts at the current
                 // ABR bitrate (and with the IDR cap) and follows every change.
                 let applyAbr: (AbrChange) -> Void = { change in
-                    encoder.setRateTarget(bitrateBps: change.toKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
+                    encoder.setRateTarget(bitrateBps: videoBps(change.toKbps), idrCapFrames: AbrHost.idrCapFrames)
                     nackSender?.setVideoBitrate(kbps: change.toKbps, paceFollows: o.udpPaceAuto)
                     encoder.noteAbrChange(change)
                 }
                 if abr.enabled {
-                    encoder.setRateTarget(bitrateBps: abr.currentKbps * 1000, idrCapFrames: AbrHost.idrCapFrames)
+                    encoder.setRateTarget(bitrateBps: videoBps(abr.currentKbps), idrCapFrames: AbrHost.idrCapFrames)
                     mouseUDP?.setReceiverReportHandler { report in
                         guard let nackSender else { return }
                         let window = nackSender.abrWindow()

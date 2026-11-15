@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Jerislink LANGUAGES CXX RC)
+project(Jerislink LANGUAGES C CXX RC)
 
 # The Microsoft Store (MSIX) build links the C runtime statically, so the package
 # needs no VCLibs framework dependency. The normal and Inno Setup builds keep the
@@ -25,12 +25,26 @@ configure_file(jerislink.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/jerislink.manif
 configure_file(setup.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/setup.manifest @ONLY)
 message(STATUS "JerisLink version ${JERISLINK_VERSION}")
 
+# libopus (BSD-3-Clause), vendored at a pinned release by
+# ../third_party/update-opus.sh: the portable float C sources only.
+set(OPUS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/opus")
+file(GLOB OPUS_SOURCES CONFIGURE_DEPENDS
+    "${OPUS_DIR}/celt/*.c" "${OPUS_DIR}/silk/*.c" "${OPUS_DIR}/silk/float/*.c" "${OPUS_DIR}/src/*.c")
+add_library(opus STATIC ${OPUS_SOURCES})
+target_compile_definitions(opus PRIVATE OPUS_BUILD USE_ALLOCA HAVE_LRINTF HAVE_LRINT)
+target_include_directories(opus PRIVATE "${OPUS_DIR}" "${OPUS_DIR}/celt" "${OPUS_DIR}/silk" "${OPUS_DIR}/silk/float"
+                                        "${OPUS_DIR}/src"
+                                PUBLIC "${OPUS_DIR}/include")
+if(MSVC)
+    target_compile_options(opus PRIVATE /w)
+endif()
+
 set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt)
 
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(Jerislink PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS})
+target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS} opus)
 if(MSVC)
     target_link_options(Jerislink PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_BINARY_DIR}/jerislink.manifest")
 endif()
@@ -73,3 +87,4 @@ add_executable(JerislinkMouseButtonsTest mouse_buttons_test.cpp)
 
 # Console unit test for the MRA1 audio jitter buffer (audio_jitter.hpp).
 add_executable(JerislinkAudioTest audio_jitter_test.cpp)
+target_link_libraries(JerislinkAudioTest PRIVATE opus)

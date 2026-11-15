@@ -202,14 +202,16 @@ public:
     }
 
     // MRM1 0x45 audio request: flags 0x01 = send audio to this viewer's IP at
-    // `port` (the player's own socket); 0 = stop now. Sent from this socket
+    // `port` (the player's own socket); 0 = stop now. 0x02 = this viewer
+    // decodes Opus (MRA1 v2); an A1 host ignores it and sends PCM (v1). Sent from this socket
     // on purpose: the host keys the MRM1 session on its source port.
     bool sendAudioRequest(bool enable, uint16_t port) {
         if (s_ == INVALID_SOCKET) return false;
         const uint32_t seq = ++sequence_;
         uint8_t p[13]{'M','R','M','1', 1, 0x45,
                       uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
-                      uint8_t(enable ? 0x01 : 0x00), uint8_t(port >> 8), uint8_t(port)};
+                      uint8_t(enable ? (jl::audio::kRequestEnable | jl::audio::kRequestOpus) : 0x00),
+                      uint8_t(port >> 8), uint8_t(port)};
         const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
                              reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
         if (n == sizeof(p)) { ++audioRequestsSent_; return true; }
@@ -2860,6 +2862,7 @@ static int appMain(int argc, char** argv) {
         auto lastPing = start - std::chrono::seconds(1);
         auto lastAudioRequest = start;
         auto lastAudioStats = start;
+        uint64_t lastAudioPayloadBytes = 0;
         auto lastStats = start;
         bool gotAny = false;
         const auto msSince = [&start](std::chrono::steady_clock::time_point t) {
@@ -2963,9 +2966,17 @@ static int appMain(int argc, char** argv) {
             }
             if (audio && now - lastAudioStats >= std::chrono::seconds(10)) {
                 const auto a = audio->stats();
+                const double statsSec = std::chrono::duration<double>(now - lastAudioStats).count();
+                const double kbps = lastAudioPayloadBytes <= a.jb.payloadBytes && statsSec > 0
+                    ? double(a.jb.payloadBytes - lastAudioPayloadBytes) * 8.0 / 1000.0 / statsSec : 0.0;
+                lastAudioPayloadBytes = a.jb.payloadBytes;
                 std::ostringstream as;
                 as << std::fixed << std::setprecision(1)
-                   << "audio.stats rx=" << a.jb.packetsRx << " lost=" << a.jb.lost
+                   << "audio.stats codec=" << jl::audio::codecName(a.jb.codec) << " bitrate_kbps=" << kbps
+                   << " rx=" << a.jb.packetsRx << " lost=" << a.jb.lost
+                   << " fec_recovered=" << a.jb.fecRecovered << " plc_frames=" << a.jb.plcFrames
+                   << " drift_inserted=" << a.jb.driftInserted << " drift_dropped=" << a.jb.driftDropped
+                   << " decode_errors=" << a.jb.decodeErrors
                    << " late=" << a.jb.late << " underruns=" << a.jb.underruns
                    << " overflow_drops=" << a.jb.overflowDrops << " target_ms=" << a.jb.targetMs
                    << " jitter_ms=" << a.jb.jitterMs << " buffered_ms=" << a.jb.bufferedMs
@@ -3273,7 +3284,16 @@ static int appMain(int argc, char** argv) {
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
                 << " clipboard_oversize=" << (clipboard ? clipboard->skippedOversize() : 0)
                 << " audio=" << (audio ? "on" : "off")
+                << " audio_codec=" << jl::audio::codecName(audioStats.jb.codec)
+                << " audio_bitrate_kbps=" << (audioStats.jb.framesPlayed + audioStats.jb.framesSilence > 0
+                       ? double(audioStats.jb.payloadBytes) * 8.0 * 48.0
+                             / double(audioStats.jb.framesPlayed + audioStats.jb.framesSilence) : 0.0)
                 << " audio_packets_rx=" << audioStats.jb.packetsRx
+                << " audio_fec_recovered=" << audioStats.jb.fecRecovered
+                << " audio_plc_frames=" << audioStats.jb.plcFrames
+                << " audio_decode_errors=" << audioStats.jb.decodeErrors
+                << " audio_drift_inserted=" << audioStats.jb.driftInserted
+                << " audio_drift_dropped=" << audioStats.jb.driftDropped
                 << " audio_lost=" << audioStats.jb.lost
                 << " audio_late=" << audioStats.jb.late
                 << " audio_duplicates=" << audioStats.jb.duplicates

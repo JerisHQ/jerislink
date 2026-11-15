@@ -1,9 +1,11 @@
 #pragma once
-// Mac audio playback for the viewer (PR-A1: 48 kHz stereo s16 PCM in MRA1).
+// Mac audio playback for the viewer: 48 kHz stereo in MRA1, Opus (v2, A2)
+// or s16 PCM (v1, from an A1 host).
 //
 // Two threads, neither touches the UI or the input loop:
 //   net thread    - its own UDP socket on bindIp:0, recvfrom with a peer IP
 //                   check, pushes MRA1 packets into the jitter buffer.
+//                   Opus is decoded later, on the render thread, in order.
 //   render thread - MMCSS "Pro Audio", WASAPI shared mode, event driven, on
 //                   the default render device. Each event fills what the
 //                   device has room for from the jitter buffer. Reopens on
