@@ -1,5 +1,6 @@
 // Unit tests for viewer_options.hpp (launch config resolution). Console app; exit 0 = pass.
 #include "viewer_options.hpp"
+#include "bind_choices.hpp"
 
 #include <cstdio>
 
@@ -155,6 +156,73 @@ int main() {
         CHECK(!debugModeEnabled("true"));
         CHECK(!debugModeEnabled(" 1"));
         CHECK(!debugModeEnabled("1 "));
+    }
+
+    // "This PC's address": Auto matches the Mac address; manual choices.
+    {
+        const std::string t = "100.64.0.25";     // this PC on the tailnet
+        const std::string macT = "100.64.0.10";  // Mac on the tailnet
+        const std::string macC = "127.0.0.1";    // Mac through the Tailcat bridge
+        CHECK(isTailnetIPv4("100.64.0.1") && isTailnetIPv4("100.127.255.254"));
+        CHECK(!isTailnetIPv4("100.128.0.1") && !isTailnetIPv4("100.63.255.255"));
+        CHECK(isTailcatIPv4("127.0.0.1") && !isTailcatIPv4("128.0.0.1"));
+
+        // Auto rule.
+        CHECK(autoBindFor(macT, {t, true}).ip == t);
+        CHECK(autoBindFor(macT, {t, true}).reason == "auto-tailnet");
+        CHECK(autoBindFor(macC, {t, true}).ip == "127.0.0.1");
+        CHECK(autoBindFor(macC, {t, true}).reason == "auto-tailcat");
+        CHECK(autoBindFor(macC, {t, false}).ip == t);  // bridge missing: old rule
+        CHECK(autoBindFor(macC, {t, false}).reason == "fallback");
+        CHECK(autoBindFor(macT, {std::nullopt, true}).reason == "none");
+        CHECK(autoBindFor("192.0.2.25", {t, true}).ip == t);
+        CHECK(autoBindFor("192.0.2.25", {t, true}).reason == "fallback");
+        CHECK(autoBindFor("", {}).ip.empty());
+
+        // Launch: empty BindIp = Auto, saved IP = manual, --bind-ip wins.
+        SavedSettings s = typicalSaved();
+        s.hostIp = macC;
+        s.bindIp = "";
+        auto r = resolveLaunch({}, s, "", BindDetection{t, true});
+        CHECK(r.status == LaunchStatus::Ok && r.options.bindIp == "127.0.0.1");
+        CHECK(r.bindSource == "auto" && r.bindReason == "auto-tailcat");
+        s.hostIp = macT;
+        r = resolveLaunch({}, s, "", BindDetection{t, true});
+        CHECK(r.options.bindIp == t && r.bindReason == "auto-tailnet");
+        r = resolveLaunch({}, s, "", BindDetection{std::nullopt, true});
+        CHECK(r.status == LaunchStatus::NoTailnet && r.bindReason == "none");
+        s.bindIp = "127.0.0.1";
+        r = resolveLaunch({}, s, "", BindDetection{t, true});
+        CHECK(r.options.bindIp == "127.0.0.1" && r.bindSource == "saved" && r.bindReason == "manual");
+        r = resolveLaunch({"--bind-ip", "192.0.2.9"}, s, "", BindDetection{t, true});
+        CHECK(r.options.bindIp == "192.0.2.9" && r.bindReason == "cli");
+        CHECK(describeLaunch(r).find("bind_reason=cli\n") != std::string::npos);
+
+        // Dialog choices.
+        auto none = bindChoices({}, "");
+        CHECK(none.size() == 1 && none[0].kind == BindKind::Auto);
+        CHECK(initialBindChoice(none, "") == 0);
+        CHECK(bindValueToSave(none, 0, "") == "");
+        CHECK(bindValueToSave(none, -1, "192.0.2.7") == "192.0.2.7");
+
+        auto both = bindChoices({t, true}, "");
+        CHECK(both.size() == 3);
+        CHECK(both[1].kind == BindKind::Tailnet && both[1].ip == t);
+        CHECK(both[2].kind == BindKind::Tailcat && both[2].ip == "127.0.0.1");
+        CHECK(initialBindChoice(both, "") == 0);
+        CHECK(bindValueToSave(both, 0, t) == "");  // back to Auto
+        CHECK(bindValueToSave(both, 1, "") == t);
+        CHECK(bindValueToSave(both, 2, "") == "127.0.0.1");
+        CHECK(bindValueToSave(both, 7, "x") == "x");
+        CHECK(initialBindChoice(bindChoices({t, true}, t), t) == 1);
+        CHECK(initialBindChoice(bindChoices({t, true}, "127.0.0.1"), "127.0.0.1") == 2);
+
+        // A saved manual IP not detected now stays selectable and is kept.
+        auto kept = bindChoices({t, false}, "192.0.2.7");
+        CHECK(kept.size() == 3 && kept[2].kind == BindKind::Saved);
+        const int k = initialBindChoice(kept, "192.0.2.7");
+        CHECK(k == 2 && bindValueToSave(kept, k, "192.0.2.7") == "192.0.2.7");
+        CHECK(bindChoices({t, false}, "junk").size() == 2);
     }
 
     std::printf("viewer_options_test: %d checks, %d failures\n", gChecks, gFailures);

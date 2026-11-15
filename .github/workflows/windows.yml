@@ -37,22 +37,29 @@ jobs:
           New-ItemProperty -Path $key -Name VideoCodec -Value 0 -PropertyType DWord -Force | Out-Null
           New-ItemProperty -Path $key -Name VideoBitrateMbps -Value 0 -PropertyType DWord -Force | Out-Null
           New-ItemProperty -Path $key -Name AudioVolumePercent -Value 70 -PropertyType DWord -Force | Out-Null
-          $dir = Join-Path $env:RUNNER_TEMP 'ui-snapshots'
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          $log = Join-Path $dir 'snapshot.txt'
-          $p = Start-Process build\Release\JerislinkUiSnapshot.exe -ArgumentList $dir -PassThru -RedirectStandardOutput $log
-          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'snapshot did not exit' }
-          Get-Content $log -ErrorAction SilentlyContinue
+          $root = Join-Path $env:RUNNER_TEMP 'ui-snapshots'
+          $codes = @{}
+          foreach ($accent in 'blue', 'green') {
+            $dir = Join-Path $root $accent
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $log = Join-Path $dir 'snapshot.txt'
+            $p = Start-Process build\Release\JerislinkUiSnapshot.exe -ArgumentList $dir, $accent -PassThru -RedirectStandardOutput $log
+            if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "snapshot $accent did not exit" }
+            Get-Content $log -ErrorAction SilentlyContinue
+            $codes[$accent] = $p.ExitCode
+          }
           Remove-Item -Path $key -Recurse -Force
           Add-Type -AssemblyName System.Drawing
-          Get-ChildItem $dir -Filter *.bmp | ForEach-Object {
+          Get-ChildItem $root -Recurse -Filter *.bmp | ForEach-Object {
             $img = [System.Drawing.Image]::FromFile($_.FullName)
             $img.Save(($_.FullName -replace '\.bmp$', '.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-            Write-Host "$($_.Name) $($img.Width)x$($img.Height)"
+            Write-Host "$($_.Directory.Name)/$($_.Name) $($img.Width)x$($img.Height)"
             $img.Dispose()
             Remove-Item $_.FullName
           }
-          if ($p.ExitCode -ne 0) { throw "snapshot exit $($p.ExitCode)" }
+          foreach ($accent in $codes.Keys) {
+            if ($codes[$accent] -ne 0) { throw "snapshot $accent exit $($codes[$accent])" }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: jerislink-ui-snapshots

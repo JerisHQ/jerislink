@@ -775,6 +775,42 @@ static std::optional<std::string> detectTailscaleIPv4() {
     return std::nullopt;
 }
 
+// Tailcat bridge present: jeris-support-transport listens for the viewer's
+// control connection on 127.0.0.1:48400 (see bind_choices.hpp).
+static bool detectTailcatBridge() {
+    ULONG size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) !=
+        ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    std::vector<uint8_t> buffer(size + 1024);
+    size = static_cast<ULONG>(buffer.size());
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+    if (GetExtendedTcpTable(table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) !=
+        NO_ERROR) {
+        return false;
+    }
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        const uint32_t addr = ntohl(row.dwLocalAddr);
+        const uint16_t port = ntohs(static_cast<u_short>(row.dwLocalPort));
+        if (addr == 0x7F000001u && port == jl::kTailcatControlPort) return true;
+    }
+    return false;
+}
+
+#ifdef JERISLINK_UI_SNAPSHOT
+// The snapshot build shows fixed, made-up addresses.
+static std::optional<jl::BindDetection> gBindDetectionOverride;
+#endif
+
+static jl::BindDetection detectBindAddresses() {
+#ifdef JERISLINK_UI_SNAPSHOT
+    if (gBindDetectionOverride) return *gBindDetectionOverride;
+#endif
+    return jl::BindDetection{detectTailscaleIPv4(), detectTailcatBridge()};
+}
+
 static constexpr UINT IDM_VIDEO_SETTINGS = 0x1F10;
 static constexpr UINT IDM_CONNECTION_INFO = 0x1F11;
 static constexpr UINT IDM_AUDIO_MUTE = 0x1F20;  // low 4 bits clear: also used in the system menu
@@ -791,6 +827,7 @@ static int gSavedAudioVolumePct = jl::audio::kDefaultVolumePercent;
 static bool gAudioVolumeLoaded = false;
 static HWND gVolumeDlg = nullptr;  // modeless "Volume..." window
 static HWND gSettingsDlg = nullptr;  // settings dialog while open (Audio section)
+static bool gSettingsNoteError = false;  // its footer note shows a validation error
 
 static void updateAudioMuteMenus(HWND hwnd) {
     const UINT state = MF_BYCOMMAND | (gAudioMuted ? MF_CHECKED : MF_UNCHECKED);
@@ -922,6 +959,23 @@ static int loadAudioVolumePercent() {
     return jl::audio::volumePercentFromSaved(ok, value);
 }
 
+// Dialog accent in HKCU\Software\Jeris\Jerislink\UiAccent (REG_SZ):
+// "green" uses the JerisLink icon green; anything else, or missing, blue.
+static void loadUiAccent() {
+    const bool green = [] {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &key) !=
+            ERROR_SUCCESS) {
+            return false;
+        }
+        const std::string value = readRegString(key, L"UiAccent");
+        RegCloseKey(key);
+        return value == "green";
+    }();
+    jl::ui::setAccent(green);
+    logLine(std::string("ui.accent=") + (green ? "green" : "blue"));
+}
+
 static void ensureAudioVolumeLoaded() {
     if (gAudioVolumeLoaded) return;
     gAudioVolumeLoaded = true;
@@ -1029,15 +1083,18 @@ static void applyThemeFonts(HWND dlg) {
         }
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
     }
-    if (HWND combo = GetDlgItem(dlg, IDC_VIDEO_CODEC)) {
+    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP}) {
+        HWND combo = GetDlgItem(dlg, id);
+        if (!combo) continue;
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), comboFieldHeight(dlg));
         SendMessageW(combo, CB_SETITEMHEIGHT, 0, jl::ui::px(td->theme.dpi, 26));
     }
     RedrawWindow(dlg, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
-// The codec drop-down paints its own closed state: rounded field, text and
-// chevron, like the edit boxes. The list itself is owner-drawn items.
+// The drop-downs (codec, this PC's address) paint their own closed state:
+// rounded field, text and chevron, like the edit boxes. The list itself is
+// owner-drawn items. Disabled: muted text, no chevron (greyed info).
 // Classic GWLP_WNDPROC subclass: SetWindowSubclass is a comctl32 v6 API and
 // the viewer does not load v6.
 static constexpr wchar_t kComboOldProcProp[] = L"JerisLink.ComboProc";
@@ -1057,8 +1114,10 @@ static LRESULT CALLBACK ThemedComboProc(HWND combo, UINT msg, WPARAM wParam, LPA
         GetClientRect(combo, &r);
         jl::ui::fillRect(dc, r, jl::ui::color::kBody);
         const bool focus = GetFocus() == combo;
-        jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
-                          focus ? jl::ui::color::kAccent : jl::ui::color::kBorder,
+        const bool enabled = IsWindowEnabled(combo) != FALSE;
+        jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8),
+                          enabled ? jl::ui::color::kField : jl::ui::color::kBody,
+                          focus ? jl::ui::accent().accent : jl::ui::color::kBorder,
                           jl::ui::px(t.dpi, 1));
         wchar_t text[64]{};
         const LRESULT sel = SendMessageW(combo, CB_GETCURSEL, 0, 0);
@@ -1068,12 +1127,17 @@ static LRESULT CALLBACK ThemedComboProc(HWND combo, UINT msg, WPARAM wParam, LPA
         }
         HGDIOBJ oldFont = SelectObject(dc, t.text);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, jl::ui::color::kText);
+        SetTextColor(dc, enabled ? jl::ui::color::kText : jl::ui::color::kMuted);
         RECT tr = r;
         tr.left += jl::ui::px(t.dpi, 10);
         tr.right -= jl::ui::px(t.dpi, 28);
-        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(dc, text, -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         SelectObject(dc, oldFont);
+        if (!enabled) {
+            EndPaint(combo, &ps);
+            return 0;
+        }
         const int cx = r.right - jl::ui::px(t.dpi, 16);
         const int cy = (r.top + r.bottom) / 2;
         const int a = jl::ui::px(t.dpi, 4);
@@ -1085,6 +1149,7 @@ static LRESULT CALLBACK ThemedComboProc(HWND combo, UINT msg, WPARAM wParam, LPA
     }
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
+    case WM_ENABLE:
         InvalidateRect(combo, nullptr, FALSE);
         break;
     case WM_NCDESTROY:
@@ -1100,6 +1165,66 @@ static LRESULT CALLBACK ThemedComboProc(HWND combo, UINT msg, WPARAM wParam, LPA
                    : DefWindowProcW(combo, msg, wParam, lParam);
 }
 
+// The drop-down list (a ComboLBox popup) is painted dark from its first
+// frame: its class background brush and its erase both use the field colour,
+// so the open animation never shows a white cell before the items draw.
+static constexpr wchar_t kListOldProcProp[] = L"JerisLink.ListProc";
+
+static HBRUSH fieldBrush() {
+    static HBRUSH brush = CreateSolidBrush(jl::ui::color::kField);  // lives for the process
+    return brush;
+}
+
+static LRESULT CALLBACK ThemedComboListProc(HWND list, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const auto oldProc = reinterpret_cast<WNDPROC>(GetPropW(list, kListOldProcProp));
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        RECT r{};
+        GetClientRect(list, &r);
+        FillRect(reinterpret_cast<HDC>(wParam), &r, fieldBrush());
+        return 1;
+    }
+    case WM_NCDESTROY:
+        if (oldProc) {
+            SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(oldProc));
+            RemovePropW(list, kListOldProcProp);
+        }
+        break;
+    default:
+        break;
+    }
+    return oldProc ? CallWindowProcW(oldProc, list, msg, wParam, lParam)
+                   : DefWindowProcW(list, msg, wParam, lParam);
+}
+
+static void themeComboBox(HWND combo) {
+    const LONG_PTR old = SetWindowLongPtrW(combo, GWLP_WNDPROC,
+                                           reinterpret_cast<LONG_PTR>(ThemedComboProc));
+    SetPropW(combo, kComboOldProcProp, reinterpret_cast<HANDLE>(old));
+    COMBOBOXINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetComboBoxInfo(combo, &info) || !info.hwndList) return;
+    SetClassLongPtrW(info.hwndList, GCLP_HBRBACKGROUND, reinterpret_cast<LONG_PTR>(fieldBrush()));
+    const LONG_PTR oldList = SetWindowLongPtrW(info.hwndList, GWLP_WNDPROC,
+                                               reinterpret_cast<LONG_PTR>(ThemedComboListProc));
+    SetPropW(info.hwndList, kListOldProcProp, reinterpret_cast<HANDLE>(oldList));
+}
+
+// Drops exactly as many rows as there are items, so the list has no empty
+// area below the last item.
+static void fitComboDropHeight(HWND combo) {
+    COMBOBOXINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetComboBoxInfo(combo, &info)) return;
+    const int count = std::max<int>(1, static_cast<int>(SendMessageW(combo, CB_GETCOUNT, 0, 0)));
+    const int itemHeight = static_cast<int>(SendMessageW(combo, CB_GETITEMHEIGHT, 0, 0));
+    const int closedHeight = info.rcItem.bottom + info.rcItem.top;  // frame is symmetric
+    RECT r{};
+    GetWindowRect(combo, &r);
+    SetWindowPos(combo, nullptr, 0, 0, r.right - r.left, closedHeight + count * itemHeight + 2,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
     auto* td = new ThemedDialog;
     td->titlePt = titlePt;
@@ -1107,10 +1232,8 @@ static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
     td->theme.build(dlg, titlePt);
     SetWindowLongPtrW(dlg, DWLP_USER, reinterpret_cast<LONG_PTR>(td));
     jl::ui::applyWindowChrome(dlg);
-    if (HWND combo = GetDlgItem(dlg, IDC_VIDEO_CODEC)) {
-        const LONG_PTR old = SetWindowLongPtrW(combo, GWLP_WNDPROC,
-                                               reinterpret_cast<LONG_PTR>(ThemedComboProc));
-        SetPropW(combo, kComboOldProcProp, reinterpret_cast<HANDLE>(old));
+    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP}) {
+        if (HWND combo = GetDlgItem(dlg, id)) themeComboBox(combo);
     }
     applyThemeFonts(dlg);
 }
@@ -1132,13 +1255,11 @@ static void paintThemedDialog(HWND dlg, const ThemedDialog& td) {
     jl::ui::fillRect(dc, divider, jl::ui::color::kBorder);
     RECT pad{0, 0, 4, 3};
     MapDialogRect(dlg, &pad);
-    for (int id : {IDC_HOST_IP, IDC_BIND_IP}) {
-        HWND edit = GetDlgItem(dlg, id);
-        if (!edit) continue;
-        RECT r = jl::ui::childRect(dlg, id);
+    if (HWND edit = GetDlgItem(dlg, IDC_HOST_IP)) {
+        RECT r = jl::ui::childRect(dlg, IDC_HOST_IP);
         InflateRect(&r, pad.right, pad.bottom);
         jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
-                          GetFocus() == edit ? jl::ui::color::kAccent : jl::ui::color::kBorder,
+                          GetFocus() == edit ? jl::ui::accent().accent : jl::ui::color::kBorder,
                           jl::ui::px(t.dpi, 1));
     }
     EndPaint(dlg, &ps);
@@ -1180,12 +1301,13 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
         COLORREF fg = jl::ui::color::kText;
         switch (textRole(id)) {
-        case TextRole::Section: fg = jl::ui::color::kAccent; break;
+        case TextRole::Section: fg = jl::ui::accent().accent; break;
         case TextRole::Subtitle:
         case TextRole::Hint:
         case TextRole::Note: fg = jl::ui::color::kMuted; break;
         default: break;
         }
+        if (id == IDC_APPLY_NOTE && gSettingsNoteError) fg = jl::ui::color::kText;
         if (!IsWindowEnabled(reinterpret_cast<HWND>(lParam))) fg = jl::ui::color::kDisabled;
         const bool footer = isFooterControl(id);
         SetTextColor(dc, fg);
@@ -1236,7 +1358,7 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             }
             const bool selected = (di.itemState & ODS_SELECTED) != 0;
             jl::ui::fillRect(di.hDC, di.rcItem,
-                             selected ? jl::ui::color::kListSelected : jl::ui::color::kField);
+                             selected ? jl::ui::accent().listSelected : jl::ui::color::kField);
             if (di.itemID != static_cast<UINT>(-1)) {
                 wchar_t text[64]{};
                 if (SendMessageW(di.hwndItem, CB_GETLBTEXTLEN, di.itemID, 0) <
@@ -1273,6 +1395,10 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         const WORD code = HIWORD(wParam);
         if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
             invalidateFieldAround(dlg, reinterpret_cast<HWND>(lParam));
+        }
+        const int fromId = LOWORD(wParam);
+        if (code == CBN_DROPDOWN && (fromId == IDC_VIDEO_CODEC || fromId == IDC_BIND_IP)) {
+            fitComboDropHeight(reinterpret_cast<HWND>(lParam));
         }
         return false;  // the dialog's own handler still sees the command
     }
@@ -1410,6 +1536,12 @@ static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
 // routes its keyboard input through IsDialogMessage.
 static void showVolumeWindow(HWND owner, const char* source) {
     ensureAudioVolumeLoaded();
+    // One dialog at a time: Settings has the same volume controls.
+    if (gSettingsDlg) {
+        SetForegroundWindow(gSettingsDlg);
+        logLine(std::string("audio.volume.window source=") + source + " focused=settings");
+        return;
+    }
     if (gVolumeDlg) {
         SetForegroundWindow(gVolumeDlg);
         return;
@@ -1452,12 +1584,101 @@ static void updateBitrateControls(HWND dlg) {
     SetDlgItemTextW(dlg, IDC_BITRATE_VALUE, text.c_str());
 }
 
+// "This PC's address" for the open settings dialog (one at a time).
+static jl::BindDetection gBindDetection;
+static std::vector<jl::BindChoice> gBindChoices;
+static std::string gBindSaved;
+// The modal copy runs before connecting (Connect); from the running viewer
+// the dialog is modeless, so video and audio keep running while it is open.
+static bool gSettingsModal = false;
+
+static std::wstring bindChoiceLabel(const jl::BindChoice& c) {
+    switch (c.kind) {
+    case jl::BindKind::Auto: return L"Auto (match Mac address)";
+    case jl::BindKind::Tailnet: return L"Tailscale  " + wideFromAscii(c.ip);
+    case jl::BindKind::Tailcat: return L"Tailcat  " + wideFromAscii(c.ip);
+    case jl::BindKind::Saved: return L"Saved  " + wideFromAscii(c.ip);
+    }
+    return {};
+}
+
+static void fillBindChoices(HWND dlg) {
+    HWND combo = GetDlgItem(dlg, IDC_BIND_IP);
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    gBindDetection = detectBindAddresses();
+    gBindChoices = jl::bindChoices(gBindDetection, gBindSaved);
+    for (const auto& c : gBindChoices) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(bindChoiceLabel(c).c_str()));
+    }
+    SendMessageW(combo, CB_SETCURSEL, jl::initialBindChoice(gBindChoices, gBindSaved), 0);
+    // Nothing detected and nothing saved: Auto is the only entry, shown greyed.
+    EnableWindow(combo, gBindChoices.size() > 1 ? TRUE : FALSE);
+}
+
+// Greyed info under the drop-down: what Auto would use for the Mac address
+// typed above, or what the manual choice always uses.
+static void updateBindHint(HWND dlg) {
+    const LRESULT sel = SendDlgItemMessageW(dlg, IDC_BIND_IP, CB_GETCURSEL, 0, 0);
+    std::wstring hint;
+    if (sel > 0 && static_cast<size_t>(sel) < gBindChoices.size()) {
+        hint = L"Always uses " + wideFromAscii(gBindChoices[static_cast<size_t>(sel)].ip) +
+               L". Choose Auto to match the Mac address.";
+    } else {
+        const std::string host = asciiFromWide(dialogText(dlg, IDC_HOST_IP));
+        const jl::AutoBind a = jl::autoBindFor(host, gBindDetection);
+        const std::wstring ip = wideFromAscii(a.ip);
+        if (a.reason == "auto-tailnet") {
+            hint = L"Uses " + ip + L" (Tailscale), matching the Mac address.";
+        } else if (a.reason == "auto-tailcat") {
+            hint = L"Uses " + ip + L" (Tailcat bridge), matching the Mac address.";
+        } else if (a.reason == "fallback") {
+            if (jl::isTailcatIPv4(host)) {
+                hint = L"No Tailcat bridge on this PC (127.0.0.1:48400). Falls back to " + ip +
+                       L" (Tailscale).";
+            } else if (jl::isIPv4(host)) {
+                hint = L"The Mac address is not Tailscale or Tailcat. Falls back to " + ip +
+                       L" (Tailscale).";
+            } else {
+                hint = L"Uses " + ip + L" (Tailscale) until the Mac address is set.";
+            }
+        } else if (jl::isTailnetIPv4(host)) {
+            hint = L"No Tailscale address on this PC. Connect Tailscale first.";
+        } else if (jl::isTailcatIPv4(host)) {
+            hint = L"No Tailcat bridge on this PC (127.0.0.1:48400) and no Tailscale address.";
+        } else {
+            hint = L"No Tailscale or Tailcat address found on this PC.";
+        }
+    }
+    SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
+}
+
+static std::wstring settingsApplyNote(bool connect) {
+    return connect ? L"Saved for next time. Hold Shift while starting JerisLink to change them."
+                   : L"Connection and video changes apply the next time JerisLink starts.";
+}
+
+// Validation errors show in the footer note (no message box: it would stop
+// the viewer's main loop like a modal dialog does).
+static void showSettingsError(HWND dlg, const wchar_t* text, int focusId) {
+    gSettingsNoteError = true;
+    SetDlgItemTextW(dlg, IDC_APPLY_NOTE, text);
+    MessageBeep(MB_ICONWARNING);
+    if (focusId) SetFocus(GetDlgItem(dlg, focusId));
+}
+
+static void closeSettingsDialog(HWND dlg, INT_PTR result) {
+    if (gSettingsModal) EndDialog(dlg, result);
+    else DestroyWindow(dlg);
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     INT_PTR themed = 0;
     if (handleThemedDialogMessage(dlg, msg, wParam, lParam, themed)) return themed;
     switch (msg) {
     case WM_INITDIALOG: {
         gSettingsDlg = dlg;
+        gSettingsModal = lParam == kSettingsDialogConnect;
+        gSettingsNoteError = false;
         initThemedDialog(dlg, 15, kSettingsFooterTop);
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_ADDSTRING, 0,
                             reinterpret_cast<LPARAM>(L"Auto"));
@@ -1484,22 +1705,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         updateBitrateControls(dlg);
 
         SetDlgItemTextW(dlg, IDC_HOST_IP, wideFromAscii(settings.hostIp).c_str());
-        SetDlgItemTextW(dlg, IDC_BIND_IP, wideFromAscii(settings.bindIp).c_str());
-        const auto detected = detectTailscaleIPv4();
-        const std::wstring hint = detected
-            ? L"Leave empty to use this PC's Tailscale address (now " +
-                  wideFromAscii(*detected) + L")."
-            : std::wstring(L"Leave empty to use this PC's Tailscale address (none found now).");
-        SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
+        gBindSaved = settings.bindIp;
+        fillBindChoices(dlg);
+        updateBindHint(dlg);
 
         ensureAudioVolumeLoaded();
         initVolumeControls(dlg);
 
-        if (lParam == kSettingsDialogConnect) {
-            SetDlgItemTextW(dlg, IDOK, L"Connect");
-            SetDlgItemTextW(dlg, IDC_APPLY_NOTE,
-                            L"Saved for next time. Hold Shift while starting JerisLink to change them.");
-        }
+        if (gSettingsModal) SetDlgItemTextW(dlg, IDOK, L"Connect");
+        SetDlgItemTextW(dlg, IDC_APPLY_NOTE, settingsApplyNote(gSettingsModal).c_str());
         // Owner-drawn buttons cannot be BS_DEFPUSHBUTTON; Enter still means Save.
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
         SetForegroundWindow(dlg);
@@ -1531,14 +1745,25 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             toggleAudioMute(GetWindow(dlg, GW_OWNER), "settings");
             return TRUE;
         }
+        if ((LOWORD(wParam) == IDC_HOST_IP && HIWORD(wParam) == EN_CHANGE) ||
+            (LOWORD(wParam) == IDC_BIND_IP && HIWORD(wParam) == CBN_SELCHANGE)) {
+            updateBindHint(dlg);
+            if (gSettingsNoteError) {
+                gSettingsNoteError = false;
+                SetDlgItemTextW(dlg, IDC_APPLY_NOTE, settingsApplyNote(gSettingsModal).c_str());
+            }
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDCANCEL) {
             // Volume and mute already applied and stay; nothing else was saved.
-            EndDialog(dlg, IDCANCEL);
+            closeSettingsDialog(dlg, IDCANCEL);
             return TRUE;
         }
         if (LOWORD(wParam) == IDOK) {
             const std::string host = asciiFromWide(dialogText(dlg, IDC_HOST_IP));
-            const std::string bind = asciiFromWide(dialogText(dlg, IDC_BIND_IP));
+            const int bindIndex = static_cast<int>(
+                SendDlgItemMessageW(dlg, IDC_BIND_IP, CB_GETCURSEL, 0, 0));
+            const std::string bind = jl::bindValueToSave(gBindChoices, bindIndex, gBindSaved);
             const LRESULT selected = SendDlgItemMessageW(
                 dlg, IDC_VIDEO_CODEC, CB_GETCURSEL, 0, 0);
             const bool autoRate = jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO);
@@ -1547,28 +1772,18 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             const UINT bitrate = autoRate
                 ? 0u
                 : static_cast<UINT>(std::clamp(sliderValue, kBitrateSliderMin, kBitrateSliderMax));
-            logLine("settings.save_attempt host=" + host + " bind=" + bind +
+            logLine("settings.save_attempt host=" + host +
+                    " bind=" + (bind.empty() ? std::string("auto") : bind) +
                     " selected=" + std::to_string(selected) +
                     " bitrate_auto=" + (autoRate ? "yes" : "no") +
                     " bitrate=" + std::to_string(bitrate));
             if (!jl::isIPv4(host)) {
-                MessageBoxW(dlg,
-                    L"Enter the Mac host's Tailscale IPv4 address, for example 100.64.0.10.",
-                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
-                SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
-                return TRUE;
-            }
-            if (!bind.empty() && !jl::isIPv4(bind)) {
-                MessageBoxW(dlg,
-                    L"This PC's address must be an IPv4 address, or empty for automatic.",
-                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
-                SetFocus(GetDlgItem(dlg, IDC_BIND_IP));
+                showSettingsError(dlg, L"Enter the Mac's IPv4 address, e.g. 100.64.0.10.",
+                                  IDC_HOST_IP);
                 return TRUE;
             }
             if (selected == CB_ERR) {
-                MessageBoxW(dlg, L"Choose a codec.", L"JerisLink Settings",
-                            MB_OK | MB_ICONWARNING);
-                SetFocus(GetDlgItem(dlg, IDC_VIDEO_CODEC));
+                showSettingsError(dlg, L"Choose a codec.", IDC_VIDEO_CODEC);
                 return TRUE;
             }
             SavedSettings settings;
@@ -1578,15 +1793,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             settings.bitrateMbps = static_cast<uint16_t>(bitrate);
             if (!saveSettings(settings)) {
                 logLine("settings.save_failed");
-                MessageBoxW(dlg, L"Could not save JerisLink settings.",
-                            L"JerisLink", MB_OK | MB_ICONERROR);
+                showSettingsError(dlg, L"Could not save the settings.", 0);
                 return TRUE;
             }
             logLine("settings.saved host=" + settings.hostIp +
                     " bind=" + (settings.bindIp.empty() ? std::string("auto") : settings.bindIp) +
                     " codec=" + settings.codec +
                     " bitrate_mbps=" + std::to_string(settings.bitrateMbps));
-            EndDialog(dlg, IDOK);
+            closeSettingsDialog(dlg, IDOK);
             return TRUE;
         }
         break;
@@ -1594,6 +1808,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
     return FALSE;
 }
 
+// Before connecting: modal, the caller waits for Connect or Cancel.
 static INT_PTR runSettingsDialog(HWND owner, LPARAM mode) {
     ensureCommonControls();
     const INT_PTR result = DialogBoxParamW(
@@ -1605,12 +1820,24 @@ static INT_PTR runSettingsDialog(HWND owner, LPARAM mode) {
     return result;
 }
 
+// From the running viewer: modeless, like the volume window, so the main
+// loop keeps presenting video and keeping audio alive. One dialog at a time:
+// opening Settings closes the volume window (Settings has the same controls).
 static void showVideoSettings(HWND owner) {
-    if (runSettingsDialog(owner, kSettingsDialogSave) == IDOK) {
-        MessageBoxW(owner,
-            L"Settings saved. Connection and video changes apply the next time JerisLink starts.",
-            L"JerisLink", MB_OK | MB_ICONINFORMATION);
+    if (gSettingsDlg) {
+        SetForegroundWindow(gSettingsDlg);
+        return;
     }
+    if (gVolumeDlg) DestroyWindow(gVolumeDlg);
+    ensureCommonControls();
+    HWND dlg = CreateDialogParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_VIDEO_SETTINGS),
+                                  owner, SettingsDlgProc, kSettingsDialogSave);
+    if (!dlg) {
+        logLine("settings.dialog_create_failed error=" + std::to_string(GetLastError()));
+        return;
+    }
+    ShowWindow(dlg, SW_SHOW);
+    logLine("settings.window open=modeless");
 }
 
 static std::wstring utf8ToWide(const std::string& text) {
@@ -2186,8 +2413,9 @@ static void pumpMessages() {
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
         if (input) noteInputAge(m);
-        // Tab, arrows and Esc for the modeless volume window.
+        // Tab, arrows and Esc for the modeless volume and settings windows.
         if (gVolumeDlg && IsDialogMessageW(gVolumeDlg, &m)) continue;
+        if (gSettingsDlg && IsDialogMessageW(gSettingsDlg, &m)) continue;
         const double dispatchStart = steadyMsNow();
         const uint64_t modalEventsBefore = gModal.events();
         TranslateMessage(&m);
@@ -3050,12 +3278,13 @@ static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
     return jl::resolveLaunch(args, loadSavedSettings(), envValue("JERISLINK_SOURCE_IP"),
-                             detectTailscaleIPv4());
+                             detectBindAddresses());
 }
 
 static int appMain(int argc, char** argv) {
     gLog.start(kLogPath, kHistoryLogPath);
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
+    loadUiAccent();
     auto request = resolveLaunchFromSystem(argc, argv);
 
     // --print-config PATH: write the resolved connection and exit. Never shows UI.
@@ -3094,18 +3323,21 @@ static int appMain(int argc, char** argv) {
         return 2;
     }
     if (request.status == jl::LaunchStatus::NoTailnet) {
-        logLine("usage error: no active Tailscale IPv4 address");
+        logLine("usage error: no local address for the Mac address bind_reason=" +
+                request.bindReason);
         MessageBoxW(nullptr,
-            L"This PC has no active Tailscale address (100.64.x.x).\n\n"
-            L"Connect Tailscale and start JerisLink again, or hold Shift while starting "
-            L"JerisLink and enter this PC's address.",
+            L"This PC has no Tailscale address (100.64.x.x) and no Tailcat bridge "
+            L"that matches the Mac address.\n\n"
+            L"Connect Tailscale or start the Tailcat bridge and start JerisLink again, "
+            L"or hold Shift while starting JerisLink and choose this PC's address.",
             L"JerisLink", MB_OK | MB_ICONERROR);
         return 2;
     }
     logLine("launch.config host=" + request.options.sourceIp +
             " host_source=" + request.hostSource +
             " bind=" + request.options.bindIp +
-            " bind_source=" + request.bindSource);
+            " bind_source=" + request.bindSource +
+            " bind_reason=" + request.bindReason);
     Options o = request.options;
     gConnectionInfo = ConnectionInfoState{};
     gConnectionInfo.configuredCodec = o.codec;
@@ -4022,8 +4254,40 @@ static void snapshotWindow(HWND hwnd, const std::wstring& dir, const std::wstrin
                << L" print=" << b << L"\n";
 }
 
-static int runUiSnapshot(const std::wstring& dir) {
+// Screen pixels of a dialog with one of its drop-downs open. "-early" is
+// taken right after the list opens, to catch a first frame that is not dark.
+static void snapshotDropDown(HWND dlg, int comboId, const std::wstring& dir,
+                             const std::wstring& name) {
+    SetForegroundWindow(dlg);
+    pumpFor(200);
+    HWND combo = GetDlgItem(dlg, comboId);
+    SetFocus(combo);
+    SendMessageW(combo, CB_SHOWDROPDOWN, TRUE, 0);
+    RECT r{};
+    if (FAILED(DwmGetWindowAttribute(dlg, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) {
+        GetWindowRect(dlg, &r);
+    }
+    HDC screen = GetDC(nullptr);
+    pumpFor(16);
+    const bool early = writeBmp(dir + L"\\" + name + L"-early-screen.bmp", screen, r.left, r.top,
+                                r.right - r.left, r.bottom - r.top, nullptr);
+    pumpFor(700);
+    const bool open = SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) != 0;
+    const bool late = writeBmp(dir + L"\\" + name + L"-screen.bmp", screen, r.left, r.top,
+                               r.right - r.left, r.bottom - r.top, nullptr);
+    ReleaseDC(nullptr, screen);
+    SendMessageW(combo, CB_SHOWDROPDOWN, FALSE, 0);
+    pumpFor(200);
+    std::wcout << name << L" dropped=" << open << L" early=" << early << L" screen=" << late
+               << L"\n";
+}
+
+static int runUiSnapshot(const std::wstring& dir, bool green) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    jl::ui::setAccent(green);
+    std::wcout << L"accent=" << (green ? L"green" : L"blue") << L"\n";
+    // Made-up addresses: a tailnet IP and the Tailcat bridge both present.
+    gBindDetectionOverride = jl::BindDetection{std::string("100.64.0.25"), true};
     ensureCommonControls();
     ensureAudioVolumeLoaded();
     HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -4038,6 +4302,31 @@ static int runUiSnapshot(const std::wstring& dir) {
     SendMessageW(settings, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
     SetFocus(GetDlgItem(settings, IDC_VIDEO_BITRATE));
     snapshotWindow(settings, dir, L"settings-manual");
+    snapshotDropDown(settings, IDC_VIDEO_CODEC, dir, L"settings-codec-open");
+    snapshotDropDown(settings, IDC_BIND_IP, dir, L"settings-bind-open");
+    // Manual pick (Tailcat) and Auto with a Tailcat Mac address.
+    SendDlgItemMessageW(settings, IDC_BIND_IP, CB_SETCURSEL, 2, 0);
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BIND_IP, CBN_SELCHANGE),
+                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_BIND_IP)));
+    snapshotWindow(settings, dir, L"settings-bind-manual");
+    SendDlgItemMessageW(settings, IDC_BIND_IP, CB_SETCURSEL, 0, 0);
+    SetDlgItemTextW(settings, IDC_HOST_IP, L"127.0.0.1");  // EN_CHANGE updates the hint
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BIND_IP, CBN_SELCHANGE),
+                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_BIND_IP)));
+    snapshotWindow(settings, dir, L"settings-bind-tailcat");
+    // Nothing detected: Auto only, greyed, with the reason below.
+    gBindDetectionOverride = jl::BindDetection{};
+    fillBindChoices(settings);
+    SetDlgItemTextW(settings, IDC_HOST_IP, L"100.64.0.10");
+    snapshotWindow(settings, dir, L"settings-bind-none");
+    const bool bindGreyed = !IsWindowEnabled(GetDlgItem(settings, IDC_BIND_IP));
+    gBindDetectionOverride = jl::BindDetection{std::string("100.64.0.25"), true};
+    // Validation error in the footer, no message box.
+    SetDlgItemTextW(settings, IDC_HOST_IP, L"");
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    snapshotWindow(settings, dir, L"settings-error");
+    const bool stillOpen = IsWindow(settings) && gSettingsDlg == settings;
+    SetDlgItemTextW(settings, IDC_HOST_IP, L"100.64.0.10");
     // Settings Audio section and the volume window open together stay in step.
     SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_VOLUME_MUTE, BN_CLICKED), 0);
 
@@ -4060,7 +4349,26 @@ static int runUiSnapshot(const std::wstring& dir) {
     DestroyWindow(volume);
     DestroyWindow(settings);
     pumpFor(100);
-    return synced ? 0 : 4;
+
+    // One dialog at a time, through the same calls as the viewer's menus.
+    showVolumeWindow(nullptr, "snapshot");
+    const bool volumeFirst = gVolumeDlg != nullptr;
+    showVideoSettings(nullptr);  // closes the volume window
+    pumpFor(100);
+    const bool settingsClosedVolume = gSettingsDlg != nullptr && gVolumeDlg == nullptr;
+    showVolumeWindow(nullptr, "snapshot");  // focuses settings instead
+    const bool volumeRefused = gVolumeDlg == nullptr;
+    const bool modeless = gSettingsDlg && !gSettingsModal;
+    if (gSettingsDlg) SendMessageW(gSettingsDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    pumpFor(100);
+    const bool closed = gSettingsDlg == nullptr;
+    const bool oneDialog = volumeFirst && settingsClosedVolume && volumeRefused && modeless && closed;
+    std::wcout << L"one_dialog=" << (oneDialog ? L"ok" : L"FAIL") << L" bind_greyed=" << bindGreyed
+               << L" error_inline=" << stillOpen << L"\n";
+    if (!synced) return 4;
+    if (!oneDialog) return 5;
+    if (!bindGreyed || !stillOpen) return 6;
+    return 0;
 }
 #endif
 
@@ -4070,8 +4378,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 #ifdef JERISLINK_UI_SNAPSHOT
     if (wideArgv && argc >= 2) {
         const std::wstring dir = wideArgv[1];
+        const bool green = argc >= 3 && std::wstring(wideArgv[2]) == L"green";
         LocalFree(wideArgv);
-        return runUiSnapshot(dir);
+        return runUiSnapshot(dir, green);
     }
 #endif
     if (!wideArgv || argc <= 0) {

@@ -10,6 +10,14 @@
 //   muted  #A3B1C6 on body 7.9, on footer 8.5
 //   accent #4C9AFF on body 6.0
 //   text   #F4F8FF on primary button #2563EB 4.9
+//
+// Two accent palettes, picked at start-up (HKCU ...\Jerislink\UiAccent):
+//   blue  (default) as above
+//   green #01DAE3, the ring colour of the JerisLink icon
+//         (msix/icon-src/JerisLink-v2.0-1024.png). White text on it is only
+//         1.6:1, so the Save button and check-box tick use dark #0C1424
+//         (10.6:1; 6.8:1 on the pressed shade #01AEB6). Accent on body 9.9,
+//         focus ring #7FF0F5 on body 12.9, text on selected item #0E4A55 9.3.
 
 #include <windows.h>
 #include <commctrl.h>
@@ -29,14 +37,33 @@ constexpr COLORREF kBorder = RGB(0x2B, 0x44, 0x63);        // window border, inp
 constexpr COLORREF kText = RGB(0xF4, 0xF8, 0xFF);          // primary text, caption text
 constexpr COLORREF kMuted = RGB(0xA3, 0xB1, 0xC6);         // hints, secondary text
 constexpr COLORREF kDisabled = RGB(0x5D, 0x6B, 0x80);      // disabled slider and text
-constexpr COLORREF kAccent = RGB(0x4C, 0x9A, 0xFF);        // section headers, slider fill, focus
-constexpr COLORREF kFocusRing = RGB(0x8D, 0xBB, 0xFF);     // keyboard focus ring
-constexpr COLORREF kPrimary = RGB(0x25, 0x63, 0xEB);       // Save / Connect button
-constexpr COLORREF kPrimaryDown = RGB(0x1D, 0x4F, 0xC4);
 constexpr COLORREF kSecondary = RGB(0x18, 0x24, 0x3A);     // Cancel / Close button
 constexpr COLORREF kSecondaryDown = RGB(0x22, 0x31, 0x4C);
-constexpr COLORREF kListSelected = RGB(0x1E, 0x3A, 0x66);  // highlighted drop-down item
 }  // namespace color
+
+// The colours that change with the accent choice.
+struct AccentPalette {
+    COLORREF accent;        // section headers, slider fill, focused field border
+    COLORREF focusRing;     // keyboard focus ring
+    COLORREF primary;       // Save / Connect button, checked box
+    COLORREF primaryDown;   // pressed primary button
+    COLORREF primaryText;   // text and tick on primary
+    COLORREF listSelected;  // highlighted drop-down item
+};
+
+constexpr AccentPalette kBlueAccent{RGB(0x4C, 0x9A, 0xFF), RGB(0x8D, 0xBB, 0xFF),
+                                    RGB(0x25, 0x63, 0xEB), RGB(0x1D, 0x4F, 0xC4),
+                                    RGB(0xF4, 0xF8, 0xFF), RGB(0x1E, 0x3A, 0x66)};
+constexpr AccentPalette kGreenAccent{RGB(0x01, 0xDA, 0xE3), RGB(0x7F, 0xF0, 0xF5),
+                                     RGB(0x01, 0xDA, 0xE3), RGB(0x01, 0xAE, 0xB6),
+                                     RGB(0x0C, 0x14, 0x24), RGB(0x0E, 0x4A, 0x55)};
+
+inline AccentPalette& accentStorage() {
+    static AccentPalette p = kBlueAccent;
+    return p;
+}
+inline const AccentPalette& accent() { return accentStorage(); }
+inline void setAccent(bool green) { accentStorage() = green ? kGreenAccent : kBlueAccent; }
 
 // The viewer's title-bar look, for any top-level window of the viewer.
 // Best effort: older Windows builds ignore attributes they do not know.
@@ -167,7 +194,7 @@ inline void setOwnerChecked(HWND dlg, int id, bool on) {
     InvalidateRect(b, nullptr, FALSE);
 }
 
-// Push button: primary (filled blue) or secondary (outlined).
+// Push button: primary (filled accent) or secondary (outlined).
 inline void drawButton(const DRAWITEMSTRUCT& di, const DialogTheme& t, bool primary,
                        COLORREF behind) {
     HDC dc = di.hDC;
@@ -175,15 +202,16 @@ inline void drawButton(const DRAWITEMSTRUCT& di, const DialogTheme& t, bool prim
     fillRect(dc, r, behind);
     const bool down = (di.itemState & ODS_SELECTED) != 0;
     const bool focus = (di.itemState & ODS_FOCUS) && !(di.itemState & ODS_NOFOCUSRECT);
-    const COLORREF fill = primary ? (down ? color::kPrimaryDown : color::kPrimary)
+    const AccentPalette& a = accent();
+    const COLORREF fill = primary ? (down ? a.primaryDown : a.primary)
                                   : (down ? color::kSecondaryDown : color::kSecondary);
-    const COLORREF edge = focus ? color::kFocusRing : (primary ? fill : color::kBorder);
+    const COLORREF edge = focus ? a.focusRing : (primary ? fill : color::kBorder);
     roundRect(dc, r, px(t.dpi, 8), fill, edge, focus ? px(t.dpi, 2) : px(t.dpi, 1));
     wchar_t text[64]{};
     GetWindowTextW(di.hwndItem, text, static_cast<int>(std::size(text)));
     HGDIOBJ oldFont = SelectObject(dc, primary ? t.label : t.text);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, color::kText);
+    SetTextColor(dc, primary ? a.primaryText : color::kText);
     RECT tr = r;
     DrawTextW(dc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_HIDEPREFIX);
     SelectObject(dc, oldFont);
@@ -199,16 +227,17 @@ inline void drawCheckBox(const DRAWITEMSTRUCT& di, const DialogTheme& t, bool ch
     const int box = px(t.dpi, 16);
     const int top = r.top + (r.bottom - r.top - box) / 2;
     const RECT b{r.left + px(t.dpi, 1), top, r.left + px(t.dpi, 1) + box, top + box};
-    roundRect(dc, b, px(t.dpi, 5), checked ? color::kPrimary : color::kField,
-              focus ? color::kFocusRing : (checked ? color::kPrimary : color::kBorder),
+    const AccentPalette& a = accent();
+    roundRect(dc, b, px(t.dpi, 5), checked ? a.primary : color::kField,
+              focus ? a.focusRing : (checked ? a.primary : color::kBorder),
               focus ? px(t.dpi, 2) : px(t.dpi, 1));
     if (checked) {
         const int w = std::max(1, px(t.dpi, 2));
         const int x0 = b.left + box * 4 / 16, y0 = b.top + box * 8 / 16;
         const int x1 = b.left + box * 7 / 16, y1 = b.top + box * 11 / 16;
         const int x2 = b.left + box * 12 / 16, y2 = b.top + box * 5 / 16;
-        line(dc, x0, y0, x1, y1, color::kText, w);
-        line(dc, x1, y1, x2, y2, color::kText, w);
+        line(dc, x0, y0, x1, y1, a.primaryText, w);
+        line(dc, x1, y1, x2, y2, a.primaryText, w);
     }
     wchar_t text[64]{};
     GetWindowTextW(di.hwndItem, text, static_cast<int>(std::size(text)));
@@ -223,7 +252,7 @@ inline void drawCheckBox(const DRAWITEMSTRUCT& di, const DialogTheme& t, bool ch
 
 // Trackbar custom draw (WM_NOTIFY / NM_CUSTOMDRAW). Paints the whole control
 // at CDDS_PREPAINT and skips the default drawing (so no dotted focus box):
-// flat track, blue fill up to the thumb, round thumb, a ring when focused.
+// flat track, accent fill up to the thumb, round thumb, a ring when focused.
 inline LRESULT drawSlider(const NMCUSTOMDRAW& cd, const DialogTheme& t) {
     if (cd.dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
     HWND slider = cd.hdr.hwndFrom;
@@ -243,16 +272,16 @@ inline LRESULT drawSlider(const NMCUSTOMDRAW& cd, const DialogTheme& t) {
     if (enabled && cx > track.left) {
         RECT filled = track;
         filled.right = cx;
-        roundRect(cd.hdc, filled, h, color::kAccent, color::kAccent);
+        roundRect(cd.hdc, filled, h, accent().accent, accent().accent);
     }
     const int d = px(t.dpi, 16);
     RECT dot{cx - d / 2, cy - d / 2, cx - d / 2 + d, cy - d / 2 + d};
     if (focus) {
         const int g = px(t.dpi, 3);
         RECT ring{dot.left - g, dot.top - g, dot.right + g, dot.bottom + g};
-        ellipse(cd.hdc, ring, color::kBody, color::kFocusRing, px(t.dpi, 2));
+        ellipse(cd.hdc, ring, color::kBody, accent().focusRing, px(t.dpi, 2));
     }
-    ellipse(cd.hdc, dot, enabled ? color::kAccent : color::kDisabled,
+    ellipse(cd.hdc, dot, enabled ? accent().accent : color::kDisabled,
             enabled ? color::kText : color::kDisabled, px(t.dpi, 2));
     return CDRF_SKIPDEFAULT;
 }

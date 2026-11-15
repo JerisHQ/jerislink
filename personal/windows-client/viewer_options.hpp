@@ -5,8 +5,12 @@
 //
 // Priority, per value:
 //   host (Mac) IP : --source-ip  > saved HostIp > JERISLINK_SOURCE_IP
-//   this PC's IP  : --bind-ip    > saved BindIp > first active 100.64.0.0/10 address
+//   this PC's IP  : --bind-ip    > saved BindIp (manual) > Auto: match the Mac
+//                   address (tailnet or Tailcat, see bind_choices.hpp), falling
+//                   back to the first active 100.64.0.0/10 address
 //   codec/bitrate : --codec/--bitrate-mbps > saved > defaults (h264, 25)
+
+#include "bind_choices.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -61,27 +65,9 @@ struct LaunchRequest {
     std::string printConfigPath;     // --print-config PATH: write the result and exit
     std::string hostSource = "none"; // cli | saved | env | none
     std::string bindSource = "none"; // cli | saved | auto | none
+    std::string bindReason = "none"; // cli | manual | auto-tailnet | auto-tailcat | fallback | none
     std::string error;
 };
-
-inline bool isIPv4(const std::string& s) {
-    int parts = 0;
-    size_t i = 0;
-    while (i <= s.size()) {
-        size_t j = i;
-        while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
-        const size_t len = j - i;
-        if (len == 0 || len > 3) return false;
-        if (len > 1 && s[i] == '0') return false;
-        if (std::stoi(s.substr(i, len)) > 255) return false;
-        ++parts;
-        if (j == s.size()) break;
-        if (s[j] != '.') return false;
-        i = j + 1;
-        if (i == s.size()) return false;
-    }
-    return parts == 4;
-}
 
 inline const char* statusName(LaunchStatus s) {
     switch (s) {
@@ -97,7 +83,7 @@ inline const char* statusName(LaunchStatus s) {
 inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
                                    const SavedSettings& saved,
                                    const std::string& envSourceIp,
-                                   const std::optional<std::string>& detectedBindIp) {
+                                   const BindDetection& detected) {
     LaunchRequest r;
     Options& o = r.options;
     o.codec = saved.codec;
@@ -163,16 +149,33 @@ inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
     if (o.sourceIp.empty() && isIPv4(saved.hostIp)) { o.sourceIp = saved.hostIp; r.hostSource = "saved"; }
     if (o.sourceIp.empty() && !envSourceIp.empty()) { o.sourceIp = envSourceIp; r.hostSource = "env"; }
 
-    if (o.bindIp.empty() && isIPv4(saved.bindIp)) { o.bindIp = saved.bindIp; r.bindSource = "saved"; }
-    if (o.bindIp.empty() && detectedBindIp && !detectedBindIp->empty()) {
-        o.bindIp = *detectedBindIp;
-        r.bindSource = "auto";
+    if (!o.bindIp.empty()) r.bindReason = "cli";
+    if (o.bindIp.empty() && isIPv4(saved.bindIp)) {
+        o.bindIp = saved.bindIp;
+        r.bindSource = "saved";
+        r.bindReason = "manual";
+    }
+    if (o.bindIp.empty()) {
+        const AutoBind a = autoBindFor(o.sourceIp, detected);
+        if (!a.ip.empty()) {
+            o.bindIp = a.ip;
+            r.bindSource = "auto";
+        }
+        r.bindReason = a.reason;
     }
 
     if (o.sourceIp.empty()) r.status = LaunchStatus::NeedsSetup;
     else if (o.bindIp.empty()) r.status = LaunchStatus::NoTailnet;
     else r.status = LaunchStatus::Ok;
     return r;
+}
+
+// Tailnet detection only (no Tailcat bridge).
+inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
+                                   const SavedSettings& saved,
+                                   const std::string& envSourceIp,
+                                   const std::optional<std::string>& detectedTailnetIp) {
+    return resolveLaunch(args, saved, envSourceIp, BindDetection{detectedTailnetIp, false});
 }
 
 inline std::string describeLaunch(const LaunchRequest& r) {
@@ -182,6 +185,7 @@ inline std::string describeLaunch(const LaunchRequest& r) {
       << "host_source=" << r.hostSource << "\n"
       << "bind=" << r.options.bindIp << "\n"
       << "bind_source=" << r.bindSource << "\n"
+      << "bind_reason=" << r.bindReason << "\n"
       << "codec=" << r.options.codec << "\n"
       << "bitrate_mbps=" << r.options.bitrateMbps << "\n"
       << "open_settings=" << (r.openSettings ? 1 : 0) << "\n";
