@@ -1,9 +1,15 @@
 JerisLink MSIX sideload test package
 ====================================
 
-This is a TEST build of the Microsoft Store package. It is signed with a
-throwaway self-signed certificate made by CI for this one build. The Store
+This is a TEST build of the Microsoft Store package. It is signed with the
+fixed JerisLink sideload test certificate (self-signed). Every CI sideload
+build uses the same certificate, so you trust it once per PC. The Store
 version will be signed by Microsoft instead.
+
+Test certificate
+  Subject      CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
+  SHA1         5E6E211F60E17FFD44F7772BE0E8C11E40DD6661
+  Valid until  2028-11-14
 
 Files
   Jerislink-<version>.0-x64-sideload.msix   the package
@@ -17,11 +23,19 @@ Install (Windows 10 1809 or later, PowerShell as Administrator)
   1. Check the files:
        Get-FileHash .\*.msix, .\*.cer -Algorithm SHA256
      and compare with SHA256SUMS.txt.
-  2. Trust the test certificate for package installs only:
+  2. Once per PC: trust the test certificate for package installs only.
+     Check the thumbprint is the SHA1 above, then import it:
+       (Get-PfxCertificate .\JerisLink-sideload-test.cer).Thumbprint
        Import-Certificate -FilePath .\JerisLink-sideload-test.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+     Skip this step if it is already there:
+       Test-Path Cert:\LocalMachine\TrustedPeople\5E6E211F60E17FFD44F7772BE0E8C11E40DD6661
   3. Install:
        Add-AppxPackage -Path .\Jerislink-<version>.0-x64-sideload.msix
   4. Start "JerisLink" from the Start menu.
+
+If the thumbprint is not the SHA1 above, this build was made without the
+CI secret (for example in a fork) and signed with a throwaway certificate.
+Import that build's .cer as in step 2, or ask for a build from the main repo.
 
 Notes
   - Settings in the packaged app are kept apart from the normal (Inno Setup)
@@ -31,5 +45,7 @@ Notes
 
 Remove
   Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage
+  Remove-Item Cert:\LocalMachine\TrustedPeople\5E6E211F60E17FFD44F7772BE0E8C11E40DD6661
+  Old throwaway test certificates from earlier builds have the same subject:
   Get-ChildItem Cert:\LocalMachine\TrustedPeople |
     Where-Object Subject -eq 'CN=89A018EB-5C52-49CB-B478-B462FA6B08DD' | Remove-Item
