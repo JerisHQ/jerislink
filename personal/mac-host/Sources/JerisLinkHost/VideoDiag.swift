@@ -196,7 +196,7 @@ struct H264SPSInfo: Equatable {
         return out
     }
 
-    private struct BitReader {
+    fileprivate struct BitReader {
         let bytes: [UInt8]
         var pos = 0
 
@@ -342,6 +342,212 @@ final class EncodedFormatLog: @unchecked Sendable {
         lock.unlock()
         if changed {
             print("encoder.format \(text)")
+            fflush(stdout)
+        }
+    }
+}
+
+/// JERISLINK_DEBUG=1 (or true/on) turns on the per-frame slice log. Read once.
+enum VideoDebug {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["JERISLINK_DEBUG"] else { return false }
+        return ["1", "true", "on", "yes"].contains(raw.lowercased())
+    }()
+}
+
+/// NAL units and slice headers of one encoded H.264 access unit: NAL types and
+/// sizes, and for each slice its first_mb_in_slice and slice_type. Parsing
+/// reads only the first bytes of each slice header.
+struct H264FrameSummary: Equatable {
+    struct Slice: Equatable {
+        var nalType: Int
+        var firstMb: Int
+        /// slice_type % 5: 0 P, 1 B, 2 I, 3 SP, 4 SI. -1 when unparsed.
+        var sliceType: Int
+        var bytes: Int
+    }
+
+    var nalTypes: [Int] = []
+    var nalSizes: [Int] = []
+    var slices: [Slice] = []
+
+    var totalBytes: Int { nalSizes.reduce(0, +) }
+    var idr: Bool { nalTypes.contains(5) }
+
+    /// One letter per slice type.
+    static func typeLetter(_ t: Int) -> String {
+        switch t {
+        case 0: return "P"
+        case 1: return "B"
+        case 2: return "I"
+        case 3: return "SP"
+        case 4: return "SI"
+        default: return "?"
+        }
+    }
+
+    /// The frame type: "IDR", "I", "P", "B" or "mixed".
+    var frameType: String {
+        if idr { return "IDR" }
+        let letters = Set(slices.map { Self.typeLetter($0.sliceType) })
+        if letters.count == 1, let only = letters.first { return only }
+        return letters.isEmpty ? "none" : "mixed"
+    }
+
+    /// Slice layout only (count, first_mb, types): changes in it are logged.
+    var layout: String {
+        "slices=\(slices.count) first_mb=\(slices.map { String($0.firstMb) }.joined(separator: ","))"
+    }
+
+    var line: String {
+        let nals = zip(nalTypes, nalSizes).map { "\($0):\($1)" }.joined(separator: ",")
+        let types = slices.map { Self.typeLetter($0.sliceType) }.joined(separator: ",")
+        let sizes = slices.map { String($0.bytes) }.joined(separator: ",")
+        return "type=\(frameType) bytes=\(totalBytes) nals=\(nals) \(layout) slice_types=\(types) slice_bytes=\(sizes)"
+    }
+
+    /// Index of the slice that holds macroblock `mb` (raster order), or nil.
+    func slice(containing mb: Int) -> Int? {
+        var found: Int?
+        for (i, s) in slices.enumerated() where s.firstMb <= mb {
+            if found == nil || s.firstMb >= slices[found!].firstMb { found = i }
+        }
+        return found
+    }
+
+    mutating func add(nal: UnsafeRawBufferPointer) {
+        guard let header = nal.first else { return }
+        let type = Int(header & 0x1f)
+        nalTypes.append(type)
+        nalSizes.append(nal.count)
+        guard type == 1 || type == 5 else { return }
+        // first_mb_in_slice and slice_type fit easily in 16 escaped bytes.
+        let head = H264SPSInfo.unescape(Array(nal.dropFirst().prefix(16)))
+        var r = H264SPSInfo.BitReader(bytes: head)
+        let firstMb = r.ue() ?? -1
+        let sliceType = r.ue().map { $0 % 5 } ?? -1
+        slices.append(Slice(nalType: type, firstMb: firstMb, sliceType: sliceType, bytes: nal.count))
+    }
+
+    /// Length-prefixed (AVCC) NAL units, as VideoToolbox emits them.
+    static func parseAVCC(_ data: UnsafeRawBufferPointer, lengthSize: Int = 4) -> H264FrameSummary? {
+        guard (1...4).contains(lengthSize) else { return nil }
+        var out = H264FrameSummary()
+        var offset = 0
+        while offset + lengthSize <= data.count {
+            var length = 0
+            for i in 0..<lengthSize { length = (length << 8) | Int(data[offset + i]) }
+            offset += lengthSize
+            guard length > 0, offset + length <= data.count else { return nil }
+            out.add(nal: UnsafeRawBufferPointer(rebasing: data[offset..<(offset + length)]))
+            offset += length
+        }
+        return out.nalTypes.isEmpty ? nil : out
+    }
+
+    static func parseAVCC(_ bytes: [UInt8], lengthSize: Int = 4) -> H264FrameSummary? {
+        bytes.withUnsafeBytes { parseAVCC($0, lengthSize: lengthSize) }
+    }
+
+    /// Start-code (Annex B) NAL units, as the viewer receives them.
+    static func parseAnnexB(_ bytes: [UInt8]) -> H264FrameSummary {
+        var out = H264FrameSummary()
+        var starts: [(code: Int, payload: Int)] = []
+        var i = 0
+        while i + 3 <= bytes.count {
+            if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
+                let code = (i > 0 && bytes[i - 1] == 0) ? i - 1 : i
+                starts.append((code, i + 3))
+                i += 3
+            } else {
+                i += 1
+            }
+        }
+        bytes.withUnsafeBytes { raw in
+            for (n, s) in starts.enumerated() {
+                let end = n + 1 < starts.count ? starts[n + 1].code : bytes.count
+                if end > s.payload { out.add(nal: UnsafeRawBufferPointer(rebasing: raw[s.payload..<end])) }
+            }
+        }
+        return out
+    }
+
+    /// The summary of an encoded H.264 sample buffer.
+    static func from(_ sample: CMSampleBuffer) -> H264FrameSummary? {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        var lengthSize: Int32 = 4
+        if let format = CMSampleBufferGetFormatDescription(sample) {
+            var count = 0
+            _ = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+                parameterSetCountOut: &count, nalUnitHeaderLengthOut: &lengthSize)
+        }
+        let total = CMBlockBufferGetDataLength(block)
+        guard total > 0 else { return nil }
+        var lengthAtOffset = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        if CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset,
+                                       totalLengthOut: nil, dataPointerOut: &pointer) == kCMBlockBufferNoErr,
+           let pointer, lengthAtOffset == total {
+            return parseAVCC(UnsafeRawBufferPointer(start: pointer, count: total), lengthSize: Int(lengthSize))
+        }
+        var copy = [UInt8](repeating: 0, count: total)
+        let status = copy.withUnsafeMutableBytes {
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: total, destination: $0.baseAddress!)
+        }
+        guard status == kCMBlockBufferNoErr else { return nil }
+        return parseAVCC(copy, lengthSize: Int(lengthSize))
+    }
+}
+
+/// Per-frame slice/NAL lines on the host, only with JERISLINK_DEBUG=1. Logs
+/// the first `initialFrames` frames, every keyframe and every slice layout
+/// change, otherwise at most one line per `interval` seconds, and never more
+/// than `maxLines` in total. Thread-safe.
+final class H264SliceLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private let initialFrames: Int
+    private let interval: Double
+    private let maxLines: Int
+    private var frames = 0
+    private var lines = 0
+    private var lastLayout: String?
+    private var lastLineAt = -Double.infinity
+    private var skippedSinceLine = 0
+    private(set) var suppressed = 0
+
+    init(initialFrames: Int = 30, interval: Double = 1.0, maxLines: Int = 600) {
+        self.initialFrames = initialFrames
+        self.interval = interval
+        self.maxLines = maxLines
+    }
+
+    /// Returns the line to print for this frame, or nil.
+    func note(_ summary: H264FrameSummary, frameID: UInt64, keyFrame: Bool, now: Double) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        frames += 1
+        let layoutChanged = lastLayout != nil && summary.layout != lastLayout
+        lastLayout = summary.layout
+        let due = frames <= initialFrames || keyFrame || layoutChanged || now - lastLineAt >= interval
+        guard due, lines < maxLines else {
+            suppressed += 1
+            skippedSinceLine += 1
+            return nil
+        }
+        lines += 1
+        lastLineAt = now
+        let skipped = skippedSinceLine
+        skippedSinceLine = 0
+        return "h264.slices fid=\(frameID) \(summary.line)\(layoutChanged ? " layout_changed=1" : "")"
+            + (skipped > 0 ? " skipped=\(skipped)" : "")
+    }
+
+    func note(_ sample: CMSampleBuffer, frameID: UInt64, keyFrame: Bool) {
+        guard let summary = H264FrameSummary.from(sample) else { return }
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        if let line = note(summary, frameID: frameID, keyFrame: keyFrame, now: now) {
+            print(line)
             fflush(stdout)
         }
     }

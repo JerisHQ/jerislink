@@ -95,6 +95,58 @@ enum VideoDiagSelfTest {
         expect(same == nil && changed != nil && overBudget == nil && log.changes == 2 && log.lines == 2,
                "capture log: repeats are quiet, changes are counted, the line budget holds")
 
+        // Slice/NAL summary: golden slice headers (first_mb_in_slice, slice_type).
+        let sps: [UInt8] = [0x67, 0x64, 0x00, 0x34, 0xac, 0xda, 0x00, 0xf0, 0x01, 0x0f, 0x90]
+        let pps: [UInt8] = [0x68, 0xce, 0x3c, 0x80]
+        let idr0: [UInt8] = [0x65, 0x88, 0xc0, 0x11, 0x22]
+        let idr4080: [UInt8] = [0x65, 0x00, 0x1f, 0xe2, 0x23, 0x44]
+        let p0: [UInt8] = [0x41, 0x9b, 0x10]
+        let p25440: [UInt8] = [0x41, 0x00, 0x03, 0x1b, 0x0f]
+        func avcc(_ nals: [[UInt8]]) -> [UInt8] {
+            nals.flatMap { n in [UInt8(n.count >> 24 & 0xff), UInt8(n.count >> 16 & 0xff), UInt8(n.count >> 8 & 0xff), UInt8(n.count & 0xff)] + n }
+        }
+        let key = H264FrameSummary.parseAVCC(avcc([sps, pps, idr0, idr4080]))
+        var keyOk = key?.nalTypes == [7, 8, 5, 5]
+        keyOk = keyOk && key?.slices.map(\.firstMb) == [0, 4080]
+        keyOk = keyOk && key?.slices.map(\.sliceType) == [2, 2]
+        keyOk = keyOk && key?.frameType == "IDR"
+        keyOk = keyOk && key?.slice(containing: 4079) == 0
+        keyOk = keyOk && key?.slice(containing: 4080) == 1
+        expect(keyOk, "slices: two-slice IDR -> \(key?.line ?? "nil")")
+        let p = H264FrameSummary.parseAVCC(avcc([p0, p25440]))
+        var pOk = p?.slices.map(\.firstMb) == [0, 25440]
+        pOk = pOk && p?.frameType == "P"
+        pOk = pOk && p?.totalBytes == 8
+        expect(pOk,
+               "slices: two-slice P frame -> \(p?.line ?? "nil")")
+        let start4: [UInt8] = [0, 0, 0, 1]
+        let start3: [UInt8] = [0, 0, 1]
+        var annexB = start4 + sps
+        annexB += start3 + pps
+        annexB += start4 + idr0
+        let viaAnnexB = H264FrameSummary.parseAnnexB(annexB)
+        var annexOk = viaAnnexB.nalTypes == [7, 8, 5]
+        annexOk = annexOk && viaAnnexB.nalSizes == [sps.count, pps.count, idr0.count]
+        annexOk = annexOk && viaAnnexB.slices.first?.firstMb == 0
+        expect(annexOk,
+               "slices: Annex B start codes (3 and 4 bytes) -> \(viaAnnexB.line)")
+        expect(H264FrameSummary.parseAVCC([0, 0, 0, 9, 0x65]) == nil, "slices: a truncated NAL is rejected")
+        let sliceLog = H264SliceLog(initialFrames: 2, interval: 1.0, maxLines: 4)
+        let one = H264FrameSummary.parseAVCC(avcc([p0]))!
+        let two = p!
+        let l1 = sliceLog.note(one, frameID: 1, keyFrame: false, now: 0.0)
+        let l2 = sliceLog.note(one, frameID: 2, keyFrame: false, now: 0.01)
+        let quiet = sliceLog.note(one, frameID: 3, keyFrame: false, now: 0.02)
+        let layout = sliceLog.note(two, frameID: 4, keyFrame: false, now: 0.03)
+        let budget = sliceLog.note(key!, frameID: 5, keyFrame: true, now: 5.0)
+        let over = sliceLog.note(key!, frameID: 6, keyFrame: true, now: 9.0)
+        var logOk = l1 != nil && l2 != nil && quiet == nil
+        logOk = logOk && layout?.contains("layout_changed=1 skipped=1") == true
+        logOk = logOk && budget?.hasPrefix("h264.slices fid=5 type=IDR") == true
+        logOk = logOk && over == nil && sliceLog.suppressed == 2
+        expect(logOk,
+               "slice log: first frames, layout change and keyframes are logged; budget holds")
+
         failures += Int(roundTrip(hardware: false))
         print("video diag self-test: \(failures == 0 ? "ok" : "\(failures) failed")")
         return failures == 0 ? 0 : 1
@@ -108,6 +160,20 @@ enum VideoDiagSelfTest {
 
     // MARK: - Round trip
 
+    /// Test pictures. Each moves a little from frame to frame, so the P-frames
+    /// carry real motion and residual, not only skipped macroblocks.
+    enum Pattern: String, CaseIterable {
+        /// Luma rises with the row; chroma neutral (128). Green garbage shows as low U/V.
+        case ramp
+        /// Colour bars in the top half, U/V gradients in the bottom half.
+        case chroma
+        /// Text-like glyphs on a light background, a noise band at the bottom,
+        /// a smooth chroma gradient.
+        case detail
+    }
+
+    static let roundTripFrames = 6  // one IDR, then P-frames
+
     /// Sizes from the host log: native 1080p-class, the 1696x954 capped case,
     /// and the 3840x2160 cap. Returns the number of failures. A missing
     /// encoder or decoder is a SKIP in the self-test (CI runners may have no
@@ -117,20 +183,23 @@ enum VideoDiagSelfTest {
         let sizes = [(1920, 1080), (3392, 1904), (3840, 2160)]
         for (w, h) in sizes {
             for padded in [false, true] {
-                let name = "h264 round trip \(w)x\(h) \(padded ? "padded" : "plain") \(hardware ? "hardware" : "any-encoder")"
-                switch roundTripOne(width: w, height: h, padded: padded, hardware: hardware) {
-                case .pass(let detail):
-                    print("PASS \(name): \(detail)")
-                case .skip(let why):
-                    if hardware {
+                for pattern in Pattern.allCases {
+                    let name = "h264 round trip \(w)x\(h) \(padded ? "padded" : "plain") \(pattern.rawValue) "
+                        + (hardware ? "hardware" : "any-encoder")
+                    switch roundTripOne(width: w, height: h, padded: padded, pattern: pattern, hardware: hardware) {
+                    case .pass(let detail):
+                        print("PASS \(name): \(detail)")
+                    case .skip(let why):
+                        if hardware {
+                            print("FAIL \(name): \(why)")
+                            failures += 1
+                        } else {
+                            print("SKIP \(name): \(why)")
+                        }
+                    case .fail(let why):
                         print("FAIL \(name): \(why)")
                         failures += 1
-                    } else {
-                        print("SKIP \(name): \(why)")
                     }
-                case .fail(let why):
-                    print("FAIL \(name): \(why)")
-                    failures += 1
                 }
             }
         }
@@ -145,19 +214,108 @@ enum VideoDiagSelfTest {
 
     private final class Box: @unchecked Sendable {
         let lock = NSLock()
-        var sample: CMSampleBuffer?
+        var samples: [CMSampleBuffer] = []
         var encodeStatus: OSStatus = noErr
         var image: CVImageBuffer?
         var decodeStatus: OSStatus = noErr
     }
 
-    /// Luma rises with the row (16...235) so a wrong or missing bottom band
-    /// shows; chroma is neutral (128), so green garbage (low U and V) shows.
+    /// Luma rises with the row (16...235).
     private static func lumaFor(row: Int, height: Int) -> UInt8 {
         UInt8(16 + (row * 219) / max(1, height - 1))
     }
 
-    private static func makeBuffer(width: Int, height: Int, padded: Bool) -> CVPixelBuffer? {
+    @inline(__always)
+    private static func hash(_ a: Int, _ b: Int, _ c: Int = 0) -> UInt32 {
+        var h = UInt32(truncatingIfNeeded: a) &* 0x9E37_79B1
+        h ^= UInt32(truncatingIfNeeded: b) &* 0x85EB_CA77
+        h ^= UInt32(truncatingIfNeeded: c) &* 0xC2B2_AE3D
+        h ^= h >> 15
+        h &*= 0x2C1B_3C6D
+        h ^= h >> 13
+        return h
+    }
+
+    private static let barUV: [(UInt8, UInt8)] = [
+        (128, 128), (16, 146), (166, 16), (54, 34), (202, 222), (90, 240), (240, 110), (110, 202),
+    ]
+
+    /// Fills a 4:2:0 bi-planar buffer with `pattern` at motion step `frame`.
+    private static func fill(_ buffer: CVPixelBuffer, pattern: Pattern, frame: Int) -> Bool {
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)?.assumingMemoryBound(to: UInt8.self),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1)?.assumingMemoryBound(to: UInt8.self)
+        else { return false }
+        let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+        let yBpr = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let uvBpr = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let cw = CVPixelBufferGetWidthOfPlane(buffer, 1), ch = CVPixelBufferGetHeightOfPlane(buffer, 1)
+        let dx = 4 * frame, dy = 2 * frame
+        switch pattern {
+        case .ramp:
+            for row in 0..<h {
+                memset(yBase.advanced(by: row * yBpr), Int32(lumaFor(row: (row + dy) % h, height: h)), w)
+            }
+            for row in 0..<ch { memset(uvBase.advanced(by: row * uvBpr), 128, cw * 2) }
+        case .chroma:
+            for row in 0..<h {
+                let line = yBase.advanced(by: row * yBpr)
+                for x in 0..<w {
+                    let sx = (x + dx) % w
+                    line[x] = row < h / 2 ? UInt8(96 + (sx * 8 / w) * 16) : UInt8(64 + (sx * 128) / w)
+                }
+            }
+            for crow in 0..<ch {
+                let line = uvBase.advanced(by: crow * uvBpr)
+                let row = crow * 2
+                for cx in 0..<cw {
+                    let sx = (cx * 2 + dx) % w
+                    let u: UInt8, v: UInt8
+                    if row < h / 2 {
+                        (u, v) = barUV[min(7, sx * 8 / w)]
+                    } else {
+                        u = UInt8((sx * 255) / max(1, w - 1))
+                        v = UInt8(255 - (row * 255) / max(1, h - 1))
+                    }
+                    line[cx * 2] = u
+                    line[cx * 2 + 1] = v
+                }
+            }
+        case .detail:
+            let noiseFrom = h * 3 / 4
+            for row in 0..<h {
+                let line = yBase.advanced(by: row * yBpr)
+                let sy = row + dy
+                if row >= noiseFrom {
+                    for x in 0..<w {
+                        line[x] = UInt8(112 + Int(hash(x + dx, sy, 7) % 33))
+                    }
+                    continue
+                }
+                let cellY = sy / 16, py = sy % 16
+                for x in 0..<w {
+                    let sx = x + dx
+                    let cellX = sx / 8, px = sx % 8
+                    let glyph = Int(hash(cellX, cellY) % 64)
+                    let ink = glyph >= 13 && px >= 1 && px <= 6 && py >= 3 && py <= 12
+                        && hash(glyph, px, py) % 100 < 45
+                    line[x] = ink ? 24 : 230
+                }
+            }
+            for crow in 0..<ch {
+                let line = uvBase.advanced(by: crow * uvBpr)
+                for cx in 0..<cw {
+                    line[cx * 2] = UInt8(96 + (cx * 64) / max(1, cw))
+                    line[cx * 2 + 1] = UInt8(160 - (crow * 64) / max(1, ch))
+                }
+            }
+        }
+        return true
+    }
+
+    private static func makeBuffer(width: Int, height: Int, padded: Bool,
+                                   pattern: Pattern = .ramp, frame: Int = 0) -> CVPixelBuffer? {
         var attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [CFString: Any]() as CFDictionary]
         if padded {
             attrs[kCVPixelBufferBytesPerRowAlignmentKey] = 256
@@ -168,56 +326,117 @@ enum VideoDiagSelfTest {
         let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                                          attrs as CFDictionary, &buffer)
-        guard status == kCVReturnSuccess, let buffer else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let y = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
-              let uv = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
-        let yBpr = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-        let uvBpr = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-        for row in 0..<height {
-            memset(y.advanced(by: row * yBpr), Int32(lumaFor(row: row, height: height)), width)
-        }
-        for row in 0..<CVPixelBufferGetHeightOfPlane(buffer, 1) {
-            memset(uv.advanced(by: row * uvBpr), 128, CVPixelBufferGetWidthOfPlane(buffer, 1) * 2)
-        }
+        guard status == kCVReturnSuccess, let buffer, fill(buffer, pattern: pattern, frame: frame) else { return nil }
         return buffer
     }
 
-    /// Mean absolute luma error and mean U/V over rows [from, to).
-    private static func measure(_ image: CVPixelBuffer, sourceHeight: Int, rows: Range<Int>) -> (luma: Double, u: Double, v: Double)? {
-        CVPixelBufferLockBaseAddress(image, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-        guard CVPixelBufferGetPlaneCount(image) == 2,
-              let y = CVPixelBufferGetBaseAddressOfPlane(image, 0)?.assumingMemoryBound(to: UInt8.self),
-              let uv = CVPixelBufferGetBaseAddressOfPlane(image, 1)?.assumingMemoryBound(to: UInt8.self)
+    /// Per-plane comparison of a decoded frame with its source, in
+    /// macroblocks (16x16 luma, 8x8 chroma per plane).
+    struct PlaneCompare {
+        var name: String
+        var sumErr = 0.0
+        var samples = 0.0
+        var worst = 0.0
+        var worstMB = (x: 0, y: 0)
+        /// Mean error over the last macroblock row.
+        var lastRow = 0.0
+        var mean: Double { samples > 0 ? sumErr / samples : 0 }
+    }
+
+    struct FrameCompare {
+        var planes: [PlaneCompare]
+        /// First macroblock in raster order over the limit: plane, mb x/y, error.
+        var firstBad: (plane: String, mbX: Int, mbY: Int, err: Double)?
+        var badMBs = 0
+    }
+
+    /// Compares `decoded` with `source`. A macroblock is bad when its mean
+    /// absolute error is above `lumaBad` (Y) or `chromaBad` (U or V).
+    static func compare(source: CVPixelBuffer, decoded: CVPixelBuffer,
+                        lumaBad: Double, chromaBad: Double) -> FrameCompare? {
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(decoded, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(decoded, .readOnly)
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+        guard CVPixelBufferGetPlaneCount(decoded) == 2,
+              CVPixelBufferGetWidth(decoded) == CVPixelBufferGetWidth(source),
+              CVPixelBufferGetHeight(decoded) == CVPixelBufferGetHeight(source),
+              let sy = CVPixelBufferGetBaseAddressOfPlane(source, 0)?.assumingMemoryBound(to: UInt8.self),
+              let suv = CVPixelBufferGetBaseAddressOfPlane(source, 1)?.assumingMemoryBound(to: UInt8.self),
+              let dy = CVPixelBufferGetBaseAddressOfPlane(decoded, 0)?.assumingMemoryBound(to: UInt8.self),
+              let duv = CVPixelBufferGetBaseAddressOfPlane(decoded, 1)?.assumingMemoryBound(to: UInt8.self)
         else { return nil }
-        let w = CVPixelBufferGetWidthOfPlane(image, 0)
-        let yBpr = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
-        let uvBpr = CVPixelBufferGetBytesPerRowOfPlane(image, 1)
-        var lumaErr = 0.0, uSum = 0.0, vSum = 0.0, n = 0.0, cn = 0.0
-        for row in rows {
-            let want = Double(lumaFor(row: row, height: sourceHeight))
-            for x in stride(from: 0, to: w, by: 8) {
-                lumaErr += abs(Double(y[row * yBpr + x]) - want)
-                n += 1
-            }
-            if row % 2 == 0 {
-                let crow = row / 2
-                for x in stride(from: 0, to: w / 2, by: 8) {
-                    uSum += Double(uv[crow * uvBpr + x * 2])
-                    vSum += Double(uv[crow * uvBpr + x * 2 + 1])
-                    cn += 1
+        let w = CVPixelBufferGetWidth(source), h = CVPixelBufferGetHeight(source)
+        let syBpr = CVPixelBufferGetBytesPerRowOfPlane(source, 0)
+        let suvBpr = CVPixelBufferGetBytesPerRowOfPlane(source, 1)
+        let dyBpr = CVPixelBufferGetBytesPerRowOfPlane(decoded, 0)
+        let duvBpr = CVPixelBufferGetBytesPerRowOfPlane(decoded, 1)
+        let mbW = (w + 15) / 16, mbH = (h + 15) / 16
+        let cw = (w + 1) / 2, ch = (h + 1) / 2
+        var planes = [PlaneCompare(name: "Y"), PlaneCompare(name: "U"), PlaneCompare(name: "V")]
+        var result = FrameCompare(planes: [])
+        for mby in 0..<mbH {
+            for mbx in 0..<mbW {
+                // Luma
+                var e = 0, n = 0
+                for row in (mby * 16)..<min(h, mby * 16 + 16) {
+                    let s = sy.advanced(by: row * syBpr), d = dy.advanced(by: row * dyBpr)
+                    for x in (mbx * 16)..<min(w, mbx * 16 + 16) {
+                        e += abs(Int(s[x]) - Int(d[x]))
+                        n += 1
+                    }
+                }
+                // Chroma (U at even bytes, V at odd bytes)
+                var eu = 0, ev = 0, cn = 0
+                for crow in (mby * 8)..<min(ch, mby * 8 + 8) {
+                    let s = suv.advanced(by: crow * suvBpr), d = duv.advanced(by: crow * duvBpr)
+                    for cx in (mbx * 8)..<min(cw, mbx * 8 + 8) {
+                        eu += abs(Int(s[cx * 2]) - Int(d[cx * 2]))
+                        ev += abs(Int(s[cx * 2 + 1]) - Int(d[cx * 2 + 1]))
+                        cn += 1
+                    }
+                }
+                let errs = [(e, n), (eu, cn), (ev, cn)]
+                for (i, (err, count)) in errs.enumerated() where count > 0 {
+                    let mean = Double(err) / Double(count)
+                    planes[i].sumErr += Double(err)
+                    planes[i].samples += Double(count)
+                    if mean > planes[i].worst {
+                        planes[i].worst = mean
+                        planes[i].worstMB = (mbx, mby)
+                    }
+                    if mby == mbH - 1 { planes[i].lastRow += mean / Double(mbW) }
+                    if mean > (i == 0 ? lumaBad : chromaBad) {
+                        result.badMBs += 1
+                        if result.firstBad == nil { result.firstBad = (planes[i].name, mbx, mby, mean) }
+                    }
                 }
             }
         }
-        guard n > 0, cn > 0 else { return nil }
-        return (lumaErr / n, uSum / cn, vSum / cn)
+        result.planes = planes
+        return result
     }
 
-    private static func roundTripOne(width: Int, height: Int, padded: Bool, hardware: Bool) -> Outcome {
-        guard let source = makeBuffer(width: width, height: height, padded: padded) else {
-            return .fail("could not create the source buffer")
+    /// Limits per pattern: (frame mean Y, frame mean U/V, bad MB Y, bad MB U/V).
+    /// Smooth pictures must come back nearly exact; the detail picture is
+    /// lossy at the production bit rate, so only gross errors count there.
+    private static func limits(_ pattern: Pattern) -> (Double, Double, Double, Double) {
+        switch pattern {
+        case .ramp, .chroma: return (6, 6, 24, 24)
+        case .detail: return (40, 8, 110, 40)
+        }
+    }
+
+    private static func roundTripOne(width: Int, height: Int, padded: Bool, pattern: Pattern,
+                                     hardware: Bool) -> Outcome {
+        var sources: [CVPixelBuffer] = []
+        for k in 0..<roundTripFrames {
+            guard let s = makeBuffer(width: width, height: height, padded: padded, pattern: pattern, frame: k) else {
+                return .fail("could not create source buffer \(k)")
+            }
+            sources.append(s)
         }
         var spec: [CFString: Any] = [:]
         if hardware {
@@ -241,6 +460,7 @@ enum VideoDiagSelfTest {
             (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse),
             (kVTCompressionPropertyKey_ExpectedFrameRate, 60 as CFNumber),
             (kVTCompressionPropertyKey_AverageBitRate, 40_000_000 as CFNumber),
+            (kVTCompressionPropertyKey_MaxKeyFrameInterval, 60 as CFNumber),
             (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel),
         ]
         for (key, value) in props where VTSessionSetProperty(encoder, key: key, value: value) != noErr {
@@ -249,26 +469,31 @@ enum VideoDiagSelfTest {
         VTCompressionSessionPrepareToEncodeFrames(encoder)
 
         let box = Box()
-        var flags = VTEncodeInfoFlags()
-        let encodeStatus = VTCompressionSessionEncodeFrame(
-            encoder, imageBuffer: source, presentationTimeStamp: CMTime(value: 0, timescale: 60),
-            duration: CMTime(value: 1, timescale: 60),
-            frameProperties: [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary,
-            infoFlagsOut: &flags
-        ) { status, _, sample in
-            box.lock.lock()
-            box.encodeStatus = status
-            box.sample = sample
-            box.lock.unlock()
+        for (k, source) in sources.enumerated() {
+            var flags = VTEncodeInfoFlags()
+            let frameProps: CFDictionary? = k == 0
+                ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary : nil
+            let encodeStatus = VTCompressionSessionEncodeFrame(
+                encoder, imageBuffer: source, presentationTimeStamp: CMTime(value: Int64(k), timescale: 60),
+                duration: CMTime(value: 1, timescale: 60), frameProperties: frameProps, infoFlagsOut: &flags
+            ) { status, _, sample in
+                box.lock.lock()
+                if status != noErr { box.encodeStatus = status }
+                if let sample { box.samples.append(sample) }
+                box.lock.unlock()
+            }
+            guard encodeStatus == noErr else { return .fail("encode frame \(k) failed: \(encodeStatus)") }
         }
-        guard encodeStatus == noErr else { return .fail("encode failed: \(encodeStatus)") }
         VTCompressionSessionCompleteFrames(encoder, untilPresentationTimeStamp: .invalid)
         box.lock.lock()
-        let sample = box.sample
+        let samples = box.samples.sorted {
+            CMSampleBufferGetPresentationTimeStamp($0).value < CMSampleBufferGetPresentationTimeStamp($1).value
+        }
         let outStatus = box.encodeStatus
         box.lock.unlock()
-        guard outStatus == noErr, let sample, let format = CMSampleBufferGetFormatDescription(sample) else {
-            return .fail("no encoded frame (status \(outStatus))")
+        guard outStatus == noErr, samples.count == roundTripFrames,
+              let format = CMSampleBufferGetFormatDescription(samples[0]) else {
+            return .fail("encoded \(samples.count)/\(roundTripFrames) frames (status \(outStatus))")
         }
         guard let spsBytes = H264SPSInfo.firstSPS(format), let info = H264SPSInfo.parse(spsBytes) else {
             return .fail("SPS missing or not parsed")
@@ -276,6 +501,16 @@ enum VideoDiagSelfTest {
         guard info.displayWidth == width, info.displayHeight == height else {
             return .fail("SPS display \(info.displayWidth)x\(info.displayHeight): \(info.line)")
         }
+        let summaries = samples.map { H264FrameSummary.from($0) }
+        let frameTypes = summaries.map { $0?.frameType ?? "unparsed" }
+        let sliceText = summaries.first.flatMap { $0?.layout } ?? "slices=?"
+        let layouts = Set(summaries.compactMap { $0?.layout })
+        let bytesText = samples.map { String(CMSampleBufferGetTotalSampleSize($0)) }.joined(separator: ",")
+        var header = "sps \(info.line); frames=\(frameTypes.joined(separator: ",")) \(sliceText)"
+            + (layouts.count > 1 ? " layouts=\(layouts.count)" : "") + " bytes=\(bytesText)"
+        if !unsupported.isEmpty { header += "; unsupported=" + unsupported.joined(separator: ",") }
+        guard frameTypes.first == "IDR" else { return .fail("first frame is not an IDR; \(header)") }
+        let pCount = frameTypes.dropFirst().filter { $0 == "P" }.count
 
         let decoderAttrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -286,38 +521,67 @@ enum VideoDiagSelfTest {
             allocator: kCFAllocatorDefault, formatDescription: format, decoderSpecification: nil,
             imageBufferAttributes: decoderAttrs as CFDictionary, outputCallback: nil, decompressionSessionOut: &decoder)
         guard decCreate == noErr, let decoder else {
-            return .skip("no H.264 decoder (status \(decCreate)); encoder SPS ok: \(info.line)")
+            return .skip("no H.264 decoder (status \(decCreate)); \(header)")
         }
         defer { VTDecompressionSessionInvalidate(decoder) }
-        var decodeFlags = VTDecodeInfoFlags()
-        let decStatus = VTDecompressionSessionDecodeFrame(
-            decoder, sampleBuffer: sample, flags: [], infoFlagsOut: &decodeFlags
-        ) { status, _, image, _, _ in
+
+        let (meanY, meanC, badY, badC) = limits(pattern)
+        var worstMean = [0.0, 0.0, 0.0]
+        var worstMB = [(0.0, 0, 0, 0), (0.0, 0, 0, 0), (0.0, 0, 0, 0)]  // err, frame, mb x, mb y
+        var lastRow = [0.0, 0.0, 0.0]
+        var firstError: String?
+        for (k, sample) in samples.enumerated() {
             box.lock.lock()
-            box.decodeStatus = status
-            box.image = image
+            box.image = nil
+            box.decodeStatus = noErr
             box.lock.unlock()
+            var decodeFlags = VTDecodeInfoFlags()
+            let decStatus = VTDecompressionSessionDecodeFrame(
+                decoder, sampleBuffer: sample, flags: [], infoFlagsOut: &decodeFlags
+            ) { status, _, image, _, _ in
+                box.lock.lock()
+                box.decodeStatus = status
+                box.image = image
+                box.lock.unlock()
+            }
+            guard decStatus == noErr else { return .fail("decode frame \(k) failed: \(decStatus); \(header)") }
+            VTDecompressionSessionWaitForAsynchronousFrames(decoder)
+            box.lock.lock()
+            let image = box.image
+            let imageStatus = box.decodeStatus
+            box.lock.unlock()
+            guard imageStatus == noErr, let image else {
+                return .fail("no decoded image for frame \(k) (status \(imageStatus)); \(header)")
+            }
+            let dw = CVPixelBufferGetWidth(image), dh = CVPixelBufferGetHeight(image)
+            guard dw == width, dh == height else { return .fail("frame \(k) decoded size \(dw)x\(dh); \(header)") }
+            guard let cmp = compare(source: sources[k], decoded: image, lumaBad: badY, chromaBad: badC) else {
+                return .fail("frame \(k): decoded image is not 4:2:0 bi-planar; \(header)")
+            }
+            for (i, p) in cmp.planes.enumerated() {
+                worstMean[i] = max(worstMean[i], p.mean)
+                lastRow[i] = max(lastRow[i], p.lastRow)
+                if p.worst > worstMB[i].0 { worstMB[i] = (p.worst, k, p.worstMB.x, p.worstMB.y) }
+                if firstError == nil, p.mean > (i == 0 ? meanY : meanC) {
+                    firstError = String(format: "frame %d (%@) plane %@ mean error %.1f over %.0f",
+                                        k, frameTypes[k], p.name, p.mean, i == 0 ? meanY : meanC)
+                }
+            }
+            if firstError == nil, let bad = cmp.firstBad {
+                let mb = bad.mbY * ((width + 15) / 16) + bad.mbX
+                let slice = summaries[k]?.slice(containing: mb).map(String.init) ?? "?"
+                firstError = String(format: "frame %d (%@) first bad MB plane %@ mb=(%d,%d) px=(%d,%d) slice=%@ err=%.1f bad_mbs=%d",
+                                    k, frameTypes[k], bad.plane, bad.mbX, bad.mbY, bad.mbX * 16, bad.mbY * 16,
+                                    slice, bad.err, cmp.badMBs)
+            }
         }
-        guard decStatus == noErr else { return .fail("decode failed: \(decStatus)") }
-        VTDecompressionSessionWaitForAsynchronousFrames(decoder)
-        box.lock.lock()
-        let image = box.image
-        let imageStatus = box.decodeStatus
-        box.lock.unlock()
-        guard imageStatus == noErr, let image else { return .fail("no decoded image (status \(imageStatus))") }
-        let dw = CVPixelBufferGetWidth(image), dh = CVPixelBufferGetHeight(image)
-        guard dw == width, dh == height else { return .fail("decoded size \(dw)x\(dh)") }
-        guard let middle = measure(image, sourceHeight: height, rows: (height / 2 - 8)..<(height / 2 + 8)),
-              let bottom = measure(image, sourceHeight: height, rows: (height - 16)..<height)
-        else { return .fail("decoded image is not 4:2:0 bi-planar") }
-        let detail = String(format: "sps %@; middle luma_err=%.1f u=%.0f v=%.0f; bottom16 luma_err=%.1f u=%.0f v=%.0f; frame_bytes=%d%@",
-                            info.line, middle.luma, middle.u, middle.v, bottom.luma, bottom.u, bottom.v,
-                            CMSampleBufferGetTotalSampleSize(sample),
-                            unsupported.isEmpty ? "" : "; unsupported=" + unsupported.joined(separator: ","))
-        let neutral = { (x: Double) in abs(x - 128) <= 12 }
-        guard middle.luma <= 10, bottom.luma <= 10, neutral(middle.u), neutral(middle.v),
-              neutral(bottom.u), neutral(bottom.v)
-        else { return .fail(detail) }
+        let names = ["Y", "U", "V"]
+        let stats = (0..<3).map { i in
+            String(format: "%@ mean=%.1f last_mb_row=%.1f worst_mb=%.1f@f%d(%d,%d)", names[i], worstMean[i], lastRow[i],
+                   worstMB[i].0, worstMB[i].1, worstMB[i].2, worstMB[i].3)
+        }.joined(separator: " ")
+        let detail = "\(header); p_frames=\(pCount); \(stats)"
+        if let firstError { return .fail("\(firstError); \(detail)") }
         return .pass(detail)
     }
 }

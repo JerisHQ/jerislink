@@ -32,6 +32,7 @@
 #include "audio_player.hpp"
 #include "ui_theme.hpp"
 #include "ui_overlay.hpp"
+#include "h264_nal_summary.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -3613,6 +3614,7 @@ public:
 
     void submit(uint64_t frameId, const std::vector<uint8_t>& annexB,
                 bool discontinuity, bool keyFrame) {
+        noteH264Frame(frameId, annexB, discontinuity, keyFrame);
         if (hardware_) {
             try {
                 hardware_->submit(frameId, annexB, discontinuity);
@@ -3634,6 +3636,7 @@ public:
                 }
                 return;
             } catch (const std::exception& e) {
+                noteDecodeError("gpu", frameId, annexB, e.what());
                 logLine(std::string("gpu.runtime_failure reason=") + e.what());
                 fallbackToCpu();
             }
@@ -3648,7 +3651,51 @@ public:
             discontinuity = true;
             logLine("gpu.fallback_keyframe_reacquired fid=" + std::to_string(frameId));
         }
-        cpuDecoder_->submit(frameId, annexB, discontinuity);
+        try {
+            cpuDecoder_->submit(frameId, annexB, discontinuity);
+        } catch (const std::exception& e) {
+            noteDecodeError("cpu", frameId, annexB, e.what());
+            throw;
+        }
+    }
+
+    // H.264 diagnostics for the green-line investigation. Slice summaries only
+    // with JERISLINK_DEBUG=1 and within a line budget (first frames, keyframes,
+    // discontinuities, layout changes, else once per second, 600 lines max).
+    // A discontinuity that does not start on an IDR is logged always, capped.
+    void noteH264Frame(uint64_t frameId, const std::vector<uint8_t>& annexB,
+                       bool discontinuity, bool keyFrame) {
+        if (codec_ != JerisVideoCodec::H264) return;
+        const bool debug = debugMode();
+        if (!debug && !discontinuity) return;
+        const jl::h264::FrameSummary summary = jl::h264::summarizeAnnexB(annexB);
+        if (discontinuity && !summary.idr() && nonIdrDiscontinuityLines_ < kCappedLines) {
+            ++nonIdrDiscontinuityLines_;
+            logLine("decoder.discontinuity_non_idr fid=" + std::to_string(frameId) + " " + summary.line());
+        }
+        if (!debug) return;
+        const double nowMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        bool layoutChanged = false;
+        if (!sliceLog_.take(summary.layout(), keyFrame, discontinuity, nowMs, &layoutChanged)) return;
+        std::string line = "h264.slices fid=" + std::to_string(frameId) +
+                           " disc=" + (discontinuity ? "1" : "0") +
+                           " key=" + (keyFrame ? "1" : "0") + " " + summary.line();
+        if (layoutChanged) line += " layout_changed=1";
+        if (sliceLog_.lastSkipped()) line += " skipped=" + std::to_string(sliceLog_.lastSkipped());
+        logLine(line);
+    }
+
+    // Always on, capped: what the failing access unit looked like.
+    void noteDecodeError(const char* path, uint64_t frameId, const std::vector<uint8_t>& annexB,
+                         const char* reason) {
+        if (decodeErrorLines_ >= kCappedLines) return;
+        ++decodeErrorLines_;
+        std::string line = std::string("decoder.error path=") + path + " fid=" + std::to_string(frameId) +
+                           " codec=" + jerisVideoCodecName(codec_) + " reason=" + reason;
+        if (codec_ == JerisVideoCodec::H264) line += " " + jl::h264::summarizeAnnexB(annexB).line();
+        else line += " bytes=" + std::to_string(annexB.size());
+        logLine(line);
     }
 
     // Hardware path only (the CPU path paints synchronously). Non-blocking.
@@ -3862,6 +3909,10 @@ private:
     std::unique_ptr<CpuPresenter> cpuPresenter_;
     std::unique_ptr<MfCpuDecoder> cpuDecoder_;
     bool waitingForCpuKeyframe_ = false;
+    static constexpr int kCappedLines = 20;
+    jl::h264::SliceLogBudget sliceLog_;
+    int decodeErrorLines_ = 0;
+    int nonIdrDiscontinuityLines_ = 0;
     uint64_t fallbacks_ = 0;
     uint64_t keyframeWaitDrops_ = 0;
     uint64_t hardwareDecodedSaved_ = 0;
