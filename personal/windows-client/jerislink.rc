@@ -33,7 +33,7 @@ BEGIN
     RTEXT           "", IDC_BITRATE_VALUE, 226, 159, 60, 9, SS_NOPREFIX
     CONTROL         "Auto", IDC_BITRATE_AUTO, "Button", BS_OWNERDRAW | WS_TABSTOP, 156, 170, 38, 16
     CONTROL         "", IDC_VIDEO_BITRATE, "msctls_trackbar32", 0x0010 | WS_TABSTOP, 196, 170, 92, 16
-    LTEXT           "Auto lets JerisLink choose. Manual: 4-100 Mbps.", IDC_UI_HINT_BITRATE, 156, 189, 130, 9, SS_NOPREFIX
+    LTEXT           "Untick Auto to set 4-100 Mbps.", IDC_UI_HINT_BITRATE, 156, 189, 130, 9, SS_NOPREFIX
 
     LTEXT           "AUDIO", IDC_UI_SECTION_AUDIO, 14, 205, 272, 9, SS_NOPREFIX
     LTEXT           "Playback volume", IDC_UI_LABEL_VOLUME, 14, 218, 70, 9, SS_NOPREFIX
