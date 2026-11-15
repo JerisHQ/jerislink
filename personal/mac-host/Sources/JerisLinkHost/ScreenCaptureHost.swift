@@ -9,6 +9,7 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
     private let queue = DispatchQueue(label: "jerislink.capture", qos: .userInteractive)
     private var stream: SCStream?
     private var receivedFrames: UInt64 = 0
+    private var geometryLog: CaptureGeometryLog?
 
     init(encoder: any FrameEncoder) {
         self.encoder = encoder
@@ -39,6 +40,7 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
         config.showsCursor = showsCursor
         config.capturesAudio = false
 
+        geometryLog = CaptureGeometryLog(targetWidth: targetWidth, targetHeight: targetHeight)
         print("Display source: id=\(display.displayID) logical=\(display.width)x\(display.height)")
         print("Capture output: \(targetWidth)x\(targetHeight) @ \(fps) fps, \(fullRange ? "420f" : "420v"), cursor=\(showsCursor ? "on" : "off"), queueDepth=\(queueDepth)")
 
@@ -80,6 +82,17 @@ final class ScreenCaptureHost: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         receivedFrames &+= 1
+        if let geometryLog {
+            let rect = (attachments[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+            let info = CaptureGeometryLog.frameInfoText(
+                contentRect: rect,
+                contentScale: (attachments[.contentScale] as? NSNumber)?.doubleValue,
+                scaleFactor: (attachments[.scaleFactor] as? NSNumber)?.doubleValue)
+            if let line = geometryLog.note(PixelBufferGeometry(imageBuffer), frameInfo: info) {
+                print(line)
+                fflush(stdout)
+            }
+        }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         // displayTime (mach ticks) is when the frame was captured; it makes the
         // encoder latency include the capture-to-callback delay.

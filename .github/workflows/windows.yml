@@ -88,6 +88,10 @@ jobs:
         run: cmake --build build --config Release --target JerislinkMouseButtonsTest
       - name: Mouse button parity test (every down gets one up; focus kill, capture lost)
         run: build\Release\JerislinkMouseButtonsTest.exe
+      - name: Build H.264 NAL summary test
+        run: cmake --build build --config Release --target JerislinkNalSummaryTest
+      - name: H.264 NAL summary test (slice first_mb / type, Annex B split, log budget)
+        run: build\Release\JerislinkNalSummaryTest.exe
       - name: Build audio jitter test
         run: cmake --build build --config Release --target JerislinkAudioTest
       - name: Audio jitter test (MRA1 v1/v2 parse, Opus round trip, PLC, FEC, drift control, A1 vs A2 link simulation)

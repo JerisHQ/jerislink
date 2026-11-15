@@ -44,6 +44,9 @@ final class H264Encoder: FrameEncoder {
     private var forceKeyframesEmitted: UInt64 = 0
     private var forceKeyframesMissed: UInt64 = 0
     private var statsTicker = StatsTicker()
+    private let formatLog: EncodedFormatLog
+    /// Per-frame slice/NAL lines; nil unless JERISLINK_DEBUG=1.
+    private let sliceLog: H264SliceLog?
 
     init(width: Int32, height: Int32, fps: Int32, bitrate: Int,
          keyframeInterval: Int32? = nil,
@@ -55,6 +58,8 @@ final class H264Encoder: FrameEncoder {
         self.fps = fps
         self.udpSender = udpSender
         self.writer = try H264AnnexBWriter(url: outputURL)
+        self.formatLog = EncodedFormatLog(codec: "h264", sessionWidth: Int(width), sessionHeight: Int(height))
+        self.sliceLog = VideoDebug.enabled ? H264SliceLog() : nil
 
         var createdSession: VTCompressionSession?
         let encoderSpecification = [
@@ -297,6 +302,8 @@ final class H264Encoder: FrameEncoder {
         let callbackLatencyMS = Double(callbackNanos - context.submitNanos) / 1_000_000.0
 
         guard let encoded = writer.annexBFrame(sampleBuffer: sampleBuffer) else { return }
+        if encoded.keyFrame { formatLog.noteKeyframe(sampleBuffer) }
+        sliceLog?.note(sampleBuffer, frameID: context.frameID, keyFrame: encoded.keyFrame)
         if context.forcedKeyframeRequested {
             if encoded.keyFrame {
                 keyframeRequestLock.lock()
