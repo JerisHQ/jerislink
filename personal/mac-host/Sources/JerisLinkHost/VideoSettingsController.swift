@@ -140,9 +140,7 @@ final class VideoSettingsController: @unchecked Sendable {
         lock.lock()
         current = readCurrent()
         lock.unlock()
-        let displayMode = try? DisplayModeResolver.currentMainDisplay()
-        let framebufferWidth = UInt16(displayMode?.pixelWidth ?? 0)
-        let framebufferHeight = UInt16(displayMode?.pixelHeight ?? 0)
+        let (framebufferWidth, framebufferHeight) = Self.negotiatedStreamSize()
         var flags: UInt8 = 0x02 // host HEVC
         if framebufferWidth > 0 && framebufferHeight > 0 { flags |= 0x08 }
         if ignored { flags |= 0x10 }
@@ -157,6 +155,27 @@ final class VideoSettingsController: @unchecked Sendable {
             framebufferWidth: framebufferWidth,
             framebufferHeight: framebufferHeight
         )
+    }
+
+    /// remote_size in the ACK: the size the video service encodes, not the
+    /// native framebuffer. Above the ceiling the stream is scaled down (for
+    /// example 4352x2448 -> 3840x2160). A viewer that starts its H.264 decoder
+    /// at the native size showed green where the smaller picture did not cover
+    /// the decoder surface. Same rule as the video service: streamSize with
+    /// the default ceiling.
+    static func negotiatedStreamSize() -> (width: UInt16, height: UInt16) {
+        guard let mode = try? DisplayModeResolver.currentMainDisplay() else { return (0, 0) }
+        return streamSizeForNegotiation(pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight)
+    }
+
+    static func streamSizeForNegotiation(pixelWidth: Int, pixelHeight: Int,
+                                         maxPixels: Int = DisplayModeResolver.defaultMaxEncodePixels)
+        -> (width: UInt16, height: UInt16) {
+        guard pixelWidth > 0, pixelHeight > 0 else { return (0, 0) }
+        let stream = DisplayModeResolver.streamSize(width: pixelWidth, height: pixelHeight, maxPixels: maxPixels)
+        guard stream.width > 0, stream.height > 0,
+              stream.width <= Int(UInt16.max), stream.height <= Int(UInt16.max) else { return (0, 0) }
+        return (UInt16(stream.width), UInt16(stream.height))
     }
 
     static func extendedRegexEscaped(_ text: String) -> String {
@@ -228,9 +247,7 @@ final class VideoSettingsController: @unchecked Sendable {
         }
 
         let codecName = selectedCodec == 2 ? "hevc" : "h264"
-        let displayMode = try? DisplayModeResolver.currentMainDisplay()
-        let framebufferWidth = UInt16(displayMode?.pixelWidth ?? 0)
-        let framebufferHeight = UInt16(displayMode?.pixelHeight ?? 0)
+        let (framebufferWidth, framebufferHeight) = Self.negotiatedStreamSize()
 
         lock.lock()
         defer { lock.unlock() }

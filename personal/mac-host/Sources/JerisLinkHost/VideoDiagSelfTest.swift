@@ -156,6 +156,23 @@ enum VideoDiagSelfTest {
         expect(logOk,
                "slice log: first frames, layout change and keyframes are logged; budget holds")
 
+        // remote_size in the video config ACK is the encoded size. The viewer
+        // starts its decoder at that size; the native framebuffer (4352x2448)
+        // gave green on H.264 because the stream is 3840x2160.
+        let capped = VideoSettingsController.streamSizeForNegotiation(pixelWidth: 4352, pixelHeight: 2448)
+        expect(capped.width == 3840 && capped.height == 2160,
+               "negotiation: 4352x2448 framebuffer -> remote_size \(capped.width)x\(capped.height), want 3840x2160")
+        let native = VideoSettingsController.streamSizeForNegotiation(pixelWidth: 3840, pixelHeight: 2160)
+        expect(native.width == 3840 && native.height == 2160,
+               "negotiation: 3840x2160 framebuffer is sent unchanged")
+        let small = VideoSettingsController.streamSizeForNegotiation(pixelWidth: 1920, pixelHeight: 1080)
+        let streamSmall = DisplayModeResolver.streamSize(width: 1920, height: 1080,
+                                                         maxPixels: DisplayModeResolver.defaultMaxEncodePixels)
+        expect(Int(small.width) == streamSmall.width && Int(small.height) == streamSmall.height,
+               "negotiation: remote_size matches the video service size for 1920x1080")
+        let none = VideoSettingsController.streamSizeForNegotiation(pixelWidth: 0, pixelHeight: 0)
+        expect(none.width == 0 && none.height == 0, "negotiation: no display -> no remote_size")
+
         failures += Int(roundTrip(hardware: false))
         print("video diag self-test: \(failures == 0 ? "ok" : "\(failures) failed")")
         return failures == 0 ? 0 : 1

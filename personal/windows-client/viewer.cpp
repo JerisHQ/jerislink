@@ -3667,8 +3667,19 @@ public:
                        bool discontinuity, bool keyFrame) {
         if (codec_ != JerisVideoCodec::H264) return;
         const bool debug = debugMode();
-        if (!debug && !discontinuity) return;
+        if (!debug && !discontinuity && !keyFrame) return;
         const jl::h264::FrameSummary summary = jl::h264::summarizeAnnexB(annexB);
+        // The decoder starts at width_ x height_ (from the host ACK or --width/
+        // --height). A different SPS size made the H.264 MFT present undecoded
+        // (green) rows when the host capped 4352x2448 to 3840x2160. Always on, capped.
+        if (summary.spsWidth > 0 && spsMismatchLines_ < kCappedLines &&
+            (static_cast<UINT32>(summary.spsWidth) != width_ || static_cast<UINT32>(summary.spsHeight) != height_)) {
+            ++spsMismatchLines_;
+            logLine("decoder.sps_size_mismatch fid=" + std::to_string(frameId) + " sps=" +
+                    std::to_string(summary.spsWidth) + "x" + std::to_string(summary.spsHeight) +
+                    " init=" + std::to_string(width_) + "x" + std::to_string(height_));
+        }
+        if (!debug && !discontinuity) return;
         if (discontinuity && !summary.idr() && nonIdrDiscontinuityLines_ < kCappedLines) {
             ++nonIdrDiscontinuityLines_;
             logLine("decoder.discontinuity_non_idr fid=" + std::to_string(frameId) + " " + summary.line());
@@ -3913,6 +3924,7 @@ private:
     jl::h264::SliceLogBudget sliceLog_;
     int decodeErrorLines_ = 0;
     int nonIdrDiscontinuityLines_ = 0;
+    int spsMismatchLines_ = 0;
     uint64_t fallbacks_ = 0;
     uint64_t keyframeWaitDrops_ = 0;
     uint64_t hardwareDecodedSaved_ = 0;

@@ -104,6 +104,38 @@ int main() {
                    c.take(a, false, true, 1001),
                "budget: once per interval, discontinuity always");
     }
+    {
+        // Golden SPS bytes shared with the Mac host self-test (independent bit
+        // writer): display size after cropping.
+        struct Golden { const char* name; Bytes nal; int w; int h; };
+        const Golden golden[] = {
+            {"high 3840x2160 L5.2", {0x67, 0x64, 0x00, 0x34, 0xac, 0xda, 0x00, 0xf0, 0x01, 0x0f, 0x90}, 3840, 2160},
+            {"constrained high 1920x1080 crop 4", {0x67, 0x64, 0x0c, 0x2a, 0xac, 0xda, 0x01, 0xe0, 0x08, 0x9f, 0x95}, 1920, 1080},
+            {"high 3392x1904 L5.1", {0x67, 0x64, 0x00, 0x33, 0xac, 0xda, 0x00, 0xd4, 0x03, 0xbe, 0x40}, 3392, 1904},
+            {"main 1920x1080 poc type 1", {0x67, 0x4d, 0x00, 0x28, 0xd1, 0x99, 0xa2, 0xa0, 0x1e, 0x00, 0x89, 0xf9, 0x50}, 1920, 1080},
+            {"high 1280x720 scaling list", {0x67, 0x64, 0x00, 0x1f, 0xad, 0x84, 0x3f, 0xff, 0x80, 0xda, 0x01, 0x40, 0x16, 0xe4}, 1280, 720},
+            {"baseline 16x16", {0x67, 0x42, 0x00, 0x00, 0xed, 0x3c, 0x80}, 16, 16},
+        };
+        for (const Golden& g : golden) {
+            int w = 0, h = 0;
+            const bool ok = detail::parseSpsDisplaySize(g.nal.data(), g.nal.size(), &w, &h);
+            expect(ok && w == g.w && h == g.h,
+                   std::string("sps size: ") + g.name + " -> " + std::to_string(w) + "x" + std::to_string(h));
+        }
+        Bytes au;
+        append(au, golden[0].nal, true);
+        append(au, pps, false);
+        append(au, idr0, true);
+        const FrameSummary f = summarizeAnnexB(au);
+        expect(f.spsWidth == 3840 && f.spsHeight == 2160, "IDR access unit carries SPS size 3840x2160");
+        expect(f.line().find("sps") == std::string::npos, "SPS size does not change the slice line");
+        int w = 0, h = 0;
+        expect(!detail::parseSpsDisplaySize(pps.data(), pps.size(), &w, &h), "sps size: a PPS is rejected");
+        expect(!detail::parseSpsDisplaySize(sps.data(), sps.size(), &w, &h), "sps size: a truncated SPS is rejected");
+        Bytes pOnly;
+        append(pOnly, p0, false);
+        expect(summarizeAnnexB(pOnly).spsWidth == 0, "P access unit has no SPS size");
+    }
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

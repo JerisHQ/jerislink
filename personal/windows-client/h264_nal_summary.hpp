@@ -27,6 +27,10 @@ struct FrameSummary {
     std::vector<int> nalTypes;
     std::vector<size_t> nalSizes;
     std::vector<Slice> slices;
+    // Display size from the access unit's SPS (after cropping); 0 when the
+    // unit has no SPS or it could not be parsed.
+    int spsWidth = 0;
+    int spsHeight = 0;
 
     size_t totalBytes() const {
         size_t n = 0;
@@ -103,7 +107,96 @@ struct BitReader {
         if (!ok) return -1;
         return (1L << zeros) - 1 + rest;
     }
+    long u(int n) {
+        long v = 0;
+        for (int i = 0; i < n; ++i) v = (v << 1) | bit();
+        return ok ? v : -1;
+    }
+    long se() {
+        const long k = ue();
+        if (k < 0) return 0;
+        return (k & 1) ? (k + 1) / 2 : -(k / 2);
+    }
 };
+
+inline std::vector<uint8_t> unescape(const uint8_t* p, size_t n);
+
+// SPS (NAL type 7, header byte included) -> display width/height after the
+// frame cropping window. Returns false for anything it cannot read.
+inline bool parseSpsDisplaySize(const uint8_t* nal, size_t n, int* width, int* height) {
+    if (n < 4 || (nal[0] & 0x1f) != 7) return false;
+    const std::vector<uint8_t> rbsp = unescape(nal + 1, n - 1);
+    BitReader r{rbsp};
+    const long profile = r.u(8);
+    r.u(8);  // constraint flags
+    r.u(8);  // level_idc
+    r.ue();  // seq_parameter_set_id
+    long chromaFormat = 1;
+    bool separateColourPlane = false;
+    switch (profile) {
+    case 100: case 110: case 122: case 244: case 44: case 83: case 86:
+    case 118: case 128: case 138: case 139: case 134: case 135: {
+        chromaFormat = r.ue();
+        if (chromaFormat == 3) separateColourPlane = r.bit() != 0;
+        r.ue();   // bit_depth_luma_minus8
+        r.ue();   // bit_depth_chroma_minus8
+        r.bit();  // qpprime_y_zero_transform_bypass_flag
+        if (r.bit()) {  // seq_scaling_matrix_present_flag
+            const int lists = chromaFormat != 3 ? 8 : 12;
+            for (int i = 0; i < lists && r.ok; ++i) {
+                if (!r.bit()) continue;
+                const int size = i < 6 ? 16 : 64;
+                long last = 8, next = 8;
+                for (int j = 0; j < size && r.ok; ++j) {
+                    if (next != 0) next = (last + r.se() + 256) % 256;
+                    last = next == 0 ? last : next;
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    r.ue();  // log2_max_frame_num_minus4
+    const long pocType = r.ue();
+    if (pocType == 0) {
+        r.ue();
+    } else if (pocType == 1) {
+        r.bit();
+        r.se();
+        r.se();
+        const long cycle = r.ue();
+        if (cycle < 0 || cycle > 255) return false;
+        for (long i = 0; i < cycle; ++i) r.se();
+    }
+    r.ue();   // max_num_ref_frames
+    r.bit();  // gaps_in_frame_num_value_allowed_flag
+    const long widthMbs = r.ue() + 1;
+    const long heightMapUnits = r.ue() + 1;
+    const int frameMbsOnly = r.bit();
+    if (!frameMbsOnly) r.bit();  // mb_adaptive_frame_field_flag
+    r.bit();                     // direct_8x8_inference_flag
+    long cropL = 0, cropR = 0, cropT = 0, cropB = 0;
+    if (r.bit()) {
+        cropL = r.ue();
+        cropR = r.ue();
+        cropT = r.ue();
+        cropB = r.ue();
+    }
+    if (!r.ok || widthMbs <= 0 || heightMapUnits <= 0 || widthMbs > 1024 || heightMapUnits > 1024) return false;
+    const long chromaArray = separateColourPlane ? 0 : chromaFormat;
+    const long subW = (chromaArray == 1 || chromaArray == 2) ? 2 : 1;
+    const long subH = chromaArray == 1 ? 2 : 1;
+    const long cropUnitX = chromaArray == 0 ? 1 : subW;
+    const long cropUnitY = (chromaArray == 0 ? 1 : subH) * (2 - frameMbsOnly);
+    const long w = widthMbs * 16 - cropUnitX * (cropL + cropR);
+    const long h = heightMapUnits * 16 * (2 - frameMbsOnly) - cropUnitY * (cropT + cropB);
+    if (w <= 0 || h <= 0) return false;
+    *width = static_cast<int>(w);
+    *height = static_cast<int>(h);
+    return true;
+}
 
 inline std::vector<uint8_t> unescape(const uint8_t* p, size_t n) {
     std::vector<uint8_t> out;
@@ -125,6 +218,14 @@ inline void addNal(FrameSummary& f, const uint8_t* nal, size_t n) {
     const int type = nal[0] & 0x1f;
     f.nalTypes.push_back(type);
     f.nalSizes.push_back(n);
+    if (type == 7) {
+        int w = 0, h = 0;
+        if (parseSpsDisplaySize(nal, n, &w, &h)) {
+            f.spsWidth = w;
+            f.spsHeight = h;
+        }
+        return;
+    }
     if (type != 1 && type != 5) return;
     const size_t headLen = n - 1 < 16 ? n - 1 : 16;
     const std::vector<uint8_t> head = unescape(nal + 1, headLen);
