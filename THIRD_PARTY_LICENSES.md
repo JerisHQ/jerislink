@@ -1,6 +1,12 @@
 # Third-party licenses
 
-The JerisLink core (`personal/`) contains no third-party source code.
+The JerisLink core (`personal/`) contains one third-party library:
+
+| Package | Version | License | Where | License file |
+|---|---|---|---|---|
+| libopus (Opus audio codec, Xiph.Org) | 1.6.1 | BSD-3-Clause | `personal/third_party/opus/` (Mac host and Windows viewer, statically linked) | `personal/third_party/opus/COPYING` |
+
+`personal/third_party/update-opus.sh` re-creates that directory from the official release tarball and checks its pinned SHA-256. Binary redistribution must carry the copyright notice and conditions in `COPYING`.
 
 The JerisLink Support component (`support/`) uses these Go modules (generated with `go-licenses report ./...`). Each module's full licence text is in its source distribution at the URL shown.
 
