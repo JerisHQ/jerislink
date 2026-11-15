@@ -57,6 +57,7 @@ final class HEVCEncoder: FrameEncoder {
     private var forceKeyframesEmitted: UInt64 = 0
     private var forceKeyframesMissed: UInt64 = 0
     private var statsTicker = StatsTicker()
+    private let formatLog: EncodedFormatLog
 
     init(width: Int32, height: Int32, fps: Int32, bitrate: Int,
          keyframeInterval: Int32? = nil,
@@ -64,6 +65,7 @@ final class HEVCEncoder: FrameEncoder {
         self.fps = fps
         self.udpSender = udpSender
         self.writer = try HEVCAnnexBWriter(url: outputURL)
+        self.formatLog = EncodedFormatLog(codec: "hevc", sessionWidth: Int(width), sessionHeight: Int(height))
 
         var createdSession: VTCompressionSession?
         let encoderSpecification = [
@@ -283,6 +285,7 @@ final class HEVCEncoder: FrameEncoder {
         }
 
         guard let encoded = writer.annexBFrame(sampleBuffer: sampleBuffer) else { return }
+        if encoded.keyFrame { formatLog.noteKeyframe(sampleBuffer) }
         if let context, context.forcedKeyframeRequested {
             if encoded.keyFrame {
                 keyframeRequestLock.lock()
