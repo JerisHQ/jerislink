@@ -323,7 +323,10 @@ static void testOpusRoundTrip() {
     const double snr = snrDb(in, out, size_t(lookahead), size_t(frames / 2), size_t(frames) - 2000);
 
     // Through the jitter buffer: same audio after the prebuffer silence.
+    // Drift control off: a dropped or inserted frame would shift the
+    // alignment (testDriftControl covers it).
     JitterBuffer jb;
+    jb.setDriftControl(false);
     const auto played = playOpus(jb, packets, [](size_t) { return false; });
     const auto st = jb.stats();
     CHECK(st.codec == kVersionOpus && st.packetFrames == kOpusFramesPerPacket);

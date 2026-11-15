@@ -22,12 +22,18 @@
 //
 // Clock drift: the Mac capture clock and the PC output clock differ by a few
 // hundred ppm, so without correction the buffer slowly drains (underrun) or
-// fills (overflow drop). With drift control on, the average buffer depth of
-// the first second after prebuffering becomes the reference; each later
-// second's average is compared with it, and while it is more than 2 ms below
-// (or 4 ms above) every decoded packet is stretched (or shrunk) by one frame
-// (linear interpolation; ~0.2% for 10 ms packets, ~0.4% for 5 ms). Target
-// changes move the reference with them, so the target still sets the latency.
+// fills (overflow drop). With drift control on, the buffer depth seen by each
+// device pull (before it takes audio, the same measure prebuffering uses) is
+// averaged over 1 s and compared with a set point: the target when
+// prebuffering ended, raised whenever the target grows (never lowered until
+// the next prebuffer, so the jitter margin is not given away). When the
+// average is below set point - 3 ms, or the lowest depth minus the packet in
+// play is under 3 ms, every decoded packet is stretched by one frame; when the
+// average is above set point + 5 ms and even the lowest depth is above the set
+// point, shrunk by one (linear interpolation; ~0.2% for 10 ms packets, ~0.4%
+// for 5 ms). Either continues until the average is back at the set point.
+// The target itself adds (packet length - 5 ms) of slack, so 10 ms Opus
+// packets get 5 ms more buffer than 5 ms PCM (see desiredTargetMs).
 //
 // The buffer is not thread-safe; the player guards it with one mutex shared
 // by the network thread (push) and the render thread (pull).
@@ -159,10 +165,10 @@ public:
     static constexpr double kUnderrunStepMs = 5.0;
     // Steady playback needed before the target may shrink by 1 ms.
     static constexpr int kShrinkAfterFrames = kSampleRate * 5;
-    // Drift control: 1 s windows; stretch below reference - 2 ms, shrink above reference + 4 ms.
+    // Drift control: 1 s windows; stretch below set point - 3 ms, shrink above set point + 5 ms.
     static constexpr int kDriftWindowFrames = kSampleRate;
-    static constexpr double kDriftLowMs = 2.0;
-    static constexpr double kDriftHighMs = 4.0;
+    static constexpr double kDriftLowMs = 3.0;
+    static constexpr double kDriftHighMs = 5.0;
 
     JitterBuffer() = default;
     ~JitterBuffer() {
@@ -220,6 +226,7 @@ public:
             if (prebuffering_) {
                 if (started_ && bufferedMs() >= targetMs_) {
                     prebuffering_ = false;
+                    driftSetMs_ = targetMs_;
                 } else {
                     silence(out + done * kChannels, frames - done);
                     return;
@@ -299,12 +306,21 @@ private:
                              (double(captureUs) - double(prevCaptureUs_));
             // A jump over 500 ms is a pause or a clock reset, not network jitter.
             if (std::fabs(d) < 500000.0) jitterUs_ += (std::fabs(d) - jitterUs_) / 16.0;
-            const double desired = std::clamp(4.0 * jitterUs_ / 1000.0 + 5.0, kMinTargetMs, kMaxTargetMs);
-            if (desired > targetMs_) setTarget(desired);
+            const double desired = desiredTargetMs();
+            if (desired > targetMs_) targetMs_ = desired;
         }
         havePrev_ = true;
         prevArrivalUs_ = arrivalUs;
         prevCaptureUs_ = captureUs;
+    }
+
+    // 4x the RFC 3550 jitter + 5 ms. Packets longer than 5 ms (Opus: 10 ms)
+    // add the extra length: a late packet is covered by the next one only
+    // after a whole packet time, so 10 ms packets need ~5 ms more slack than
+    // A1's 5 ms PCM for the same underrun rate (simulated on the wifi case).
+    double desiredTargetMs() const {
+        const double pktMs = double(packetFrames_) * 1000.0 / kSampleRate;
+        return std::clamp(4.0 * jitterUs_ / 1000.0 + 5.0 + std::max(0.0, pktMs - 5.0), kMinTargetMs, kMaxTargetMs);
     }
 
     bool ensureDecoder() {
@@ -400,33 +416,35 @@ private:
         if (driftMode_ > 0) ++stats_.driftInserted; else ++stats_.driftDropped;
     }
 
-    void setTarget(double ms) {
-        if (driftRefMs_ >= 0) driftRefMs_ = std::max(0.0, driftRefMs_ + (ms - targetMs_));
-        targetMs_ = ms;
-    }
-
-    // Depth is sampled before and after each pull (the midpoint is the
-    // average over the device period).
+    // Stretching also starts when the window's lowest margin (depth minus the
+    // packet being played) falls under 3 ms, so 10 ms packets keep the same
+    // slack against late packets as 5 ms ones.
+    // Shrinking starts only when even the window's lowest depth is above the
+    // set point: a buffer that still dips (jitter, bursts) keeps its margin.
+    // Hysteresis: once on, stretching (shrinking) continues until the
+    // average is back at the set point.
     void observeDrift(size_t frames, double beforeMs) {
         if (!driftControl_ || prebuffering_) return;
-        driftSumMs_ += (beforeMs + bufferedMs()) * 0.5 * double(frames);
+        driftSumMs_ += beforeMs * double(frames);
+        driftMinMs_ = driftFrames_ == 0 ? beforeMs : std::min(driftMinMs_, beforeMs);
         driftFrames_ += int(frames);
         if (driftFrames_ < kDriftWindowFrames) return;
         const double avg = driftSumMs_ / double(driftFrames_);
         driftSumMs_ = 0;
         driftFrames_ = 0;
-        if (driftRefMs_ < 0) {
-            driftRefMs_ = avg;
-            return;
-        }
-        driftMode_ = avg < driftRefMs_ - kDriftLowMs ? 1 : (avg > driftRefMs_ + kDriftHighMs ? -1 : 0);
+        driftSetMs_ = std::max(driftSetMs_, targetMs_);
+        // The lowest depth before a pull includes the packet being played,
+        // so the real margin is that minus one packet.
+        const double margin = driftMinMs_ - double(packetFrames_) / (kSampleRate / 1000.0);
+        if (avg < driftSetMs_ - kDriftLowMs || margin < kDriftLowMs) driftMode_ = 1;
+        else if (avg > driftSetMs_ + kDriftHighMs && driftMinMs_ > driftSetMs_) driftMode_ = -1;
+        else if ((driftMode_ > 0 && avg >= driftSetMs_) || (driftMode_ < 0 && avg <= driftSetMs_)) driftMode_ = 0;
     }
 
     void resetDrift() {
         driftMode_ = 0;
         driftSumMs_ = 0;
         driftFrames_ = 0;
-        driftRefMs_ = -1;
     }
 
     void trimOverflow() {
@@ -446,8 +464,8 @@ private:
         steadyFrames_ += int(frames);
         if (steadyFrames_ >= kShrinkAfterFrames) {
             steadyFrames_ = 0;
-            const double desired = std::clamp(4.0 * jitterUs_ / 1000.0 + 5.0, kMinTargetMs, kMaxTargetMs);
-            if (targetMs_ - 1.0 >= desired) setTarget(targetMs_ - 1.0);
+            const double desired = desiredTargetMs();
+            if (targetMs_ - 1.0 >= desired) targetMs_ -= 1.0;
         }
     }
 
@@ -483,8 +501,9 @@ private:
     bool driftControl_ = true;
     int driftMode_ = 0;
     double driftSumMs_ = 0;
+    double driftMinMs_ = 0;
     int driftFrames_ = 0;
-    double driftRefMs_ = -1;  // reference depth; < 0 until the first window after prebuffering
+    double driftSetMs_ = kInitialTargetMs;  // drift control set point (see the top of the file)
     OpusDecoder* dec_ = nullptr;
     JitterStats stats_;
 };

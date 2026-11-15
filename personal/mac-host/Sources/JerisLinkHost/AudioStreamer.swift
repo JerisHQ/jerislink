@@ -116,11 +116,11 @@ final class OpusAudioEncoder {
         guard samples.count == MRA1.opusFramesPerPacket * MRA1.channels else { return nil }
         let n = samples.withContiguousStorageIfAvailable { pcm in
             out.withUnsafeMutableBufferPointer { o in
-                opus_encode(enc, pcm.baseAddress, Int32(MRA1.opusFramesPerPacket), o.baseAddress, Int32(o.count))
+                opus_encode(enc, pcm.baseAddress!, Int32(MRA1.opusFramesPerPacket), o.baseAddress!, Int32(o.count))
             }
         } ?? Array(samples).withUnsafeBufferPointer { pcm in
             out.withUnsafeMutableBufferPointer { o in
-                opus_encode(enc, pcm.baseAddress, Int32(MRA1.opusFramesPerPacket), o.baseAddress, Int32(o.count))
+                opus_encode(enc, pcm.baseAddress!, Int32(MRA1.opusFramesPerPacket), o.baseAddress!, Int32(o.count))
             }
         }
         guard n > 0 else { return nil }
@@ -647,7 +647,7 @@ enum AudioSelfTest {
             }
             let n = back.payload.withUnsafeBufferPointer { p in
                 pcm.withUnsafeMutableBufferPointer { o in
-                    opus_decode(dec, p.baseAddress, Int32(p.count), o.baseAddress, Int32(frames), 0)
+                    opus_decode(dec, p.baseAddress, Int32(p.count), o.baseAddress!, Int32(frames), 0)
                 }
             }
             if n != Int32(frames) { layoutOK = false; continue }
