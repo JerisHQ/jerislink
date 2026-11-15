@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <iphlpapi.h>
@@ -788,16 +789,24 @@ static std::optional<std::string> detectTailscaleIPv4() {
 static constexpr UINT IDM_VIDEO_SETTINGS = 0x1F10;
 static constexpr UINT IDM_CONNECTION_INFO = 0x1F11;
 static constexpr UINT IDM_AUDIO_MUTE = 0x1F20;  // low 4 bits clear: also used in the system menu
+static constexpr UINT IDM_AUDIO_VOLUME = 0x1F30;  // low 4 bits clear: also used in the system menu
 
 // Mac audio. The player lives in the session (runViewer); mute is local to
 // this viewer, kept across reconnects, and never sent to the Mac.
 static jl::audio::AudioPlayer* gAudio = nullptr;
 static bool gAudioMuted = false;
+// Viewer volume, 0-100, kept across reconnects and saved in HKCU. Mute is a
+// separate switch and never changes it.
+static int gAudioVolumePct = jl::audio::kDefaultVolumePercent;
+static int gSavedAudioVolumePct = jl::audio::kDefaultVolumePercent;
+static bool gAudioVolumeLoaded = false;
+static HWND gVolumeDlg = nullptr;  // modeless "Volume..." window
 
 static void updateAudioMuteMenus(HWND hwnd) {
     const UINT state = MF_BYCOMMAND | (gAudioMuted ? MF_CHECKED : MF_UNCHECKED);
     if (HMENU bar = GetMenu(hwnd)) CheckMenuItem(bar, IDM_AUDIO_MUTE, state);
     if (HMENU sys = GetSystemMenu(hwnd, FALSE)) CheckMenuItem(sys, IDM_AUDIO_MUTE, state);
+    if (gVolumeDlg) CheckDlgButton(gVolumeDlg, IDC_VOLUME_MUTE, gAudioMuted ? BST_CHECKED : BST_UNCHECKED);
 }
 
 static void toggleAudioMute(HWND hwnd, const char* source) {
@@ -907,6 +916,149 @@ static bool saveSettings(const SavedSettings& settings) {
     RegCloseKey(key);
     return codecResult == ERROR_SUCCESS && bitrateResult == ERROR_SUCCESS &&
            hostResult == ERROR_SUCCESS && bindResult == ERROR_SUCCESS;
+}
+
+// Viewer volume in HKCU\Software\Jeris\Jerislink\AudioVolumePercent
+// (REG_DWORD 0-100). Missing or unreadable means 100%; larger values clamp.
+static int loadAudioVolumePercent() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool ok = RegGetValueW(HKEY_CURRENT_USER, kJerislinkSettingsKey, L"AudioVolumePercent",
+                                 RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS;
+    return jl::audio::volumePercentFromSaved(ok, value);
+}
+
+static void ensureAudioVolumeLoaded() {
+    if (gAudioVolumeLoaded) return;
+    gAudioVolumeLoaded = true;
+    gAudioVolumePct = gSavedAudioVolumePct = loadAudioVolumePercent();
+}
+
+static bool saveAudioVolumePercent(int pct) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    const DWORD value = static_cast<DWORD>(jl::audio::clampVolumePercent(pct));
+    const LONG result = RegSetValueExW(key, L"AudioVolumePercent", 0, REG_DWORD,
+                                       reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+static void setAudioVolume(int pct) {
+    gAudioVolumePct = jl::audio::clampVolumePercent(pct);
+    if (gAudio) gAudio->setVolumePercent(gAudioVolumePct);
+}
+
+// Saves once per gesture (thumb released, key up, window closed), not on
+// every slider step.
+static void commitAudioVolume(const char* source) {
+    if (gAudioVolumePct == gSavedAudioVolumePct) return;
+    const bool saved = saveAudioVolumePercent(gAudioVolumePct);
+    if (saved) gSavedAudioVolumePct = gAudioVolumePct;
+    logLine("audio.volume=" + std::to_string(gAudioVolumePct) + " source=" + source +
+            " saved=" + (saved ? "yes" : "no"));
+}
+
+static void updateVolumeLabel(HWND dlg) {
+    wchar_t text[16]{};
+    swprintf(text, std::size(text), L"%d%%", gAudioVolumePct);
+    SetDlgItemTextW(dlg, IDC_VOLUME_VALUE, text);
+}
+
+// Opens at the top-right corner of the viewer window, inside its monitor's
+// work area, so it covers the corner of the picture and not the middle.
+static void placeVolumeWindow(HWND dlg, HWND owner) {
+    RECT o{}, d{};
+    if (!owner || !GetWindowRect(owner, &o) || !GetWindowRect(dlg, &d)) return;
+    const int w = d.right - d.left;
+    const int h = d.bottom - d.top;
+    const int margin = GetSystemMetrics(SM_CYCAPTION);
+    int x = o.right - w - margin;
+    int y = o.top + 2 * margin;
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi)) {
+        const int left = mi.rcWork.left, top = mi.rcWork.top;
+        x = std::clamp(x, left, std::max(left, static_cast<int>(mi.rcWork.right) - w));
+        y = std::clamp(y, top, std::max(top, static_cast<int>(mi.rcWork.bottom) - h));
+    }
+    SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
+        SendMessageW(slider, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
+        SendMessageW(slider, TBM_SETLINESIZE, 0, 1);
+        SendMessageW(slider, TBM_SETPAGESIZE, 0, 10);
+        SendMessageW(slider, TBM_SETPOS, TRUE, gAudioVolumePct);
+        CheckDlgButton(dlg, IDC_VOLUME_MUTE, gAudioMuted ? BST_CHECKED : BST_UNCHECKED);
+        updateVolumeLabel(dlg);
+        placeVolumeWindow(dlg, reinterpret_cast<HWND>(lParam));
+        return TRUE;  // focus on the slider, the first tab stop
+    }
+    case WM_HSCROLL: {
+        HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
+        if (reinterpret_cast<HWND>(lParam) != slider) break;
+        setAudioVolume(static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0)));
+        updateVolumeLabel(dlg);
+        if (LOWORD(wParam) == TB_ENDTRACK) commitAudioVolume("slider");
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_VOLUME_MUTE:
+            if (HIWORD(wParam) == BN_CLICKED) toggleAudioMute(GetWindow(dlg, GW_OWNER), "volume-window");
+            return TRUE;
+        case IDOK:
+        case IDCANCEL:
+            DestroyWindow(dlg);
+            return TRUE;
+        default:
+            break;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(dlg);
+        return TRUE;
+    case WM_DESTROY:
+        commitAudioVolume("close");
+        gVolumeDlg = nullptr;
+        return TRUE;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+// Modeless, so video keeps running while the slider moves; the main loop
+// routes its keyboard input through IsDialogMessage.
+static void showVolumeWindow(HWND owner, const char* source) {
+    ensureAudioVolumeLoaded();
+    if (gVolumeDlg) {
+        SetForegroundWindow(gVolumeDlg);
+        return;
+    }
+    static bool controlsReady = false;
+    if (!controlsReady) {
+        INITCOMMONCONTROLSEX icc{};
+        icc.dwSize = sizeof(icc);
+        icc.dwICC = ICC_BAR_CLASSES;
+        controlsReady = InitCommonControlsEx(&icc) != FALSE;
+    }
+    gVolumeDlg = CreateDialogParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_AUDIO_VOLUME),
+                                    owner, VolumeDlgProc, reinterpret_cast<LPARAM>(owner));
+    if (!gVolumeDlg) {
+        logLine("audio.volume_window_failed error=" + std::to_string(GetLastError()));
+        return;
+    }
+    ShowWindow(gVolumeDlg, SW_SHOW);
+    logLine(std::string("audio.volume.window source=") + source +
+            " volume=" + std::to_string(gAudioVolumePct));
 }
 
 // lParam of the dialog: kSettingsDialogConnect when shown before connecting
@@ -1140,6 +1292,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case IDM_AUDIO_MUTE:
             toggleAudioMute(hwnd, "menu");
             return 0;
+        case IDM_AUDIO_VOLUME:
+            showVolumeWindow(hwnd, "menu");
+            return 0;
         default:
             break;
         }
@@ -1152,6 +1307,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         if ((wParam & 0xFFF0u) == IDM_AUDIO_MUTE) {
             toggleAudioMute(hwnd, "system-menu");
+            return 0;
+        }
+        if ((wParam & 0xFFF0u) == IDM_AUDIO_VOLUME) {
+            showVolumeWindow(hwnd, "system-menu");
             return 0;
         }
         break;
@@ -1462,6 +1621,7 @@ static HMENU createViewerMenu() {
         AppendMenuW(settingsMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"&Connection Settings...") &&
         AppendMenuW(settingsMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
                     L"&Mute Mac Audio\tCtrl+Alt+M") &&
+        AppendMenuW(settingsMenu, MF_STRING, IDM_AUDIO_VOLUME, L"&Volume...") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(connectionMenu), L"&Connection") &&
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(settingsMenu), L"&Settings");
     if (!ok) {
@@ -1510,6 +1670,7 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
         AppendMenuW(systemMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"Connection Settings...");
         AppendMenuW(systemMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
                     L"Mute Mac Audio\tCtrl+Alt+M");
+        AppendMenuW(systemMenu, MF_STRING, IDM_AUDIO_VOLUME, L"Volume...");
     }
     applyModernWindowChrome(hwnd);
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
@@ -1608,6 +1769,8 @@ static void pumpMessages() {
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
         if (input) noteInputAge(m);
+        // Tab, arrows and Esc for the modeless volume window.
+        if (gVolumeDlg && IsDialogMessageW(gVolumeDlg, &m)) continue;
         const double dispatchStart = steadyMsNow();
         const uint64_t modalEventsBefore = gModal.events();
         TranslateMessage(&m);
@@ -2768,6 +2931,8 @@ static int appMain(int argc, char** argv) {
             std::string audioErr;
             if (audio->start(o.bindIp, o.sourceIp, audioErr)) {
                 audio->setMuted(gAudioMuted);
+                ensureAudioVolumeLoaded();
+                audio->setVolumePercent(gAudioVolumePct);
                 gAudio = audio.get();
                 mouseMoveUdp->sendAudioRequest(true, audio->port());
             } else {
@@ -2779,7 +2944,8 @@ static int appMain(int argc, char** argv) {
                 " requested=" + o.audio +
                 " host_audio=" + (hostSupportsAudio ? "yes" : "no") +
                 " port=" + std::to_string(audio ? audio->port() : 0) +
-                " muted=" + (gAudioMuted ? "yes" : "no"));
+                " muted=" + (gAudioMuted ? "yes" : "no") +
+                " volume=" + std::to_string(gAudioVolumePct));
         if (nackEnabled || abrEnabled) {
             // Wake up often enough for the 2 ms reorder grace and 40 ms hold.
             DWORD nackTimeout = 5;
@@ -2986,7 +3152,9 @@ static int appMain(int argc, char** argv) {
                    << " device_reopens=" << a.deviceReopens << " device_notify=" << (a.deviceNotify ? "on" : "off")
                    << " device_notifications=" << a.deviceNotifications
                    << " last_reopen=\"" << a.lastReopenReason << "\""
-                   << " muted=" << (a.muted ? "yes" : "no");
+                   << " muted=" << (a.muted ? "yes" : "no")
+                   << " volume=" << a.volumePercent
+                   << " session_volume=" << (a.sessionVolume ? "yes" : "no");
                 logLine(as.str());
                 lastAudioStats = now;
             }
@@ -3320,6 +3488,7 @@ static int appMain(int argc, char** argv) {
                 << " audio_requests_tx=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestsSent() : 0)
                 << " audio_request_drops=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestDrops() : 0)
                 << " audio_muted=" << (gAudioMuted ? "yes" : "no")
+                << " audio_volume_pct=" << gAudioVolumePct
                 << " bad=" << bad << " rejected=" << rejected;
         logLine(summary.str());
         gControl = nullptr;

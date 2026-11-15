@@ -11,6 +11,7 @@
 //    control) over links with jitter, loss, 20 ms capture bursts and clock
 //    drift, pulled in 10 ms device periods.
 #include "audio_jitter.hpp"
+#include "audio_volume.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -655,6 +656,25 @@ static void testSimulation() {
     }
 }
 
+// Saved viewer volume: missing/corrupt -> 100%, clamp to 0-100, linear level.
+static void testVolumeSettings() {
+    using namespace jl::audio;
+    CHECK(volumePercentFromSaved(false, 0) == 100);
+    CHECK(volumePercentFromSaved(false, 42) == 100);
+    CHECK(volumePercentFromSaved(true, 0) == 0);
+    CHECK(volumePercentFromSaved(true, 37) == 37);
+    CHECK(volumePercentFromSaved(true, 100) == 100);
+    CHECK(volumePercentFromSaved(true, 101) == 100);
+    CHECK(volumePercentFromSaved(true, 0xFFFFFFFFu) == 100);
+    CHECK(clampVolumePercent(-5) == 0);
+    CHECK(clampVolumePercent(55) == 55);
+    CHECK(clampVolumePercent(150) == 100);
+    CHECK(volumeScalar(0) == 0.0f);
+    CHECK(volumeScalar(100) == 1.0f);
+    CHECK(volumeScalar(50) > 0.499f && volumeScalar(50) < 0.501f);
+    CHECK(volumeScalar(250) == 1.0f);
+}
+
 int main() {
     testParse();
     testPrebufferAndOrder();
@@ -672,6 +692,7 @@ int main() {
     testOpusOutputGap();
     testDriftControl();
     testSimulation();
+    testVolumeSettings();
     if (gFailures) {
         std::printf("audio jitter test: %d FAILURES\n", gFailures);
         return 1;

@@ -25,6 +25,7 @@
 // unmuting does not play stale audio); only the device gets silence.
 
 #include "audio_jitter.hpp"
+#include "audio_volume.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -61,6 +62,8 @@ struct PlayerStats {
     bool deviceOk = false;
     bool deviceNotify = false;       // change notifications registered
     bool muted = false;
+    int volumePercent = kDefaultVolumePercent;  // viewer session level, 0-100
+    bool sessionVolume = false;      // ISimpleAudioVolume available on the open device
 
     // Audio received but not yet heard: jitter buffer + device queue + the
     // device's own stream latency. An estimate (no DAC or speaker delay).
@@ -181,6 +184,16 @@ public:
     void setMuted(bool m) { muted_ = m; }
     bool muted() const { return muted_; }
 
+    // The viewer's own level (0-100), set on this process's audio session
+    // with ISimpleAudioVolume; the Windows master volume is never touched.
+    // Separate from mute, so unmuting plays at this level again. Applied on
+    // the render thread, and again on every device (re)open.
+    void setVolumePercent(int pct) {
+        volumePct_ = clampVolumePercent(pct);
+        volumeDirty_ = true;
+    }
+    int volumePercent() const { return volumePct_; }
+
     PlayerStats stats() {
         PlayerStats s;
         {
@@ -203,6 +216,8 @@ public:
         s.deviceOk = deviceOk_;
         s.deviceNotify = deviceNotify_;
         s.muted = muted_;
+        s.volumePercent = volumePct_;
+        s.sessionVolume = sessionVolumeOk_;
         return s;
     }
 
@@ -384,6 +399,11 @@ private:
             ? uint32_t(latency * kSampleRate / 10000000) : 0;
         hr = client_->GetService(IID_PPV_ARGS(&render_client_));
         if (FAILED(hr)) { why = "render client " + hex(hr); return false; }
+        // The viewer's row in the Windows volume mixer. Not fatal: without it
+        // the volume slider has no effect but audio still plays.
+        if (FAILED(client_->GetService(IID_PPV_ARGS(&session_volume_)))) session_volume_.Reset();
+        sessionVolumeOk_ = session_volume_ != nullptr;
+        volumeDirty_ = true;
         // Start with one silent buffer so the first event has room to fill.
         BYTE* data = nullptr;
         if (SUCCEEDED(render_client_->GetBuffer(frames, &data)))
@@ -399,6 +419,7 @@ private:
         while (!stop_) {
             const DWORD w = WaitForMultipleObjects(changeEvent ? 3 : 2, waits, FALSE, 200);
             if (w == WAIT_OBJECT_0 + 1) return "";
+            applyVolume();
             if (w == WAIT_OBJECT_0 + 2) {
                 // Windows reported a change; only some of them concern us.
                 deviceNotifications_ = notifier->count();
@@ -433,8 +454,16 @@ private:
         return "";
     }
 
+    void applyVolume() {
+        if (!session_volume_ || !volumeDirty_.exchange(false)) return;
+        const HRESULT hr = session_volume_->SetMasterVolume(volumeScalar(volumePct_), nullptr);
+        if (FAILED(hr) && log_) log_("audio.volume_failed " + hex(hr));
+    }
+
     void closeDevice() {
         if (client_) client_->Stop();
+        session_volume_.Reset();
+        sessionVolumeOk_ = false;
         render_client_.Reset();
         client_.Reset();
         enumerator_.Reset();
@@ -453,6 +482,9 @@ private:
     bool running_ = false;
     std::atomic<bool> stop_{false};
     std::atomic<bool> muted_{false};
+    std::atomic<int> volumePct_{kDefaultVolumePercent};
+    std::atomic<bool> volumeDirty_{true};
+    std::atomic<bool> sessionVolumeOk_{false};
 
     std::mutex mu_;
     JitterBuffer jb_;
@@ -461,6 +493,7 @@ private:
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator_;
     Microsoft::WRL::ComPtr<IAudioClient> client_;
     Microsoft::WRL::ComPtr<IAudioRenderClient> render_client_;
+    Microsoft::WRL::ComPtr<ISimpleAudioVolume> session_volume_;
     std::wstring deviceId_;
 
     std::atomic<uint64_t> rxBadPeer_{0};
