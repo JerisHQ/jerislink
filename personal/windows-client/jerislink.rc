@@ -4,38 +4,64 @@
 
 IDI_JERISLINK ICON "jerislink.ico"
 
-IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 260, 196
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+// Settings and volume windows: dark theme from the viewer's title bar, drawn in
+// viewer.cpp (WM_CTLCOLOR*, owner-draw buttons, trackbar custom draw). Edit
+// boxes have no border of their own; the dialog paints a rounded field around
+// each one, 4 x 3 dialog units larger. The footer band starts at y = 262
+// (settings) and y = 70 (volume); keep kSettingsFooterTop / kVolumeFooterTop
+// in viewer.cpp in step. Trackbar style 0x0010 = TBS_HORZ | TBS_NOTICKS.
+IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 300, 292
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 CAPTION "JerisLink Settings"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Mac host address:", -1, 14, 16, 70, 10
-    EDITTEXT        IDC_HOST_IP, 90, 13, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "The Mac's Tailscale IPv4 address, e.g. 100.64.0.10.", -1, 90, 30, 150, 10
-    LTEXT           "This PC's address:", -1, 14, 50, 70, 10
-    EDITTEXT        IDC_BIND_IP, 90, 47, 150, 14, ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "", IDC_BIND_HINT, 90, 64, 150, 18
-    LTEXT           "Codec:", -1, 14, 92, 70, 10
-    COMBOBOX        IDC_VIDEO_CODEC, 90, 89, 150, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Bitrate (Mbps):", -1, 14, 118, 70, 10
-    EDITTEXT        IDC_VIDEO_BITRATE, 90, 115, 60, 14, ES_NUMBER | WS_TABSTOP
-    LTEXT           "0 = Auto. Manual range: 4-100 Mbps.", -1, 90, 132, 150, 10
-    LTEXT           "Changes apply the next time JerisLink starts.", IDC_APPLY_NOTE, 14, 152, 232, 18
-    DEFPUSHBUTTON   "Save", IDOK, 136, 174, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 190, 174, 50, 14
+    LTEXT           "Settings", IDC_UI_TITLE, 14, 8, 272, 16, SS_NOPREFIX
+    LTEXT           "Connection, video and audio preferences", IDC_UI_SUBTITLE, 14, 25, 272, 9, SS_NOPREFIX
+
+    LTEXT           "CONNECTION", IDC_UI_SECTION_CONNECTION, 14, 42, 272, 9, SS_NOPREFIX
+    LTEXT           "Mac host address", IDC_UI_LABEL_HOST, 14, 54, 272, 9, SS_NOPREFIX
+    EDITTEXT        IDC_HOST_IP, 18, 68, 264, 10, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER
+    LTEXT           "The Mac's Tailscale IPv4 address, e.g. 100.64.0.10.", IDC_UI_HINT_HOST, 14, 84, 272, 9, SS_NOPREFIX
+    LTEXT           "This PC's address", IDC_UI_LABEL_BIND, 14, 97, 272, 9, SS_NOPREFIX
+    EDITTEXT        IDC_BIND_IP, 18, 111, 264, 10, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER
+    LTEXT           "", IDC_BIND_HINT, 14, 127, 272, 16, SS_NOPREFIX
+
+    LTEXT           "VIDEO", IDC_UI_SECTION_VIDEO, 14, 147, 272, 9, SS_NOPREFIX
+    LTEXT           "Codec", IDC_UI_LABEL_CODEC, 14, 159, 132, 9, SS_NOPREFIX
+    COMBOBOX        IDC_VIDEO_CODEC, 14, 170, 132, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Bitrate", IDC_UI_LABEL_BITRATE, 156, 159, 70, 9, SS_NOPREFIX
+    RTEXT           "", IDC_BITRATE_VALUE, 226, 159, 60, 9, SS_NOPREFIX
+    CONTROL         "Auto", IDC_BITRATE_AUTO, "Button", BS_OWNERDRAW | WS_TABSTOP, 156, 170, 38, 16
+    CONTROL         "", IDC_VIDEO_BITRATE, "msctls_trackbar32", 0x0010 | WS_TABSTOP, 196, 170, 92, 16
+    LTEXT           "Auto lets JerisLink choose. Manual: 4-100 Mbps.", IDC_UI_HINT_BITRATE, 156, 189, 130, 9, SS_NOPREFIX
+
+    LTEXT           "AUDIO", IDC_UI_SECTION_AUDIO, 14, 205, 272, 9, SS_NOPREFIX
+    LTEXT           "Playback volume", IDC_UI_LABEL_VOLUME, 14, 218, 70, 9, SS_NOPREFIX
+    CONTROL         "", IDC_VOLUME_SLIDER, "msctls_trackbar32", 0x0010 | WS_TABSTOP, 84, 214, 166, 16
+    RTEXT           "100%", IDC_VOLUME_VALUE, 252, 218, 34, 9, SS_NOPREFIX
+    CONTROL         "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, "Button", BS_OWNERDRAW | WS_TABSTOP, 14, 232, 110, 12
+    LTEXT           "How loud the Mac's audio plays on this PC. Applies right away.", IDC_UI_HINT_VOLUME, 14, 247, 272, 9, SS_NOPREFIX
+
+    LTEXT           "Connection and video changes apply the next time JerisLink starts.", IDC_APPLY_NOTE, 14, 268, 166, 18, SS_NOPREFIX
+    CONTROL         "Cancel", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 186, 269, 48, 16
+    CONTROL         "Save", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 238, 269, 48, 16
 END
 
-// Modeless "Volume..." window. Slider style 0x0010 = TBS_HORZ | TBS_NOTICKS.
-IDD_AUDIO_VOLUME DIALOGEX 0, 0, 196, 58
-STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+// Modeless "Volume..." window. Only changes how loud the Mac's audio plays on
+// this PC (this app's audio session); it never touches the Mac.
+IDD_AUDIO_VOLUME DIALOGEX 0, 0, 210, 94
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 EXSTYLE WS_EX_TOOLWINDOW
-CAPTION "Mac Audio Volume"
+CAPTION "Playback Volume"
 FONT 9, "Segoe UI"
 BEGIN
-    CONTROL         "", IDC_VOLUME_SLIDER, "msctls_trackbar32", 0x0010 | WS_TABSTOP, 8, 10, 146, 16
-    RTEXT           "100%", IDC_VOLUME_VALUE, 156, 14, 30, 10
-    AUTOCHECKBOX    "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, 10, 38, 110, 10, WS_TABSTOP
-    PUSHBUTTON      "Close", IDCANCEL, 138, 36, 50, 14
+    LTEXT           "Mac audio on this PC", IDC_UI_TITLE, 10, 7, 190, 13, SS_NOPREFIX
+    LTEXT           "Playback volume on this PC only. Applies right away.", IDC_UI_SUBTITLE, 10, 21, 190, 9, SS_NOPREFIX
+    LTEXT           "Volume", IDC_UI_LABEL_VOLUME, 10, 39, 34, 9, SS_NOPREFIX
+    CONTROL         "", IDC_VOLUME_SLIDER, "msctls_trackbar32", 0x0010 | WS_TABSTOP, 44, 35, 122, 16
+    RTEXT           "100%", IDC_VOLUME_VALUE, 166, 39, 34, 9, SS_NOPREFIX
+    CONTROL         "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, "Button", BS_OWNERDRAW | WS_TABSTOP, 10, 55, 110, 12
+    CONTROL         "Close", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 152, 75, 48, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

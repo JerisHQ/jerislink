@@ -30,6 +30,7 @@
 #include "mouse_buttons.hpp"
 #include "video_worker.hpp"
 #include "audio_player.hpp"
+#include "ui_theme.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -534,22 +535,10 @@ static void applyRemoteCursorShape(HWND hwnd, uint8_t shape) {
     if (hwnd && gRemoteCursor) SetCursor(gRemoteCursor);
 }
 
+// Dark caption, border and rounded corners; shared with the settings and
+// volume dialogs (ui_theme.hpp).
 static void applyModernWindowChrome(HWND hwnd) {
-    // These DWM attributes are best-effort. Older Windows builds may ignore
-    // one or more of them, while Windows 11 gets a dark caption and rounded
-    // corners without replacing the native non-client controls.
-    BOOL dark = TRUE;
-    (void)DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-
-    const COLORREF caption = RGB(12, 20, 36);
-    const COLORREF border = RGB(43, 68, 99);
-    const COLORREF text = RGB(244, 248, 255);
-    (void)DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
-    (void)DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
-    (void)DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text, sizeof(text));
-
-    DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
-    (void)DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    jl::ui::applyWindowChrome(hwnd);
 }
 
 static bool physicalKeyDown(int vk) {
@@ -801,12 +790,17 @@ static int gAudioVolumePct = jl::audio::kDefaultVolumePercent;
 static int gSavedAudioVolumePct = jl::audio::kDefaultVolumePercent;
 static bool gAudioVolumeLoaded = false;
 static HWND gVolumeDlg = nullptr;  // modeless "Volume..." window
+static HWND gSettingsDlg = nullptr;  // settings dialog while open (Audio section)
 
 static void updateAudioMuteMenus(HWND hwnd) {
     const UINT state = MF_BYCOMMAND | (gAudioMuted ? MF_CHECKED : MF_UNCHECKED);
-    if (HMENU bar = GetMenu(hwnd)) CheckMenuItem(bar, IDM_AUDIO_MUTE, state);
-    if (HMENU sys = GetSystemMenu(hwnd, FALSE)) CheckMenuItem(sys, IDM_AUDIO_MUTE, state);
-    if (gVolumeDlg) CheckDlgButton(gVolumeDlg, IDC_VOLUME_MUTE, gAudioMuted ? BST_CHECKED : BST_UNCHECKED);
+    if (hwnd) {
+        if (HMENU bar = GetMenu(hwnd)) CheckMenuItem(bar, IDM_AUDIO_MUTE, state);
+        if (HMENU sys = GetSystemMenu(hwnd, FALSE)) CheckMenuItem(sys, IDM_AUDIO_MUTE, state);
+    }
+    for (HWND dlg : {gVolumeDlg, gSettingsDlg}) {
+        if (dlg) jl::ui::setOwnerChecked(dlg, IDC_VOLUME_MUTE, gAudioMuted);
+    }
 }
 
 static void toggleAudioMute(HWND hwnd, const char* source) {
@@ -962,10 +956,396 @@ static void commitAudioVolume(const char* source) {
             " saved=" + (saved ? "yes" : "no"));
 }
 
+// ---- Themed dialogs (settings, volume) ------------------------------------
+// Colours and DWM title bar come from ui_theme.hpp, the same helper the
+// viewer window uses, so the dialogs match the viewer's title bar.
+
+static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
+static constexpr int kSettingsFooterTop = 262;  // dialog units, see jerislink.rc
+static constexpr int kVolumeFooterTop = 70;
+
+struct ThemedDialog {
+    jl::ui::DialogTheme theme;
+    int titlePt = 15;
+    int footerTopDlu = 0;
+};
+
+static ThemedDialog* themedDialog(HWND dlg) {
+    return reinterpret_cast<ThemedDialog*>(GetWindowLongPtrW(dlg, DWLP_USER));
+}
+
+enum class TextRole { Other, Title, Subtitle, Section, Label, Value, Hint, Note };
+
+static TextRole textRole(int id) {
+    switch (id) {
+    case IDC_UI_TITLE: return TextRole::Title;
+    case IDC_UI_SUBTITLE: return TextRole::Subtitle;
+    case IDC_UI_SECTION_CONNECTION:
+    case IDC_UI_SECTION_VIDEO:
+    case IDC_UI_SECTION_AUDIO: return TextRole::Section;
+    case IDC_UI_LABEL_HOST:
+    case IDC_UI_LABEL_BIND:
+    case IDC_UI_LABEL_CODEC:
+    case IDC_UI_LABEL_BITRATE:
+    case IDC_UI_LABEL_VOLUME: return TextRole::Label;
+    case IDC_BITRATE_VALUE:
+    case IDC_VOLUME_VALUE: return TextRole::Value;
+    case IDC_UI_HINT_HOST:
+    case IDC_UI_HINT_BITRATE:
+    case IDC_UI_HINT_VOLUME:
+    case IDC_BIND_HINT: return TextRole::Hint;
+    case IDC_APPLY_NOTE: return TextRole::Note;
+    default: return TextRole::Other;
+    }
+}
+
+static int dialogUnitsY(HWND dlg, int dlu) {
+    RECT r{0, 0, 0, dlu};
+    MapDialogRect(dlg, &r);
+    return r.bottom;
+}
+
+// Selection field height for the owner-drawn codec box: the combo box adds
+// 3 px of frame above and below, and we want it as tall as an edit field
+// (edit 10 DLU + 2 x 3 DLU padding).
+static int comboFieldHeight(HWND dlg) {
+    return std::max(8, dialogUnitsY(dlg, 16) - 6);
+}
+
+static void applyThemeFonts(HWND dlg) {
+    ThemedDialog* td = themedDialog(dlg);
+    if (!td) return;
+    for (HWND c = GetWindow(dlg, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        HFONT font = td->theme.text;
+        switch (textRole(GetDlgCtrlID(c))) {
+        case TextRole::Title: font = td->theme.title; break;
+        case TextRole::Section: font = td->theme.section; break;
+        case TextRole::Label:
+        case TextRole::Value: font = td->theme.label; break;
+        case TextRole::Subtitle:
+        case TextRole::Hint:
+        case TextRole::Note: font = td->theme.small; break;
+        default: break;
+        }
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    }
+    if (HWND combo = GetDlgItem(dlg, IDC_VIDEO_CODEC)) {
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), comboFieldHeight(dlg));
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, jl::ui::px(td->theme.dpi, 26));
+    }
+    RedrawWindow(dlg, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+// The codec drop-down paints its own closed state: rounded field, text and
+// chevron, like the edit boxes. The list itself is owner-drawn items.
+// Classic GWLP_WNDPROC subclass: SetWindowSubclass is a comctl32 v6 API and
+// the viewer does not load v6.
+static constexpr wchar_t kComboOldProcProp[] = L"JerisLink.ComboProc";
+
+static LRESULT CALLBACK ThemedComboProc(HWND combo, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const auto oldProc = reinterpret_cast<WNDPROC>(GetPropW(combo, kComboOldProcProp));
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        ThemedDialog* td = themedDialog(GetParent(combo));
+        if (!td) break;
+        const auto& t = td->theme;
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(combo, &ps);
+        RECT r{};
+        GetClientRect(combo, &r);
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        const bool focus = GetFocus() == combo;
+        jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
+                          focus ? jl::ui::color::kAccent : jl::ui::color::kBorder,
+                          jl::ui::px(t.dpi, 1));
+        wchar_t text[64]{};
+        const LRESULT sel = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR &&
+            SendMessageW(combo, CB_GETLBTEXTLEN, sel, 0) < static_cast<LRESULT>(std::size(text))) {
+            SendMessageW(combo, CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(text));
+        }
+        HGDIOBJ oldFont = SelectObject(dc, t.text);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, jl::ui::color::kText);
+        RECT tr = r;
+        tr.left += jl::ui::px(t.dpi, 10);
+        tr.right -= jl::ui::px(t.dpi, 28);
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, oldFont);
+        const int cx = r.right - jl::ui::px(t.dpi, 16);
+        const int cy = (r.top + r.bottom) / 2;
+        const int a = jl::ui::px(t.dpi, 4);
+        const int w = jl::ui::px(t.dpi, 2);
+        jl::ui::line(dc, cx - a, cy - a / 2, cx, cy + a / 2, jl::ui::color::kMuted, w);
+        jl::ui::line(dc, cx, cy + a / 2, cx + a, cy - a / 2, jl::ui::color::kMuted, w);
+        EndPaint(combo, &ps);
+        return 0;
+    }
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(combo, nullptr, FALSE);
+        break;
+    case WM_NCDESTROY:
+        if (oldProc) {
+            SetWindowLongPtrW(combo, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(oldProc));
+            RemovePropW(combo, kComboOldProcProp);
+        }
+        break;
+    default:
+        break;
+    }
+    return oldProc ? CallWindowProcW(oldProc, combo, msg, wParam, lParam)
+                   : DefWindowProcW(combo, msg, wParam, lParam);
+}
+
+static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
+    auto* td = new ThemedDialog;
+    td->titlePt = titlePt;
+    td->footerTopDlu = footerTopDlu;
+    td->theme.build(dlg, titlePt);
+    SetWindowLongPtrW(dlg, DWLP_USER, reinterpret_cast<LONG_PTR>(td));
+    jl::ui::applyWindowChrome(dlg);
+    if (HWND combo = GetDlgItem(dlg, IDC_VIDEO_CODEC)) {
+        const LONG_PTR old = SetWindowLongPtrW(combo, GWLP_WNDPROC,
+                                               reinterpret_cast<LONG_PTR>(ThemedComboProc));
+        SetPropW(combo, kComboOldProcProp, reinterpret_cast<HANDLE>(old));
+    }
+    applyThemeFonts(dlg);
+}
+
+static bool isFooterControl(int id) {
+    return id == IDC_APPLY_NOTE || id == IDOK || id == IDCANCEL;
+}
+
+static void paintThemedDialog(HWND dlg, const ThemedDialog& td) {
+    const auto& t = td.theme;
+    PAINTSTRUCT ps{};
+    HDC dc = BeginPaint(dlg, &ps);
+    RECT client{};
+    GetClientRect(dlg, &client);
+    const int footerTop = dialogUnitsY(dlg, td.footerTopDlu);
+    RECT footer{client.left, footerTop, client.right, client.bottom};
+    jl::ui::fillRect(dc, footer, jl::ui::color::kCaption);
+    RECT divider{client.left, footerTop, client.right, footerTop + jl::ui::px(t.dpi, 1)};
+    jl::ui::fillRect(dc, divider, jl::ui::color::kBorder);
+    RECT pad{0, 0, 4, 3};
+    MapDialogRect(dlg, &pad);
+    for (int id : {IDC_HOST_IP, IDC_BIND_IP}) {
+        HWND edit = GetDlgItem(dlg, id);
+        if (!edit) continue;
+        RECT r = jl::ui::childRect(dlg, id);
+        InflateRect(&r, pad.right, pad.bottom);
+        jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
+                          GetFocus() == edit ? jl::ui::color::kAccent : jl::ui::color::kBorder,
+                          jl::ui::px(t.dpi, 1));
+    }
+    EndPaint(dlg, &ps);
+}
+
+static void invalidateFieldAround(HWND dlg, HWND child) {
+    RECT r{};
+    GetWindowRect(child, &r);
+    MapWindowPoints(nullptr, dlg, reinterpret_cast<POINT*>(&r), 2);
+    RECT pad{0, 0, 8, 6};
+    MapDialogRect(dlg, &pad);
+    InflateRect(&r, pad.right, pad.bottom);
+    InvalidateRect(dlg, &r, TRUE);
+}
+
+// Shared message handling for both dialogs. Returns true when handled and
+// sets `result` to the dialog procedure's return value.
+static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam,
+                                      INT_PTR& result) {
+    if (msg == WM_MEASUREITEM) {
+        // Arrives while the controls are created, before WM_INITDIALOG.
+        auto* mi = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (mi->CtlType != ODT_COMBOBOX) return false;
+        mi->itemHeight = mi->itemID == static_cast<UINT>(-1)
+            ? static_cast<UINT>(comboFieldHeight(dlg))
+            : static_cast<UINT>(jl::ui::px(jl::ui::windowDpi(dlg), 26));
+        result = TRUE;
+        return true;
+    }
+    ThemedDialog* td = themedDialog(dlg);
+    if (!td) return false;
+    const auto& t = td->theme;
+    switch (msg) {
+    case WM_CTLCOLORDLG:
+        result = reinterpret_cast<INT_PTR>(t.body);
+        return true;
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+        COLORREF fg = jl::ui::color::kText;
+        switch (textRole(id)) {
+        case TextRole::Section: fg = jl::ui::color::kAccent; break;
+        case TextRole::Subtitle:
+        case TextRole::Hint:
+        case TextRole::Note: fg = jl::ui::color::kMuted; break;
+        default: break;
+        }
+        if (!IsWindowEnabled(reinterpret_cast<HWND>(lParam))) fg = jl::ui::color::kDisabled;
+        const bool footer = isFooterControl(id);
+        SetTextColor(dc, fg);
+        SetBkColor(dc, footer ? jl::ui::color::kCaption : jl::ui::color::kBody);
+        SetBkMode(dc, TRANSPARENT);
+        result = reinterpret_cast<INT_PTR>(footer ? t.footer : t.body);
+        return true;
+    }
+    case WM_CTLCOLORBTN: {
+        const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+        result = reinterpret_cast<INT_PTR>(isFooterControl(id) ? t.footer : t.body);
+        return true;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, jl::ui::color::kText);
+        SetBkColor(dc, jl::ui::color::kField);
+        result = reinterpret_cast<INT_PTR>(t.field);
+        return true;
+    }
+    case WM_PAINT:
+        paintThemedDialog(dlg, *td);
+        result = TRUE;
+        return true;
+    case WM_DRAWITEM: {
+        const auto& di = *reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (di.CtlType == ODT_BUTTON) {
+            const int id = static_cast<int>(di.CtlID);
+            const COLORREF behind = isFooterControl(id) ? jl::ui::color::kCaption
+                                                        : jl::ui::color::kBody;
+            if (id == IDOK || id == IDCANCEL) {
+                // Settings: Save is primary. Volume window: Close is its only button.
+                const bool primary = id == IDOK || GetDlgItem(dlg, IDOK) == nullptr;
+                jl::ui::drawButton(di, t, primary, behind);
+            } else {
+                jl::ui::drawCheckBox(di, t, jl::ui::ownerChecked(dlg, id), behind);
+            }
+            result = TRUE;
+            return true;
+        }
+        if (di.CtlType == ODT_COMBOBOX) {
+            if (di.itemState & ODS_COMBOBOXEDIT) {
+                // The closed field is painted by ThemedComboProc.
+                InvalidateRect(di.hwndItem, nullptr, FALSE);
+                result = TRUE;
+                return true;
+            }
+            const bool selected = (di.itemState & ODS_SELECTED) != 0;
+            jl::ui::fillRect(di.hDC, di.rcItem,
+                             selected ? jl::ui::color::kListSelected : jl::ui::color::kField);
+            if (di.itemID != static_cast<UINT>(-1)) {
+                wchar_t text[64]{};
+                if (SendMessageW(di.hwndItem, CB_GETLBTEXTLEN, di.itemID, 0) <
+                    static_cast<LRESULT>(std::size(text))) {
+                    SendMessageW(di.hwndItem, CB_GETLBTEXT, di.itemID,
+                                 reinterpret_cast<LPARAM>(text));
+                }
+                HGDIOBJ oldFont = SelectObject(di.hDC, t.text);
+                SetBkMode(di.hDC, TRANSPARENT);
+                SetTextColor(di.hDC, jl::ui::color::kText);
+                RECT tr = di.rcItem;
+                tr.left += jl::ui::px(t.dpi, 10);
+                DrawTextW(di.hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(di.hDC, oldFont);
+            }
+            result = TRUE;
+            return true;
+        }
+        return false;
+    }
+    case WM_NOTIFY: {
+        const auto* hdr = reinterpret_cast<const NMHDR*>(lParam);
+        if (hdr->code != NM_CUSTOMDRAW ||
+            (hdr->idFrom != IDC_VOLUME_SLIDER && hdr->idFrom != IDC_VIDEO_BITRATE)) {
+            return false;
+        }
+        SetWindowLongPtrW(dlg, DWLP_MSGRESULT,
+                          jl::ui::drawSlider(*reinterpret_cast<const NMCUSTOMDRAW*>(lParam), t));
+        result = TRUE;
+        return true;
+    }
+    case WM_COMMAND: {
+        // Repaint the field outline when an edit box gains or loses focus.
+        const WORD code = HIWORD(wParam);
+        if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
+            invalidateFieldAround(dlg, reinterpret_cast<HWND>(lParam));
+        }
+        return false;  // the dialog's own handler still sees the command
+    }
+    case WM_DPICHANGED:
+        // Let the dialog manager rescale the layout first, then rebuild fonts.
+        PostMessageW(dlg, kMsgThemeDpiChanged, 0, 0);
+        return false;
+    case kMsgThemeDpiChanged:
+        td->theme.build(dlg, td->titlePt);
+        applyThemeFonts(dlg);
+        result = TRUE;
+        return true;
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(dlg, DWLP_USER, 0);
+        delete td;
+        return false;
+    default:
+        return false;
+    }
+}
+
 static void updateVolumeLabel(HWND dlg) {
     wchar_t text[16]{};
     swprintf(text, std::size(text), L"%d%%", gAudioVolumePct);
     SetDlgItemTextW(dlg, IDC_VOLUME_VALUE, text);
+}
+
+// The volume window and the settings dialog's Audio section show the same
+// two values; whichever moves, both follow.
+static void syncVolumeControls(HWND dlg) {
+    if (!dlg) return;
+    if (HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER)) {
+        if (SendMessageW(slider, TBM_GETPOS, 0, 0) != gAudioVolumePct) {
+            SendMessageW(slider, TBM_SETPOS, TRUE, gAudioVolumePct);
+        }
+    }
+    updateVolumeLabel(dlg);
+    jl::ui::setOwnerChecked(dlg, IDC_VOLUME_MUTE, gAudioMuted);
+}
+
+static void syncVolumeWindows() {
+    syncVolumeControls(gVolumeDlg);
+    syncVolumeControls(gSettingsDlg);
+}
+
+static void initVolumeControls(HWND dlg) {
+    HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
+    SendMessageW(slider, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
+    SendMessageW(slider, TBM_SETLINESIZE, 0, 1);
+    SendMessageW(slider, TBM_SETPAGESIZE, 0, 10);
+    SendMessageW(slider, TBM_SETPOS, TRUE, gAudioVolumePct);
+    syncVolumeControls(dlg);
+}
+
+// WM_HSCROLL from a volume slider. Volume applies at once; it is saved once
+// per gesture (thumb released, key up), not on every step.
+static bool handleVolumeScroll(HWND dlg, WPARAM wParam, LPARAM lParam, const char* source) {
+    HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
+    if (!slider || reinterpret_cast<HWND>(lParam) != slider) return false;
+    setAudioVolume(static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0)));
+    syncVolumeWindows();
+    InvalidateRect(slider, nullptr, FALSE);
+    if (LOWORD(wParam) == TB_ENDTRACK) commitAudioVolume(source);
+    return true;
+}
+
+static void ensureCommonControls() {
+    static bool ready = false;
+    if (ready) return;
+    INITCOMMONCONTROLSEX icc{};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_BAR_CLASSES;
+    ready = InitCommonControlsEx(&icc) != FALSE;
 }
 
 // Opens at the top-right corner of the viewer window, inside its monitor's
@@ -989,26 +1369,17 @@ static void placeVolumeWindow(HWND dlg, HWND owner) {
 }
 
 static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    INT_PTR themed = 0;
+    if (handleThemedDialogMessage(dlg, msg, wParam, lParam, themed)) return themed;
     switch (msg) {
-    case WM_INITDIALOG: {
-        HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
-        SendMessageW(slider, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
-        SendMessageW(slider, TBM_SETLINESIZE, 0, 1);
-        SendMessageW(slider, TBM_SETPAGESIZE, 0, 10);
-        SendMessageW(slider, TBM_SETPOS, TRUE, gAudioVolumePct);
-        CheckDlgButton(dlg, IDC_VOLUME_MUTE, gAudioMuted ? BST_CHECKED : BST_UNCHECKED);
-        updateVolumeLabel(dlg);
+    case WM_INITDIALOG:
+        initThemedDialog(dlg, 12, kVolumeFooterTop);
+        initVolumeControls(dlg);
         placeVolumeWindow(dlg, reinterpret_cast<HWND>(lParam));
         return TRUE;  // focus on the slider, the first tab stop
-    }
-    case WM_HSCROLL: {
-        HWND slider = GetDlgItem(dlg, IDC_VOLUME_SLIDER);
-        if (reinterpret_cast<HWND>(lParam) != slider) break;
-        setAudioVolume(static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0)));
-        updateVolumeLabel(dlg);
-        if (LOWORD(wParam) == TB_ENDTRACK) commitAudioVolume("slider");
-        return TRUE;
-    }
+    case WM_HSCROLL:
+        if (handleVolumeScroll(dlg, wParam, lParam, "slider")) return TRUE;
+        break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDC_VOLUME_MUTE:
@@ -1043,13 +1414,7 @@ static void showVolumeWindow(HWND owner, const char* source) {
         SetForegroundWindow(gVolumeDlg);
         return;
     }
-    static bool controlsReady = false;
-    if (!controlsReady) {
-        INITCOMMONCONTROLSEX icc{};
-        icc.dwSize = sizeof(icc);
-        icc.dwICC = ICC_BAR_CLASSES;
-        controlsReady = InitCommonControlsEx(&icc) != FALSE;
-    }
+    ensureCommonControls();
     gVolumeDlg = CreateDialogParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_AUDIO_VOLUME),
                                     owner, VolumeDlgProc, reinterpret_cast<LPARAM>(owner));
     if (!gVolumeDlg) {
@@ -1066,15 +1431,34 @@ static void showVolumeWindow(HWND owner, const char* source) {
 static constexpr LPARAM kSettingsDialogSave = 0;
 static constexpr LPARAM kSettingsDialogConnect = 1;
 
+// Manual bitrate range on the slider; 0 (saved) means Auto.
+static constexpr int kBitrateSliderMin = 4;
+static constexpr int kBitrateSliderMax = 100;
+static constexpr int kBitrateSliderDefault = 25;
+
 static std::wstring dialogText(HWND dlg, int id) {
     wchar_t text[64]{};
     GetDlgItemTextW(dlg, id, text, static_cast<int>(std::size(text)));
     return text;
 }
 
+static void updateBitrateControls(HWND dlg) {
+    const bool autoRate = jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO);
+    HWND slider = GetDlgItem(dlg, IDC_VIDEO_BITRATE);
+    EnableWindow(slider, autoRate ? FALSE : TRUE);
+    InvalidateRect(slider, nullptr, FALSE);
+    const int value = static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0));
+    const std::wstring text = autoRate ? std::wstring(L"Auto") : std::to_wstring(value) + L" Mbps";
+    SetDlgItemTextW(dlg, IDC_BITRATE_VALUE, text.c_str());
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    INT_PTR themed = 0;
+    if (handleThemedDialogMessage(dlg, msg, wParam, lParam, themed)) return themed;
     switch (msg) {
     case WM_INITDIALOG: {
+        gSettingsDlg = dlg;
+        initThemedDialog(dlg, 15, kSettingsFooterTop);
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_ADDSTRING, 0,
                             reinterpret_cast<LPARAM>(L"Auto"));
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_ADDSTRING, 0,
@@ -1086,7 +1470,19 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         if (settings.codec == "auto") index = 0;
         else if (settings.codec == "hevc") index = 2;
         SendDlgItemMessageW(dlg, IDC_VIDEO_CODEC, CB_SETCURSEL, index, 0);
-        SetDlgItemInt(dlg, IDC_VIDEO_BITRATE, settings.bitrateMbps, FALSE);
+
+        HWND bitrate = GetDlgItem(dlg, IDC_VIDEO_BITRATE);
+        SendMessageW(bitrate, TBM_SETRANGE, FALSE, MAKELPARAM(kBitrateSliderMin, kBitrateSliderMax));
+        SendMessageW(bitrate, TBM_SETLINESIZE, 0, 1);
+        SendMessageW(bitrate, TBM_SETPAGESIZE, 0, 5);
+        const bool autoRate = settings.bitrateMbps == 0;
+        SendMessageW(bitrate, TBM_SETPOS, TRUE,
+                     autoRate ? kBitrateSliderDefault
+                              : std::clamp<int>(settings.bitrateMbps, kBitrateSliderMin,
+                                                kBitrateSliderMax));
+        jl::ui::setOwnerChecked(dlg, IDC_BITRATE_AUTO, autoRate);
+        updateBitrateControls(dlg);
+
         SetDlgItemTextW(dlg, IDC_HOST_IP, wideFromAscii(settings.hostIp).c_str());
         SetDlgItemTextW(dlg, IDC_BIND_IP, wideFromAscii(settings.bindIp).c_str());
         const auto detected = detectTailscaleIPv4();
@@ -1095,11 +1491,17 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                   wideFromAscii(*detected) + L")."
             : std::wstring(L"Leave empty to use this PC's Tailscale address (none found now).");
         SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
+
+        ensureAudioVolumeLoaded();
+        initVolumeControls(dlg);
+
         if (lParam == kSettingsDialogConnect) {
             SetDlgItemTextW(dlg, IDOK, L"Connect");
             SetDlgItemTextW(dlg, IDC_APPLY_NOTE,
                             L"Saved for next time. Hold Shift while starting JerisLink to change them.");
         }
+        // Owner-drawn buttons cannot be BS_DEFPUSHBUTTON; Enter still means Save.
+        SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
         SetForegroundWindow(dlg);
         if (settings.hostIp.empty()) {
             SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
@@ -1107,8 +1509,30 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         }
         return TRUE;
     }
+    case WM_HSCROLL:
+        if (handleVolumeScroll(dlg, wParam, lParam, "settings")) return TRUE;
+        if (reinterpret_cast<HWND>(lParam) == GetDlgItem(dlg, IDC_VIDEO_BITRATE)) {
+            updateBitrateControls(dlg);
+            return TRUE;
+        }
+        break;
+    case WM_DESTROY:
+        commitAudioVolume("settings");
+        if (gSettingsDlg == dlg) gSettingsDlg = nullptr;
+        break;
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_BITRATE_AUTO && HIWORD(wParam) == BN_CLICKED) {
+            jl::ui::setOwnerChecked(dlg, IDC_BITRATE_AUTO,
+                                    !jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO));
+            updateBitrateControls(dlg);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDC_VOLUME_MUTE && HIWORD(wParam) == BN_CLICKED) {
+            toggleAudioMute(GetWindow(dlg, GW_OWNER), "settings");
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDCANCEL) {
+            // Volume and mute already applied and stay; nothing else was saved.
             EndDialog(dlg, IDCANCEL);
             return TRUE;
         }
@@ -1117,22 +1541,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             const std::string bind = asciiFromWide(dialogText(dlg, IDC_BIND_IP));
             const LRESULT selected = SendDlgItemMessageW(
                 dlg, IDC_VIDEO_CODEC, CB_GETCURSEL, 0, 0);
-            const std::wstring bitrateText = dialogText(dlg, IDC_VIDEO_BITRATE);
-            bool bitrateValid = !bitrateText.empty();
-            unsigned long bitrateValue = 0;
-            if (bitrateValid) {
-                try {
-                    size_t consumed = 0;
-                    bitrateValue = std::stoul(bitrateText, &consumed, 10);
-                    bitrateValid = consumed == bitrateText.size() && bitrateValue <= 100;
-                } catch (...) {
-                    bitrateValid = false;
-                }
-            }
-            const UINT bitrate = bitrateValid ? static_cast<UINT>(bitrateValue) : 0;
+            const bool autoRate = jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO);
+            const int sliderValue = static_cast<int>(
+                SendDlgItemMessageW(dlg, IDC_VIDEO_BITRATE, TBM_GETPOS, 0, 0));
+            const UINT bitrate = autoRate
+                ? 0u
+                : static_cast<UINT>(std::clamp(sliderValue, kBitrateSliderMin, kBitrateSliderMax));
             logLine("settings.save_attempt host=" + host + " bind=" + bind +
                     " selected=" + std::to_string(selected) +
-                    " valid_bitrate=" + (bitrateValid ? "yes" : "no") +
+                    " bitrate_auto=" + (autoRate ? "yes" : "no") +
                     " bitrate=" + std::to_string(bitrate));
             if (!jl::isIPv4(host)) {
                 MessageBoxW(dlg,
@@ -1148,11 +1565,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                 SetFocus(GetDlgItem(dlg, IDC_BIND_IP));
                 return TRUE;
             }
-            if (selected == CB_ERR || !bitrateValid ||
-                (bitrate != 0 && (bitrate < 4 || bitrate > 100))) {
-                MessageBoxW(dlg,
-                    L"Bitrate must be 0 (Auto) or a value from 4 to 100 Mbps.",
-                    L"JerisLink Settings", MB_OK | MB_ICONWARNING);
+            if (selected == CB_ERR) {
+                MessageBoxW(dlg, L"Choose a codec.", L"JerisLink Settings",
+                            MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, IDC_VIDEO_CODEC));
                 return TRUE;
             }
             SavedSettings settings;
@@ -1179,6 +1595,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
 }
 
 static INT_PTR runSettingsDialog(HWND owner, LPARAM mode) {
+    ensureCommonControls();
     const INT_PTR result = DialogBoxParamW(
         GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_VIDEO_SETTINGS),
         owner, SettingsDlgProc, mode);
@@ -1191,7 +1608,7 @@ static INT_PTR runSettingsDialog(HWND owner, LPARAM mode) {
 static void showVideoSettings(HWND owner) {
     if (runSettingsDialog(owner, kSettingsDialogSave) == IDOK) {
         MessageBoxW(owner,
-            L"Settings saved. They apply the next time JerisLink starts.",
+            L"Settings saved. Connection and video changes apply the next time JerisLink starts.",
             L"JerisLink", MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -3531,9 +3948,132 @@ static std::string wideArgToUtf8(const wchar_t* text) {
     return out;
 }
 
+#ifdef JERISLINK_UI_SNAPSHOT
+// CI-only build (JerislinkUiSnapshot.exe, never packaged): opens the real
+// settings and volume dialogs from this file's resources and saves each
+// window as a BMP, so the look can be reviewed without a Mac host.
+static void pumpFor(DWORD ms) {
+    const ULONGLONG until = GetTickCount64() + ms;
+    while (GetTickCount64() < until) {
+        MSG m{};
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        Sleep(15);
+    }
+}
+
+static bool writeBmp(const std::wstring& path, HDC src, int x, int y, int w, int h,
+                     HWND printFrom) {
+    HDC mem = CreateCompatibleDC(src);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = h;  // bottom-up
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 24;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(src, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { DeleteDC(mem); return false; }
+    HGDIOBJ old = SelectObject(mem, bmp);
+    bool ok = printFrom ? PrintWindow(printFrom, mem, 2 /* PW_RENDERFULLCONTENT */) != FALSE
+                        : BitBlt(mem, 0, 0, w, h, src, x, y, SRCCOPY | CAPTUREBLT) != FALSE;
+    GdiFlush();
+    const DWORD stride = (static_cast<DWORD>(w) * 3 + 3) & ~3u;
+    const DWORD imageSize = stride * static_cast<DWORD>(h);
+    BITMAPFILEHEADER fh{};
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(fh) + sizeof(bi.bmiHeader);
+    fh.bfSize = fh.bfOffBits + imageSize;
+    bi.bmiHeader.biSizeImage = imageSize;
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
+    out.write(reinterpret_cast<const char*>(&bi.bmiHeader), sizeof(bi.bmiHeader));
+    out.write(static_cast<const char*>(bits), imageSize);
+    ok = ok && out.good();
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    return ok;
+}
+
+// Saves <name>-screen.bmp (screen pixels: DWM title bar as shown) and
+// <name>-print.bmp (PrintWindow, for desktops where the screen is blank).
+static void snapshotWindow(HWND hwnd, const std::wstring& dir, const std::wstring& name) {
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+    pumpFor(700);
+    RECT r{};
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) {
+        GetWindowRect(hwnd, &r);
+    }
+    RECT wr{};
+    GetWindowRect(hwnd, &wr);
+    HDC screen = GetDC(nullptr);
+    const bool a = writeBmp(dir + L"\\" + name + L"-screen.bmp", screen, r.left, r.top,
+                            r.right - r.left, r.bottom - r.top, nullptr);
+    const bool b = writeBmp(dir + L"\\" + name + L"-print.bmp", screen, 0, 0,
+                            wr.right - wr.left, wr.bottom - wr.top, hwnd);
+    ReleaseDC(nullptr, screen);
+    std::wcout << name << L" dpi=" << GetDpiForWindow(hwnd) << L" screen=" << a
+               << L" print=" << b << L"\n";
+}
+
+static int runUiSnapshot(const std::wstring& dir) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ensureCommonControls();
+    ensureAudioVolumeLoaded();
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+
+    HWND settings = CreateDialogParamW(inst, MAKEINTRESOURCEW(IDD_VIDEO_SETTINGS), nullptr,
+                                       SettingsDlgProc, kSettingsDialogSave);
+    if (!settings) return 2;
+    ShowWindow(settings, SW_SHOW);
+    snapshotWindow(settings, dir, L"settings-auto");
+    // Manual bitrate: Auto off, slider enabled; keyboard focus on the slider.
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BITRATE_AUTO, BN_CLICKED), 0);
+    SendMessageW(settings, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+    SetFocus(GetDlgItem(settings, IDC_VIDEO_BITRATE));
+    snapshotWindow(settings, dir, L"settings-manual");
+    // Settings Audio section and the volume window open together stay in step.
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_VOLUME_MUTE, BN_CLICKED), 0);
+
+    HWND volume = CreateDialogParamW(inst, MAKEINTRESOURCEW(IDD_AUDIO_VOLUME), nullptr,
+                                     VolumeDlgProc, 0);
+    if (!volume) return 3;
+    gVolumeDlg = volume;
+    syncVolumeWindows();
+    SetWindowPos(volume, nullptr, 40, 40, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    ShowWindow(volume, SW_SHOW);
+    snapshotWindow(volume, dir, L"volume-muted");
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_VOLUME_MUTE, BN_CLICKED), 0);
+    snapshotWindow(volume, dir, L"volume");
+    const bool synced =
+        SendDlgItemMessageW(volume, IDC_VOLUME_SLIDER, TBM_GETPOS, 0, 0) == gAudioVolumePct &&
+        SendDlgItemMessageW(settings, IDC_VOLUME_SLIDER, TBM_GETPOS, 0, 0) == gAudioVolumePct &&
+        jl::ui::ownerChecked(volume, IDC_VOLUME_MUTE) == gAudioMuted &&
+        jl::ui::ownerChecked(settings, IDC_VOLUME_MUTE) == gAudioMuted;
+    std::wcout << L"volume_sync=" << (synced ? L"ok" : L"MISMATCH") << L"\n";
+    DestroyWindow(volume);
+    DestroyWindow(settings);
+    pumpFor(100);
+    return synced ? 0 : 4;
+}
+#endif
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* wideArgv = CommandLineToArgvW(GetCommandLineW(), &argc);
+#ifdef JERISLINK_UI_SNAPSHOT
+    if (wideArgv && argc >= 2) {
+        const std::wstring dir = wideArgv[1];
+        LocalFree(wideArgv);
+        return runUiSnapshot(dir);
+    }
+#endif
     if (!wideArgv || argc <= 0) {
         if (wideArgv) LocalFree(wideArgv);
         return 2;

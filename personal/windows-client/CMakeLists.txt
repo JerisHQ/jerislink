@@ -49,6 +49,16 @@ if(MSVC)
     target_link_options(Jerislink PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_BINARY_DIR}/jerislink.manifest")
 endif()
 
+# CI-only: the real settings / volume dialogs rendered to BMP for review.
+# Not installed or packaged.
+add_executable(JerislinkUiSnapshot WIN32 EXCLUDE_FROM_ALL viewer.cpp clipboard_channel.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+target_compile_definitions(JerislinkUiSnapshot PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX JERISLINK_UI_SNAPSHOT)
+target_include_directories(JerislinkUiSnapshot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(JerislinkUiSnapshot PRIVATE ${JERISLINK_LIBS} opus comctl32)
+if(MSVC)
+    target_link_options(JerislinkUiSnapshot PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_BINARY_DIR}/jerislink.manifest")
+endif()
+
 configure_file(setup.rc.in ${CMAKE_CURRENT_BINARY_DIR}/setup.generated.rc @ONLY)
 add_executable(JerislinkSetup WIN32 setup_gui.cpp ${CMAKE_CURRENT_BINARY_DIR}/setup.generated.rc)
 target_compile_definitions(JerislinkSetup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
