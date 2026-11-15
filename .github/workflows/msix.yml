@@ -2,8 +2,11 @@ name: msix
 
 # Builds the Microsoft Store (MSIX) package of the Windows viewer.
 # Produces artifacts only. It never uploads to Partner Center or the Store.
-# The sideload test package is signed with a self-signed certificate that is
-# created inside this run and deleted before the job ends (no secrets used).
+# The sideload test package is signed with the fixed self-signed test
+# certificate from the secrets MSIX_SIDELOAD_TEST_PFX / _PASSWORD (public half:
+# personal/windows-client/msix/JerisLink-sideload-test.cer). Without those
+# secrets (forks) a throwaway certificate is made for the run. The Store
+# package stays unsigned and never uses the test certificate.
 
 on:
   push:
@@ -43,6 +46,9 @@ jobs:
           $deps | Write-Host
           if ($deps -match '(?i)(vcruntime|msvcp)\d+\.dll|api-ms-win-crt-') { throw 'Jerislink.exe still links the dynamic CRT' }
       - name: Package MSIX + sideload test package
+        env:
+          MSIX_SIDELOAD_TEST_PFX: ${{ secrets.MSIX_SIDELOAD_TEST_PFX }}
+          MSIX_SIDELOAD_TEST_PFX_PASSWORD: ${{ secrets.MSIX_SIDELOAD_TEST_PFX_PASSWORD }}
         run: ./msix/build-msix.ps1 -ExePath build-msix\Release\Jerislink.exe -OutDir "$env:RUNNER_TEMP\msix" -SideloadTest
       - name: Check the packed icons are the checked v2.0 assets
         run: |
