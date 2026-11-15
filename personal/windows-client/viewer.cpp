@@ -31,9 +31,11 @@
 #include "video_worker.hpp"
 #include "audio_player.hpp"
 #include "ui_theme.hpp"
+#include "ui_overlay.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -41,6 +43,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -49,6 +52,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -811,10 +815,12 @@ static jl::BindDetection detectBindAddresses() {
     return jl::BindDetection{detectTailscaleIPv4(), detectTailcatBridge()};
 }
 
-static constexpr UINT IDM_VIDEO_SETTINGS = 0x1F10;
-static constexpr UINT IDM_CONNECTION_INFO = 0x1F11;
-static constexpr UINT IDM_AUDIO_MUTE = 0x1F20;  // low 4 bits clear: also used in the system menu
-static constexpr UINT IDM_AUDIO_VOLUME = 0x1F30;  // low 4 bits clear: also used in the system menu
+// The viewer has no menu bar and adds nothing to the system menu: every
+// action lives on the launch screen, the in-session overlay or a shortcut
+// (Win32 menus run a modal loop). The snapshot build checks that the old
+// command range 0x1F10-0x1F3F stays out of the system menu.
+static constexpr UINT kRemovedMenuIdFirst = 0x1F10;
+static constexpr UINT kRemovedMenuIdLast = 0x1F3F;
 
 // Mac audio. The player lives in the session (runViewer); mute is local to
 // this viewer, kept across reconnects, and never sent to the Mac.
@@ -827,30 +833,27 @@ static int gSavedAudioVolumePct = jl::audio::kDefaultVolumePercent;
 static bool gAudioVolumeLoaded = false;
 static HWND gVolumeDlg = nullptr;  // modeless "Volume..." window
 static HWND gSettingsDlg = nullptr;  // settings dialog while open (Audio section)
+static HWND gInfoDlg = nullptr;      // modeless "Connection info" window
 static bool gSettingsNoteError = false;  // its footer note shows a validation error
 
-static void updateAudioMuteMenus(HWND hwnd) {
-    const UINT state = MF_BYCOMMAND | (gAudioMuted ? MF_CHECKED : MF_UNCHECKED);
-    if (hwnd) {
-        if (HMENU bar = GetMenu(hwnd)) CheckMenuItem(bar, IDM_AUDIO_MUTE, state);
-        if (HMENU sys = GetSystemMenu(hwnd, FALSE)) CheckMenuItem(sys, IDM_AUDIO_MUTE, state);
-    }
+static void overlayRefresh();  // repaints the in-session overlay, if shown
+
+// Mute shows in the volume window, the settings dialog and the overlay.
+static void syncMuteUi() {
     for (HWND dlg : {gVolumeDlg, gSettingsDlg}) {
         if (dlg) jl::ui::setOwnerChecked(dlg, IDC_VOLUME_MUTE, gAudioMuted);
     }
+    overlayRefresh();
 }
 
-static void toggleAudioMute(HWND hwnd, const char* source) {
+static void toggleAudioMute(const char* source) {
     gAudioMuted = !gAudioMuted;
     if (gAudio) gAudio->setMuted(gAudioMuted);
-    updateAudioMuteMenus(hwnd);
+    syncMuteUi();
     logLine(std::string("audio.mute=") + (gAudioMuted ? "on" : "off") + " source=" + source);
 }
 
-// Ctrl+Alt+M toggles mute on the viewer only; the M never reaches the Mac.
-static bool isAudioMuteShortcut(WPARAM vk) {
-    return vk == 'M' && physicalKeyDown(VK_CONTROL) && physicalKeyDown(VK_MENU);
-}
+
 static constexpr wchar_t kJerislinkSettingsKey[] = L"Software\\Jeris\\Jerislink";
 
 using SavedSettings = jl::SavedSettings;
@@ -976,6 +979,24 @@ static void loadUiAccent() {
     logLine(std::string("ui.accent=") + (blue ? "blue" : "green"));
 }
 
+// The theme picker on the launch screen: applies at once and is saved.
+static bool saveUiAccent(bool blue) {
+    jl::ui::setAccent(blue ? jl::ui::Accent::Blue : jl::ui::Accent::Green);
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        logLine(std::string("ui.accent.save=") + (blue ? "blue" : "green") + " saved=no");
+        return false;
+    }
+    const bool ok = writeRegString(key, L"UiAccent", blue ? "blue" : "green") == ERROR_SUCCESS;
+    RegCloseKey(key);
+    logLine(std::string("ui.accent.save=") + (blue ? "blue" : "green") +
+            " saved=" + (ok ? "yes" : "no"));
+    return ok;
+}
+
+static bool accentIsBlue() { return jl::ui::accent().accent == jl::ui::kBlueAccent.accent; }
+
 static void ensureAudioVolumeLoaded() {
     if (gAudioVolumeLoaded) return;
     gAudioVolumeLoaded = true;
@@ -1017,23 +1038,41 @@ static void commitAudioVolume(const char* source) {
 static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
 static constexpr int kSettingsFooterTop = 262;  // dialog units, see jerislink.rc
 static constexpr int kVolumeFooterTop = 70;
+static constexpr int kLaunchFooterTop = 238;
+static constexpr int kInfoFooterTop = 172;
+
+struct ThemedDialog;
+using ThemedExtraPaint = void (*)(HWND dlg, HDC dc, const ThemedDialog& td);
 
 struct ThemedDialog {
     jl::ui::DialogTheme theme;
     int titlePt = 15;
     int footerTopDlu = 0;
+    ThemedExtraPaint extraPaint = nullptr;  // dialog-specific painting after the base
 };
 
 static ThemedDialog* themedDialog(HWND dlg) {
     return reinterpret_cast<ThemedDialog*>(GetWindowLongPtrW(dlg, DWLP_USER));
 }
 
-enum class TextRole { Other, Title, Subtitle, Section, Label, Value, Hint, Note };
+enum class TextRole { Other, Title, Subtitle, Section, Label, Value, Hint, Note, Hero, Brand, Error };
 
 static TextRole textRole(int id) {
     switch (id) {
     case IDC_UI_TITLE: return TextRole::Title;
-    case IDC_UI_SUBTITLE: return TextRole::Subtitle;
+    case IDC_UI_SUBTITLE:
+    case IDC_LAUNCH_TAGLINE: return TextRole::Subtitle;
+    case IDC_LAUNCH_HERO: return TextRole::Hero;
+    case IDC_LAUNCH_BRAND: return TextRole::Brand;
+    case IDC_LAUNCH_ERROR: return TextRole::Error;
+    case IDC_LAUNCH_PRIVACY: return TextRole::Note;
+    case IDC_LAUNCH_CODE_NOTE: return TextRole::Hint;
+    case IDC_UI_SECTION_THEME:
+    case IDC_LAUNCH_EYEBROW:
+    case IDC_LAUNCH_READY:
+    case IDC_INFO_SECTION_CONFIGURED:
+    case IDC_INFO_SECTION_EFFECTIVE:
+    case IDC_INFO_SECTION_DECODER:
     case IDC_UI_SECTION_CONNECTION:
     case IDC_UI_SECTION_VIDEO:
     case IDC_UI_SECTION_AUDIO: return TextRole::Section;
@@ -1073,11 +1112,14 @@ static void applyThemeFonts(HWND dlg) {
         HFONT font = td->theme.text;
         switch (textRole(GetDlgCtrlID(c))) {
         case TextRole::Title: font = td->theme.title; break;
+        case TextRole::Hero: font = td->theme.hero; break;
         case TextRole::Section: font = td->theme.section; break;
         case TextRole::Label:
+        case TextRole::Brand:
         case TextRole::Value: font = td->theme.label; break;
         case TextRole::Subtitle:
         case TextRole::Hint:
+        case TextRole::Error:
         case TextRole::Note: font = td->theme.smallText; break;
         default: break;
         }
@@ -1238,8 +1280,15 @@ static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
     applyThemeFonts(dlg);
 }
 
-static bool isFooterControl(int id) {
-    return id == IDC_APPLY_NOTE || id == IDOK || id == IDCANCEL;
+// A control whose top edge is inside the footer band (below footerTopDlu)
+// sits on the footer colour.
+static bool isFooterControl(HWND dlg, HWND control) {
+    const ThemedDialog* td = themedDialog(dlg);
+    if (!td || !control) return false;
+    RECT r{};
+    GetWindowRect(control, &r);
+    MapWindowPoints(nullptr, dlg, reinterpret_cast<POINT*>(&r), 2);
+    return r.top >= dialogUnitsY(dlg, td->footerTopDlu);
 }
 
 static void paintThemedDialog(HWND dlg, const ThemedDialog& td) {
@@ -1255,13 +1304,15 @@ static void paintThemedDialog(HWND dlg, const ThemedDialog& td) {
     jl::ui::fillRect(dc, divider, jl::ui::color::kBorder);
     RECT pad{0, 0, 4, 3};
     MapDialogRect(dlg, &pad);
-    if (HWND edit = GetDlgItem(dlg, IDC_HOST_IP)) {
+    HWND edit = GetDlgItem(dlg, IDC_HOST_IP);
+    if (edit && IsWindowVisible(edit)) {
         RECT r = jl::ui::childRect(dlg, IDC_HOST_IP);
         InflateRect(&r, pad.right, pad.bottom);
         jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
                           GetFocus() == edit ? jl::ui::accent().accent : jl::ui::color::kBorder,
                           jl::ui::px(t.dpi, 1));
     }
+    if (td.extraPaint) td.extraPaint(dlg, dc, td);
     EndPaint(dlg, &ps);
 }
 
@@ -1301,7 +1352,9 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
         COLORREF fg = jl::ui::color::kText;
         switch (textRole(id)) {
-        case TextRole::Section: fg = jl::ui::accent().accent; break;
+        case TextRole::Section:
+        case TextRole::Brand: fg = jl::ui::accent().accent; break;
+        case TextRole::Error: fg = jl::ui::color::kError; break;
         case TextRole::Subtitle:
         case TextRole::Hint:
         case TextRole::Note: fg = jl::ui::color::kMuted; break;
@@ -1309,18 +1362,17 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         }
         if (id == IDC_APPLY_NOTE && gSettingsNoteError) fg = jl::ui::color::kText;
         if (!IsWindowEnabled(reinterpret_cast<HWND>(lParam))) fg = jl::ui::color::kDisabled;
-        const bool footer = isFooterControl(id);
+        const bool footer = isFooterControl(dlg, reinterpret_cast<HWND>(lParam));
         SetTextColor(dc, fg);
         SetBkColor(dc, footer ? jl::ui::color::kCaption : jl::ui::color::kBody);
         SetBkMode(dc, TRANSPARENT);
         result = reinterpret_cast<INT_PTR>(footer ? t.footer : t.body);
         return true;
     }
-    case WM_CTLCOLORBTN: {
-        const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
-        result = reinterpret_cast<INT_PTR>(isFooterControl(id) ? t.footer : t.body);
+    case WM_CTLCOLORBTN:
+        result = reinterpret_cast<INT_PTR>(
+            isFooterControl(dlg, reinterpret_cast<HWND>(lParam)) ? t.footer : t.body);
         return true;
-    }
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORLISTBOX: {
         HDC dc = reinterpret_cast<HDC>(wParam);
@@ -1337,8 +1389,8 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         const auto& di = *reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
         if (di.CtlType == ODT_BUTTON) {
             const int id = static_cast<int>(di.CtlID);
-            const COLORREF behind = isFooterControl(id) ? jl::ui::color::kCaption
-                                                        : jl::ui::color::kBody;
+            const COLORREF behind = isFooterControl(dlg, di.hwndItem) ? jl::ui::color::kCaption
+                                                                      : jl::ui::color::kBody;
             if (id == IDOK || id == IDCANCEL) {
                 // Settings: Save is primary. Volume window: Close is its only button.
                 const bool primary = id == IDOK || GetDlgItem(dlg, IDOK) == nullptr;
@@ -1442,6 +1494,7 @@ static void syncVolumeControls(HWND dlg) {
 static void syncVolumeWindows() {
     syncVolumeControls(gVolumeDlg);
     syncVolumeControls(gSettingsDlg);
+    overlayRefresh();
 }
 
 static void initVolumeControls(HWND dlg) {
@@ -1509,7 +1562,7 @@ static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDC_VOLUME_MUTE:
-            if (HIWORD(wParam) == BN_CLICKED) toggleAudioMute(GetWindow(dlg, GW_OWNER), "volume-window");
+            if (HIWORD(wParam) == BN_CLICKED) toggleAudioMute("volume-window");
             return TRUE;
         case IDOK:
         case IDCANCEL:
@@ -1530,6 +1583,23 @@ static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         break;
     }
     return FALSE;
+}
+
+// In-session windows (Volume, Settings, Info opened while the viewer runs)
+// share the overlay's translucency: a layered window at the one
+// jl::overlay::kSessionUiAlpha token. Only the window's composition changes;
+// it stays a modeless owned dialog driven by the main loop, so nothing here
+// runs a modal loop. Before connecting (owner is not the viewer) they stay
+// opaque: there is no video behind them.
+static bool isSessionOwner(HWND owner) { return owner != nullptr && owner == gViewerHwnd; }
+
+static void applySessionTranslucency(HWND wnd, HWND owner, const char* what) {
+    if (!wnd || !isSessionOwner(owner)) return;
+    SetWindowLongPtrW(wnd, GWL_EXSTYLE, GetWindowLongPtrW(wnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+    if (!SetLayeredWindowAttributes(wnd, 0, jl::overlay::kSessionUiAlpha, LWA_ALPHA)) {
+        logLine(std::string("session_ui.alpha_failed window=") + what +
+                " error=" + std::to_string(GetLastError()));
+    }
 }
 
 // Modeless, so video keeps running while the slider moves; the main loop
@@ -1553,6 +1623,7 @@ static void showVolumeWindow(HWND owner, const char* source) {
         logLine("audio.volume_window_failed error=" + std::to_string(GetLastError()));
         return;
     }
+    applySessionTranslucency(gVolumeDlg, owner, "volume");
     ShowWindow(gVolumeDlg, SW_SHOW);
     logLine(std::string("audio.volume.window source=") + source +
             " volume=" + std::to_string(gAudioVolumePct));
@@ -1652,9 +1723,11 @@ static void updateBindHint(HWND dlg) {
     SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
 }
 
+// Says what applies now and what needs a reconnect (Disconnect in the
+// overlay, then Connect on the launch screen).
 static std::wstring settingsApplyNote(bool connect) {
-    return connect ? L"Saved for next time. Hold Shift while starting JerisLink to change them."
-                   : L"Connection and video changes apply the next time JerisLink starts.";
+    return connect ? L"Used for your next connection. Volume applies now."
+                   : L"Volume applies now. Connection and video changes apply when you reconnect.";
 }
 
 // Validation errors show in the footer note (no message box: it would stop
@@ -1712,7 +1785,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         ensureAudioVolumeLoaded();
         initVolumeControls(dlg);
 
-        if (gSettingsModal) SetDlgItemTextW(dlg, IDOK, L"Connect");
         SetDlgItemTextW(dlg, IDC_APPLY_NOTE, settingsApplyNote(gSettingsModal).c_str());
         // Owner-drawn buttons cannot be BS_DEFPUSHBUTTON; Enter still means Save.
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
@@ -1742,7 +1814,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             return TRUE;
         }
         if (LOWORD(wParam) == IDC_VOLUME_MUTE && HIWORD(wParam) == BN_CLICKED) {
-            toggleAudioMute(GetWindow(dlg, GW_OWNER), "settings");
+            toggleAudioMute("settings");
             return TRUE;
         }
         if ((LOWORD(wParam) == IDC_HOST_IP && HIWORD(wParam) == EN_CHANGE) ||
@@ -1836,6 +1908,7 @@ static void showVideoSettings(HWND owner) {
         logLine("settings.dialog_create_failed error=" + std::to_string(GetLastError()));
         return;
     }
+    applySessionTranslucency(dlg, owner, "settings");
     ShowWindow(dlg, SW_SHOW);
     logLine("settings.window open=modeless");
 }
@@ -1866,42 +1939,103 @@ static void updateViewerTitle(HWND hwnd) {
     SetWindowTextW(hwnd, title.str().c_str());
 }
 
-static void showConnectionInfo(HWND owner) {
-    const std::wstring configuredCodec = codecDisplayName(gConnectionInfo.configuredCodec);
-    const std::wstring effectiveCodec = codecDisplayName(gConnectionInfo.effectiveCodec);
-    const std::wstring configuredBitrate = gConnectionInfo.configuredBitrateMbps == 0
-        ? L"Auto"
-        : std::to_wstring(gConnectionInfo.configuredBitrateMbps) + L" Mbps";
+// ---- Connection info (modeless) -------------------------------------------
+// Replaces the old message box, which ran a modal loop and stopped the
+// viewer's main loop. Refreshes every second while open.
 
-    std::wostringstream info;
-    info << L"Configured\n"
-         << L"  Codec: " << configuredCodec << L"\n"
-         << L"  Bandwidth: " << configuredBitrate << L"\n\n"
-         << L"Effective connection\n"
-         << L"  Codec: " << effectiveCodec << L"\n"
-         << L"  Bandwidth: " << gConnectionInfo.effectiveBitrateMbps << L" Mbps\n"
-         << L"  Remote: " << gConnectionInfo.remoteWidth << L" x "
-         << gConnectionInfo.remoteHeight << L" @ " << gConnectionInfo.fps << L" fps\n";
+static constexpr UINT_PTR kInfoRefreshTimer = 1;
 
-    if (gConnectionInfo.controlConnected) {
-        info << L"  Control RTT: " << std::fixed << std::setprecision(1)
-             << gConnectionInfo.rttMs << L" ms\n";
+static std::wstring connectionInfoText(int id) {
+    const auto& c = gConnectionInfo;
+    std::wostringstream s;
+    if (id == IDC_INFO_CONFIGURED) {
+        s << L"Codec: " << codecDisplayName(c.configuredCodec) << L"\r\nBandwidth: "
+          << (c.configuredBitrateMbps == 0 ? std::wstring(L"Auto")
+                                           : std::to_wstring(c.configuredBitrateMbps) + L" Mbps");
+    } else if (id == IDC_INFO_EFFECTIVE) {
+        s << L"Codec: " << codecDisplayName(c.effectiveCodec) << L"\r\nBandwidth: "
+          << c.effectiveBitrateMbps << L" Mbps\r\nRemote: " << c.remoteWidth << L" x "
+          << c.remoteHeight << L" @ " << c.fps << L" fps\r\nControl RTT: ";
+        if (c.controlConnected) {
+            s << std::fixed << std::setprecision(1) << c.rttMs << L" ms";
+        } else {
+            s << L"unavailable";
+        }
     } else {
-        info << L"  Control RTT: unavailable\n";
+        s << L"Backend: " << utf8ToWide(c.backend) << L"\r\nDecoder: " << utf8ToWide(c.decoder)
+          << L"\r\nGPU: "
+          << (c.adapter.empty() ? std::wstring(L"CPU / unavailable") : utf8ToWide(c.adapter));
     }
+    return s.str();
+}
 
-    info << L"\nDecoder\n"
-         << L"  Backend: " << utf8ToWide(gConnectionInfo.backend) << L"\n"
-         << L"  Decoder: " << utf8ToWide(gConnectionInfo.decoder) << L"\n"
-         << L"  GPU: "
-         << (gConnectionInfo.adapter.empty()
-                ? L"CPU / unavailable"
-                : utf8ToWide(gConnectionInfo.adapter))
-         << L"\n";
+static std::wstring windowText(HWND hwnd) {
+    const int n = hwnd ? GetWindowTextLengthW(hwnd) : 0;
+    if (n <= 0) return {};
+    std::wstring out(static_cast<size_t>(n) + 1, L'\0');
+    out.resize(static_cast<size_t>(GetWindowTextW(hwnd, out.data(), n + 1)));
+    return out;
+}
 
-    MessageBoxW(owner, info.str().c_str(), L"JerisLink Connection Info",
-                MB_OK | MB_ICONINFORMATION);
-    logLine("connection.info.opened");
+// Only changed text is set, so the window does not flicker every second.
+static void fillConnectionInfo(HWND dlg) {
+    for (int id : {IDC_INFO_CONFIGURED, IDC_INFO_EFFECTIVE, IDC_INFO_DECODER}) {
+        HWND item = GetDlgItem(dlg, id);
+        const std::wstring next = connectionInfoText(id);
+        if (item && windowText(item) != next) SetWindowTextW(item, next.c_str());
+    }
+}
+
+static INT_PTR CALLBACK InfoDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    INT_PTR themed = 0;
+    if (handleThemedDialogMessage(dlg, msg, wParam, lParam, themed)) return themed;
+    switch (msg) {
+    case WM_INITDIALOG:
+        initThemedDialog(dlg, 13, kInfoFooterTop);
+        fillConnectionInfo(dlg);
+        placeVolumeWindow(dlg, reinterpret_cast<HWND>(lParam));
+        SetTimer(dlg, kInfoRefreshTimer, 1000, nullptr);
+        return TRUE;
+    case WM_TIMER:
+        if (wParam == kInfoRefreshTimer) {
+            fillConnectionInfo(dlg);
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            DestroyWindow(dlg);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(dlg);
+        return TRUE;
+    case WM_DESTROY:
+        KillTimer(dlg, kInfoRefreshTimer);
+        if (gInfoDlg == dlg) gInfoDlg = nullptr;
+        return TRUE;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+static void showConnectionInfo(HWND owner, const char* source) {
+    if (gInfoDlg) {
+        SetForegroundWindow(gInfoDlg);
+        return;
+    }
+    gInfoDlg = CreateDialogParamW(GetModuleHandleW(nullptr),
+                                  MAKEINTRESOURCEW(IDD_CONNECTION_INFO), owner, InfoDlgProc,
+                                  reinterpret_cast<LPARAM>(owner));
+    if (!gInfoDlg) {
+        logLine("connection.info_failed error=" + std::to_string(GetLastError()));
+        return;
+    }
+    applySessionTranslucency(gInfoDlg, owner, "info");
+    ShowWindow(gInfoDlg, SW_SHOW);
+    logLine(std::string("connection.info.opened source=") + source + " window=modeless");
 }
 
 using jl::Options;
@@ -1921,42 +2055,618 @@ static bool debugMode() {
     return on;
 }
 
+// ---- Session timers, disconnect and relaunch ------------------------------
+// Windows runs its own modal loop while the caption is dragged, the window
+// is sized or the system menu is open; the main loop is stopped then, but
+// WM_TIMER is still dispatched. The session timer drains the socket and
+// sends the keep-alives from there, so video and audio keep flowing. While
+// the main loop runs it reads the socket itself and the tick does nothing.
+static constexpr UINT_PTR kSessionTickTimer = 0x4A4C;
+static constexpr UINT_PTR kOverlayHoverTimer = 0x4A4D;
+static constexpr UINT kSessionTickMs = 10;
+static constexpr UINT kOverlayHoverMs = 100;
+static std::function<void()> gSessionModalTick;
+static bool gInSessionTick = false;
+static double gMainLoopRecvMs = 0.0;  // last time the main loop read the socket
+static uint64_t gSessionTicks = 0;
+// Disconnect, a timeout or an error ends the session and starts JerisLink
+// again on the launch screen, which shows gRelaunchNote.
+static bool gRelaunch = false;
+static std::wstring gRelaunchNote;
+
+static void runSessionModalTick() {
+    if (!gSessionModalTick || gInSessionTick) return;
+    if (steadyMsNow() - gMainLoopRecvMs < 20.0) return;  // the main loop is running
+    gInSessionTick = true;
+    ++gSessionTicks;
+    try {
+        gSessionModalTick();
+    } catch (const std::exception& e) {
+        logLine(std::string("session.tick_error ") + e.what());
+    }
+    gInSessionTick = false;
+}
+
+// ---- In-session overlay (B1) ----------------------------------------------
+// A thin bar at the top centre of the viewer: status, mute, volume, Info,
+// Settings, Disconnect. A non-activating owned popup: it never takes the
+// keyboard from the viewer and never runs a modal loop. It is a layered
+// window at ov::kSessionUiAlpha opacity, so the video shows through. Ctrl+Alt+O
+// opens it for the keyboard; holding the pointer in the bottom-left corner of
+// the viewer for 2 s opens it for the mouse (the bar still opens at the top).
+namespace ov = jl::overlay;
+
+static HWND gOverlay = nullptr;
+static bool gOverlayKeyboard = false;  // opened with Ctrl+Alt+O: focus ring, keys
+static ov::Item gOverlayFocus = ov::Item::Mute;
+static ov::Item gOverlayHot = ov::Item::None;
+static ov::Item gOverlayPressed = ov::Item::None;
+static bool gOverlayDragging = false;
+static bool gOverlayTracking = false;
+static double gOverlayHideAtMs = 0.0;  // 0: no pending auto-hide
+static ov::Dwell gOverlayDwell(2000.0);
+static std::bitset<256> gOverlaySwallowUp;  // key-ups of keys the overlay used
+static std::string gSessionHostLabel;
+static jl::ui::DialogTheme gOverlayTheme;
+static UINT gOverlayThemeDpi = 0;
+
+static const char* overlayItemName(ov::Item item) {
+    switch (item) {
+    case ov::Item::Status: return "status";
+    case ov::Item::Mute: return "mute";
+    case ov::Item::Volume: return "volume";
+    case ov::Item::Info: return "info";
+    case ov::Item::Settings: return "settings";
+    case ov::Item::Disconnect: return "disconnect";
+    default: return "none";
+    }
+}
+
+static bool overlayVisible() { return gOverlay && IsWindowVisible(gOverlay); }
+
+static void overlayRefresh() {
+    if (gOverlay) InvalidateRect(gOverlay, nullptr, FALSE);
+}
+
+static UINT overlayDpi() {
+    return jl::ui::windowDpi(gOverlay ? gOverlay : gViewerHwnd);
+}
+
+static void overlayReposition() {
+    if (!gOverlay || !gViewerHwnd) return;
+    const UINT dpi = overlayDpi();
+    const ov::Layout l = ov::layoutFor(dpi);
+    RECT c{};
+    GetClientRect(gViewerHwnd, &c);
+    MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
+    const ov::Point p = ov::placeInClient({c.left, c.top, c.right, c.bottom}, l.size.width(),
+                                          l.size.height(), ov::scale(16, dpi));
+    SetWindowPos(gOverlay, nullptr, p.x, p.y, l.size.width(), l.size.height(),
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void overlayShow(bool keyboard, const char* source, double autoHideMs) {
+    if (!gOverlay || !gViewerHwnd || IsIconic(gViewerHwnd)) return;
+    const bool wasVisible = overlayVisible();
+    gOverlayKeyboard = keyboard;
+    if (keyboard && gOverlayFocus == ov::Item::None) gOverlayFocus = ov::Item::Mute;
+    gOverlayHideAtMs = autoHideMs > 0 ? steadyMsNow() + autoHideMs : 0.0;
+    overlayReposition();
+    if (!wasVisible) ShowWindow(gOverlay, SW_SHOWNOACTIVATE);
+    overlayRefresh();
+    logLine(std::string("overlay.show source=") + source + " keyboard=" + (keyboard ? "1" : "0"));
+}
+
+static void overlayHide(const char* source) {
+    if (!overlayVisible()) return;
+    if (gOverlayDragging) {
+        gOverlayDragging = false;
+        if (GetCapture() == gOverlay) ReleaseCapture();
+        commitAudioVolume("overlay");
+    }
+    ShowWindow(gOverlay, SW_HIDE);
+    gOverlayKeyboard = false;
+    gOverlayHot = ov::Item::None;
+    gOverlayPressed = ov::Item::None;
+    gOverlayHideAtMs = 0.0;
+    logLine(std::string("overlay.hide source=") + source);
+}
+
+// Ends the session from the overlay: the main loop stops, the session is
+// torn down as on close, and JerisLink starts again on the launch screen.
+static void requestDisconnect(const char* source) {
+    logLine(std::string("session.disconnect source=") + source);
+    gRelaunch = true;
+    overlayHide("disconnect");
+    releaseRemoteButtons("disconnect");
+    releaseRemoteModifiers();
+    if (gViewerHwnd) ShowWindow(gViewerHwnd, SW_HIDE);
+    gWindowClosed = true;
+}
+
+static void overlayActivate(ov::Item item, const char* source) {
+    logLine(std::string("overlay.action item=") + overlayItemName(item) + " source=" + source);
+    switch (item) {
+    case ov::Item::Mute:
+        toggleAudioMute("overlay");
+        break;
+    case ov::Item::Volume:
+        overlayHide("action");
+        showVolumeWindow(gViewerHwnd, "overlay");
+        break;
+    case ov::Item::Info:
+        overlayHide("action");
+        showConnectionInfo(gViewerHwnd, "overlay");
+        break;
+    case ov::Item::Settings:
+        overlayHide("action");
+        logLine("video.settings.command source=overlay");
+        showVideoSettings(gViewerHwnd);
+        break;
+    case ov::Item::Disconnect:
+        requestDisconnect("overlay");
+        break;
+    default:
+        break;
+    }
+}
+
+// Viewer-only shortcuts (Ctrl+Alt+letter); the letter never reaches the Mac.
+static bool viewerHotkey(WPARAM vk, const char* source) {
+    switch (vk) {
+    case 'O':
+        if (overlayVisible()) overlayHide(source);
+        else overlayShow(true, source, 0);
+        return true;
+    case 'M':
+        toggleAudioMute(source);
+        return true;
+    case 'V':
+        showVolumeWindow(gViewerHwnd, source);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool isViewerHotkey(WPARAM vk) {
+    return (vk == 'O' || vk == 'M' || vk == 'V') && physicalKeyDown(VK_CONTROL) &&
+           physicalKeyDown(VK_MENU);
+}
+
+static void overlaySetVolume(int pct) {
+    if (pct == gAudioVolumePct) return;
+    setAudioVolume(pct);
+    syncVolumeWindows();
+}
+
+// Keys while the overlay is open for the keyboard.
+static void overlayKey(WPARAM vk, bool repeat) {
+    gOverlayHideAtMs = 0.0;
+    switch (vk) {
+    case VK_TAB:
+        gOverlayFocus = ov::nextFocus(gOverlayFocus, physicalKeyDown(VK_SHIFT) ? -1 : 1);
+        break;
+    case VK_UP:
+        gOverlayFocus = ov::nextFocus(gOverlayFocus, -1);
+        break;
+    case VK_DOWN:
+        gOverlayFocus = ov::nextFocus(gOverlayFocus, 1);
+        break;
+    case VK_LEFT:
+    case VK_RIGHT: {
+        const int dir = vk == VK_RIGHT ? 1 : -1;
+        if (gOverlayFocus == ov::Item::Volume) {
+            overlaySetVolume(ov::volumeStep(gAudioVolumePct, dir));
+            commitAudioVolume("overlay-key");
+        } else {
+            gOverlayFocus = ov::nextFocus(gOverlayFocus, dir);
+        }
+        break;
+    }
+    case VK_RETURN:
+    case VK_SPACE:
+        if (!repeat) overlayActivate(gOverlayFocus, "overlay-key");
+        return;
+    case VK_ESCAPE:
+        overlayHide("escape");
+        return;
+    default:
+        return;
+    }
+    overlayRefresh();
+}
+
+// WM_KEYDOWN / WM_SYSKEYDOWN on the viewer, before anything is forwarded.
+// Returns true when the key belongs to the viewer and must not reach the Mac.
+static bool overlayHandleKeyDown(WPARAM vk, LPARAM lParam) {
+    const bool repeat = (lParam & (1LL << 30)) != 0;
+    if (isViewerHotkey(vk)) {
+        // The key-up is swallowed via gSuppressedShortcutKey. Ctrl and Alt
+        // were already sent as plain modifier downs and are released normally.
+        if (!repeat) viewerHotkey(vk, "shortcut");
+        gSuppressedShortcutKey = vk;
+        gTemporarilyReleasedModifier = 0;
+        return true;
+    }
+    if (!gOverlayKeyboard || !overlayVisible()) return false;
+    switch (vk) {
+    case VK_TAB:
+    case VK_LEFT:
+    case VK_RIGHT:
+    case VK_UP:
+    case VK_DOWN:
+    case VK_RETURN:
+    case VK_SPACE:
+    case VK_ESCAPE:
+        gOverlaySwallowUp.set(static_cast<size_t>(vk));
+        overlayKey(vk, repeat);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static RECT toRECT(const ov::Rect& r) { return RECT{r.left, r.top, r.right, r.bottom}; }
+
+static void overlayFocusFrame(HDC dc, const RECT& r, UINT dpi) {
+    HPEN pen = CreatePen(PS_INSIDEFRAME, std::max(1, ov::scale(2, dpi)),
+                         jl::ui::accent().focusRing);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    const int radius = ov::scale(8, dpi);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+static void overlayText(HDC dc, const std::wstring& text, RECT r, HFONT font, COLORREF color,
+                        UINT format) {
+    HGDIOBJ old = SelectObject(dc, font);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &r, format | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, old);
+}
+
+// Speaker drawn with GDI (no icon font): body, cone, then two waves or an X.
+static void drawSpeaker(HDC dc, const RECT& r, bool muted, COLORREF color, UINT dpi) {
+    const auto s = [dpi](int v) { return ov::scale(v, dpi); };
+    const int cx = (r.left + r.right) / 2 - s(2);
+    const int cy = (r.top + r.bottom) / 2;
+    POINT body[6] = {{cx - s(7), cy - s(3)}, {cx - s(3), cy - s(3)}, {cx + s(2), cy - s(7)},
+                     {cx + s(2), cy + s(7)}, {cx - s(3), cy + s(3)}, {cx - s(7), cy + s(3)}};
+    SetDCBrushColor(dc, color);
+    SetDCPenColor(dc, color);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(DC_BRUSH));
+    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(DC_PEN));
+    Polygon(dc, body, 6);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    const int w = std::max(1, s(2));
+    if (muted) {
+        jl::ui::line(dc, cx + s(5), cy - s(4), cx + s(11), cy + s(4), color, w);
+        jl::ui::line(dc, cx + s(11), cy - s(4), cx + s(5), cy + s(4), color, w);
+        return;
+    }
+    HPEN pen = CreatePen(PS_SOLID, w, color);
+    HGDIOBJ penWas = SelectObject(dc, pen);
+    HGDIOBJ brushWas = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    for (int radius : {s(5), s(9)}) {
+        const int ax = cx + s(2);
+        Arc(dc, ax - radius, cy - radius, ax + radius, cy + radius, ax + radius, cy + radius,
+            ax + radius, cy - radius);
+    }
+    SelectObject(dc, brushWas);
+    SelectObject(dc, penWas);
+    DeleteObject(pen);
+}
+
+static void overlayButton(HDC dc, const RECT& r, const wchar_t* text, ov::Item item,
+                          COLORREF textColor, UINT dpi) {
+    namespace c = jl::ui::color;
+    const bool hot = gOverlayHot == item || gOverlayPressed == item;
+    jl::ui::roundRect(dc, r, ov::scale(8, dpi), hot ? c::kSecondaryDown : c::kSecondary,
+                      c::kBorder, 1);
+    overlayText(dc, text, r, gOverlayTheme.text, textColor, DT_CENTER | DT_VCENTER);
+}
+
+static void paintOverlay(HWND hwnd) {
+    namespace c = jl::ui::color;
+    PAINTSTRUCT ps{};
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max<LONG>(1, client.right),
+                                         std::max<LONG>(1, client.bottom));
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+
+    const UINT dpi = overlayDpi();
+    if (gOverlayThemeDpi != dpi || !gOverlayTheme.text) {
+        gOverlayTheme.build(hwnd, 9);
+        gOverlayThemeDpi = dpi;
+    }
+    const auto& t = gOverlayTheme;
+    const auto& a = jl::ui::accent();
+    const auto s = [dpi](int v) { return ov::scale(v, dpi); };
+    const ov::Layout l = ov::layoutFor(dpi);
+    SetBkMode(dc, TRANSPARENT);
+
+    jl::ui::fillRect(dc, client, c::kBody);
+    jl::ui::roundRect(dc, client, s(12), c::kBody, c::kBorder, 1);
+
+    // Status: accent dot, "Connected", and the Mac's address.
+    const RECT st = toRECT(l.status);
+    const int mid = (st.top + st.bottom) / 2;
+    const int dot = s(8);
+    const RECT dotR{st.left, mid - s(10) - dot / 2, st.left + dot, mid - s(10) - dot / 2 + dot};
+    jl::ui::ellipse(dc, dotR, a.accent, a.accent);
+    overlayText(dc, L"Connected", RECT{st.left + dot + s(8), st.top, st.right, mid}, t.label,
+                c::kText, DT_LEFT | DT_VCENTER);
+    const std::wstring host = gSessionHostLabel.empty()
+        ? std::wstring(L"Mac") : L"Mac " + wideFromAscii(gSessionHostLabel);
+    overlayText(dc, host, RECT{st.left, mid, st.right, st.bottom}, t.smallText, c::kMuted,
+                DT_LEFT | DT_VCENTER);
+
+    for (int x : {l.sep1, l.sep2}) {
+        jl::ui::fillRect(dc, RECT{x, l.bar.top + s(12), x + std::max(1, s(1)),
+                                  l.bar.bottom - s(12)}, c::kBorder);
+    }
+
+    // Mute.
+    const RECT mute = toRECT(l.mute);
+    jl::ui::roundRect(dc, mute, s(8),
+                      gOverlayHot == ov::Item::Mute || gOverlayPressed == ov::Item::Mute
+                          ? c::kSecondaryDown : c::kSecondary,
+                      c::kBorder, 1);
+    drawSpeaker(dc, mute, gAudioMuted, gAudioMuted ? c::kError : c::kText, dpi);
+
+    // Volume label and slider.
+    const RECT vl = toRECT(l.volumeLabel);
+    const int vmid = (vl.top + vl.bottom) / 2;
+    overlayText(dc, L"Volume", RECT{vl.left, vl.top, vl.right, vmid}, t.smallText, c::kMuted,
+                DT_LEFT | DT_VCENTER);
+    overlayText(dc, gAudioMuted ? std::wstring(L"Muted") : std::to_wstring(gAudioVolumePct) + L"%",
+                RECT{vl.left, vmid, vl.right, vl.bottom}, t.label,
+                gAudioMuted ? c::kMuted : c::kText, DT_LEFT | DT_VCENTER);
+    const RECT sl = toRECT(l.slider);
+    const int scy = (sl.top + sl.bottom) / 2;
+    const int th = std::max(2, s(4));
+    const int r = ov::sliderKnobRadius(dpi);
+    const int knobX = ov::sliderKnobX(l.slider, gAudioVolumePct, dpi);
+    const COLORREF fill = gAudioMuted ? c::kDisabled : a.accent;
+    jl::ui::roundRect(dc, RECT{sl.left + r, scy - th / 2, sl.right - r, scy - th / 2 + th}, th,
+                      c::kBorder, c::kBorder);
+    if (knobX > sl.left + r) {
+        jl::ui::roundRect(dc, RECT{sl.left + r, scy - th / 2, knobX, scy - th / 2 + th}, th,
+                          fill, fill);
+    }
+    jl::ui::ellipse(dc, RECT{knobX - r, scy - r, knobX + r, scy + r}, fill,
+                    gOverlayHot == ov::Item::Volume || gOverlayDragging ? c::kText : fill);
+
+    overlayButton(dc, toRECT(l.info), L"Info", ov::Item::Info, c::kText, dpi);
+    overlayButton(dc, toRECT(l.settings), L"Settings", ov::Item::Settings, c::kText, dpi);
+    overlayButton(dc, toRECT(l.disconnect), L"Disconnect", ov::Item::Disconnect, c::kError, dpi);
+
+    if (gOverlayKeyboard) {
+        RECT f{};
+        switch (gOverlayFocus) {
+        case ov::Item::Mute: f = mute; break;
+        case ov::Item::Volume: f = RECT{vl.left - s(4), vl.top, sl.right + s(2), sl.bottom}; break;
+        case ov::Item::Info: f = toRECT(l.info); break;
+        case ov::Item::Settings: f = toRECT(l.settings); break;
+        case ov::Item::Disconnect: f = toRECT(l.disconnect); break;
+        default: break;
+        }
+        if (f.right > f.left) overlayFocusFrame(dc, f, dpi);
+    }
+
+    jl::ui::fillRect(dc, RECT{l.hint.left, l.bar.bottom - 1, l.hint.right, l.bar.bottom},
+                     c::kBorder);
+    overlayText(dc,
+                gOverlayKeyboard
+                    ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
+                    : L"Ctrl+Alt+O, or hold the pointer bottom-left for 2 s",
+                toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
+
+    BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const int x = static_cast<short>(LOWORD(lParam));
+    const int y = static_cast<short>(HIWORD(lParam));
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;  // the viewer keeps the keyboard
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paintOverlay(hwnd);
+        return 0;
+    case WM_MOUSEMOVE: {
+        if (!gOverlayTracking) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            gOverlayTracking = TrackMouseEvent(&tme) != FALSE;
+        }
+        gOverlayHideAtMs = 0.0;
+        const UINT dpi = overlayDpi();
+        if (gOverlayDragging) {
+            overlaySetVolume(ov::sliderValueAt(ov::layoutFor(dpi).slider, x, dpi));
+            return 0;
+        }
+        const ov::Item hot = ov::hitTest(ov::layoutFor(dpi), x, y);
+        if (hot != gOverlayHot) {
+            gOverlayHot = hot;
+            overlayRefresh();
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        gOverlayTracking = false;
+        if (gOverlayHot != ov::Item::None) {
+            gOverlayHot = ov::Item::None;
+            overlayRefresh();
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const UINT dpi = overlayDpi();
+        const ov::Layout l = ov::layoutFor(dpi);
+        gOverlayPressed = ov::hitTest(l, x, y);
+        if (gOverlayPressed == ov::Item::None) return 0;
+        SetCapture(hwnd);
+        if (gOverlayPressed == ov::Item::Volume) {
+            gOverlayDragging = true;
+            overlaySetVolume(ov::sliderValueAt(l.slider, x, dpi));
+        }
+        overlayRefresh();
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const ov::Item pressed = gOverlayPressed;
+        gOverlayPressed = ov::Item::None;
+        if (gOverlayDragging) {
+            gOverlayDragging = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            commitAudioVolume("overlay");
+            overlayRefresh();
+            return 0;
+        }
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (pressed != ov::Item::None && pressed == ov::hitTest(ov::layoutFor(overlayDpi()), x, y)) {
+            overlayActivate(pressed, "overlay-click");
+        }
+        overlayRefresh();
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (gOverlayDragging) {
+            gOverlayDragging = false;
+            commitAudioVolume("overlay");
+        }
+        gOverlayPressed = ov::Item::None;
+        overlayRefresh();
+        return 0;
+    case WM_DESTROY:
+        if (gOverlay == hwnd) gOverlay = nullptr;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void overlayCreate(HWND viewer) {
+    if (gOverlay || !viewer) return;
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = OverlayWndProc;
+        wc.hInstance = hi;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"JerislinkOverlay";
+        registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    gOverlay = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                               L"JerislinkOverlay",
+                               L"JerisLink controls", WS_POPUP, 0, 0, 1, 1, viewer, nullptr, hi,
+                               nullptr);
+    if (!gOverlay) {
+        logLine("overlay.create_failed error=" + std::to_string(GetLastError()));
+        return;
+    }
+    // Whole-window alpha: GDI painting stays as it is (no per-pixel alpha).
+    if (!SetLayeredWindowAttributes(gOverlay, 0, ov::kSessionUiAlpha, LWA_ALPHA)) {
+        logLine("overlay.alpha_failed error=" + std::to_string(GetLastError()));
+    }
+    // Rounded on Windows 11; Windows 10 keeps square corners.
+    DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(gOverlay, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    ensureAudioVolumeLoaded();
+    gOverlayFocus = ov::Item::Mute;
+    gOverlayDwell.reset();
+    gOverlaySwallowUp.reset();
+    overlayReposition();
+    logLine("overlay.created");
+}
+
+static void overlayDestroy() {
+    if (gOverlay && IsWindow(gOverlay)) DestroyWindow(gOverlay);
+    gOverlay = nullptr;
+    gOverlayKeyboard = false;
+    gOverlayDragging = false;
+    gOverlayTracking = false;
+    gOverlayHot = ov::Item::None;
+    gOverlayPressed = ov::Item::None;
+    gOverlaySwallowUp.reset();
+}
+
+// Every 100 ms: the bottom-left hover fallback and the auto-hide.
+static void overlayHoverTick() {
+    if (!gOverlay || !gViewerHwnd) return;
+    const double now = steadyMsNow();
+    if (IsIconic(gViewerHwnd) || !IsWindowVisible(gViewerHwnd)) {
+        gOverlayDwell.reset();
+        overlayHide("minimized");
+        return;
+    }
+    POINT pt{};
+    bool inZone = false;
+    bool overOverlay = false;
+    if (GetCursorPos(&pt)) {
+        HWND under = WindowFromPoint(pt);
+        overOverlay = under == gOverlay;
+        if (under == gViewerHwnd) {
+            POINT cp = pt;
+            ScreenToClient(gViewerHwnd, &cp);
+            RECT c{};
+            GetClientRect(gViewerHwnd, &c);
+            inZone = ov::inCornerZone(cp.x, cp.y, c.right, c.bottom,
+                                      ov::scale(ov::kHoverZone, overlayDpi()));
+        }
+    }
+    if (gOverlayDwell.update(inZone, now) && !overlayVisible()) overlayShow(false, "hover", 0);
+    if (!overlayVisible() || gOverlayKeyboard || gOverlayDragging) return;
+    if (overOverlay || inZone) {
+        gOverlayHideAtMs = 0.0;
+        return;
+    }
+    if (gOverlayHideAtMs == 0.0) gOverlayHideAtMs = now + 3000.0;
+    else if (now >= gOverlayHideAtMs) overlayHide("auto");
+}
+
 static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     const ModalScope modal(msg);
     switch (msg) {
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case IDM_VIDEO_SETTINGS:
-            logLine("video.settings.command source=menu");
-            showVideoSettings(hwnd);
+    case WM_SYSCOMMAND:
+        // Alt or F10 on its own would enter the menu loop (a modal loop) and
+        // Alt is a Mac key here: never start it.
+        if ((wParam & 0xFFF0u) == SC_KEYMENU) return 0;
+        break;
+    case WM_TIMER:
+        if (wParam == kSessionTickTimer) {
+            runSessionModalTick();
             return 0;
-        case IDM_CONNECTION_INFO:
-            showConnectionInfo(hwnd);
+        }
+        if (wParam == kOverlayHoverTimer) {
+            overlayHoverTick();
             return 0;
-        case IDM_AUDIO_MUTE:
-            toggleAudioMute(hwnd, "menu");
-            return 0;
-        case IDM_AUDIO_VOLUME:
-            showVolumeWindow(hwnd, "menu");
-            return 0;
-        default:
-            break;
         }
         break;
-    case WM_SYSCOMMAND:
-        if ((wParam & 0xFFF0u) == IDM_VIDEO_SETTINGS) {
-            logLine("video.settings.command source=system-menu");
-            showVideoSettings(hwnd);
-            return 0;
-        }
-        if ((wParam & 0xFFF0u) == IDM_AUDIO_MUTE) {
-            toggleAudioMute(hwnd, "system-menu");
-            return 0;
-        }
-        if ((wParam & 0xFFF0u) == IDM_AUDIO_VOLUME) {
-            showVolumeWindow(hwnd, "system-menu");
-            return 0;
-        }
+    case WM_MOVE:
+        overlayReposition();
         break;
     case WM_SETFOCUS:
         gViewerFocused = true;
@@ -1993,15 +2703,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return MA_ACTIVATE;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
-        if (viewerHasInteractiveFocus(hwnd) && isAudioMuteShortcut(wParam)) {
-            // Handled here before any forwarding; the key-up is swallowed via
-            // gSuppressedShortcutKey. Ctrl and Alt were already sent as plain
-            // modifier downs and are released normally.
-            if ((lParam & (1LL << 30)) == 0) toggleAudioMute(hwnd, "shortcut");
-            gSuppressedShortcutKey = 'M';
-            gTemporarilyReleasedModifier = 0;
-            return 0;
-        }
+        // Viewer shortcuts (Ctrl+Alt+O/M/V) and the keyboard-driven overlay
+        // are handled before anything is forwarded to the Mac.
+        if (viewerHasInteractiveFocus(hwnd) && overlayHandleKeyDown(wParam, lParam)) return 0;
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         logFirstInput("keyboard");
         const bool repeat = (lParam & (1LL << 30)) != 0;
@@ -2058,6 +2762,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
     case WM_KEYUP:
     case WM_SYSKEYUP: {
+        if (wParam < 256 && gOverlaySwallowUp.test(static_cast<size_t>(wParam))) {
+            gOverlaySwallowUp.reset(static_cast<size_t>(wParam));
+            return 0;
+        }
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         if (gSuppressedShortcutKey != 0 && wParam == gSuppressedShortcutKey) {
             if (gTemporarilyReleasedModifier == 1 && physicalKeyDown(VK_CONTROL)) {
@@ -2205,6 +2913,8 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             logLine(std::string("window.size type=") + name + " client=" +
                     std::to_string(LOWORD(lParam)) + "x" + std::to_string(HIWORD(lParam)));
         }
+        if (type == SIZE_MINIMIZED) overlayHide("minimized");
+        else overlayReposition();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -2249,32 +2959,6 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return r;
 }
 
-static HMENU createViewerMenu() {
-    HMENU menuBar = CreateMenu();
-    HMENU connectionMenu = CreatePopupMenu();
-    HMENU settingsMenu = CreatePopupMenu();
-    if (!menuBar || !connectionMenu || !settingsMenu) {
-        if (settingsMenu) DestroyMenu(settingsMenu);
-        if (connectionMenu) DestroyMenu(connectionMenu);
-        if (menuBar) DestroyMenu(menuBar);
-        return nullptr;
-    }
-
-    const bool ok =
-        AppendMenuW(connectionMenu, MF_STRING, IDM_CONNECTION_INFO, L"&Connection Info...") &&
-        AppendMenuW(settingsMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"&Connection Settings...") &&
-        AppendMenuW(settingsMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
-                    L"&Mute Mac Audio\tCtrl+Alt+M") &&
-        AppendMenuW(settingsMenu, MF_STRING, IDM_AUDIO_VOLUME, L"&Volume...") &&
-        AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(connectionMenu), L"&Connection") &&
-        AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(settingsMenu), L"&Settings");
-    if (!ok) {
-        DestroyMenu(menuBar);
-        return nullptr;
-    }
-    return menuBar;
-}
-
 static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HINSTANCE hi = GetModuleHandleW(nullptr);
@@ -2295,27 +2979,15 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
                   WS_MAXIMIZEBOX | WS_THICKFRAME;
-    HMENU menuBar = createViewerMenu();
     RECT r{0, 0, static_cast<LONG>(clientW), static_cast<LONG>(clientH)};
-    AdjustWindowRect(&r, style, menuBar != nullptr);
+    AdjustWindowRect(&r, style, FALSE);
     HWND hwnd = CreateWindowExW(0, cls, L"JerisLink \u2014 Connecting...",
                                 style, CW_USEDEFAULT, CW_USEDEFAULT,
                                 r.right - r.left, r.bottom - r.top,
-                                nullptr, menuBar, hi, nullptr);
-    if (!hwnd) {
-        if (menuBar) DestroyMenu(menuBar);
-        throw std::runtime_error("CreateWindowExW failed");
-    }
-    logLine(menuBar
-        ? "viewer.menu connection_info=yes video_settings=yes"
-        : "viewer.menu unavailable");
-    if (HMENU systemMenu = GetSystemMenu(hwnd, FALSE)) {
-        AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(systemMenu, MF_STRING, IDM_VIDEO_SETTINGS, L"Connection Settings...");
-        AppendMenuW(systemMenu, MF_STRING | (gAudioMuted ? MF_CHECKED : 0), IDM_AUDIO_MUTE,
-                    L"Mute Mac Audio\tCtrl+Alt+M");
-        AppendMenuW(systemMenu, MF_STRING, IDM_AUDIO_VOLUME, L"Volume...");
-    }
+                                nullptr, nullptr, hi, nullptr);
+    if (!hwnd) throw std::runtime_error("CreateWindowExW failed");
+    // No menu bar and nothing added to the system menu (see kRemovedMenuIdFirst).
+    logLine("viewer.menu none");
     applyModernWindowChrome(hwnd);
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(wc.hIconSm));
@@ -2413,9 +3085,10 @@ static void pumpMessages() {
                            (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST) ||
                            (m.message >= WM_MR_WIN_C && m.message <= WM_MR_CAPS_LOCK);
         if (input) noteInputAge(m);
-        // Tab, arrows and Esc for the modeless volume and settings windows.
+        // Tab, arrows and Esc for the modeless volume, settings and info windows.
         if (gVolumeDlg && IsDialogMessageW(gVolumeDlg, &m)) continue;
         if (gSettingsDlg && IsDialogMessageW(gSettingsDlg, &m)) continue;
+        if (gInfoDlg && IsDialogMessageW(gInfoDlg, &m)) continue;
         const double dispatchStart = steadyMsNow();
         const uint64_t modalEventsBefore = gModal.events();
         TranslateMessage(&m);
@@ -2715,7 +3388,24 @@ static void paintCpuFrame(HWND hwnd) {
         } else {
             RECT r{};
             GetClientRect(hwnd, &r);
+#ifdef JERISLINK_UI_SNAPSHOT
+            // CI snapshots: coloured bars stand in for video, so the
+            // overlay's translucency shows in the PNGs.
+            static const COLORREF kBars[] = {RGB(200, 200, 200), RGB(200, 200, 0),
+                                             RGB(0, 200, 200),   RGB(0, 200, 0),
+                                             RGB(200, 0, 200),   RGB(200, 0, 0),
+                                             RGB(0, 0, 200),     RGB(16, 16, 16)};
+            const LONG n = static_cast<LONG>(sizeof(kBars) / sizeof(kBars[0]));
+            for (LONG i = 0; i < n; ++i) {
+                RECT b{r.left + (r.right - r.left) * i / n, r.top,
+                       r.left + (r.right - r.left) * (i + 1) / n, r.bottom};
+                HBRUSH br = CreateSolidBrush(kBars[i]);
+                FillRect(dc, &b, br);
+                DeleteObject(br);
+            }
+#else
             FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+#endif
         }
         EndPaint(hwnd, &ps);
     }
@@ -3274,18 +3964,330 @@ static void applyVideoInfo(HWND hwnd) {
     if (size || backend) updateViewerTitle(hwnd);
 }
 
-static jl::LaunchRequest resolveLaunchFromSystem(int argc, char** argv) {
+static std::vector<std::string> commandArgs(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return args;
+}
+
+static jl::LaunchRequest resolveLaunchArgs(const std::vector<std::string>& args) {
     return jl::resolveLaunch(args, loadSavedSettings(), envValue("JERISLINK_SOURCE_IP"),
                              detectBindAddresses());
+}
+
+// ---- Launch screen ---------------------------------------------------------
+// Shown before every connection (unless --source-ip came on the command
+// line) and again after a session ends. Left: brand, theme picker. Right:
+// tabs, the Mac's address, Connect, Advanced settings. Nothing here runs
+// while video is playing, so the modal dialog cannot stall a session.
+
+static const wchar_t* const kNoTailnetNote =
+    L"No Tailscale or Tailcat address on this PC. Connect one, or set this PC's "
+    L"address in Advanced settings.";
+
+struct LaunchContext {
+    std::wstring note;              // why we are here (shown in the error line)
+    std::vector<std::string> args;  // command-line arguments after argv[0]
+    bool codeTab = false;
+};
+static LaunchContext* gLaunch = nullptr;
+
+static RECT dluRect(HWND dlg, int x, int y, int w, int h) {
+    RECT r{x, y, x + w, y + h};
+    MapDialogRect(dlg, &r);
+    return r;
+}
+
+static void paintLaunchExtras(HWND dlg, HDC dc, const ThemedDialog& td) {
+    const UINT dpi = td.theme.dpi;
+    const auto s = [dpi](int v) { return jl::ui::px(dpi, v); };
+    const COLORREF accent = jl::ui::accent().accent;
+    // App icon above the headline.
+    const RECT iconAt = dluRect(dlg, 18, 18, 1, 1);
+    const int iconSize = s(40);
+    if (HICON icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+                                                   MAKEINTRESOURCEW(IDI_JERISLINK), IMAGE_ICON,
+                                                   iconSize, iconSize, LR_DEFAULTCOLOR))) {
+        DrawIconEx(dc, iconAt.left, iconAt.top, icon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+        DestroyIcon(icon);
+    }
+    // Column divider, stopping above the footer band.
+    const int footerTop = dialogUnitsY(dlg, td.footerTopDlu);
+    const RECT col = dluRect(dlg, 180, 12, 1, 1);
+    RECT divider{col.left, col.top, col.left + s(1), footerTop - col.top};
+    jl::ui::fillRect(dc, divider, jl::ui::color::kBorder);
+    // Tab row: a hairline under both tabs, an accent bar under the active one.
+    const RECT host = jl::ui::childRect(dlg, IDC_TAB_HOST);
+    const RECT code = jl::ui::childRect(dlg, IDC_TAB_CODE);
+    const RECT rightEdge = dluRect(dlg, 446, 0, 1, 1);
+    RECT hair{host.left, host.bottom + s(2), rightEdge.left, host.bottom + s(3)};
+    jl::ui::fillRect(dc, hair, jl::ui::color::kBorder);
+    const RECT& active = gLaunch && gLaunch->codeTab ? code : host;
+    RECT bar{active.left, host.bottom + s(1), active.right, host.bottom + s(3)};
+    jl::ui::fillRect(dc, bar, accent);
+    // Divider above Advanced settings.
+    const RECT adv = jl::ui::childRect(dlg, IDC_LAUNCH_ADVANCED);
+    const RECT gap = dluRect(dlg, 0, 0, 1, 8);
+    RECT advLine{adv.left, adv.top - gap.bottom, adv.right, adv.top - gap.bottom + s(1)};
+    jl::ui::fillRect(dc, advLine, jl::ui::color::kBorder);
+    // Ready dot next to READY TO CONNECT.
+    const RECT ready = jl::ui::childRect(dlg, IDC_LAUNCH_READY);
+    const int d = s(7);
+    const RECT dotAt = dluRect(dlg, 18, 0, 1, 1);
+    const int cy = (ready.top + ready.bottom) / 2;
+    RECT dot{dotAt.left, cy - d / 2, dotAt.left + d, cy - d / 2 + d};
+    jl::ui::ellipse(dc, dot, accent, accent);
+}
+
+static void launchText(HDC dc, const wchar_t* text, RECT r, HFONT font, COLORREF color,
+                       UINT format) {
+    HGDIOBJ old = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text, -1, &r, format | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, old);
+}
+
+// Owner-drawn launch buttons: theme pills, tabs, Advanced and Connect.
+static bool drawLaunchButton(HWND dlg, const DRAWITEMSTRUCT& di) {
+    const ThemedDialog* td = themedDialog(dlg);
+    if (!td || di.CtlType != ODT_BUTTON) return false;
+    const auto& t = td->theme;
+    const auto s = [&t](int v) { return jl::ui::px(t.dpi, v); };
+    const auto& a = jl::ui::accent();
+    HDC dc = di.hDC;
+    const RECT r = di.rcItem;
+    const bool focus = (di.itemState & ODS_FOCUS) && !(di.itemState & ODS_NOFOCUSRECT);
+    const bool down = (di.itemState & ODS_SELECTED) != 0;
+    const int id = static_cast<int>(di.CtlID);
+    wchar_t text[96]{};
+    GetWindowTextW(di.hwndItem, text, static_cast<int>(std::size(text)));
+    switch (id) {
+    case IDC_THEME_GREEN:
+    case IDC_THEME_BLUE: {
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        const bool blue = id == IDC_THEME_BLUE;
+        const bool selected = blue == accentIsBlue();
+        jl::ui::roundRect(dc, r, r.bottom - r.top,
+                          selected || down ? jl::ui::color::kSecondaryDown
+                                           : jl::ui::color::kSecondary,
+                          selected ? a.accent : jl::ui::color::kBorder, selected ? s(2) : s(1));
+        const int d = s(10);
+        const int cy = (r.top + r.bottom) / 2;
+        const COLORREF swatch = blue ? jl::ui::kBlueAccent.accent : jl::ui::kGreenAccent.accent;
+        RECT sw{r.left + s(10), cy - d / 2, r.left + s(10) + d, cy - d / 2 + d};
+        jl::ui::ellipse(dc, sw, swatch, swatch);
+        RECT tr = r;
+        tr.left = sw.right + s(7);
+        launchText(dc, text, tr, selected ? t.label : t.text,
+                   selected ? jl::ui::color::kText : jl::ui::color::kMuted, DT_LEFT | DT_VCENTER);
+        if (focus) overlayFocusFrame(dc, r, t.dpi);
+        return true;
+    }
+    case IDC_TAB_HOST:
+    case IDC_TAB_CODE: {
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        const bool active = (id == IDC_TAB_CODE) == (gLaunch && gLaunch->codeTab);
+        launchText(dc, text, r, active ? t.label : t.text,
+                   active ? jl::ui::color::kText : jl::ui::color::kMuted, DT_LEFT | DT_VCENTER);
+        if (focus) {
+            RECT f = r;
+            f.left -= s(4);
+            overlayFocusFrame(dc, f, t.dpi);
+        }
+        return true;
+    }
+    case IDC_LAUNCH_ADVANCED: {
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        jl::ui::roundRect(dc, r, s(8),
+                          down ? jl::ui::color::kSecondaryDown : jl::ui::color::kSecondary,
+                          focus ? a.focusRing : jl::ui::color::kBorder, focus ? s(2) : s(1));
+        const int mid = (r.top + r.bottom) / 2;
+        RECT title{r.left + s(12), r.top, r.right - s(30), mid};
+        launchText(dc, L"Advanced settings", title, t.label, jl::ui::color::kText,
+                   DT_LEFT | DT_BOTTOM);
+        RECT sub{r.left + s(12), mid + s(1), r.right - s(30), r.bottom};
+        launchText(dc, L"Bandwidth, codec, this PC's address", sub, t.smallText,
+                   jl::ui::color::kMuted, DT_LEFT | DT_TOP);
+        RECT chevron{r.right - s(30), r.top, r.right - s(8), r.bottom};
+        launchText(dc, L"\u203a", chevron, t.title, jl::ui::color::kMuted,
+                   DT_CENTER | DT_VCENTER);
+        return true;
+    }
+    case IDOK:
+        if (IsWindowEnabled(di.hwndItem)) {
+            jl::ui::drawButton(di, t, true, jl::ui::color::kBody);
+        } else {
+            jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+            jl::ui::roundRect(dc, r, s(8), jl::ui::color::kSecondary, jl::ui::color::kBorder,
+                              s(1));
+            launchText(dc, text, r, t.label, jl::ui::color::kDisabled, DT_CENTER | DT_VCENTER);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void launchSetError(HWND dlg, const std::wstring& text) {
+    SetDlgItemTextW(dlg, IDC_LAUNCH_ERROR, text.c_str());
+    InvalidateRect(GetDlgItem(dlg, IDC_LAUNCH_ERROR), nullptr, TRUE);
+}
+
+// Host tab: address, hint, error line and Connect. Code tab: a note only
+// (pairing codes are reserved for jerispair, not built yet).
+static void launchSetTab(HWND dlg, bool code) {
+    if (gLaunch) gLaunch->codeTab = code;
+    for (int id : {IDC_UI_LABEL_HOST, IDC_HOST_IP, IDC_UI_HINT_HOST, IDC_LAUNCH_ERROR}) {
+        ShowWindow(GetDlgItem(dlg, id), code ? SW_HIDE : SW_SHOW);
+    }
+    ShowWindow(GetDlgItem(dlg, IDC_LAUNCH_CODE_NOTE), code ? SW_SHOW : SW_HIDE);
+    EnableWindow(GetDlgItem(dlg, IDOK), code ? FALSE : TRUE);
+    InvalidateRect(dlg, nullptr, TRUE);
+}
+
+static std::string launchHostText(HWND dlg) {
+    std::string host = asciiFromWide(windowText(GetDlgItem(dlg, IDC_HOST_IP)));
+    const auto first = host.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    const auto last = host.find_last_not_of(" \t");
+    return host.substr(first, last - first + 1);
+}
+
+static void launchConnect(HWND dlg) {
+    if (gLaunch && gLaunch->codeTab) return;
+    HWND edit = GetDlgItem(dlg, IDC_HOST_IP);
+    const std::string host = launchHostText(dlg);
+    if (!jl::isIPv4(host)) {
+        launchSetError(dlg, L"Enter the Mac's IPv4 address, e.g. 100.64.0.10.");
+        SetFocus(edit);
+        return;
+    }
+    auto saved = loadSavedSettings();
+    saved.hostIp = host;
+    if (!saveSettings(saved)) {
+        launchSetError(dlg, L"Could not save the address.");
+        return;
+    }
+    const std::vector<std::string> none;
+    const auto request = resolveLaunchArgs(jl::argsAfterLaunchScreen(gLaunch ? gLaunch->args : none));
+    if (request.status == jl::LaunchStatus::NoTailnet) {
+        logLine("launch.connect_blocked reason=no-tailnet bind_reason=" + request.bindReason);
+        launchSetError(dlg, kNoTailnetNote);
+        return;
+    }
+    if (request.status != jl::LaunchStatus::Ok) {
+        logLine("launch.connect_blocked status=" + std::to_string(static_cast<int>(request.status)));
+        launchSetError(dlg, L"JerisLink cannot start this connection. Check Advanced settings.");
+        return;
+    }
+    logLine("launch.connect host_source=" + request.hostSource +
+            " bind_source=" + request.bindSource);
+    EndDialog(dlg, IDOK);
+}
+
+static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DRAWITEM &&
+        drawLaunchButton(dlg, *reinterpret_cast<const DRAWITEMSTRUCT*>(lParam))) {
+        return TRUE;
+    }
+    INT_PTR themed = 0;
+    if (handleThemedDialogMessage(dlg, msg, wParam, lParam, themed)) return themed;
+    switch (msg) {
+    case WM_INITDIALOG: {
+        gLaunch = reinterpret_cast<LaunchContext*>(lParam);
+        initThemedDialog(dlg, 15, kLaunchFooterTop);
+        if (ThemedDialog* td = themedDialog(dlg)) td->extraPaint = paintLaunchExtras;
+        SetDlgItemTextW(dlg, IDC_LAUNCH_HERO, L"Your Mac,\r\nwithin reach.");
+        SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  \u2192");
+        HINSTANCE inst = GetModuleHandleW(nullptr);
+        SendMessageW(dlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(LoadImageW(
+            inst, MAKEINTRESOURCEW(IDI_JERISLINK), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON), LR_SHARED)));
+        SendMessageW(dlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(LoadImageW(
+            inst, MAKEINTRESOURCEW(IDI_JERISLINK), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON), LR_SHARED)));
+        HWND edit = GetDlgItem(dlg, IDC_HOST_IP);
+        SendMessageW(edit, EM_LIMITTEXT, 15, 0);
+        const std::string savedHost = loadSavedSettings().hostIp;
+        SetWindowTextW(edit, wideFromAscii(savedHost).c_str());
+        launchSetError(dlg, gLaunch ? gLaunch->note : std::wstring());
+        launchSetTab(dlg, gLaunch && gLaunch->codeTab);
+        SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
+        SetFocus(savedHost.empty() ? edit : GetDlgItem(dlg, IDOK));
+        logLine(std::string("launch.screen shown saved_host=") + (savedHost.empty() ? "no" : "yes") +
+                " note=" + (gLaunch && !gLaunch->note.empty() ? "yes" : "no"));
+        return FALSE;  // focus set above
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wParam);
+        const WORD code = HIWORD(wParam);
+        switch (id) {
+        case IDC_TAB_HOST:
+        case IDC_TAB_CODE:
+            if (code == BN_CLICKED) {
+                launchSetTab(dlg, id == IDC_TAB_CODE);
+                logLine(std::string("launch.tab=") + (id == IDC_TAB_CODE ? "code" : "host"));
+            }
+            return TRUE;
+        case IDC_THEME_GREEN:
+        case IDC_THEME_BLUE:
+            if (code == BN_CLICKED) {
+                const bool blue = id == IDC_THEME_BLUE;
+                if (blue != accentIsBlue()) saveUiAccent(blue);
+                RedrawWindow(dlg, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+            }
+            return TRUE;
+        case IDC_LAUNCH_ADVANCED:
+            if (code == BN_CLICKED &&
+                runSettingsDialog(dlg, kSettingsDialogConnect) == IDOK) {
+                SetDlgItemTextW(dlg, IDC_HOST_IP,
+                                wideFromAscii(loadSavedSettings().hostIp).c_str());
+                launchSetError(dlg, L"");
+            }
+            return TRUE;
+        case IDC_HOST_IP:
+            if (code == EN_CHANGE) launchSetError(dlg, L"");
+            return FALSE;
+        case IDOK:
+            launchConnect(dlg);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dlg, IDCANCEL);
+            return TRUE;
+        default:
+            break;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        EndDialog(dlg, IDCANCEL);
+        return TRUE;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+static INT_PTR runLaunchScreen(LaunchContext& ctx) {
+    ensureCommonControls();
+    const INT_PTR result = DialogBoxParamW(GetModuleHandleW(nullptr),
+                                           MAKEINTRESOURCEW(IDD_LAUNCH), nullptr, LaunchDlgProc,
+                                           reinterpret_cast<LPARAM>(&ctx));
+    gLaunch = nullptr;
+    if (result == -1) {
+        logLine("launch.dialog_create_failed error=" + std::to_string(GetLastError()));
+    }
+    return result;
 }
 
 static int appMain(int argc, char** argv) {
     gLog.start(kLogPath, kHistoryLogPath);
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
     loadUiAccent();
-    auto request = resolveLaunchFromSystem(argc, argv);
+    const std::vector<std::string> args = commandArgs(argc, argv);
+    auto request = resolveLaunchArgs(args);
 
     // --print-config PATH: write the resolved connection and exit. Never shows UI.
     if (!request.printConfigPath.empty()) {
@@ -3303,35 +4305,41 @@ static int appMain(int argc, char** argv) {
         return 2;
     }
 
-    // First run (no host anywhere), --settings, or Shift held while starting:
-    // show the settings dialog, then connect with what was saved.
+    // The launch screen, unless the Mac's address came on the command line.
+    // A session that ended (Disconnect, lost stream, error) restarts the
+    // process with --settings and the reason in JERISLINK_LAUNCH_NOTE.
+    LaunchContext launch;
+    launch.args = args;
+    {
+        wchar_t note[1024]{};
+        const DWORD len = GetEnvironmentVariableW(L"JERISLINK_LAUNCH_NOTE", note,
+                                                  static_cast<DWORD>(std::size(note)));
+        if (len > 0 && len < std::size(note)) launch.note = note;
+        SetEnvironmentVariableW(L"JERISLINK_LAUNCH_NOTE", nullptr);
+    }
     const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-    if (request.status == jl::LaunchStatus::NeedsSetup || request.openSettings || shiftHeld) {
-        logLine(std::string("settings.startup_dialog reason=") +
-                (request.status == jl::LaunchStatus::NeedsSetup ? "no-host"
-                 : request.openSettings ? "flag" : "shift"));
-        if (runSettingsDialog(nullptr, kSettingsDialogConnect) != IDOK) {
-            logLine("settings.startup_dialog cancelled");
-            return 0;
+    bool show = jl::showLaunchScreen(request, shiftHeld);
+    if (show) {
+        logLine(std::string("launch.screen reason=") +
+                (request.openSettings ? "flag" : shiftHeld ? "shift" : "default"));
+    }
+    for (;;) {
+        if (show) {
+            if (runLaunchScreen(launch) != IDOK) {
+                logLine("launch.screen closed");
+                return 0;
+            }
+            request = resolveLaunchArgs(jl::argsAfterLaunchScreen(args));
         }
-        request = resolveLaunchFromSystem(argc, argv);
-    }
-    if (request.status == jl::LaunchStatus::NeedsSetup) {
-        logLine("usage error: no host address");
-        MessageBoxW(nullptr, L"JerisLink needs the Mac host address. Start JerisLink again and enter it.",
-                    L"JerisLink", MB_OK | MB_ICONERROR);
-        return 2;
-    }
-    if (request.status == jl::LaunchStatus::NoTailnet) {
-        logLine("usage error: no local address for the Mac address bind_reason=" +
-                request.bindReason);
-        MessageBoxW(nullptr,
-            L"This PC has no Tailscale address (100.64.x.x) and no Tailcat bridge "
-            L"that matches the Mac address.\n\n"
-            L"Connect Tailscale or start the Tailcat bridge and start JerisLink again, "
-            L"or hold Shift while starting JerisLink and choose this PC's address.",
-            L"JerisLink", MB_OK | MB_ICONERROR);
-        return 2;
+        if (request.status == jl::LaunchStatus::Ok) break;
+        if (request.status == jl::LaunchStatus::NoTailnet) {
+            logLine("launch.blocked reason=no-tailnet bind_reason=" + request.bindReason);
+            launch.note = kNoTailnetNote;
+        } else {
+            logLine("launch.blocked reason=no-host");
+            launch.note = L"Enter the Mac's address to connect.";
+        }
+        show = true;
     }
     logLine("launch.config host=" + request.options.sourceIp +
             " host_source=" + request.hostSource +
@@ -3739,6 +4747,71 @@ static int appMain(int argc, char** argv) {
                 logLine(lb);
             }
         };
+        // Keep-alives and packet handling, shared by the main loop and the
+        // session timer that runs while Windows holds a modal loop.
+        auto sendKeepAlives = [&](std::chrono::steady_clock::time_point now) {
+            if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
+                mouseMoveUdp->sendPing();
+                lastPing = now;
+            }
+            if (audio && now - lastAudioRequest >= std::chrono::seconds(1)) {
+                // Keep-alive: the host stops capturing 3 s after the last request.
+                mouseMoveUdp->sendAudioRequest(true, audio->port());
+                lastAudioRequest = now;
+            }
+        };
+        // Returns false for a datagram from another address (dropped).
+        auto onDatagram = [&](int n, const sockaddr_in& peer,
+                              std::chrono::steady_clock::time_point now) {
+            const auto packetGapMs = gotAny
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
+                : 0;
+            if (!gotAny) firstPacket = now;
+            gotAny = true;
+            lastPacket = now;
+            if (peer.sin_addr.s_addr != allowed.s_addr) {
+                ++rejected;
+                return false;
+            }
+            if (abrEnabled && n >= 20 && std::memcmp(buf.data(), "MR02", 4) == 0) {
+                arrivalSlope.onPacket(jl::receiverBe64(buf.data() + 6), (buf[5] & 0x04) != 0, msSince(now));
+            }
+            receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
+            receiver.tick(msSince(now));
+            return true;
+        };
+        gSessionModalTick = [&] {
+            sendKeepAlives(std::chrono::steady_clock::now());
+            for (int i = 0; i < 512; ++i) {
+                sockaddr_in peer{};
+                int plen = sizeof(peer);
+                const int n = recvfrom(s, reinterpret_cast<char*>(buf.data()),
+                                       static_cast<int>(buf.size()), 0,
+                                       reinterpret_cast<sockaddr*>(&peer), &plen);
+                if (n == SOCKET_ERROR) break;
+                onDatagram(n, peer, std::chrono::steady_clock::now());
+            }
+            receiver.tick(msSince(std::chrono::steady_clock::now()));
+        };
+        // Clears the tick (it refers to this scope), the timers and the
+        // overlay on every way out of the session, exceptions included.
+        struct SessionTickGuard {
+            ~SessionTickGuard() {
+                gSessionModalTick = nullptr;
+                if (gViewerHwnd) {
+                    KillTimer(gViewerHwnd, kSessionTickTimer);
+                    KillTimer(gViewerHwnd, kOverlayHoverTimer);
+                }
+                overlayDestroy();
+            }
+        } sessionTickGuard;
+        gMainLoopRecvMs = steadyMsNow();
+        SetTimer(hwnd, kSessionTickTimer, kSessionTickMs, nullptr);
+        SetTimer(hwnd, kOverlayHoverTimer, kOverlayHoverMs, nullptr);
+        gSessionHostLabel = o.sourceIp;
+        overlayCreate(hwnd);
+        overlayShow(false, "session-start", 4000);
+
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
         gLoopResponsiveMs = steadyMsNow();
@@ -3770,15 +4843,7 @@ static int appMain(int argc, char** argv) {
 
             auto now = std::chrono::steady_clock::now();
             presentedFps.update(msSince(now), videoSink.presented.load());
-            if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
-                mouseMoveUdp->sendPing();
-                lastPing = now;
-            }
-            if (audio && now - lastAudioRequest >= std::chrono::seconds(1)) {
-                // Keep-alive: the host stops capturing 3 s after the last request.
-                mouseMoveUdp->sendAudioRequest(true, audio->port());
-                lastAudioRequest = now;
-            }
+            sendKeepAlives(now);
             if (audio && now - lastAudioStats >= std::chrono::seconds(10)) {
                 const auto a = audio->stats();
                 const double statsSec = std::chrono::duration<double>(now - lastAudioStats).count();
@@ -3924,6 +4989,7 @@ static int appMain(int argc, char** argv) {
 
             sockaddr_in peer{}; int plen = sizeof(peer);
             WSAResetEvent(socketEvent);
+            gMainLoopRecvMs = steadyMsNow();
             int n = recvfrom(s, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
                              reinterpret_cast<sockaddr*>(&peer), &plen);
             markPhase(jl::IterPhase::Recv);
@@ -3940,34 +5006,35 @@ static int appMain(int argc, char** argv) {
                     noteLoopBusy(now);
                     waits.wait(loopWaitMs);
                     gLoopResponsiveMs = steadyMsNow();  // woke: input is taken next pump
+                    gMainLoopRecvMs = gLoopResponsiveMs;
                     now = std::chrono::steady_clock::now();
                     receiver.tick(msSince(now));
                     auto base = gotAny ? lastPacket : start;
                     const int timeoutMs = gotAny ? o.idleTimeoutMs : o.startupTimeoutMs;
-                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) break;
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - base).count() >= timeoutMs) {
+                        // Back to the launch screen with the reason.
+                        gRelaunch = true;
+                        gRelaunchNote = gotAny
+                            ? L"The connection was lost: no video from the Mac for a while."
+                            : L"The Mac did not answer. Check that the JerisLink host is running.";
+                        logLine(gotAny ? "session.end reason=idle-timeout"
+                                       : "session.end reason=startup-timeout");
+                        break;
+                    }
                     continue;
                 }
                 WSACloseEvent(socketEvent);
                 closesocket(s);
                 throw std::runtime_error("recvfrom failed");
             }
-            const auto packetGapMs = gotAny
-                ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
-                : 0;
-            if (!gotAny) firstPacket = now;
-            gotAny = true;
-            lastPacket = now;
-            if (peer.sin_addr.s_addr != allowed.s_addr) { ++rejected; continue; }
-            if (abrEnabled && n >= 20 && std::memcmp(buf.data(), "MR02", 4) == 0) {
-                arrivalSlope.onPacket(jl::receiverBe64(buf.data() + 6), (buf[5] & 0x04) != 0, msSince(now));
-            }
-            receiver.onPacket(buf.data(), static_cast<size_t>(n), msSince(now), packetGapMs);
-            receiver.tick(msSince(now));
+            if (!onDatagram(n, peer, now)) continue;
             markPhase(jl::IterPhase::Packet);
             noteLoopBusy(std::chrono::steady_clock::now());
         }
 
         const auto loopEnd = std::chrono::steady_clock::now();
+        gSessionModalTick = nullptr;  // the session is ending; stopAndWait pumps below
+        logLine("session.modal_ticks=" + std::to_string(gSessionTicks));
         // Decode what is queued, finish() on the video thread, keep pumping
         // window messages meanwhile. After this the pipeline is ours again.
         videoWorker.stopAndWait([] { pumpMessages(); });
@@ -4162,7 +5229,10 @@ static int appMain(int argc, char** argv) {
         gControl = nullptr;
         gAudio = nullptr;  // the player itself was destroyed during unwinding
         logLine(std::string("FATAL ") + e.what());
-        MessageBoxA(nullptr, e.what(), "JerisLink", MB_OK | MB_ICONERROR);
+        // No message box (a modal loop): back to the launch screen, which
+        // shows the reason.
+        gRelaunch = true;
+        gRelaunchNote = L"JerisLink stopped: " + utf8ToWide(e.what());
         if (wsaStarted) WSACleanup();
         if (mfStarted) MFShutdown();
         CoUninitialize();
@@ -4282,11 +5352,59 @@ static void snapshotDropDown(HWND dlg, int comboId, const std::wstring& dir,
                << L"\n";
 }
 
+// ---- No-freeze checks ------------------------------------------------------
+// Every in-session action (hotkeys, overlay keys, overlay buttons) must
+// return at once and must not enter a Win32 modal loop: a WH_MSGFILTER hook
+// counts dialog-box and menu loops, and a watchdog thread ends the process
+// with exit code 9 if one action takes more than 5 s.
+static int gSnapshotModalLoops = 0;
+static std::atomic<double> gSnapshotActionStart{0.0};
+static std::atomic<bool> gSnapshotDone{false};
+
+static LRESULT CALLBACK snapshotMsgFilter(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == MSGF_DIALOGBOX || code == MSGF_MENU) ++gSnapshotModalLoops;
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+static void snapshotWatchdog() {
+    while (!gSnapshotDone.load()) {
+        const double start = gSnapshotActionStart.load();
+        if (start > 0.0 && steadyMsNow() - start > 5000.0) {
+            std::wcout << L"no_freeze=FAIL watchdog\n" << std::flush;
+            ExitProcess(9);
+        }
+        Sleep(100);
+    }
+}
+
+// Opens the launch screen modeless (the app shows it modal before any
+// session) so it can be captured and driven.
+static HWND snapshotLaunchScreen(LaunchContext& ctx) {
+    HWND dlg = CreateDialogParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_LAUNCH),
+                                  nullptr, LaunchDlgProc, reinterpret_cast<LPARAM>(&ctx));
+    if (dlg) ShowWindow(dlg, SW_SHOW);
+    return dlg;
+}
+
+static std::string savedUiAccentValue() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &key) !=
+        ERROR_SUCCESS) {
+        return {};
+    }
+    const std::string value = readRegString(key, L"UiAccent");
+    RegCloseKey(key);
+    return value;
+}
+
 static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    jl::ui::setAccent(accentName == L"blue"      ? jl::ui::Accent::Blue
-                      : accentName == L"green-b" ? jl::ui::Accent::GreenCandidateB
-                                                 : jl::ui::Accent::Green);
+    if (accentName != L"blue" && accentName != L"green") {
+        std::wcout << L"unknown accent " << accentName << L"\n";
+        return 12;
+    }
+    const bool wantBlue = accentName == L"blue";
+    jl::ui::setAccent(wantBlue ? jl::ui::Accent::Blue : jl::ui::Accent::Green);
     std::wcout << L"accent=" << accentName << L"\n";
     // Made-up addresses: a tailnet IP and the Tailcat bridge both present.
     gBindDetectionOverride = jl::BindDetection{std::string("100.64.0.25"), true};
@@ -4367,9 +5485,229 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     const bool oneDialog = volumeFirst && settingsClosedVolume && volumeRefused && modeless && closed;
     std::wcout << L"one_dialog=" << (oneDialog ? L"ok" : L"FAIL") << L" bind_greyed=" << bindGreyed
                << L" error_inline=" << stillOpen << L"\n";
+
+    // Launch screen: host tab, code tab, inline error.
+    LaunchContext launchCtx;
+    HWND launch = snapshotLaunchScreen(launchCtx);
+    if (!launch) return 11;
+    snapshotWindow(launch, dir, L"launch-host");
+    launchSetTab(launch, true);
+    snapshotWindow(launch, dir, L"launch-code");
+    const bool codeTabBlocks = !IsWindowEnabled(GetDlgItem(launch, IDOK)) &&
+                               IsWindowVisible(GetDlgItem(launch, IDC_LAUNCH_CODE_NOTE));
+    launchSetTab(launch, false);
+    SetDlgItemTextW(launch, IDC_HOST_IP, L"");
+    SendMessageW(launch, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    const bool launchError = IsWindow(launch) &&
+                             !windowText(GetDlgItem(launch, IDC_LAUNCH_ERROR)).empty();
+    snapshotWindow(launch, dir, L"launch-error");
+    // Theme picker: the other theme, then back; each click saves UiAccent.
+    SendMessageW(launch, WM_COMMAND,
+                 MAKEWPARAM(wantBlue ? IDC_THEME_GREEN : IDC_THEME_BLUE, BN_CLICKED), 0);
+    const bool switched = accentIsBlue() == !wantBlue &&
+                          savedUiAccentValue() == (wantBlue ? "green" : "blue");
+    SendMessageW(launch, WM_COMMAND,
+                 MAKEWPARAM(wantBlue ? IDC_THEME_BLUE : IDC_THEME_GREEN, BN_CLICKED), 0);
+    const bool restored = accentIsBlue() == wantBlue &&
+                          savedUiAccentValue() == (wantBlue ? "blue" : "green");
+    const bool accentSaved = switched && restored;
+    std::wcout << L"launch code_tab=" << codeTabBlocks << L" error_inline=" << launchError
+               << L" accent_saved=" << (accentSaved ? L"ok" : L"FAIL") << L"\n";
+    DestroyWindow(launch);
+    gLaunch = nullptr;
+    pumpFor(100);
+
+    // Viewer window: no menu bar, nothing added to the system menu.
+    HWND viewer = createViewerWindow(960, 540);
+    ShowWindow(viewer, SW_SHOWNORMAL);
+    UpdateWindow(viewer);
+    bool sysMenuClean = true;
+    if (HMENU sys = GetSystemMenu(viewer, FALSE)) {
+        for (int i = 0; i < GetMenuItemCount(sys); ++i) {
+            const UINT id = GetMenuItemID(sys, i);
+            if (id >= kRemovedMenuIdFirst && id <= kRemovedMenuIdLast) sysMenuClean = false;
+        }
+    }
+    const bool noMenu = GetMenu(viewer) == nullptr && sysMenuClean;
+    std::wcout << L"viewer_menu=" << (noMenu ? L"none" : L"PRESENT") << L"\n";
+
+    // Overlay with made-up session values, open for the keyboard, then hidden.
+    gSessionHostLabel = "100.64.0.10";
+    gConnectionInfo = ConnectionInfoState{};
+    gConnectionInfo.configuredCodec = "h265";
+    gConnectionInfo.configuredBitrateMbps = 40;
+    gConnectionInfo.effectiveCodec = "h265";
+    gConnectionInfo.effectiveBitrateMbps = 40;
+    gConnectionInfo.remoteWidth = 2560;
+    gConnectionInfo.remoteHeight = 1440;
+    gConnectionInfo.fps = 60;
+    gConnectionInfo.rttMs = 3.2;
+    gConnectionInfo.controlConnected = true;
+    gConnectionInfo.backend = "d3d11";
+    gConnectionInfo.decoder = "hardware";
+    gConnectionInfo.adapter = "Sample GPU";
+    overlayCreate(viewer);
+    overlayShow(false, "snapshot", 0);
+    snapshotWindow(viewer, dir, L"overlay-open-mouse");
+    overlayShow(true, "snapshot", 0);
+    snapshotWindow(viewer, dir, L"overlay-open");
+    const bool overlayShown = overlayVisible();
+    // Placement and translucency: top centre of the client area, a layered
+    // window at ov::kSessionUiAlpha.
+    bool overlayPlaced = false;
+    BYTE overlayAlpha = 0;
+    DWORD alphaFlags = 0;
+    const bool layered =
+        gOverlay && (GetWindowLongPtrW(gOverlay, GWL_EXSTYLE) & WS_EX_LAYERED) != 0 &&
+        GetLayeredWindowAttributes(gOverlay, nullptr, &overlayAlpha, &alphaFlags) &&
+        (alphaFlags & LWA_ALPHA) != 0 && overlayAlpha == ov::kSessionUiAlpha;
+    if (gOverlay) {
+        RECT c{}, o{};
+        GetClientRect(viewer, &c);
+        MapWindowPoints(viewer, nullptr, reinterpret_cast<POINT*>(&c), 2);
+        GetWindowRect(gOverlay, &o);
+        const LONG gapL = o.left - c.left, gapR = c.right - o.right;
+        const LONG topGap = o.top - c.top;
+        overlayPlaced = gapL >= 0 && gapR >= 0 && std::abs(gapL - gapR) <= 1 &&
+                        topGap == ov::scale(16, overlayDpi());
+        std::wcout << L"overlay_place=" << (overlayPlaced ? L"top-centre" : L"FAIL")
+                   << L" gap_l=" << gapL << L" gap_r=" << gapR << L" top=" << topGap
+                   << L" layered=" << layered
+                   << L" alpha=" << static_cast<int>(overlayAlpha) << L"\n";
+    }
+    overlayHide("snapshot");
+    snapshotWindow(viewer, dir, L"overlay-hidden");
+
+    // Every in-session action, timed, with modal loops counted.
+    std::thread watchdog(snapshotWatchdog);
+    HHOOK filter = SetWindowsHookExW(WH_MSGFILTER, snapshotMsgFilter, nullptr,
+                                     GetCurrentThreadId());
+    double worstMs = 0.0;
+    bool actionsOk = filter != nullptr;
+    const auto timed = [&](const char* name, const std::function<void()>& action,
+                           bool expect) {
+        const double start = steadyMsNow();
+        gSnapshotActionStart = start;
+        action();
+        const double ms = steadyMsNow() - start;
+        gSnapshotActionStart = 0.0;
+        pumpFor(60);
+        worstMs = std::max(worstMs, ms);
+        const bool ok = expect && ms < 1000.0;
+        if (!ok) actionsOk = false;
+        std::wcout << L"action " << name << L" ms=" << ms << L" ok=" << ok << L"\n";
+    };
+    const bool mutedBefore = gAudioMuted;
+    // Info, Settings and Volume opened from the overlay share its opacity
+    // token; checked on the real windows.
+    int sessionLayered = 0;
+    const auto sessionAlpha = [&sessionLayered](HWND w, const wchar_t* name) {
+        BYTE a = 0;
+        DWORD flags = 0;
+        const bool ok = w && (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_LAYERED) != 0 &&
+                        GetLayeredWindowAttributes(w, nullptr, &a, &flags) &&
+                        (flags & LWA_ALPHA) != 0 && a == ov::kSessionUiAlpha;
+        if (ok) ++sessionLayered;
+        std::wcout << L"session_alpha " << name << L" layered=" << ok
+                   << L" alpha=" << static_cast<int>(a) << L"\n";
+    };
+    timed("hotkey-O-open", [] { viewerHotkey('O', "snapshot"); }, true);
+    timed("hotkey-O-check", [] {}, overlayVisible() && gOverlayKeyboard);
+    timed("overlay-key-tab", [] { overlayKey(VK_TAB, false); }, true);
+    timed("overlay-key-right", [] { overlayKey(VK_RIGHT, false); }, true);
+    timed("overlay-key-esc", [] { overlayKey(VK_ESCAPE, false); }, true);
+    timed("overlay-hidden-check", [] {}, !overlayVisible());
+    timed("hotkey-M", [] { viewerHotkey('M', "snapshot"); }, true);
+    timed("hotkey-M-check", [] {}, gAudioMuted != mutedBefore);
+    timed("hotkey-M-again", [] { viewerHotkey('M', "snapshot"); }, true);
+    timed("hotkey-M-again-check", [] {}, gAudioMuted == mutedBefore);
+    timed("hotkey-V", [] { viewerHotkey('V', "snapshot"); }, true);
+    timed("hotkey-V-check", [] {}, gVolumeDlg != nullptr);
+    if (gVolumeDlg) SendMessageW(gVolumeDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    pumpFor(60);
+    timed("overlay-mute", [] { overlayActivate(ov::Item::Mute, "snapshot"); }, true);
+    timed("overlay-mute-check", [] {}, gAudioMuted != mutedBefore);
+    timed("overlay-mute-again", [] { overlayActivate(ov::Item::Mute, "snapshot"); }, true);
+    timed("overlay-mute-again-check", [] {}, gAudioMuted == mutedBefore);
+    timed("overlay-info", [] { overlayActivate(ov::Item::Info, "snapshot"); }, true);
+    timed("overlay-info-check", [] {}, gInfoDlg != nullptr);
+    if (gInfoDlg) {
+        sessionAlpha(gInfoDlg, L"info");
+        snapshotWindow(gInfoDlg, dir, L"connection-info");
+        SendMessageW(gInfoDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    }
+    pumpFor(60);
+    timed("overlay-settings", [] { overlayActivate(ov::Item::Settings, "snapshot"); }, true);
+    timed("overlay-settings-check", [] {}, gSettingsDlg != nullptr && !gSettingsModal);
+    if (gSettingsDlg) {
+        sessionAlpha(gSettingsDlg, L"settings");
+        snapshotWindow(gSettingsDlg, dir, L"settings-session");
+        SendMessageW(gSettingsDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    }
+    pumpFor(60);
+    timed("overlay-volume", [] { overlayActivate(ov::Item::Volume, "snapshot"); }, true);
+    timed("overlay-volume-check", [] {}, gVolumeDlg != nullptr);
+    if (gVolumeDlg) {
+        sessionAlpha(gVolumeDlg, L"volume");
+        snapshotWindow(gVolumeDlg, dir, L"volume-session");
+        SendMessageW(gVolumeDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    }
+    pumpFor(60);
+    overlayShow(false, "snapshot", 0);
+    timed("overlay-disconnect", [] { overlayActivate(ov::Item::Disconnect, "snapshot"); }, true);
+    timed("overlay-disconnect-check", [] {},
+          gRelaunch && gWindowClosed && !IsWindowVisible(viewer) && !overlayVisible());
+    gRelaunch = false;
+    gRelaunchNote.clear();
+    gWindowClosed = false;
+    if (filter) UnhookWindowsHookEx(filter);
+    const bool noModal = gSnapshotModalLoops == 0;
+    const bool sessionDialogsLayered = sessionLayered == 3;
+    std::wcout << L"no_freeze=" << (actionsOk && noModal ? L"ok" : L"FAIL")
+               << L" modal_loops=" << gSnapshotModalLoops << L" worst_ms=" << worstMs << L"\n";
+
+    // While Windows holds a modal loop (here a popup menu, like a caption
+    // drag or the system menu) the session timer still runs the tick.
+    ShowWindow(viewer, SW_SHOWNORMAL);
+    SetForegroundWindow(viewer);
+    pumpFor(100);
+    int tickCalls = 0;
+    gSessionModalTick = [&tickCalls] { ++tickCalls; };
+    gMainLoopRecvMs = 0.0;
+    SetTimer(viewer, kSessionTickTimer, kSessionTickMs, nullptr);
+    SetTimer(nullptr, 0, 800, [](HWND, UINT, UINT_PTR id, DWORD) {
+        KillTimer(nullptr, id);
+        EndMenu();
+    });
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"Modal loop");
+    const double menuStart = steadyMsNow();
+    gSnapshotActionStart = menuStart;
+    TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, 120, 120, 0, viewer, nullptr);
+    gSnapshotActionStart = 0.0;
+    const double heldMs = steadyMsNow() - menuStart;
+    KillTimer(viewer, kSessionTickTimer);
+    gSessionModalTick = nullptr;
+    DestroyMenu(menu);
+    const bool tickOk = heldMs >= 500.0 && tickCalls >= 10;
+    std::wcout << L"modal_tick=" << (tickOk ? L"ok" : L"FAIL") << L" held_ms=" << heldMs
+               << L" ticks=" << tickCalls << L"\n";
+    gSnapshotDone = true;
+    watchdog.join();
+    overlayDestroy();
+    DestroyWindow(viewer);
+    pumpFor(100);
+
     if (!synced) return 4;
     if (!oneDialog) return 5;
     if (!bindGreyed || !stillOpen) return 6;
+    if (!noMenu) return 7;
+    if (!actionsOk || !noModal || !overlayShown || !overlayPlaced || !layered ||
+        !sessionDialogsLayered)
+        return 8;
+    if (!tickOk) return 10;
+    if (!codeTabBlocks || !launchError) return 11;
+    if (!accentSaved) return 12;
     return 0;
 }
 #endif
@@ -4404,6 +5742,37 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     LocalFree(wideArgv);
     const int rc = appMain(argc, argv.data());
+    if (gRelaunch) {
+        // Back to the launch screen in a fresh process: the session's
+        // threads, sockets and decoder are all gone with this one.
+        std::vector<std::string> rest(utf8Args.begin() + 1, utf8Args.end());
+        std::wstring cmd;
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        cmd = L"\"" + std::wstring(exe) + L"\"";
+        for (const auto& a : jl::argsForRelaunch(rest)) {
+            std::wstring w = utf8ToWide(a);
+            std::wstring quoted = L" \"";
+            for (wchar_t c : w) {
+                if (c == L'"') quoted += L'\\';
+                quoted += c;
+            }
+            cmd += quoted + L"\"";
+        }
+        SetEnvironmentVariableW(L"JERISLINK_LAUNCH_NOTE",
+                                gRelaunchNote.empty() ? nullptr : gRelaunchNote.c_str());
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        const BOOL ok = CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                       nullptr, &si, &pi);
+        logLine(std::string("launch.relaunch started=") + (ok ? "yes" : "no") +
+                " error=" + std::to_string(ok ? 0 : GetLastError()));
+        if (ok) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
     gLog.stop();  // write out every queued line before the process exits
     return rc;
 }

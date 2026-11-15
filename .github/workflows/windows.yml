@@ -27,7 +27,7 @@ jobs:
           path: personal/windows-client/build/Release/Jerislink.exe
       - name: Build settings UI snapshot (CI only, not packaged)
         run: cmake --build build --config Release --target JerislinkUiSnapshot
-      - name: Settings and volume window snapshots
+      - name: UI snapshots and no-freeze checks (launch screen, overlay, settings, volume)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -39,7 +39,7 @@ jobs:
           New-ItemProperty -Path $key -Name AudioVolumePercent -Value 70 -PropertyType DWord -Force | Out-Null
           $root = Join-Path $env:RUNNER_TEMP 'ui-snapshots'
           $codes = @{}
-          foreach ($accent in 'green', 'green-b', 'blue') {
+          foreach ($accent in 'green', 'blue') {
             $dir = Join-Path $root $accent
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             $log = Join-Path $dir 'snapshot.txt'
@@ -64,6 +64,10 @@ jobs:
         with:
           name: jerislink-ui-snapshots
           path: ${{ runner.temp }}/ui-snapshots
+      - name: Build overlay unit test
+        run: cmake --build build --config Release --target JerislinkOverlayTest
+      - name: Overlay unit test (layout, hit-test, keyboard focus, slider, hover dwell)
+        run: build\Release\JerislinkOverlayTest.exe
       - name: Build launch-config unit test
         run: cmake --build build --config Release --target JerislinkOptionsTest
       - name: Launch-config unit test
