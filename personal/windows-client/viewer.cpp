@@ -960,9 +960,9 @@ static int loadAudioVolumePercent() {
 }
 
 // Dialog accent in HKCU\Software\Jeris\Jerislink\UiAccent (REG_SZ):
-// "green" uses the JerisLink icon green; anything else, or missing, blue.
+// "blue" uses the blue accent; anything else, empty or missing, the icon green.
 static void loadUiAccent() {
-    const bool green = [] {
+    const bool blue = [] {
         HKEY key = nullptr;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &key) !=
             ERROR_SUCCESS) {
@@ -970,10 +970,10 @@ static void loadUiAccent() {
         }
         const std::string value = readRegString(key, L"UiAccent");
         RegCloseKey(key);
-        return value == "green";
+        return value == "blue";
     }();
-    jl::ui::setAccent(green);
-    logLine(std::string("ui.accent=") + (green ? "green" : "blue"));
+    jl::ui::setAccent(blue ? jl::ui::Accent::Blue : jl::ui::Accent::Green);
+    logLine(std::string("ui.accent=") + (blue ? "blue" : "green"));
 }
 
 static void ensureAudioVolumeLoaded() {
@@ -4282,10 +4282,12 @@ static void snapshotDropDown(HWND dlg, int comboId, const std::wstring& dir,
                << L"\n";
 }
 
-static int runUiSnapshot(const std::wstring& dir, bool green) {
+static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    jl::ui::setAccent(green);
-    std::wcout << L"accent=" << (green ? L"green" : L"blue") << L"\n";
+    jl::ui::setAccent(accentName == L"blue"      ? jl::ui::Accent::Blue
+                      : accentName == L"green-b" ? jl::ui::Accent::GreenCandidateB
+                                                 : jl::ui::Accent::Green);
+    std::wcout << L"accent=" << accentName << L"\n";
     // Made-up addresses: a tailnet IP and the Tailcat bridge both present.
     gBindDetectionOverride = jl::BindDetection{std::string("100.64.0.25"), true};
     ensureCommonControls();
@@ -4378,9 +4380,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 #ifdef JERISLINK_UI_SNAPSHOT
     if (wideArgv && argc >= 2) {
         const std::wstring dir = wideArgv[1];
-        const bool green = argc >= 3 && std::wstring(wideArgv[2]) == L"green";
+        const std::wstring accentName = argc >= 3 ? std::wstring(wideArgv[2]) : L"green";
         LocalFree(wideArgv);
-        return runUiSnapshot(dir, green);
+        return runUiSnapshot(dir, accentName);
     }
 #endif
     if (!wideArgv || argc <= 0) {

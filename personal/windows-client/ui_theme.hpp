@@ -12,12 +12,16 @@
 //   text   #F4F8FF on primary button #2563EB 4.9
 //
 // Two accent palettes, picked at start-up (HKCU ...\Jerislink\UiAccent):
-//   blue  (default) as above
-//   green #01DAE3, the ring colour of the JerisLink icon
-//         (msix/icon-src/JerisLink-v2.0-1024.png). White text on it is only
-//         1.6:1, so the Save button and check-box tick use dark #0C1424
-//         (10.6:1; 6.8:1 on the pressed shade #01AEB6). Accent on body 9.9,
-//         focus ring #7FF0F5 on body 12.9, text on selected item #0E4A55 9.3.
+//   green (default; UiAccent empty, missing or "green") keeps the hue of the
+//         JerisLink icon ring #01DAE3 (msix/icon-src/JerisLink-v2.0-1024.png)
+//         at 88% brightness, candidate A: #01C0C8. White text on it is only
+//         ~2:1, so the Save button and check-box tick use dark #0C1424
+//         (8.2:1; 6.0:1 on the pressed shade #01A3AA). Accent on body 7.7,
+//         focus ring #73DCE1 on body 10.7, text on selected item #074652 9.8.
+//   blue  (UiAccent "blue") as above.
+// Candidate B (78% brightness) is kept for the comparison snapshot only.
+// Shades: pressed = main x 0.85, focus = main mixed 45% with white,
+// selected = main mixed 70% with the field colour.
 
 #include <windows.h>
 #include <commctrl.h>
@@ -54,16 +58,25 @@ struct AccentPalette {
 constexpr AccentPalette kBlueAccent{RGB(0x4C, 0x9A, 0xFF), RGB(0x8D, 0xBB, 0xFF),
                                     RGB(0x25, 0x63, 0xEB), RGB(0x1D, 0x4F, 0xC4),
                                     RGB(0xF4, 0xF8, 0xFF), RGB(0x1E, 0x3A, 0x66)};
-constexpr AccentPalette kGreenAccent{RGB(0x01, 0xDA, 0xE3), RGB(0x7F, 0xF0, 0xF5),
-                                     RGB(0x01, 0xDA, 0xE3), RGB(0x01, 0xAE, 0xB6),
-                                     RGB(0x0C, 0x14, 0x24), RGB(0x0E, 0x4A, 0x55)};
+constexpr AccentPalette kGreenAccent{RGB(0x01, 0xC0, 0xC8), RGB(0x73, 0xDC, 0xE1),
+                                     RGB(0x01, 0xC0, 0xC8), RGB(0x01, 0xA3, 0xAA),
+                                     RGB(0x0C, 0x14, 0x24), RGB(0x07, 0x46, 0x52)};
+constexpr AccentPalette kGreenAccentB{RGB(0x01, 0xAA, 0xB1), RGB(0x73, 0xD0, 0xD4),
+                                      RGB(0x01, 0xAA, 0xB1), RGB(0x01, 0x91, 0x96),
+                                      RGB(0x0C, 0x14, 0x24), RGB(0x07, 0x3F, 0x4C)};
+
+enum class Accent { Green, Blue, GreenCandidateB };
 
 inline AccentPalette& accentStorage() {
-    static AccentPalette p = kBlueAccent;
+    static AccentPalette p = kGreenAccent;
     return p;
 }
 inline const AccentPalette& accent() { return accentStorage(); }
-inline void setAccent(bool green) { accentStorage() = green ? kGreenAccent : kBlueAccent; }
+inline void setAccent(Accent a) {
+    accentStorage() = a == Accent::Blue              ? kBlueAccent
+                      : a == Accent::GreenCandidateB ? kGreenAccentB
+                                                     : kGreenAccent;
+}
 
 // The viewer's title-bar look, for any top-level window of the viewer.
 // Best effort: older Windows builds ignore attributes they do not know.
