@@ -92,6 +92,16 @@ jobs:
         run: cmake --build build --config Release --target JerislinkNalSummaryTest
       - name: H.264 NAL summary test (slice first_mb / type, Annex B split, log budget)
         run: build\Release\JerislinkNalSummaryTest.exe
+      - name: Build keymap golden test
+        run: cmake --build build --config Release --target JerislinkKeymapTest
+      - name: Keymap golden test (positional layout, Ctrl+A/C/V/Z, Win+C / Win+Space, viewer hotkeys, focus-loss release)
+        run: build\Release\JerislinkKeymapTest.exe
+      - name: No always-on shortcut or key log lines in the viewer
+        shell: pwsh
+        run: |
+          $hits = Select-String -Path viewer.cpp -Pattern 'logLine\("(shortcut\.|key\.)'
+          if ($hits) { $hits | ForEach-Object { Write-Host $_ }; throw "shortcut/key log lines must go through sendKeyOutput (JERISLINK_DEBUG=1 only)" }
+          Write-Host "OK: no direct shortcut./key. log lines in viewer.cpp"
       - name: Build audio jitter test
         run: cmake --build build --config Release --target JerislinkAudioTest
       - name: Audio jitter test (MRA1 v1/v2 parse, Opus round trip, PLC, FEC, drift control, A1 vs A2 link simulation)
