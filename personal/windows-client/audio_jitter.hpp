@@ -35,6 +35,15 @@
 // The target itself adds (packet length - 5 ms) of slack, so 10 ms Opus
 // packets get 5 ms more buffer than 5 ms PCM (see desiredTargetMs).
 //
+// Output gaps: while the player has no open device (startup, a default
+// output switch, a device that went away) nothing pulls, so the buffer would
+// fill to target + 30 ms and then drop one packet per arrival as "overflow".
+// The player marks those spans with setOutputActive(false): packets beyond
+// the target are dropped as idleDrops instead, and setOutputActive(true)
+// trims to the newest `target` of audio (the live edge), resets the Opus
+// decoder across the discontinuity and prebuffers again, so the new device
+// starts at the normal latency instead of with a backlog.
+//
 // The buffer is not thread-safe; the player guards it with one mutex shared
 // by the network thread (push) and the render thread (pull).
 
@@ -143,6 +152,7 @@ struct JitterStats {
     uint64_t duplicates = 0;
     uint64_t underruns = 0;      // buffer ran dry while playing
     uint64_t overflowDrops = 0;  // packets dropped because the buffer grew past target + 30 ms
+    uint64_t idleDrops = 0;      // packets dropped past the target while no output device was playing
     uint64_t resets = 0;         // host restart flag, codec change or a large sequence jump
     uint64_t fecRecovered = 0;   // lost Opus packets rebuilt from the next packet's in-band FEC
     uint64_t plcFrames = 0;      // frames concealed by Opus PLC (lost packets without FEC)
@@ -182,6 +192,24 @@ public:
         driftControl_ = on;
         resetDrift();
     }
+
+    // False while the player has no device pulling (see "Output gaps" at the
+    // top). Going active flushes to the live edge and prebuffers again.
+    void setOutputActive(bool active) {
+        if (active == outputActive_) return;
+        outputActive_ = active;
+        if (!active || !started_) return;
+        // The packet that was playing when the old device went away is stale.
+        cur_.clear();
+        curPos_ = 0;
+        curSilent_ = false;
+        trimTo(targetMs_, stats_.idleDrops);
+        prebuffering_ = true;
+        steadyFrames_ = 0;
+        resetDrift();
+        if (dec_) opus_decoder_ctl(dec_, OPUS_RESET_STATE);
+    }
+    bool outputActive() const { return outputActive_; }
 
     // arrivalUs: viewer monotonic clock at receive time.
     void push(const Mra1Packet& pkt, uint64_t arrivalUs) {
@@ -448,13 +476,18 @@ private:
     }
 
     void trimOverflow() {
-        while (!packets_.empty() && bufferedMs() > targetMs_ + kOverflowSlackMs) {
-            // Drop the oldest buffered audio to pull latency back.
+        if (outputActive_) trimTo(targetMs_ + kOverflowSlackMs, stats_.overflowDrops);
+        else trimTo(targetMs_, stats_.idleDrops);
+    }
+
+    // Drops the oldest buffered audio until at most `limitMs` is left.
+    void trimTo(double limitMs, uint64_t& counter) {
+        while (!packets_.empty() && bufferedMs() > limitMs) {
             auto it = packets_.begin();
             bufferedFrames_ -= std::min<uint64_t>(bufferedFrames_, it->second.frames);
             next_ = it->first + 1;
             packets_.erase(it);
-            ++stats_.overflowDrops;
+            ++counter;
             // The Opus decoder skips a packet: conceal nothing, it resyncs on
             // the next one (CELT recovers within a frame).
         }
@@ -499,6 +532,7 @@ private:
     double targetMs_ = kInitialTargetMs;
     int steadyFrames_ = 0;
     bool driftControl_ = true;
+    bool outputActive_ = true;
     int driftMode_ = 0;
     double driftSumMs_ = 0;
     double driftMinMs_ = 0;

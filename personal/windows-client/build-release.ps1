@@ -20,6 +20,7 @@ $outDir = Join-Path $here "dist\portable"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Copy-Item $exe (Join-Path $outDir "Jerislink.exe") -Force
 Copy-Item (Join-Path $here "README-Windows.txt") (Join-Path $outDir "README.txt") -Force
+Copy-Item (Join-Path $here "..\third_party\opus\COPYING") (Join-Path $outDir "COPYING-opus.txt") -Force
 
 $zip = Join-Path $here "dist\Jerislink-$version-windows-x64-portable.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }

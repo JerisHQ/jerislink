@@ -2978,9 +2978,14 @@ static int appMain(int argc, char** argv) {
                    << " drift_inserted=" << a.jb.driftInserted << " drift_dropped=" << a.jb.driftDropped
                    << " decode_errors=" << a.jb.decodeErrors
                    << " late=" << a.jb.late << " underruns=" << a.jb.underruns
-                   << " overflow_drops=" << a.jb.overflowDrops << " target_ms=" << a.jb.targetMs
+                   << " overflow_drops=" << a.jb.overflowDrops << " idle_drops=" << a.jb.idleDrops
+                   << " target_ms=" << a.jb.targetMs
                    << " jitter_ms=" << a.jb.jitterMs << " buffered_ms=" << a.jb.bufferedMs
+                   << " latency_ms=" << a.outputLatencyMs()
                    << " device_ok=" << (a.deviceOk ? "yes" : "no") << " device_errors=" << a.deviceErrors
+                   << " device_reopens=" << a.deviceReopens << " device_notify=" << (a.deviceNotify ? "on" : "off")
+                   << " device_notifications=" << a.deviceNotifications
+                   << " last_reopen=\"" << a.lastReopenReason << "\""
                    << " muted=" << (a.muted ? "yes" : "no");
                 logLine(as.str());
                 lastAudioStats = now;
@@ -3299,6 +3304,7 @@ static int appMain(int argc, char** argv) {
                 << " audio_duplicates=" << audioStats.jb.duplicates
                 << " audio_underruns=" << audioStats.jb.underruns
                 << " audio_overflow_drops=" << audioStats.jb.overflowDrops
+                << " audio_idle_drops=" << audioStats.jb.idleDrops
                 << " audio_resets=" << audioStats.jb.resets
                 << " audio_target_ms=" << audioStats.jb.targetMs
                 << " audio_jitter_ms=" << audioStats.jb.jitterMs
@@ -3308,6 +3314,9 @@ static int appMain(int argc, char** argv) {
                 << " audio_rx_malformed=" << audioStats.rxMalformed
                 << " audio_device_opens=" << audioStats.deviceOpens
                 << " audio_device_errors=" << audioStats.deviceErrors
+                << " audio_device_reopens=" << audioStats.deviceReopens
+                << " audio_device_notifications=" << audioStats.deviceNotifications
+                << " audio_latency_ms=" << audioStats.outputLatencyMs()
                 << " audio_requests_tx=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestsSent() : 0)
                 << " audio_request_drops=" << (mouseMoveUdp ? mouseMoveUdp->audioRequestDrops() : 0)
                 << " audio_muted=" << (gAudioMuted ? "yes" : "no")

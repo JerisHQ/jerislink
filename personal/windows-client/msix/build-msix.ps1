@@ -46,6 +46,8 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Assets') | Out-Null
 Copy-Item $ExePath (Join-Path $stage 'Jerislink.exe')
 Copy-Item (Join-Path $here 'Assets\*.png') (Join-Path $stage 'Assets')
+# libopus is BSD-3-Clause: its notice ships with every binary.
+Copy-Item (Join-Path $here '..\..\third_party\opus\COPYING') (Join-Path $stage 'COPYING-opus.txt')
 $manifest = (Get-Content (Join-Path $here 'AppxManifest.xml.in') -Raw).Replace('@MSIX_VERSION@', $msixVersion)
 if ($manifest -match '@[A-Z_]+@') { throw "unfilled placeholder in AppxManifest: $($Matches[0])" }
 [IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'), $manifest, (New-Object Text.UTF8Encoding $false))

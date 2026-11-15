@@ -38,6 +38,8 @@ cp "$HERE/JerisLink-Info.plist" "$APP/Contents/Info.plist"
 cp "$HERE/JerisLinkInputHelper-Info.plist" "$HELPER/Contents/Info.plist"
 cp Brand/JerisLink.icns "$APP/Contents/Resources/JerisLink.icns"
 cp Brand/JerisLink.icns "$HELPER/Contents/Resources/JerisLink.icns"
+# libopus is BSD-3-Clause: its notice ships inside the app.
+cp ../third_party/opus/COPYING "$APP/Contents/Resources/COPYING-opus.txt"
 cp "$HERE"/LaunchAgents/*.plist "$APP/Contents/Library/LaunchAgents/"
 
 # Single source of the version: VERSION at the repository root.
