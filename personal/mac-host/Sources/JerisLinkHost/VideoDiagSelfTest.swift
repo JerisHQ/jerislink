@@ -103,7 +103,16 @@ enum VideoDiagSelfTest {
         let p0: [UInt8] = [0x41, 0x9b, 0x10]
         let p25440: [UInt8] = [0x41, 0x00, 0x03, 0x1b, 0x0f]
         func avcc(_ nals: [[UInt8]]) -> [UInt8] {
-            nals.flatMap { n in [UInt8(n.count >> 24 & 0xff), UInt8(n.count >> 16 & 0xff), UInt8(n.count >> 8 & 0xff), UInt8(n.count & 0xff)] + n }
+            var out: [UInt8] = []
+            for n in nals {
+                let count = UInt32(n.count)
+                out.append(UInt8(truncatingIfNeeded: count >> 24))
+                out.append(UInt8(truncatingIfNeeded: count >> 16))
+                out.append(UInt8(truncatingIfNeeded: count >> 8))
+                out.append(UInt8(truncatingIfNeeded: count))
+                out.append(contentsOf: n)
+            }
+            return out
         }
         let key = H264FrameSummary.parseAVCC(avcc([sps, pps, idr0, idr4080]))
         var keyOk = key?.nalTypes == [7, 8, 5, 5]
@@ -298,8 +307,11 @@ enum VideoDiagSelfTest {
                     let sx = x + dx
                     let cellX = sx / 8, px = sx % 8
                     let glyph = Int(hash(cellX, cellY) % 64)
-                    let ink = glyph >= 13 && px >= 1 && px <= 6 && py >= 3 && py <= 12
-                        && hash(glyph, px, py) % 100 < 45
+                    let inCell: Bool = (1...6).contains(px) && (3...12).contains(py)
+                    var ink = false
+                    if glyph >= 13 && inCell {
+                        ink = hash(glyph, px, py) % 100 < 45
+                    }
                     line[x] = ink ? 24 : 230
                 }
             }
