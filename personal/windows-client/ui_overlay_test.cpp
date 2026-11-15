@@ -1,5 +1,5 @@
 // In-session overlay maths (ui_overlay.hpp): layout, hit-test, keyboard
-// focus order, slider, hover dwell, top-centre zone and placement.
+// focus order, slider, hover dwell, corner zone, opacity token and placement.
 #include "ui_overlay.hpp"
 
 #include <array>
@@ -117,21 +117,14 @@ void dwellTests() {
 }
 
 void zoneTests() {
-    // 1280 wide: the zone is x 560..719, y 0..23.
-    expect(inTopCentreZone(640, 0, 1280, 720, 160, 24), "top-centre pixel is in the zone");
-    expect(inTopCentreZone(560, 23, 1280, 720, 160, 24) &&
-               inTopCentreZone(719, 23, 1280, 720, 160, 24),
-           "zone edges are in");
-    expect(!inTopCentreZone(559, 5, 1280, 720, 160, 24) &&
-               !inTopCentreZone(720, 5, 1280, 720, 160, 24),
-           "left and right of the zone are out");
-    expect(!inTopCentreZone(640, 24, 1280, 720, 160, 24), "below the zone is out");
-    expect(!inTopCentreZone(640, -1, 1280, 720, 160, 24), "outside the client area is out");
-    expect(!inTopCentreZone(0, 0, 1280, 720, 160, 24) &&
-               !inTopCentreZone(0, 719, 1280, 720, 160, 24),
-           "the old bottom-left corner is no longer a zone");
-    expect(inTopCentreZone(0, 0, 100, 720, 160, 24) && inTopCentreZone(99, 0, 100, 720, 160, 24),
-           "narrow client: the zone spans its width");
+    expect(inCornerZone(0, 719, 1280, 720, 48), "corner pixel is in the zone");
+    expect(inCornerZone(47, 672, 1280, 720, 48), "zone edge is in");
+    expect(!inCornerZone(48, 700, 1280, 720, 48), "right of the zone is out");
+    expect(!inCornerZone(10, 671, 1280, 720, 48), "above the zone is out");
+    expect(!inCornerZone(-1, 700, 1280, 720, 48) && !inCornerZone(10, 720, 1280, 720, 48),
+           "outside the client area is out");
+    expect(!inCornerZone(640, 0, 1280, 720, 48), "the top centre is not a zone");
+    expect(kSessionUiAlpha >= 179 && kSessionUiAlpha <= 204, "session UI alpha is about 75%");
 }
 
 void placementTests() {

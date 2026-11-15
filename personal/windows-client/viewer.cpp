@@ -1585,6 +1585,23 @@ static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
     return FALSE;
 }
 
+// In-session windows (Volume, Settings, Info opened while the viewer runs)
+// share the overlay's translucency: a layered window at the one
+// jl::overlay::kSessionUiAlpha token. Only the window's composition changes;
+// it stays a modeless owned dialog driven by the main loop, so nothing here
+// runs a modal loop. Before connecting (owner is not the viewer) they stay
+// opaque: there is no video behind them.
+static bool isSessionOwner(HWND owner) { return owner != nullptr && owner == gViewerHwnd; }
+
+static void applySessionTranslucency(HWND wnd, HWND owner, const char* what) {
+    if (!wnd || !isSessionOwner(owner)) return;
+    SetWindowLongPtrW(wnd, GWL_EXSTYLE, GetWindowLongPtrW(wnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+    if (!SetLayeredWindowAttributes(wnd, 0, jl::overlay::kSessionUiAlpha, LWA_ALPHA)) {
+        logLine(std::string("session_ui.alpha_failed window=") + what +
+                " error=" + std::to_string(GetLastError()));
+    }
+}
+
 // Modeless, so video keeps running while the slider moves; the main loop
 // routes its keyboard input through IsDialogMessage.
 static void showVolumeWindow(HWND owner, const char* source) {
@@ -1606,6 +1623,7 @@ static void showVolumeWindow(HWND owner, const char* source) {
         logLine("audio.volume_window_failed error=" + std::to_string(GetLastError()));
         return;
     }
+    applySessionTranslucency(gVolumeDlg, owner, "volume");
     ShowWindow(gVolumeDlg, SW_SHOW);
     logLine(std::string("audio.volume.window source=") + source +
             " volume=" + std::to_string(gAudioVolumePct));
@@ -1890,6 +1908,7 @@ static void showVideoSettings(HWND owner) {
         logLine("settings.dialog_create_failed error=" + std::to_string(GetLastError()));
         return;
     }
+    applySessionTranslucency(dlg, owner, "settings");
     ShowWindow(dlg, SW_SHOW);
     logLine("settings.window open=modeless");
 }
@@ -2014,6 +2033,7 @@ static void showConnectionInfo(HWND owner, const char* source) {
         logLine("connection.info_failed error=" + std::to_string(GetLastError()));
         return;
     }
+    applySessionTranslucency(gInfoDlg, owner, "info");
     ShowWindow(gInfoDlg, SW_SHOW);
     logLine(std::string("connection.info.opened source=") + source + " window=modeless");
 }
@@ -2071,9 +2091,9 @@ static void runSessionModalTick() {
 // A thin bar at the top centre of the viewer: status, mute, volume, Info,
 // Settings, Disconnect. A non-activating owned popup: it never takes the
 // keyboard from the viewer and never runs a modal loop. It is a layered
-// window at ov::kOverlayAlpha opacity, so the video shows through. Ctrl+Alt+O
-// opens it for the keyboard; holding the pointer at the top centre of the
-// viewer for 2 s opens it for the mouse.
+// window at ov::kSessionUiAlpha opacity, so the video shows through. Ctrl+Alt+O
+// opens it for the keyboard; holding the pointer in the bottom-left corner of
+// the viewer for 2 s opens it for the mouse (the bar still opens at the top).
 namespace ov = jl::overlay;
 
 static HWND gOverlay = nullptr;
@@ -2447,7 +2467,7 @@ static void paintOverlay(HWND hwnd) {
     overlayText(dc,
                 gOverlayKeyboard
                     ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
-                    : L"Ctrl+Alt+O, or hold the pointer at the top centre for 2 s",
+                    : L"Ctrl+Alt+O, or hold the pointer bottom-left for 2 s",
                 toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
 
     BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -2568,7 +2588,7 @@ static void overlayCreate(HWND viewer) {
         return;
     }
     // Whole-window alpha: GDI painting stays as it is (no per-pixel alpha).
-    if (!SetLayeredWindowAttributes(gOverlay, 0, ov::kOverlayAlpha, LWA_ALPHA)) {
+    if (!SetLayeredWindowAttributes(gOverlay, 0, ov::kSessionUiAlpha, LWA_ALPHA)) {
         logLine("overlay.alpha_failed error=" + std::to_string(GetLastError()));
     }
     // Rounded on Windows 11; Windows 10 keeps square corners.
@@ -2593,7 +2613,7 @@ static void overlayDestroy() {
     gOverlaySwallowUp.reset();
 }
 
-// Every 100 ms: the top-centre hover fallback and the auto-hide.
+// Every 100 ms: the bottom-left hover fallback and the auto-hide.
 static void overlayHoverTick() {
     if (!gOverlay || !gViewerHwnd) return;
     const double now = steadyMsNow();
@@ -2613,10 +2633,8 @@ static void overlayHoverTick() {
             ScreenToClient(gViewerHwnd, &cp);
             RECT c{};
             GetClientRect(gViewerHwnd, &c);
-            const UINT dpi = overlayDpi();
-            inZone = ov::inTopCentreZone(cp.x, cp.y, c.right, c.bottom,
-                                         ov::scale(ov::kHoverZoneW, dpi),
-                                         ov::scale(ov::kHoverZoneH, dpi));
+            inZone = ov::inCornerZone(cp.x, cp.y, c.right, c.bottom,
+                                      ov::scale(ov::kHoverZone, overlayDpi()));
         }
     }
     if (gOverlayDwell.update(inZone, now) && !overlayVisible()) overlayShow(false, "hover", 0);
@@ -5535,14 +5553,14 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     snapshotWindow(viewer, dir, L"overlay-open");
     const bool overlayShown = overlayVisible();
     // Placement and translucency: top centre of the client area, a layered
-    // window at ov::kOverlayAlpha.
+    // window at ov::kSessionUiAlpha.
     bool overlayPlaced = false;
     BYTE overlayAlpha = 0;
     DWORD alphaFlags = 0;
     const bool layered =
         gOverlay && (GetWindowLongPtrW(gOverlay, GWL_EXSTYLE) & WS_EX_LAYERED) != 0 &&
         GetLayeredWindowAttributes(gOverlay, nullptr, &overlayAlpha, &alphaFlags) &&
-        (alphaFlags & LWA_ALPHA) != 0 && overlayAlpha == ov::kOverlayAlpha;
+        (alphaFlags & LWA_ALPHA) != 0 && overlayAlpha == ov::kSessionUiAlpha;
     if (gOverlay) {
         RECT c{}, o{};
         GetClientRect(viewer, &c);
@@ -5580,6 +5598,19 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         std::wcout << L"action " << name << L" ms=" << ms << L" ok=" << ok << L"\n";
     };
     const bool mutedBefore = gAudioMuted;
+    // Info, Settings and Volume opened from the overlay share its opacity
+    // token; checked on the real windows.
+    int sessionLayered = 0;
+    const auto sessionAlpha = [&sessionLayered](HWND w, const wchar_t* name) {
+        BYTE a = 0;
+        DWORD flags = 0;
+        const bool ok = w && (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_LAYERED) != 0 &&
+                        GetLayeredWindowAttributes(w, nullptr, &a, &flags) &&
+                        (flags & LWA_ALPHA) != 0 && a == ov::kSessionUiAlpha;
+        if (ok) ++sessionLayered;
+        std::wcout << L"session_alpha " << name << L" layered=" << ok
+                   << L" alpha=" << static_cast<int>(a) << L"\n";
+    };
     timed("hotkey-O-open", [] { viewerHotkey('O', "snapshot"); }, true);
     timed("hotkey-O-check", [] {}, overlayVisible() && gOverlayKeyboard);
     timed("overlay-key-tab", [] { overlayKey(VK_TAB, false); }, true);
@@ -5601,6 +5632,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     timed("overlay-info", [] { overlayActivate(ov::Item::Info, "snapshot"); }, true);
     timed("overlay-info-check", [] {}, gInfoDlg != nullptr);
     if (gInfoDlg) {
+        sessionAlpha(gInfoDlg, L"info");
         snapshotWindow(gInfoDlg, dir, L"connection-info");
         SendMessageW(gInfoDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     }
@@ -5608,12 +5640,18 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     timed("overlay-settings", [] { overlayActivate(ov::Item::Settings, "snapshot"); }, true);
     timed("overlay-settings-check", [] {}, gSettingsDlg != nullptr && !gSettingsModal);
     if (gSettingsDlg) {
+        sessionAlpha(gSettingsDlg, L"settings");
+        snapshotWindow(gSettingsDlg, dir, L"settings-session");
         SendMessageW(gSettingsDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     }
     pumpFor(60);
     timed("overlay-volume", [] { overlayActivate(ov::Item::Volume, "snapshot"); }, true);
     timed("overlay-volume-check", [] {}, gVolumeDlg != nullptr);
-    if (gVolumeDlg) SendMessageW(gVolumeDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    if (gVolumeDlg) {
+        sessionAlpha(gVolumeDlg, L"volume");
+        snapshotWindow(gVolumeDlg, dir, L"volume-session");
+        SendMessageW(gVolumeDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    }
     pumpFor(60);
     overlayShow(false, "snapshot", 0);
     timed("overlay-disconnect", [] { overlayActivate(ov::Item::Disconnect, "snapshot"); }, true);
@@ -5624,6 +5662,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     gWindowClosed = false;
     if (filter) UnhookWindowsHookEx(filter);
     const bool noModal = gSnapshotModalLoops == 0;
+    const bool sessionDialogsLayered = sessionLayered == 3;
     std::wcout << L"no_freeze=" << (actionsOk && noModal ? L"ok" : L"FAIL")
                << L" modal_loops=" << gSnapshotModalLoops << L" worst_ms=" << worstMs << L"\n";
 
@@ -5663,7 +5702,9 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     if (!oneDialog) return 5;
     if (!bindGreyed || !stillOpen) return 6;
     if (!noMenu) return 7;
-    if (!actionsOk || !noModal || !overlayShown || !overlayPlaced || !layered) return 8;
+    if (!actionsOk || !noModal || !overlayShown || !overlayPlaced || !layered ||
+        !sessionDialogsLayered)
+        return 8;
     if (!tickOk) return 10;
     if (!codeTabBlocks || !launchError) return 11;
     if (!accentSaved) return 12;

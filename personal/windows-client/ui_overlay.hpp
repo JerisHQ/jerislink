@@ -105,21 +105,21 @@ inline int sliderKnobX(const Rect& slider, int value, unsigned dpi) {
 // Left / Right on the focused volume item: 5% steps, clamped.
 inline int volumeStep(int value, int dir) { return std::clamp(value + 5 * dir, 0, 100); }
 
-// Hover fallback: the pointer rests in a small zone at the middle of the
-// top edge of the viewer's client area (zoneW wide, zoneH tall, centred).
-inline bool inTopCentreZone(int x, int y, int clientW, int clientH, int zoneW, int zoneH) {
-    const int w = std::min(zoneW, clientW);
-    const int left = (clientW - w) / 2;
-    return x >= left && x < left + w && y >= 0 && y < std::min(zoneH, clientH);
+// Hover fallback: the pointer rests in the bottom-left corner of the viewer's
+// client area (zone x zone pixels). The overlay itself opens at the top centre.
+inline bool inCornerZone(int x, int y, int clientW, int clientH, int zone) {
+    return x >= 0 && y < clientH && x < std::min(zone, clientW) && y >= clientH - zone;
 }
 
 // Hover zone size in logical pixels (scaled with the dpi).
-constexpr int kHoverZoneW = 160;
-constexpr int kHoverZoneH = 24;
+constexpr int kHoverZone = 48;
 
-// Whole-window opacity of the overlay (layered window, LWA_ALPHA): 224/255
-// is about 88%, so the video shows through while text stays readable.
-constexpr unsigned char kOverlayAlpha = 224;
+// One opacity token for every in-session surface: the overlay and the Info,
+// Settings and Volume windows opened while connected (layered windows,
+// LWA_ALPHA). 191/255 is about 75%, so the video shows through; primary text
+// keeps at least 7:1 contrast over any backdrop, hints at least 4.3:1.
+// A later user setting (Settings > overlay opacity) only has to change this.
+constexpr unsigned char kSessionUiAlpha = 191;
 
 // Fires once when `on` has held for `ms` without a break; resets when it
 // stops holding.
