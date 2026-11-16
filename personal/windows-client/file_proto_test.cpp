@@ -73,7 +73,11 @@ int main() {
     expect(!encode(Data{1, 0, 0, std::vector<uint8_t>(kMaxChunk + 1, 0)}), "DATA over 32 KiB not encoded");
     expect(!decode(type::kEntry, std::vector<uint8_t>(25, 0)), "ENTRY with empty path rejected");
     expect(!decode(type::kEntry, std::vector<uint8_t>(25 + kMaxPathBytes + 1, 0)), "ENTRY path over 1024 bytes rejected");
-    expect(decode(type::kEntry, std::vector<uint8_t>(25 + kMaxPathBytes, 'a')).has_value(), "ENTRY path of 1024 bytes accepted");
+    {
+        std::vector<uint8_t> fullPath(25, 0);   // header with kind 0 (file)
+        fullPath.insert(fullPath.end(), kMaxPathBytes, 'a');
+        expect(decode(type::kEntry, fullPath).has_value(), "ENTRY path of 1024 bytes accepted");
+    }
     auto badKind = *encode(Entry{1, 0, 0, 0, 0, {'a'}});
     badKind[8] = 2;
     expect(!decode(type::kEntry, badKind), "ENTRY unknown kind rejected");
