@@ -372,6 +372,7 @@ static constexpr UINT WM_MR_WIN_DOWN = WM_APP + 42;
 static constexpr UINT WM_MR_WIN_UP = WM_APP + 43;
 static constexpr UINT WM_MR_WIN_SPACE = WM_APP + 44;
 static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
+static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -552,8 +553,18 @@ static bool physicalKeyDown(int vk) {
     return (GetKeyState(vk) & 0x8000) != 0;
 }
 
+// F2 file upload state (UI thread). The UI itself is further down, after the overlay.
+static FileSession* gFileSession = nullptr;  // set while a session runs
+static jl::fileup::PasteGate gPasteGate;
+static HWND gFileConfirm = nullptr;
+static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileConfirm); }
+static bool pasteEligible();
+static void startPasteUpload();
+
 static bool viewerHasInteractiveFocus(HWND hwnd) {
     if (!hwnd) return false;
+    // The disconnect confirm owns keys and mouse while it is open.
+    if (fileConfirmVisible()) return false;
     return gViewerFocused || GetFocus() == hwnd || GetForegroundWindow() == hwnd;
 }
 
@@ -597,9 +608,12 @@ static jl::keymap::Held heldModifiers() {
 
 // Sends a keymap result to the host. The shortcut name is logged only with
 // JERISLINK_DEBUG=1; ordinary keys are never logged.
+// A Cmd+V with copied Windows files is held here while they upload (F2).
 static void sendKeyOutput(const jl::keymap::Output& out) {
     if (!gControl) return;
-    for (const auto& e : out.events) gControl->sendKey(e.down, e.semantic);
+    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible);
+    for (const auto& e : f.events) gControl->sendKey(e.down, e.semantic);
+    if (f.startUpload) startPasteUpload();
     if (!out.debugTag.empty() && debugMode()) logLine(out.debugTag);
 }
 
@@ -661,6 +675,7 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
 }
 
 static void releaseRemoteModifiers() {
+    gPasteGate.modifiersReleased();
     if (!gControl) return;
     for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
 }
@@ -2182,7 +2197,10 @@ static void overlayHide(const char* source) {
 
 // Ends the session from the overlay: the main loop stops, the session is
 // torn down as on close, and JerisLink starts again on the launch screen.
-static void requestDisconnect(const char* source) {
+static bool fileTransferRunning();
+static void fileConfirmShow(const char* source);
+
+static void disconnectNow(const char* source) {
     logLine(std::string("session.disconnect source=") + source);
     gRelaunch = true;
     overlayHide("disconnect");
@@ -2190,6 +2208,16 @@ static void requestDisconnect(const char* source) {
     releaseRemoteModifiers();
     if (gViewerHwnd) ShowWindow(gViewerHwnd, SW_HIDE);
     gWindowClosed = true;
+}
+
+// Overlay Disconnect: asks first while a file transfer runs (D9).
+static void requestDisconnect(const char* source) {
+    if (fileTransferRunning()) {
+        overlayHide("file_confirm");
+        fileConfirmShow("overlay");
+        return;
+    }
+    disconnectNow(source);
 }
 
 static void overlayActivate(ov::Item item, const char* source) {
@@ -2619,6 +2647,504 @@ static void overlayDestroy() {
     gOverlaySwallowUp.reset();
 }
 
+// ---- F2 Windows->Mac paste: Cmd+V hold, progress chip, disconnect confirm ----
+//
+// Cmd+V with files on the Windows clipboard (newer than the last upload)
+// is held by gPasteGate while FileSession uploads them; the Mac pasteboard
+// then holds the files and the held Cmd+V is sent (within 3 s), or the chip
+// says "Ready, press Cmd+V again". The chip (top right, under the remote
+// menu bar) shows progress with Cancel. X, Alt+F4 and overlay Disconnect
+// ask first while an upload runs. Both windows are layered, non-activating
+// popups drawn with GDI like the overlay: no modal loop on the UI thread.
+// Nothing here logs file names.
+
+namespace fu = jl::fileup;
+
+enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled };
+static HWND gFileChip = nullptr;
+static ChipMode gChipMode = ChipMode::Hidden;
+static double gChipHideAtMs = 0.0;
+static bool gChipCancelHot = false;
+static uint64_t gChipPastedFiles = 0;
+static DWORD gLastUploadClipSeq = 0;  // clipboard sequence of the last good upload
+static DWORD gPendingClipSeq = 0;
+static std::vector<std::wstring> gPendingRoots;
+static const char* gConfirmSource = "close";
+static fu::ConfirmKeys gConfirmKeys;
+static int gConfirmHot = -1;  // 0 keep, 1 disconnect
+static bool gConfirmKeyboard = false;
+static bool gFileUiSample = false;  // UI snapshot: made-up progress, no session
+static constexpr UINT_PTR kFileChipTimer = 1;
+
+static FileSession::UploadProgress currentUpload() {
+    if (gFileUiSample) {
+        FileSession::UploadProgress p;
+        p.state = FileSession::UploadState::Running;
+        p.files = 3;
+        p.filesDone = 1;
+        p.total = 4000000000ull;
+        p.committed = 1200000000ull;
+        p.bytesPerSec = 85000000ull;
+        return p;
+    }
+    return gFileSession ? gFileSession->uploadProgress() : FileSession::UploadProgress{};
+}
+
+static bool fileTransferRunning() {
+    return gFileUiSample || (gFileSession && gFileSession->uploadRunning());
+}
+
+static uint32_t readFileTransferMaxMbps() {
+    DWORD v = fu::kDefaultMaxMbps;
+    DWORD size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kJerislinkSettingsKey, L"FileTransferMaxMbps", RRF_RT_REG_DWORD,
+                     nullptr, &v, &size) != ERROR_SUCCESS) {
+        return fu::kDefaultMaxMbps;
+    }
+    return std::min<DWORD>(v, 10000);
+}
+
+// Asked by the gate only when a Cmd+V is about to go out. Reads the copied
+// paths (CF_HDROP) now, so a clipboard that cannot be opened lets the key
+// pass through instead of eating it.
+static bool pasteEligible() {
+    if (!gFileSession || !gFileSession->canUpload()) return false;
+    if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
+    const DWORD seq = GetClipboardSequenceNumber();
+    if (seq == gLastUploadClipSeq) return false;
+    if (!OpenClipboard(gViewerHwnd)) return false;
+    std::vector<std::wstring> roots;
+    if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        HDROP drop = static_cast<HDROP>(h);
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (len == 0) continue;
+            std::wstring path(len + 1, L'\0');
+            if (DragQueryFileW(drop, i, path.data(), len + 1) == len) {
+                path.resize(len);
+                roots.push_back(std::move(path));
+            }
+        }
+    }
+    CloseClipboard();
+    if (roots.empty()) return false;
+    gPendingRoots = std::move(roots);
+    gPendingClipSeq = seq;
+    return true;
+}
+
+static UINT fileUiDpi() { return jl::ui::windowDpi(gViewerHwnd); }
+
+struct ChipLayout {
+    int width = 0, height = 0;
+    RECT text{}, cancel{};
+};
+
+static ChipLayout chipLayout(UINT dpi) {
+    const auto s = [dpi](int v) { return ov::scale(v, dpi); };
+    ChipLayout l;
+    l.width = s(360);
+    l.height = s(36);
+    const bool cancel = gChipMode == ChipMode::Running;
+    l.cancel = cancel ? RECT{l.width - s(84), s(5), l.width - s(6), l.height - s(5)} : RECT{0, 0, 0, 0};
+    l.text = RECT{s(12), 0, cancel ? l.cancel.left - s(8) : l.width - s(12), l.height};
+    return l;
+}
+
+static std::wstring chipLabel() {
+    switch (gChipMode) {
+    case ChipMode::Running: {
+        const auto p = currentUpload();
+        return utf8ToWide(fu::chipText(p.files, p.committed, p.total, p.bytesPerSec));
+    }
+    case ChipMode::Pasted:
+        return utf8ToWide("Pasted " + fu::plural(gChipPastedFiles, "file", "files") + " on the Mac");
+    case ChipMode::Ready: return L"Ready, press Cmd+V again";
+    case ChipMode::Failed: return L"Paste to the Mac failed";
+    case ChipMode::Cancelled: return L"Upload cancelled";
+    default: return L"";
+    }
+}
+
+static void fileUiReposition() {
+    if (!gViewerHwnd) return;
+    const UINT dpi = fileUiDpi();
+    RECT c{};
+    GetClientRect(gViewerHwnd, &c);
+    const int cw = c.right - c.left, ch = c.bottom - c.top;
+    MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
+    if (gFileChip) {
+        const ChipLayout l = chipLayout(dpi);
+        const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+        SetWindowPos(gFileChip, nullptr, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width, l.height,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (gFileConfirm) {
+        const int w = ov::scale(460, dpi), h = ov::scale(200, dpi);
+        SetWindowPos(gFileConfirm, HWND_TOP, c.left + (cw - w) / 2, c.top + (ch - h) / 2, w, h, SWP_NOACTIVATE);
+    }
+}
+
+static void paintFileChip(HWND hwnd) {
+    namespace c = jl::ui::color;
+    PAINTSTRUCT ps{};
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max<LONG>(1, client.right), std::max<LONG>(1, client.bottom));
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    const UINT dpi = fileUiDpi();
+    if (gOverlayThemeDpi != dpi || !gOverlayTheme.text) {
+        gOverlayTheme.build(hwnd, 9);
+        gOverlayThemeDpi = dpi;
+    }
+    SetBkMode(dc, TRANSPARENT);
+    jl::ui::fillRect(dc, client, c::kBody);
+    jl::ui::roundRect(dc, client, ov::scale(10, dpi), c::kBody, c::kBorder, 1);
+    const ChipLayout l = chipLayout(dpi);
+    const COLORREF fg = gChipMode == ChipMode::Failed ? c::kError : c::kText;
+    overlayText(dc, chipLabel(), l.text, gOverlayTheme.label, fg, DT_LEFT | DT_VCENTER);
+    if (gChipMode == ChipMode::Running) {
+        jl::ui::roundRect(dc, l.cancel, ov::scale(8, dpi), gChipCancelHot ? c::kSecondaryDown : c::kSecondary,
+                          c::kBorder, 1);
+        overlayText(dc, L"Cancel", l.cancel, gOverlayTheme.text, c::kText, DT_CENTER | DT_VCENTER);
+    }
+    BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static void fileChipHide() {
+    gChipMode = ChipMode::Hidden;
+    gChipHideAtMs = 0.0;
+    if (gFileChip) ShowWindow(gFileChip, SW_HIDE);
+}
+
+static void fileConfirmHide();
+
+static void fileChipTick() {
+    if (gChipMode == ChipMode::Running && gFileChip) InvalidateRect(gFileChip, nullptr, FALSE);
+    if (fileConfirmVisible()) InvalidateRect(gFileConfirm, nullptr, FALSE);
+    if (gChipHideAtMs > 0.0 && steadyMsNow() >= gChipHideAtMs) fileChipHide();
+}
+
+static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const POINT pt{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paintFileChip(hwnd);
+        return 0;
+    case WM_TIMER:
+        if (wParam == kFileChipTimer) fileChipTick();
+        return 0;
+    case WM_MOUSEMOVE: {
+        const ChipLayout l = chipLayout(fileUiDpi());
+        const bool hot = gChipMode == ChipMode::Running && PtInRect(&l.cancel, pt);
+        if (hot != gChipCancelHot) {
+            gChipCancelHot = hot;
+            if (hot) {
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        gChipCancelHot = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        const ChipLayout l = chipLayout(fileUiDpi());
+        if (gChipMode == ChipMode::Running && PtInRect(&l.cancel, pt) && gFileSession) {
+            gFileSession->cancelUpload();
+            logLine("file.upload_cancel source=chip");
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        KillTimer(hwnd, kFileChipTimer);
+        if (gFileChip == hwnd) gFileChip = nullptr;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static HWND createFilePopup(const wchar_t* cls, WNDPROC proc, const wchar_t* title) {
+    if (!gViewerHwnd) return nullptr;
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = proc;
+    wc.hInstance = hi;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = cls;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return nullptr;
+    HWND w = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED, cls, title, WS_POPUP,
+                             0, 0, 1, 1, gViewerHwnd, nullptr, hi, nullptr);
+    if (!w) {
+        logLine("file.ui_create_failed error=" + std::to_string(GetLastError()));
+        return nullptr;
+    }
+    SetLayeredWindowAttributes(w, 0, ov::kSessionUiAlpha, LWA_ALPHA);
+    DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(w, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    return w;
+}
+
+static void fileChipShow(ChipMode mode, double hideAfterMs) {
+    if (!gFileChip) {
+        gFileChip = createFilePopup(L"JerislinkFileChip", FileChipWndProc, L"JerisLink file transfer");
+        if (!gFileChip) return;
+        SetTimer(gFileChip, kFileChipTimer, 250, nullptr);
+    }
+    gChipMode = mode;
+    gChipCancelHot = false;
+    gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
+    fileUiReposition();
+    if (gViewerHwnd && !IsIconic(gViewerHwnd)) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    InvalidateRect(gFileChip, nullptr, FALSE);
+}
+
+static void startPasteUpload() {
+    std::vector<std::wstring> roots = std::move(gPendingRoots);
+    gPendingRoots.clear();
+    if (!gFileSession || !gFileSession->startUpload(std::move(roots), readFileTransferMaxMbps())) {
+        gPasteGate.finish(false, steadyMsNow());
+        logLine("file.paste=not_started");
+        return;
+    }
+    logLine("file.paste=held");
+    fileChipShow(ChipMode::Running, 0);
+}
+
+// ---- disconnect confirm ----
+
+struct ConfirmLayout {
+    RECT title{}, body{}, keep{}, disconnect{};
+};
+
+static ConfirmLayout confirmLayout(UINT dpi, const RECT& client) {
+    const auto s = [dpi](int v) { return ov::scale(v, dpi); };
+    ConfirmLayout l;
+    l.title = RECT{s(20), s(16), client.right - s(20), s(40)};
+    l.body = RECT{s(20), s(46), client.right - s(20), client.bottom - s(60)};
+    const int bh = s(32), by = client.bottom - s(16) - bh;
+    l.disconnect = RECT{client.right - s(20) - s(190), by, client.right - s(20), by + bh};
+    l.keep = RECT{l.disconnect.left - s(10) - s(160), by, l.disconnect.left - s(10), by + bh};
+    return l;
+}
+
+static void paintFileConfirm(HWND hwnd) {
+    namespace c = jl::ui::color;
+    PAINTSTRUCT ps{};
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max<LONG>(1, client.right), std::max<LONG>(1, client.bottom));
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    const UINT dpi = fileUiDpi();
+    if (gOverlayThemeDpi != dpi || !gOverlayTheme.text) {
+        gOverlayTheme.build(hwnd, 9);
+        gOverlayThemeDpi = dpi;
+    }
+    const auto& t = gOverlayTheme;
+    SetBkMode(dc, TRANSPARENT);
+    jl::ui::fillRect(dc, client, c::kBody);
+    jl::ui::roundRect(dc, client, ov::scale(12, dpi), c::kBody, c::kBorder, 1);
+    const ConfirmLayout l = confirmLayout(dpi, client);
+    overlayText(dc, utf8ToWide(fu::confirmTitle()), l.title, t.label, c::kText, DT_LEFT | DT_VCENTER);
+    const auto p = currentUpload();
+    const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
+    {
+        RECT body = l.body;
+        HGDIOBJ old = SelectObject(dc, t.text);
+        SetTextColor(dc, c::kMuted);
+        const std::wstring text = utf8ToWide(fu::confirmBody(left, p.committed, p.total));
+        DrawTextW(dc, text.c_str(), -1, &body, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+    }
+    const bool focusKeep = gConfirmKeys.focus() == fu::ConfirmKeys::Button::Keep;
+    jl::ui::roundRect(dc, l.keep, ov::scale(8, dpi), gConfirmHot == 0 ? c::kSecondaryDown : c::kSecondary,
+                      c::kBorder, 1);
+    overlayText(dc, L"Keep transferring", l.keep, t.text, c::kText, DT_CENTER | DT_VCENTER);
+    jl::ui::roundRect(dc, l.disconnect, ov::scale(8, dpi), gConfirmHot == 1 ? c::kSecondaryDown : c::kSecondary,
+                      c::kBorder, 1);
+    overlayText(dc, L"Disconnect and remove", l.disconnect, t.text, c::kError, DT_CENTER | DT_VCENTER);
+    // Keep shows as the default; the ring follows Tab.
+    overlayFocusFrame(dc, focusKeep ? l.keep : l.disconnect, dpi);
+    BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static void closeViewerNow(HWND hwnd) {
+    gWindowClosed = true;
+    releaseRemoteButtons("close");
+    releaseRemoteModifiers();
+    DestroyWindow(hwnd);
+}
+
+static void fileConfirmHide() {
+    if (gFileConfirm) ShowWindow(gFileConfirm, SW_HIDE);
+    gConfirmHot = -1;
+}
+
+static void fileConfirmChoose(fu::ConfirmKeys::Action action) {
+    if (action == fu::ConfirmKeys::Action::None) return;
+    fileConfirmHide();
+    if (action == fu::ConfirmKeys::Action::Keep) {
+        logLine(std::string("file.disconnect_confirm=kept source=") + gConfirmSource);
+        return;
+    }
+    logLine(std::string("file.disconnect_confirm=disconnected source=") + gConfirmSource);
+    // The session teardown stops FileSession, which sends CANCEL: the Mac
+    // removes the unfinished files.
+    if (gFileSession) gFileSession->cancelUpload();
+    if (std::strcmp(gConfirmSource, "overlay") == 0) disconnectNow("overlay");
+    else if (gViewerHwnd) closeViewerNow(gViewerHwnd);
+}
+
+static LRESULT CALLBACK FileConfirmWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const POINT pt{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+    auto hit = [&]() -> int {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const ConfirmLayout l = confirmLayout(fileUiDpi(), client);
+        if (PtInRect(&l.keep, pt)) return 0;
+        if (PtInRect(&l.disconnect, pt)) return 1;
+        return -1;
+    };
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;  // keys keep going to the viewer, which routes them here
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paintFileConfirm(hwnd);
+        return 0;
+    case WM_MOUSEMOVE: {
+        const int h = hit();
+        if (h != gConfirmHot) {
+            gConfirmHot = h;
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        gConfirmHot = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        const int h = hit();
+        if (h == 0) fileConfirmChoose(fu::ConfirmKeys::Action::Keep);
+        else if (h == 1) fileConfirmChoose(fu::ConfirmKeys::Action::Disconnect);
+        return 0;
+    }
+    case WM_DESTROY:
+        if (gFileConfirm == hwnd) gFileConfirm = nullptr;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void fileConfirmShow(const char* source) {
+    if (!gFileConfirm) {
+        gFileConfirm = createFilePopup(L"JerislinkFileConfirm", FileConfirmWndProc, L"File transfer in progress");
+        if (!gFileConfirm) return;
+    }
+    gConfirmSource = source;
+    gConfirmKeys.reset();
+    gConfirmHot = -1;
+    // Nothing goes to the Mac while it is open: lift what is held there now.
+    gHookFilter.reset();
+    gKeys.reset();
+    releaseRemoteButtons("file_confirm");
+    releaseRemoteModifiers();
+    if (GetCapture() == gViewerHwnd) ReleaseCapture();
+    fileUiReposition();
+    if (gViewerHwnd && IsIconic(gViewerHwnd)) ShowWindow(gViewerHwnd, SW_RESTORE);
+    ShowWindow(gFileConfirm, SW_SHOWNOACTIVATE);
+    InvalidateRect(gFileConfirm, nullptr, FALSE);
+    logLine(std::string("file.disconnect_confirm=shown source=") + source);
+}
+
+// WM_KEYDOWN / WM_SYSKEYDOWN while the confirm is open. Every key stays here.
+static void fileConfirmKey(WPARAM vk, LPARAM lParam) {
+    if (vk < 256) gOverlaySwallowUp.set(static_cast<size_t>(vk));
+    if ((lParam & (1LL << 30)) != 0) return;  // auto-repeat
+    const auto action = gConfirmKeys.key(static_cast<uint32_t>(vk));
+    if (action == fu::ConfirmKeys::Action::None) {
+        InvalidateRect(gFileConfirm, nullptr, FALSE);
+        return;
+    }
+    fileConfirmChoose(action);
+}
+
+// The upload ended (FileSession thread posted WM_MR_FILE_UPLOAD_DONE).
+static void onFileUploadDone() {
+    const auto p = gFileSession ? gFileSession->uploadProgress() : FileSession::UploadProgress{};
+    const bool ok = p.state == FileSession::UploadState::Done;
+    if (ok) gLastUploadClipSeq = gPendingClipSeq;
+    auto f = gPasteGate.finish(ok, steadyMsNow());
+    using O = fu::PasteGate::Outcome;
+    // Paste only into a viewer that still has the keyboard.
+    if (f.outcome == O::Paste && !(gControl && gViewerHwnd && viewerHasInteractiveFocus(gViewerHwnd))) {
+        f.outcome = O::Late;
+    }
+    if (f.outcome == O::Paste) {
+        for (const auto& e : f.events) gControl->sendKey(e.down, e.semantic);
+        gChipPastedFiles = p.files;
+        fileChipShow(ChipMode::Pasted, 2500);
+        logLine("file.paste=pasted");
+    } else if (ok) {
+        fileChipShow(ChipMode::Ready, 10000);
+        logLine("file.paste=ready");
+    } else if (p.state == FileSession::UploadState::Cancelled) {
+        fileChipShow(ChipMode::Cancelled, 3000);
+        logLine("file.paste=cancelled");
+    } else {
+        fileChipShow(ChipMode::Failed, 6000);
+        logLine("file.paste=failed");
+    }
+    // The transfer is over: the confirm closes by itself, nothing is disconnected.
+    if (fileConfirmVisible()) fileConfirmHide();
+}
+
+static void fileUiDestroy() {
+    if (gFileChip && IsWindow(gFileChip)) DestroyWindow(gFileChip);
+    if (gFileConfirm && IsWindow(gFileConfirm)) DestroyWindow(gFileConfirm);
+    gFileChip = nullptr;
+    gFileConfirm = nullptr;
+    gChipMode = ChipMode::Hidden;
+    gChipHideAtMs = 0.0;
+}
+
+static void fileUiEndSession() {
+    gFileSession = nullptr;
+    gPasteGate = fu::PasteGate{};
+    gPendingRoots.clear();
+    gLastUploadClipSeq = 0;
+    fileUiDestroy();
+}
+
 // The bottom-left hover zone in screen coordinates, on whatever monitor the
 // viewer is: the bottom-left corner of the remote picture (the drawn video,
 // not the black bars) that is on that monitor's work area (not off-screen,
@@ -2703,6 +3229,17 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     case WM_MOVE:
         overlayReposition();
+        fileUiReposition();
+        break;
+    case WM_MR_FILE_UPLOAD_DONE:
+        onFileUploadDone();
+        return 0;
+    case WM_QUERYENDSESSION:
+        // Logoff or shutdown: no confirm; cancel so the Mac cleans up.
+        if (gFileSession && gFileSession->uploadRunning()) {
+            gFileSession->cancelUpload();
+            logLine("file.upload_cancel source=endsession");
+        }
         break;
     case WM_SETFOCUS:
         gViewerFocused = true;
@@ -2712,6 +3249,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_KILLFOCUS:
         gViewerFocused = false;
         gHaveMouse = false;
+        gPasteGate.abandon();  // a held paste never lands after focus left
         gHookFilter.reset();
         gKeys.reset();
         releaseRemoteButtons("focus_kill");
@@ -2735,6 +3273,11 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return MA_ACTIVATE;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        // The disconnect confirm takes every key while it is open.
+        if (fileConfirmVisible()) {
+            fileConfirmKey(wParam, lParam);
+            return 0;
+        }
         // Viewer shortcuts (Ctrl+Alt+O/M/V) and the keyboard-driven overlay
         // are handled before anything is forwarded to the Mac.
         if (viewerHasInteractiveFocus(hwnd) && overlayHandleKeyDown(wParam, lParam)) return 0;
@@ -2873,6 +3416,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         if (type == SIZE_MINIMIZED) overlayHide("minimized");
         else overlayReposition();
+        fileUiReposition();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -2882,10 +3426,12 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         paintCpuFrame(hwnd);
         return 0;
     case WM_CLOSE:
-        gWindowClosed = true;
-        releaseRemoteButtons("close");
-        releaseRemoteModifiers();
-        DestroyWindow(hwnd);
+        // X or Alt+F4 while a file transfer runs: ask first (D9).
+        if (fileTransferRunning()) {
+            fileConfirmShow("close");
+            return 0;
+        }
+        closeViewerNow(hwnd);
         return 0;
     case WM_DESTROY:
         gWindowClosed = true;
@@ -4518,11 +5064,15 @@ static int appMain(int argc, char** argv) {
                 [](const std::string& message) { logLine(message); });
             clipboard->start();
             logLine("clipboard.enabled mode=unicode-text max_bytes=61440");
-            // File transfer (F1): capability probe on its own TCP connection.
+            // File transfer: its own TCP connection (F1 probe, F2 paste upload).
             fileSession = std::make_unique<FileSession>(
                 o.bindIp, o.sourceIp, o.controlPort,
                 [](const std::string& message) { logLine(message); });
+            fileSession->setUploadDoneCallback([] {
+                if (HWND w = gViewerHwnd) PostMessageW(w, WM_MR_FILE_UPLOAD_DONE, 0, 0);
+            });
             fileSession->start();
+            gFileSession = fileSession.get();
         } else {
             gControl = nullptr;
             gMouseMoveUdp = nullptr;
@@ -4832,6 +5382,7 @@ static int appMain(int argc, char** argv) {
                     KillTimer(gViewerHwnd, kOverlayHoverTimer);
                 }
                 overlayDestroy();
+                fileUiEndSession();
             }
         } sessionTickGuard;
         gMainLoopRecvMs = steadyMsNow();
@@ -5203,6 +5754,7 @@ static int appMain(int argc, char** argv) {
                 << " clipboard_oversize=" << (clipboard ? clipboard->skippedOversize() : 0)
                 << " file_cap=" << (fileSession ? (fileSession->capability() == FileSession::Capability::Yes ? "yes" : fileSession->capability() == FileSession::Capability::No ? "no" : "unknown") : "off")
                 << " file_sessions=" << (fileSession ? fileSession->sessions() : 0)
+                << " file_tx_bytes=" << (fileSession ? fileSession->txBytes() : 0)
                 << " audio=" << (audio ? "on" : "off")
                 << " audio_codec=" << jl::audio::codecName(audioStats.jb.codec)
                 << " audio_bitrate_kbps=" << (audioStats.jb.framesPlayed + audioStats.jb.framesSilence > 0
@@ -5245,6 +5797,7 @@ static int appMain(int argc, char** argv) {
         // control channel is released. Video/keyboard/mouse paths remain
         // independent from this second TCP session.
         if (clipboard) clipboard->stop();
+        gFileSession = nullptr;
         if (fileSession) fileSession->stop();
 
         // Release Media Foundation / D3D objects before MFShutdown/CoUninitialize.
@@ -5630,6 +6183,23 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     }
     overlayHide("snapshot");
     snapshotWindow(viewer, dir, L"overlay-hidden");
+
+    // F2 file transfer UI with made-up numbers (3 files, 1.2 of 4.0 GB, 85 MB/s).
+    gFileUiSample = true;
+    fileChipShow(ChipMode::Running, 0);
+    snapshotWindow(viewer, dir, L"file-chip");
+    fileConfirmShow("snapshot");
+    const bool confirmShown = fileConfirmVisible();
+    snapshotWindow(viewer, dir, L"file-confirm");
+    fileConfirmKey(VK_TAB, 0);
+    snapshotWindow(viewer, dir, L"file-confirm-tab");
+    fileConfirmKey(VK_ESCAPE, 0);
+    const bool confirmKept = !fileConfirmVisible() && IsWindow(viewer) && !gWindowClosed;
+    gOverlaySwallowUp.reset();
+    std::wcout << L"file_ui chip=" << (gFileChip != nullptr) << L" confirm_shown=" << confirmShown
+               << L" esc_keeps=" << confirmKept << L"\n";
+    fileChipHide();
+    gFileUiSample = false;
 
     // Every in-session action, timed, with modal loops counted.
     std::thread watchdog(snapshotWatchdog);

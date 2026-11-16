@@ -13,6 +13,7 @@ enum FileProtocolSelfTest {
         codec(expect)
         paths(expect)
         clashNames(expect)
+        FileUploadSelfTest.run(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -69,7 +70,7 @@ enum FileProtocolSelfTest {
         expect(FileProto.decode(type: 0x5D, payload: []) == nil && FileProto.decode(type: 0x4F, payload: []) == nil,
                "file codec: types outside 0x50-0x5C rejected")
         expect(M.fileEnd(transfer: 1, index: 0, sha256: [1]).encode() == nil, "file codec: FILE_END needs 32-byte hash")
-        expect(FileProto.Caps.host == 0, "file codec: F1 host advertises no file features (caps=0)")
+        expect(FileProto.Caps.host == FileProto.Caps.upload, "file codec: F2 host advertises upload only")
     }
 
     private static func paths(_ expect: (Bool, String) -> Void) {

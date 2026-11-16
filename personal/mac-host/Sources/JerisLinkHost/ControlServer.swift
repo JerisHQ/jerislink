@@ -32,6 +32,10 @@ final class ControlServer: @unchecked Sendable {
     private(set) var settingsRejected: UInt64 = 0
     private(set) var fileSessions: UInt64 = 0
     private(set) var fileRefused: UInt64 = 0
+    private(set) var fileUploads: UInt64 = 0
+    private(set) var fileUploadsFailed: UInt64 = 0
+    private(set) var fileRxBytes: UInt64 = 0
+    private let fileStatsLock = NSLock()
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
     private let settingsClientIP: () -> String?
@@ -46,6 +50,8 @@ final class ControlServer: @unchecked Sendable {
     /// Answer FILE_HELLO (0x50). Only the viewer-facing direct listener;
     /// the loopback relay and the legacy listeners refuse it (design D13).
     private let allowFileSessions: Bool
+    /// Where paste uploads are staged (a temp folder in the self-test).
+    private let fileStagingRoot: URL
     private static let maxClipboardBytes = 60 * 1024
     /// Pasteboard access for clipboard sessions (a fake in the self-test).
     private let clipboard: ClipboardBackend
@@ -59,6 +65,7 @@ final class ControlServer: @unchecked Sendable {
          inputHelper: InputHelperClient? = nil,
          announceInputSessions: Bool = true,
          allowFileSessions: Bool = false,
+         fileStagingRoot: URL = FileUploadReceiver.defaultRoot,
          clipboard: ClipboardBackend = SystemClipboard.shared,
          inputSources: InputSourceCache = .shared) {
         self.bindIP = bindIP
@@ -66,6 +73,7 @@ final class ControlServer: @unchecked Sendable {
         self.inputSources = inputSources
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
+        self.fileStagingRoot = fileStagingRoot
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -163,7 +171,7 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) file_sessions=\(fileSessions) file_refused=\(fileRefused) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) file_sessions=\(fileSessions) file_refused=\(fileRefused) \(fileStatsText()) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
     }
 
     private func acceptLoop() {
@@ -378,13 +386,21 @@ final class ControlServer: @unchecked Sendable {
     }
     private static let sessionIDs = SessionIDCounter()
 
-    /// A file session (F1): HELLO_ACK with this build's caps, PING echo, and
-    /// REJECT `denied` for every request until F2-F5 implement them. Any
-    /// malformed or unexpected message closes the session. Runs on this
-    /// client's own thread; it never touches the main thread. Logs carry no
-    /// file names (D15): only open/closed and counts.
+    private func fileStatsText() -> String {
+        fileStatsLock.lock(); defer { fileStatsLock.unlock() }
+        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes)"
+    }
+
+    /// A file session: HELLO_ACK with this build's caps, PING echo, paste
+    /// uploads through `FileUploadReceiver` (F2), and REJECT `denied` for
+    /// every other request until F3-F5 implement them. Any malformed or
+    /// unexpected message closes the session, and a session that ends with
+    /// an upload running removes its partial files. Runs on this client's own
+    /// thread; only the final pasteboard write hops to the main thread. Logs
+    /// carry no file names (D15): only open/closed and counts.
     private func handleFileSession(_ fd: Int32) {
         fileSessions += 1
+        let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard)
         let ack = FileProto.Message.helloAck(proto: FileProto.version, caps: FileProto.Caps.host,
                                              maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
         guard let ackBytes = ack.encode(), sendPacket(fd, type: ack.type, payload: ackBytes) else { return }
@@ -392,7 +408,15 @@ final class ControlServer: @unchecked Sendable {
         var received = 0
         var refused = 0
         var reason = "peer_closed"
-        defer { print("file.session=closed reason=\(reason) messages=\(received) refused=\(refused)") }
+        defer {
+            receiver.abort(reason: reason)
+            fileStatsLock.lock()
+            fileUploads += receiver.completed
+            fileUploadsFailed += receiver.failed
+            fileRxBytes += receiver.bytesIn
+            fileStatsLock.unlock()
+            print("file.session=closed reason=\(reason) messages=\(received) refused=\(refused)")
+        }
         var lastMessage = Date()
 
         while true {
@@ -424,6 +448,14 @@ final class ControlServer: @unchecked Sendable {
             switch msg {
             case .ping:
                 guard sendPacket(fd, type: type, payload: payload) else { reason = "send_failed"; return }
+            case .offer(_, FileProto.Purpose.paste, _, _), .entry, .data, .fileEnd, .cancel:
+                let step = receiver.handle(msg)
+                for out in step.send {
+                    guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else {
+                        reason = "send_failed"; return
+                    }
+                }
+                if let why = step.close { reason = why; return }
             case .offer(let transfer, _, _, _), .reveal(let transfer):
                 refused += 1
                 let reply = FileProto.Message.reply(transfer: transfer, status: FileProto.Status.denied)
@@ -432,8 +464,8 @@ final class ControlServer: @unchecked Sendable {
                 }
             case .hello, .helloAck:
                 reason = "unexpected"; return
-            case .entry, .reply, .data, .fileEnd, .result, .cancel, .request, .progress:
-                // No transfer can exist yet: these refer to nothing. Ignore.
+            case .reply, .result, .request, .progress:
+                // Host-to-viewer messages, or pulls (F3): nothing to answer yet.
                 break
             }
         }
@@ -494,7 +526,13 @@ final class ControlServer: @unchecked Sendable {
             let changeCount = clipboard.changeCount()
             if changeCount == lastChangeCount { continue }
             lastChangeCount = changeCount
-            guard let text = clipboard.readText() else { continue }
+            // Our own file-URL write (Windows->Mac paste): Windows already
+            // holds those files; never send the staging path back as text.
+            if clipboard.ownFileWriteChangeCount() == changeCount { continue }
+            let text = clipboard.readText()
+            let settled = clipboard.changeCount()
+            if clipboard.ownFileWriteChangeCount() == settled { lastChangeCount = settled; continue }
+            guard let text else { continue }
             let payload = Array(text.utf8)
             if payload.count > Self.maxClipboardBytes {
                 print("Clipboard skip oversize bytes=\(payload.count)")
