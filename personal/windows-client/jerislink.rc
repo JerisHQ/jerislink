@@ -45,7 +45,7 @@ BEGIN
     LTEXT           "KEYBOARD", IDC_UI_SECTION_KEYBOARD, 14, 263, 272, 9, SS_NOPREFIX
     LTEXT           "Key layout", IDC_UI_LABEL_KEYBOARD, 14, 276, 70, 9, SS_NOPREFIX
     COMBOBOX        IDC_KEYBOARD_PRESET, 84, 272, 202, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Mac: Win = Cmd, Ctrl+C/V/X/Z/A/S/F = Cmd. Windows: Ctrl = Cmd, Win = Control. Applies right away.", IDC_UI_HINT_KEYBOARD, 14, 290, 272, 9, SS_NOPREFIX
+    LTEXT           "Mac: Win = Cmd. Windows: Ctrl = Cmd, Win = Control. Applies right away.", IDC_UI_HINT_KEYBOARD, 14, 290, 272, 9, SS_NOPREFIX
 
     LTEXT           "Volume and keyboard apply now. Connection and video apply when you reconnect.", IDC_APPLY_NOTE, 14, 312, 166, 18, SS_NOPREFIX
     CONTROL         "Cancel", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 186, 313, 48, 16
