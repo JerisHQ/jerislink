@@ -94,7 +94,7 @@ jobs:
         run: build\Release\JerislinkNalSummaryTest.exe
       - name: Build keymap golden test
         run: cmake --build build --config Release --target JerislinkKeymapTest
-      - name: Keymap golden test (positional layout, Ctrl+A/C/V/Z, Win+C / Win+Space, viewer hotkeys, focus-loss release)
+      - name: Keymap golden test (Mac and Windows presets, Ctrl+A/C/V/X/Z/S/F, Ctrl+Y redo, Win+C / Win+Space, Alt+Tab, viewer hotkeys, focus-loss release, live preset switch)
         run: build\Release\JerislinkKeymapTest.exe
       - name: No always-on shortcut or key log lines in the viewer
         shell: pwsh

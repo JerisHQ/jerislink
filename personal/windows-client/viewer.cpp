@@ -591,7 +591,7 @@ static_assert(jl::keymap::vk::Oem1 == VK_OEM_1 && jl::keymap::vk::OemPlus == VK_
 
 static jl::keymap::Held heldModifiers() {
     return {physicalKeyDown(VK_CONTROL), physicalKeyDown(VK_MENU),
-            physicalKeyDown(VK_LWIN) || physicalKeyDown(VK_RWIN)};
+            physicalKeyDown(VK_LWIN) || physicalKeyDown(VK_RWIN), physicalKeyDown(VK_SHIFT)};
 }
 
 // Sends a keymap result to the host. The shortcut name is logged only with
@@ -949,6 +949,37 @@ static bool saveUiAccent(bool blue) {
     return ok;
 }
 
+// Keyboard preset in HKCU\Software\Jeris\Jerislink\KeyboardPreset (REG_SZ):
+// "windows" is the Windows layout (Ctrl = Cmd, Win = Control); anything
+// else, empty or missing, the Mac layout (Win = Cmd). keymap.hpp.
+static jl::keymap::Preset loadKeyboardPreset() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return jl::keymap::Preset::Mac;
+    }
+    const std::string value = readRegString(key, L"KeyboardPreset");
+    RegCloseKey(key);
+    return jl::keymap::presetFromSaved(value);
+}
+
+// Settings > Keyboard: applies to the next key at once (no reconnect) and is
+// saved. Remote modifiers are released so nothing stays held across the
+// switch. Logs the preset name only, never keys.
+static void applyKeyboardPreset(jl::keymap::Preset preset, const char* source) {
+    if (preset == gKeys.preset()) return;
+    releaseRemoteModifiers();
+    gKeys.setPreset(preset);
+    bool saved = false;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, nullptr, 0, KEY_SET_VALUE,
+                        nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        saved = writeRegString(key, L"KeyboardPreset", jl::keymap::presetName(preset)) == ERROR_SUCCESS;
+        RegCloseKey(key);
+    }
+    logLine(std::string("keymap.preset=") + jl::keymap::presetName(preset) + " source=" + source +
+            " saved=" + (saved ? "yes" : "no"));
+}
+
 static bool accentIsBlue() { return jl::ui::accent().accent == jl::ui::kBlueAccent.accent; }
 
 static void ensureAudioVolumeLoaded() {
@@ -990,7 +1021,7 @@ static void commitAudioVolume(const char* source) {
 // viewer window uses, so the dialogs match the viewer's title bar.
 
 static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
-static constexpr int kSettingsFooterTop = 262;  // dialog units, see jerislink.rc
+static constexpr int kSettingsFooterTop = 306;  // dialog units, see jerislink.rc
 static constexpr int kVolumeFooterTop = 70;
 static constexpr int kLaunchFooterTop = 238;
 static constexpr int kInfoFooterTop = 172;
@@ -1029,17 +1060,20 @@ static TextRole textRole(int id) {
     case IDC_INFO_SECTION_DECODER:
     case IDC_UI_SECTION_CONNECTION:
     case IDC_UI_SECTION_VIDEO:
-    case IDC_UI_SECTION_AUDIO: return TextRole::Section;
+    case IDC_UI_SECTION_AUDIO:
+    case IDC_UI_SECTION_KEYBOARD: return TextRole::Section;
     case IDC_UI_LABEL_HOST:
     case IDC_UI_LABEL_BIND:
     case IDC_UI_LABEL_CODEC:
     case IDC_UI_LABEL_BITRATE:
-    case IDC_UI_LABEL_VOLUME: return TextRole::Label;
+    case IDC_UI_LABEL_VOLUME:
+    case IDC_UI_LABEL_KEYBOARD: return TextRole::Label;
     case IDC_BITRATE_VALUE:
     case IDC_VOLUME_VALUE: return TextRole::Value;
     case IDC_UI_HINT_HOST:
     case IDC_UI_HINT_BITRATE:
     case IDC_UI_HINT_VOLUME:
+    case IDC_UI_HINT_KEYBOARD:
     case IDC_BIND_HINT: return TextRole::Hint;
     case IDC_APPLY_NOTE: return TextRole::Note;
     default: return TextRole::Other;
@@ -1079,7 +1113,7 @@ static void applyThemeFonts(HWND dlg) {
         }
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
     }
-    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP}) {
+    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP, IDC_KEYBOARD_PRESET}) {
         HWND combo = GetDlgItem(dlg, id);
         if (!combo) continue;
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), comboFieldHeight(dlg));
@@ -1228,7 +1262,7 @@ static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
     td->theme.build(dlg, titlePt);
     SetWindowLongPtrW(dlg, DWLP_USER, reinterpret_cast<LONG_PTR>(td));
     jl::ui::applyWindowChrome(dlg);
-    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP}) {
+    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP, IDC_KEYBOARD_PRESET}) {
         if (HWND combo = GetDlgItem(dlg, id)) themeComboBox(combo);
     }
     applyThemeFonts(dlg);
@@ -1403,7 +1437,8 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             invalidateFieldAround(dlg, reinterpret_cast<HWND>(lParam));
         }
         const int fromId = LOWORD(wParam);
-        if (code == CBN_DROPDOWN && (fromId == IDC_VIDEO_CODEC || fromId == IDC_BIND_IP)) {
+        if (code == CBN_DROPDOWN &&
+            (fromId == IDC_VIDEO_CODEC || fromId == IDC_BIND_IP || fromId == IDC_KEYBOARD_PRESET)) {
             fitComboDropHeight(reinterpret_cast<HWND>(lParam));
         }
         return false;  // the dialog's own handler still sees the command
@@ -1680,8 +1715,8 @@ static void updateBindHint(HWND dlg) {
 // Says what applies now and what needs a reconnect (Disconnect in the
 // overlay, then Connect on the launch screen).
 static std::wstring settingsApplyNote(bool connect) {
-    return connect ? L"Used for your next connection. Volume applies now."
-                   : L"Volume applies now. Connection and video changes apply when you reconnect.";
+    return connect ? L"Used for your next connection. Volume and keyboard apply now."
+                   : L"Volume and keyboard apply now. Connection and video apply when you reconnect.";
 }
 
 // Validation errors show in the footer note (no message box: it would stop
@@ -1739,6 +1774,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         ensureAudioVolumeLoaded();
         initVolumeControls(dlg);
 
+        // Same order as jl::keymap::Preset.
+        SendDlgItemMessageW(dlg, IDC_KEYBOARD_PRESET, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(L"Mac layout (Win = Cmd)"));
+        SendDlgItemMessageW(dlg, IDC_KEYBOARD_PRESET, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(L"Windows layout (Ctrl = Cmd)"));
+        SendDlgItemMessageW(dlg, IDC_KEYBOARD_PRESET, CB_SETCURSEL,
+                            gKeys.preset() == jl::keymap::Preset::Windows ? 1 : 0, 0);
+
         SetDlgItemTextW(dlg, IDC_APPLY_NOTE, settingsApplyNote(gSettingsModal).c_str());
         // Owner-drawn buttons cannot be BS_DEFPUSHBUTTON; Enter still means Save.
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
@@ -1769,6 +1812,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         }
         if (LOWORD(wParam) == IDC_VOLUME_MUTE && HIWORD(wParam) == BN_CLICKED) {
             toggleAudioMute("settings");
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDC_KEYBOARD_PRESET && HIWORD(wParam) == CBN_SELCHANGE) {
+            const LRESULT sel = SendDlgItemMessageW(dlg, IDC_KEYBOARD_PRESET, CB_GETCURSEL, 0, 0);
+            applyKeyboardPreset(sel == 1 ? jl::keymap::Preset::Windows : jl::keymap::Preset::Mac,
+                                "settings");
             return TRUE;
         }
         if ((LOWORD(wParam) == IDC_HOST_IP && HIWORD(wParam) == EN_CHANGE) ||
@@ -2691,7 +2740,8 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         logFirstInput("keyboard");
         const bool repeat = (lParam & (1LL << 30)) != 0;
-        // Win+Space, Win+C, Ctrl+A/C/V/Z and plain keys: keymap.hpp.
+        // Keyboard preset, Win+Space, Win+C, Ctrl compat shortcuts, Ctrl+Y and
+        // plain keys: keymap.hpp.
         const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());
         if (!out.handled) break;
         sendKeyOutput(out);
@@ -2712,21 +2762,21 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     // Posted by the low-level hook, which owns the Windows key and Caps Lock
     // while the viewer is focused.
     case WM_MR_WIN_DOWN:
-        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookWinDown());
+        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(gKeys.hookWinDown());
         return 0;
     case WM_MR_WIN_UP:
-        sendKeyOutput(jl::keymap::Translator::hookWinUp());
+        sendKeyOutput(gKeys.hookWinUp());
         return 0;
     case WM_MR_WIN_C:
         if (viewerHasInteractiveFocus(hwnd)) {
-            sendKeyOutput(jl::keymap::Translator::hookWinC(gHookFilter.winDown()));
+            sendKeyOutput(gKeys.hookWinC(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_WIN_SPACE:
         // Windows+Space becomes native macOS Control+Space for switching
-        // input sources (Parsec muscle memory).
+        // input sources (Parsec muscle memory), in both keyboard presets.
         if (viewerHasInteractiveFocus(hwnd)) {
-            sendKeyOutput(jl::keymap::Translator::hookWinSpace(gHookFilter.winDown()));
+            sendKeyOutput(gKeys.hookWinSpace(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_CAPS_LOCK:
@@ -4256,6 +4306,7 @@ static int appMain(int argc, char** argv) {
     gLog.start(kLogPath, kHistoryLogPath);
     logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
     loadUiAccent();
+    gKeys.setPreset(loadKeyboardPreset());
     const std::vector<std::string> args = commandArgs(argc, argv);
     auto request = resolveLaunchArgs(args);
 
@@ -4384,6 +4435,7 @@ static int appMain(int argc, char** argv) {
                 std::ostringstream ctl;
                 ctl << "control.connected rtt_ms=" << controlRtt;
                 logLine(ctl.str());
+                logLine(std::string("keymap.preset=") + jl::keymap::presetName(gKeys.preset()));
                 gConnectionInfo.controlConnected = true;
                 gConnectionInfo.rttMs = controlRtt;
 
@@ -5394,6 +5446,22 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     snapshotWindow(settings, dir, L"settings-manual");
     snapshotDropDown(settings, IDC_VIDEO_CODEC, dir, L"settings-codec-open");
     snapshotDropDown(settings, IDC_BIND_IP, dir, L"settings-bind-open");
+    snapshotDropDown(settings, IDC_KEYBOARD_PRESET, dir, L"settings-keyboard-open");
+    // Keyboard preset applies at once (no Save) and is saved; then back.
+    const jl::keymap::Preset presetBefore = gKeys.preset();
+    SendDlgItemMessageW(settings, IDC_KEYBOARD_PRESET, CB_SETCURSEL, 1, 0);
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_KEYBOARD_PRESET, CBN_SELCHANGE),
+                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_KEYBOARD_PRESET)));
+    snapshotWindow(settings, dir, L"settings-keyboard-windows");
+    const bool keymapLive = gKeys.preset() == jl::keymap::Preset::Windows &&
+                            loadKeyboardPreset() == jl::keymap::Preset::Windows;
+    SendDlgItemMessageW(settings, IDC_KEYBOARD_PRESET, CB_SETCURSEL, 0, 0);
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_KEYBOARD_PRESET, CBN_SELCHANGE),
+                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_KEYBOARD_PRESET)));
+    const bool keymapBack = gKeys.preset() == jl::keymap::Preset::Mac &&
+                            loadKeyboardPreset() == jl::keymap::Preset::Mac;
+    std::wcout << L"keymap_live=" << (keymapLive && keymapBack ? L"ok" : L"FAIL")
+               << L" before=" << jl::keymap::presetName(presetBefore) << L"\n";
     // Manual pick (Tailcat) and Auto with a Tailcat Mac address.
     SendDlgItemMessageW(settings, IDC_BIND_IP, CB_SETCURSEL, 2, 0);
     SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BIND_IP, CBN_SELCHANGE),
@@ -5682,6 +5750,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     if (!tickOk) return 10;
     if (!codeTabBlocks || !launchError) return 11;
     if (!accentSaved) return 12;
+    if (!keymapLive || !keymapBack) return 13;
     return 0;
 }
 #endif

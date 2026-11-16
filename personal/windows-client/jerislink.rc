@@ -7,16 +7,16 @@ IDI_JERISLINK ICON "jerislink.ico"
 // Settings and volume windows: dark theme from the viewer's title bar, drawn in
 // viewer.cpp (WM_CTLCOLOR*, owner-draw buttons, trackbar custom draw). Edit
 // boxes have no border of their own; the dialog paints a rounded field around
-// each one, 4 x 3 dialog units larger. The footer band starts at y = 262
+// each one, 4 x 3 dialog units larger. The footer band starts at y = 306
 // (settings) and y = 70 (volume); keep kSettingsFooterTop / kVolumeFooterTop
 // in viewer.cpp in step. Trackbar style 0x0010 = TBS_HORZ | TBS_NOTICKS.
-IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 300, 292
+IDD_VIDEO_SETTINGS DIALOGEX 0, 0, 300, 336
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 CAPTION "JerisLink Settings"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT           "Settings", IDC_UI_TITLE, 14, 8, 272, 16, SS_NOPREFIX
-    LTEXT           "Connection, video and audio preferences", IDC_UI_SUBTITLE, 14, 25, 272, 9, SS_NOPREFIX
+    LTEXT           "Connection, video, audio and keyboard preferences", IDC_UI_SUBTITLE, 14, 25, 272, 9, SS_NOPREFIX
 
     LTEXT           "CONNECTION", IDC_UI_SECTION_CONNECTION, 14, 42, 272, 9, SS_NOPREFIX
     LTEXT           "Mac host address", IDC_UI_LABEL_HOST, 14, 54, 272, 9, SS_NOPREFIX
@@ -42,9 +42,14 @@ BEGIN
     CONTROL         "Mute (Ctrl+Alt+M)", IDC_VOLUME_MUTE, "Button", BS_OWNERDRAW | WS_TABSTOP, 14, 232, 110, 12
     LTEXT           "How loud the Mac's audio plays on this PC. Applies right away.", IDC_UI_HINT_VOLUME, 14, 247, 272, 9, SS_NOPREFIX
 
-    LTEXT           "Volume applies now. Connection and video changes apply when you reconnect.", IDC_APPLY_NOTE, 14, 268, 166, 18, SS_NOPREFIX
-    CONTROL         "Cancel", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 186, 269, 48, 16
-    CONTROL         "Save", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 238, 269, 48, 16
+    LTEXT           "KEYBOARD", IDC_UI_SECTION_KEYBOARD, 14, 263, 272, 9, SS_NOPREFIX
+    LTEXT           "Key layout", IDC_UI_LABEL_KEYBOARD, 14, 276, 70, 9, SS_NOPREFIX
+    COMBOBOX        IDC_KEYBOARD_PRESET, 84, 272, 202, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Mac: Win = Cmd. Windows: Ctrl = Cmd, Win = Control. Applies right away.", IDC_UI_HINT_KEYBOARD, 14, 290, 272, 9, SS_NOPREFIX
+
+    LTEXT           "Volume and keyboard apply now. Connection and video apply when you reconnect.", IDC_APPLY_NOTE, 14, 312, 166, 18, SS_NOPREFIX
+    CONTROL         "Cancel", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 186, 313, 48, 16
+    CONTROL         "Save", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 238, 313, 48, 16
 END
 
 // Modeless "Volume..." window. Only changes how loud the Mac's audio plays on

@@ -1,6 +1,8 @@
-// Golden tests for keymap.hpp: lock today's Windows -> Mac key events exactly
-// (positional layout, Ctrl+A/C/V/Z compat, Win+C / Win+Space escapes, viewer
-// hotkeys, focus-loss release) before presets are added.
+// Golden tests for keymap.hpp: lock the Windows -> Mac key events exactly for
+// both presets. Mac layout (default, positional): Ctrl+A/C/V/X/Z/S/F compat,
+// Ctrl+Y redo, Win+C / Win+Space escapes. Windows layout: Ctrl = Command,
+// Win = Control. Both: viewer hotkeys, Alt+Tab left to Windows, focus-loss
+// release, live preset switch.
 #include "keymap.hpp"
 
 #include <cstdio>
@@ -61,6 +63,13 @@ struct Viewer {
         if (key == vk::Control || key == vk::LControl || key == vk::RControl) held.ctrl = down;
         if (key == vk::Menu || key == vk::LMenu || key == vk::RMenu) held.alt = down;
         if (key == vk::LWin || key == vk::RWin) held.win = down;
+        if (key == vk::Shift || key == vk::LShift || key == vk::RShift) held.shift = down;
+    }
+
+    // Live switch from Settings: forget shortcut state, release modifiers.
+    void switchPreset(Preset p) {
+        keys.setPreset(p);
+        emit({true, releaseAllModifiers(), ""});
     }
 
     // Returns true when the hook swallowed the key (no window message).
@@ -69,10 +78,10 @@ struct Viewer {
         const auto d = hook.onKey(key, down, !down);
         switch (d.post) {
         case HookFilter::Post::CapsLock: emit(Translator::hookCapsLock()); break;
-        case HookFilter::Post::WinDown: emit(Translator::hookWinDown()); break;
-        case HookFilter::Post::WinUp: emit(Translator::hookWinUp()); break;
-        case HookFilter::Post::WinC: emit(Translator::hookWinC(hook.winDown())); break;
-        case HookFilter::Post::WinSpace: emit(Translator::hookWinSpace(hook.winDown())); break;
+        case HookFilter::Post::WinDown: emit(keys.hookWinDown()); break;
+        case HookFilter::Post::WinUp: emit(keys.hookWinUp()); break;
+        case HookFilter::Post::WinC: emit(keys.hookWinC(hook.winDown())); break;
+        case HookFilter::Post::WinSpace: emit(keys.hookWinSpace(hook.winDown())); break;
         case HookFilter::Post::None: break;
         }
         return d.swallow;
@@ -141,7 +150,7 @@ void testSemantics() {
 }
 
 void testCtrlCompat() {
-    for (char c : {'A', 'C', 'V', 'Z'}) {
+    for (char c : {'A', 'C', 'V', 'X', 'Z', 'S', 'F'}) {
         Viewer v;
         v.down(vk::LControl);
         v.down(static_cast<uint32_t>(c));
@@ -173,14 +182,14 @@ void testCtrlCompat() {
         expectEvents(v.wire, {D(1), U(1), D(3), D('C'), U('C'), U(3), D(1), U(1)},
                      "held Ctrl+C: repeats suppressed, letter never leaks");
     }
-    for (char c : {'X', 'S', 'F', 'Y'}) {
+    for (char c : {'B', 'D', 'R', 'T'}) {
         Viewer v;
         v.down(vk::LControl);
         v.tap(static_cast<uint32_t>(c));
         v.up(vk::LControl);
         const uint16_t k = static_cast<uint16_t>(c);
         expectEvents(v.wire, {D(1), D(k), U(k), U(1)},
-                     std::string("Ctrl+") + c + " stays Control+" + c + " (today's gap)");
+                     std::string("Ctrl+") + c + " stays Control+" + c + " (not in the compat list)");
         expect(v.tags.empty(), std::string("Ctrl+") + c + " has no debug tag");
     }
     {
@@ -350,6 +359,219 @@ void testPlainKeysAndRelease() {
     expectEvents(releaseAllModifiers(), {U(1), U(2), U(3), U(4)}, "releaseAllModifiers sends ups for 1-4");
 }
 
+constexpr uint16_t ZK = static_cast<uint16_t>('Z');
+
+void testMacRedo() {
+    {
+        Viewer v;
+        v.down(vk::LControl);
+        v.down('Y');
+        v.down('Y', true);
+        v.up('Y');
+        v.up(vk::LControl);
+        expectEvents(v.wire, {D(1), U(1), D(3), D(4), D(ZK), U(ZK), U(4), U(3), D(1), U(1)},
+                     "Mac layout Ctrl+Y -> Command+Shift+Z once, repeat suppressed, Control restored");
+        expect(v.tags == std::vector<std::string>{"shortcut.ctrl_y=command_shift_z"}, "Ctrl+Y debug tag");
+    }
+    {
+        Viewer v;
+        v.down(vk::LControl);
+        v.down(vk::LShift);
+        v.tap('Y');
+        v.up(vk::LShift);
+        v.up(vk::LControl);
+        expectEvents(v.wire, {D(1), D(4), U(1), D(3), D(ZK), U(ZK), U(3), D(1), U(4), U(1)},
+                     "Mac layout Ctrl+Shift+Y: held Shift is not pressed or released again");
+    }
+    {
+        Viewer v;
+        v.down(vk::LMenu);
+        v.tap('Y');
+        v.up(vk::LMenu);
+        expectEvents(v.wire, {D(2), D('Y'), U('Y'), U(2)}, "Alt+Y is plain Option+Y");
+    }
+}
+
+void testWindowsPreset() {
+    for (uint32_t k : {vk::Control, vk::LControl, vk::RControl})
+        expect(semanticKey(k, Preset::Windows) == kWin, "Windows layout: Ctrl VK " + std::to_string(k) + " -> 3 Command");
+    for (uint32_t k : {vk::LWin, vk::RWin})
+        expect(semanticKey(k, Preset::Windows) == kCtrl, "Windows layout: Win VK " + std::to_string(k) + " -> 1 Control");
+    for (uint32_t k : {vk::Menu, vk::LMenu, vk::RMenu})
+        expect(semanticKey(k, Preset::Windows) == kAlt, "Windows layout: Alt VK " + std::to_string(k) + " -> 2 Option");
+    {
+        int wrong = 0;
+        const std::set<uint32_t> swapped = {0x11, 0x5B, 0x5C, 0xA2, 0xA3};
+        for (uint32_t k = 0; k < 256; ++k) {
+            if (swapped.count(k)) continue;
+            if (semanticKey(k, Preset::Windows) != semanticKey(k, Preset::Mac)) ++wrong;
+        }
+        expect(wrong == 0, "Windows layout changes only Ctrl and Win; every other VK sends the same");
+    }
+    for (char c : {'A', 'C', 'V', 'X', 'Z', 'S', 'F', 'T'}) {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.tap(static_cast<uint32_t>(c));
+        v.up(vk::LControl);
+        const uint16_t k = static_cast<uint16_t>(c);
+        expectEvents(v.wire, {D(3), D(k), U(k), U(3)},
+                     std::string("Windows layout Ctrl+") + c + " -> Command+" + c + " with no remap");
+        expect(v.tags.empty(), std::string("Windows layout Ctrl+") + c + " has no debug tag");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.down('Y');
+        v.down('Y', true);
+        v.up('Y');
+        v.up(vk::LControl);
+        expectEvents(v.wire, {D(3), D(4), D(ZK), U(ZK), U(4), U(3)},
+                     "Windows layout Ctrl+Y -> Command+Shift+Z, repeat suppressed");
+        expect(v.tags == std::vector<std::string>{"shortcut.ctrl_y=command_shift_z"}, "Windows layout Ctrl+Y debug tag");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.down(vk::LShift);
+        v.tap('Z');
+        v.tap('Y');
+        v.up(vk::LShift);
+        v.up(vk::LControl);
+        expectEvents(v.wire, {D(3), D(4), D(ZK), U(ZK), D(ZK), U(ZK), U(4), U(3)},
+                     "Windows layout Ctrl+Shift+Z and Ctrl+Shift+Y both redo, Shift untouched");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LWin);
+        v.tap('C');
+        v.tap(vk::Space);
+        v.up(vk::LWin);
+        expectEvents(v.wire, {D(1), D('C'), U('C'), D(SP), U(SP), U(1)},
+                     "Windows layout Win+C / Win+Space (no hook) are plain Control+C / Control+Space");
+        expect(v.tags.empty(), "Windows layout Win+C / Win+Space (no hook) have no debug tag");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.useHook = true;
+        v.down(vk::LWin);
+        v.down('C');
+        v.down('C', true);
+        v.up('C');
+        v.up(vk::LWin);
+        expectEvents(v.wire, {D(1), D('C'), U('C'), U(1)}, "Windows layout hook Win+C -> Control+C once");
+        expect(v.tags == std::vector<std::string>{"shortcut.win_hook=control_down", "shortcut.win_c_hook=control_c",
+                                                  "shortcut.win_hook=control_up"},
+               "Windows layout hook Win+C debug tags");
+        expect(v.passedToWindows == 0, "Windows layout hook Win+C: nothing reaches Windows");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.useHook = true;
+        v.down(vk::RWin);
+        v.tap(vk::Space);
+        v.up(vk::RWin);
+        expectEvents(v.wire, {D(1), D(SP), U(SP), U(1)},
+                     "Windows layout hook Win+Space -> Control+Space (input source switch)");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.useHook = true;
+        v.down(vk::LWin);
+        v.tap('L');
+        v.up(vk::LWin);
+        expectEvents(v.wire, {D(1), D('L'), U('L'), U(1)}, "Windows layout hook Win+L -> Control+L");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.useHook = true;
+        v.down(vk::Capital);
+        v.up(vk::Capital);
+        expectEvents(v.wire, {D(CAPS), U(CAPS)}, "Windows layout Caps Lock unchanged");
+    }
+    for (char c : {'O', 'M', 'V'}) {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.down(vk::LMenu);
+        v.down(static_cast<uint32_t>(c));
+        v.up(static_cast<uint32_t>(c));
+        v.up(vk::LMenu);
+        v.up(vk::LControl);
+        expectEvents(v.wire, {D(3), D(2), U(2), U(3)},
+                     std::string("Windows layout Ctrl+Alt+") + c + " stays on the viewer");
+        expect(v.tags.empty(), std::string("Windows layout Ctrl+Alt+") + c + " has no debug tag");
+    }
+    {
+        Viewer v;
+        v.keys.setPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.down('C');
+        v.focusKill();
+        expectEvents(v.wire, {D(3), D('C'), U(1), U(2), U(3), U(4)}, "Windows layout focus kill releases 1-4");
+    }
+}
+
+void testAltTab() {
+    for (Preset p : {Preset::Mac, Preset::Windows}) {
+        HookFilter h;
+        h.onKey(vk::LMenu, true, false);
+        const auto d = h.onKey(vk::Tab, true, false);
+        expect(!d.swallow && d.post == HookFilter::Post::None,
+               std::string("Alt+Tab is left to Windows (") + presetName(p) + ")");
+        Translator t;
+        t.setPreset(p);
+        const auto o = t.keyDown(vk::LMenu, false, {});
+        expect(o.events == std::vector<KeyEvent>{D(2)}, std::string("Alt is Option (") + presetName(p) + ")");
+    }
+}
+
+void testPresetSwitch() {
+    expect(presetFromSaved("windows") == Preset::Windows, "saved \"windows\" -> Windows layout");
+    expect(presetFromSaved("mac") == Preset::Mac && presetFromSaved("") == Preset::Mac &&
+               presetFromSaved("WINDOWS") == Preset::Mac && presetFromSaved("x") == Preset::Mac,
+           "missing or unknown saved value -> Mac layout (default)");
+    expect(std::string(presetName(Preset::Mac)) == "mac" && std::string(presetName(Preset::Windows)) == "windows",
+           "preset names round-trip");
+    expect(Translator{}.preset() == Preset::Mac, "Translator starts in the Mac layout");
+    {
+        Viewer v;
+        v.down(vk::LControl);
+        v.down('C');
+        expect(v.keys.suppressedKey() == 'C', "shortcut in progress before the switch");
+        v.switchPreset(Preset::Windows);
+        expect(v.keys.suppressedKey() == 0 && v.keys.releasedModifier() == 0, "switch clears shortcut state");
+    }
+    {
+        Viewer v;
+        v.down(vk::LControl);
+        v.tap('C');
+        v.up(vk::LControl);
+        v.switchPreset(Preset::Windows);
+        v.down(vk::LControl);
+        v.tap('C');
+        v.up(vk::LControl);
+        v.switchPreset(Preset::Mac);
+        v.down(vk::LWin);
+        v.tap('T');
+        v.up(vk::LWin);
+        expectEvents(v.wire,
+                     {D(1), U(1), D(3), D('C'), U('C'), U(3), D(1), U(1),  // Mac: compat chord
+                      U(1), U(2), U(3), U(4),                              // switch: release all
+                      D(3), D('C'), U('C'), U(3),                          // Windows: Ctrl is Command
+                      U(1), U(2), U(3), U(4),                              // switch back
+                      D(3), D('T'), U('T'), U(3)},                         // Mac: Win is Command
+                     "live switch Mac -> Windows -> Mac applies to the next key");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -359,6 +581,10 @@ int main() {
     testWinWithHook();
     testViewerHotkeys();
     testPlainKeysAndRelease();
+    testMacRedo();
+    testWindowsPreset();
+    testAltTab();
+    testPresetSwitch();
     std::printf("keymap: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }
