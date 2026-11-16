@@ -110,8 +110,20 @@ void roundTrip() {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text,
                                                                  nullptr)) {
             const std::wstring s = text;
-            daclOk = info.AceCount == 1 && s.find(currentUserSid()) != std::wstring::npos && s.rfind(L"D:P", 0) == 0;
-            std::printf("dacl aces=%lu protected=%d\n", info.AceCount, s.rfind(L"D:P", 0) == 0 ? 1 : 0);
+            // Compare the ACE's own SID (SDDL may print well-known SIDs as aliases).
+            std::wstring aceSid;
+            void* ace = nullptr;
+            if (info.AceCount == 1 && GetAce(dacl, 0, &ace) &&
+                static_cast<ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+                LPWSTR sidText = nullptr;
+                if (ConvertSidToStringSidW(&static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart, &sidText)) {
+                    aceSid = sidText;
+                    LocalFree(sidText);
+                }
+            }
+            daclOk = info.AceCount == 1 && aceSid == currentUserSid() && s.rfind(L"D:P", 0) == 0;
+            std::printf("dacl aces=%lu protected=%d sddl=%ls ace_sid_is_user=%d\n", info.AceCount,
+                        s.rfind(L"D:P", 0) == 0 ? 1 : 0, s.c_str(), aceSid == currentUserSid() ? 1 : 0);
             LocalFree(text);
         }
         LocalFree(sd);
