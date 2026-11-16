@@ -1,4 +1,4 @@
-// Tests for file_panel.hpp (F4 Files panel): host level from caps, the
+// Tests for file_panel.hpp (F4/F5a Files panel): host level from caps, the two cards,
 // guide/tip/last texts, drop notices, buttons, layout and hit-test at
 // several dpi, and the panel keys.
 #include "file_panel.hpp"
@@ -41,12 +41,42 @@ void hostLevels() {
     expect(hostFromCaps(true, true, caps::kUpload | caps::kReveal | caps::kAnnounce) == Host::Full, "host: F4 host takes drops");
 }
 
+void cards() {
+    expectEq(title(), "Files", "card: panel title stays English");
+    expectEq(guideHeading(), "\xE2\x91\xA0 Copy & Paste", "card 1: heading");
+    expectEq(sendToHeading(), "\xE2\x91\xA1 Right-click \xE2\x80\xBA Send to JerisLink", "card 2: heading");
+    const auto cp = copyPasteRows();
+    expect(cp.size() == 2 && cp[0].label == "This PC \xE2\x86\x92 Mac" && cp[1].label == "Mac \xE2\x86\x92 This PC",
+           "card 1: This PC -> Mac, then Mac -> This PC");
+    expect(cp[0].text.find("Ctrl+C in Explorer, then paste in Finder here.") != std::string::npos && !cp[0].muted,
+           "card 1: PC to Mac line");
+    expect(cp[1].text.find("Cmd+C in Finder here, then Ctrl+V in Explorer.") != std::string::npos && !cp[1].muted,
+           "card 1: Mac to PC line");
+
+    auto st = sendToRows(SendToSetup::Installed);
+    expect(st.size() == 2 && st[0].label == cp[0].label && st[1].label == cp[1].label, "card 2: same two directions");
+    expectEq(st[0].text,
+             "Right-click files \xE2\x80\xBA Send to \xE2\x80\xBA JerisLink (Windows 11: Show more options first). "
+             "They go to Downloads/JerisLink on the Mac.",
+             "card 2: installed, how to send");
+    expect(!st[0].muted, "card 2: installed line is not grey");
+    expectEq(st[1].text, "Right-click in Finder: coming with the next JerisLink update on the Mac.",
+             "card 2: Mac -> This PC waits for F5b");
+    expect(st[1].muted, "card 2: Mac -> This PC is grey");
+    st = sendToRows(SendToSetup::NotInstalled);
+    expectEq(st[0].text, "Not set up on this PC. Install JerisLink with its installer to add it.",
+             "card 2: no shortcut (zip / deleted)");
+    expect(st[0].muted, "card 2: not set up is grey");
+    st = sendToRows(SendToSetup::StorePackage);
+    expectEq(st[0].text, "Not in the Microsoft Store version yet. Drag files onto this window instead.",
+             "card 2: Store build degrades to drag");
+    expect(st[0].muted && st.size() == 2, "card 2: Store line is grey");
+}
+
 void texts() {
     expectEq(tipLine(Host::Full), "Tip: you can also drag files onto this window to send them to the Mac.", "tip: F4 host");
     expectEq(tipLine(Host::PasteOnly), "Update JerisLink on the Mac to drag files onto this window.", "tip: F3 host");
     expectEq(tipLine(Host::None), "The Mac's JerisLink has no file transfer. Update JerisLink on the Mac.", "tip: old host");
-    expect(guideBody().find("Ctrl+C in Explorer, paste in Finder here.") != std::string::npos, "guide: PC to Mac line");
-    expect(guideBody().find("Cmd+C in Finder here, Ctrl+V in Explorer.") != std::string::npos, "guide: Mac to PC line");
 
     expectEq(lastLine(Last{}), "", "last: nothing yet");
     expectEq(lastLine(lastFrom(2, true, 0, 3)), "Last: 3 files sent to the Mac", "last: drop of 3 files");
@@ -94,13 +124,30 @@ void layouts() {
         const Layout l = layoutFor(dpi);
         const jl::overlay::Rect win{0, 0, l.width, l.height};
         const std::string d = " @" + std::to_string(dpi);
-        expect(inside(l.title, win) && inside(l.heading, win) && inside(l.guide, win) && inside(l.tip, win) &&
-                   inside(l.progress, win) && inside(l.cancel, win) && inside(l.last, win) &&
+        expect(inside(l.title, win) && inside(l.copyPaste.box, win) && inside(l.sendTo.box, win) &&
+                   inside(l.tip, win) && inside(l.progress, win) && inside(l.cancel, win) && inside(l.last, win) &&
                    inside(l.openFolder, win),
                "layout: every part inside the panel" + d);
-        expect(apart(l.progress, l.cancel) && apart(l.last, l.openFolder) && apart(l.cancel, l.openFolder) &&
-                   apart(l.guide, l.tip) && apart(l.tip, l.progress) && apart(l.progress, l.last),
-               "layout: parts do not overlap" + d);
+        bool cardsOk = true;
+        for (const Card* c : {&l.copyPaste, &l.sendTo}) {
+            cardsOk = cardsOk && inside(c->heading, c->box);
+            for (int i = 0; i < 2; ++i) {
+                cardsOk = cardsOk && inside(c->label[i], c->box) && inside(c->text[i], c->box) &&
+                          apart(c->heading, c->label[i]) && apart(c->label[i], c->text[i]);
+                // room for four lines of the small font (about 16 px each at 96 dpi)
+                cardsOk = cardsOk && c->text[i].height() >= jl::overlay::scale(64, dpi);
+            }
+            cardsOk = cardsOk && apart(c->text[0], c->label[1]) && apart(c->text[0], c->text[1]);
+        }
+        expect(cardsOk, "layout: card heading, labels and texts inside their card, no overlap" + d);
+        expect(apart(l.copyPaste.box, l.sendTo.box) && l.copyPaste.box.right < l.sendTo.box.left &&
+                   l.copyPaste.box.top == l.sendTo.box.top && l.copyPaste.box.width() == l.sendTo.box.width(),
+               "layout: card 1 left, card 2 right, same size" + d);
+        expect(apart(l.title, l.copyPaste.box) && apart(l.copyPaste.box, l.tip) && apart(l.sendTo.box, l.tip) &&
+                   apart(l.progress, l.cancel) && apart(l.last, l.openFolder) && apart(l.cancel, l.openFolder) &&
+                   apart(l.tip, l.progress) && apart(l.progress, l.last) && l.tip.top >= l.copyPaste.box.bottom &&
+                   l.progress.top >= l.tip.bottom && l.last.top >= l.progress.bottom,
+               "layout: title, cards, tip, progress, last in order without overlap" + d);
         State s;
         s.host = Host::Full;
         s.uploadRunning = true;
@@ -153,6 +200,7 @@ void keys() {
 
 int main() {
     hostLevels();
+    cards();
     texts();
     buttonSets();
     layouts();

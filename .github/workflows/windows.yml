@@ -110,8 +110,72 @@ jobs:
         run: build\Release\JerislinkFileUploadTest.exe
       - name: Build Files panel test
         run: cmake --build build --config Release --target JerislinkFilePanelTest
-      - name: Files panel test (F4 guide, tip by host caps, last transfer, Cancel / Open folder, layout at 96-288 dpi, keys)
+      - name: Files panel test (F4/F5a two cards, Send to setup lines, tip by host caps, last transfer, Cancel / Open folder, layout at 96-288 dpi, keys)
         run: build\Release\JerislinkFilePanelTest.exe
+      - name: Build Send to test
+        run: cmake --build build --config Release --target JerislinkSendToTest
+      - name: Send to test (F5a --send-to arguments, path checks, decision like a drop, dialog texts, exit codes, pipe bytes and limits)
+        run: build\Release\JerislinkSendToTest.exe
+      - name: Build Send to pipe test
+        run: cmake --build build --config Release --target JerislinkSendToPipeTest
+      - name: Send to pipe test (real named pipe, paths round trip, first instance, this-user DACL, corrupt / idle / slow peers, quiet exit)
+        timeout-minutes: 3
+        run: build\Release\JerislinkSendToPipeTest.exe
+      - name: Send to with no viewer running (Jerislink.exe --send-to, quiet, exit 21, no window)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path build\Release\Jerislink.exe).Path
+          $file = Join-Path $env:RUNNER_TEMP 'send to test.txt'
+          Set-Content -Path $file -Value 'F5a'
+          $env:JERISLINK_SENDTO_QUIET = '1'
+          $p = Start-Process $exe -ArgumentList @('--send-to', "`"$file`"") -PassThru
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'Jerislink.exe --send-to did not exit' }
+          Write-Host "exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 21) { throw "expected exit 21 (not connected), got $($p.ExitCode)" }
+          $p = Start-Process $exe -ArgumentList @('--send-to') -PassThru
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'Jerislink.exe --send-to (nothing) did not exit' }
+          if ($p.ExitCode -ne 27) { throw "expected exit 27 (nothing selected), got $($p.ExitCode)" }
+          Write-Host 'OK: --send-to answers without a viewer and opens no window'
+      - name: Install Inno Setup 6.7.1
+        run: choco install innosetup --version 6.7.1 -y --no-progress
+      - name: Installer adds and removes Send to > JerisLink (silent per-user install, shortcut target and arguments, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          & $iscc Jerislink.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+          $setup = Get-ChildItem dist -Filter 'Jerislink-*-windows-x64-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'no setup exe' }
+          $dir = Join-Path $env:RUNNER_TEMP 'jl-install'
+          $lnk = Join-Path ([Environment]::GetFolderPath('SendTo')) 'JerisLink.lnk'
+          if (Test-Path $lnk) { throw "Send to shortcut exists before install: $lnk" }
+          $p = Start-Process $setup.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=`"$dir`"") -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'setup did not exit' }
+          if ($p.ExitCode -ne 0) { throw "setup exit $($p.ExitCode)" }
+          if (-not (Test-Path $lnk)) { throw "no Send to shortcut at $lnk" }
+          $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          Write-Host "target: $($sc.TargetPath)"; Write-Host "arguments: $($sc.Arguments)"
+          if ($sc.TargetPath -ne (Join-Path $dir 'Jerislink.exe')) { throw 'shortcut target is not the installed Jerislink.exe' }
+          if ($sc.Arguments -ne '--send-to') { throw "shortcut arguments: '$($sc.Arguments)'" }
+          # What Explorer runs for Send to: the shortcut's target and arguments, then the selected paths.
+          $file = Join-Path $env:RUNNER_TEMP 'send to via shortcut.txt'
+          Set-Content -Path $file -Value 'F5a'
+          $env:JERISLINK_SENDTO_QUIET = '1'
+          $p = Start-Process $sc.TargetPath -ArgumentList @($sc.Arguments, "`"$file`"") -PassThru
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'installed --send-to did not exit' }
+          if ($p.ExitCode -ne 21) { throw "installed --send-to: expected exit 21, got $($p.ExitCode)" }
+          $p = Start-Process (Join-Path $dir 'unins000.exe') -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'uninstall did not exit' }
+          for ($i = 0; $i -lt 30 -and (Test-Path $lnk); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path $lnk) { throw 'Send to shortcut still there after uninstall' }
+          Write-Host 'OK: installer adds Send to > JerisLink (--send-to) and uninstall removes it'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-windows-setup-unsigned
+          path: personal/windows-client/dist/Jerislink-*-windows-x64-setup.exe
       - name: Build paste pull test
         run: cmake --build build --config Release --target JerislinkFilePullTest
       - name: Paste pull test (announce checks, Windows names, request window, stale drain, hold-back until SHA-256, cancel and failure)

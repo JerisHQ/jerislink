@@ -1,11 +1,12 @@
 #pragma once
 
-// Files panel (F4): the overlay's Files button opens a small guide with the
-// copy & paste steps, the running transfer with Cancel, and the last
-// transfer with Open folder (REVEAL) after a drop. Texts, layout, the buttons
-// shown and the panel keys live here without Win32 so file_panel_test.cpp
-// can check them; viewer.cpp paints and drives the real popup. No file names
-// are shown or logged.
+// Files panel (F4, F5a): the overlay's Files button opens a small guide with
+// two cards, (1) copy & paste and (2) right-click Send to JerisLink, the
+// running transfer with Cancel, and the last transfer with Open folder
+// (REVEAL) after a drop or Send to. Texts, layout, the buttons shown and the
+// panel keys live here without Win32 so file_panel_test.cpp can check them;
+// viewer.cpp paints and drives the real popup. No file names are shown or
+// logged.
 
 #include "file_proto.hpp"
 #include "file_upload.hpp"
@@ -50,11 +51,51 @@ inline Last lastFrom(int state, bool send, uint8_t hostStatus, uint64_t files) {
 
 inline const char* title() { return "Files"; }
 inline const char* guideHeading() { return "\xE2\x91\xA0 Copy & Paste"; }  // (1)
-inline std::string guideBody() {
-    return "This PC \xE2\x86\x92 Mac   Ctrl+C in Explorer, paste in Finder here.\n"
-           "Files go to the folder you paste into.\n"
-           "Mac \xE2\x86\x92 This PC   Cmd+C in Finder here, Ctrl+V in Explorer.\n"
-           "Files go to that folder.";
+inline const char* sendToHeading() { return "\xE2\x91\xA1 Right-click \xE2\x80\xBA Send to JerisLink"; }  // (2)
+
+// One direction inside a card: a short label and up to four lines of text.
+struct CardRow {
+    std::string label;
+    std::string text;
+    bool muted = false;  // not usable here (yet): drawn grey
+};
+
+inline const char* pcToMac() { return "This PC \xE2\x86\x92 Mac"; }
+inline const char* macToPc() { return "Mac \xE2\x86\x92 This PC"; }
+
+inline std::vector<CardRow> copyPasteRows() {
+    return {
+        {pcToMac(), "Ctrl+C in Explorer, then paste in Finder here. Files go to the folder you paste into.", false},
+        {macToPc(), "Cmd+C in Finder here, then Ctrl+V in Explorer. Files go to that folder.", false},
+    };
+}
+
+// Whether Explorer's Send to menu has JerisLink on this PC.
+enum class SendToSetup {
+    NotInstalled,  // e.g. the bare exe from a zip, or the shortcut was deleted
+    Installed,     // the installer's JerisLink shortcut is in the user's SendTo folder
+    StorePackage,  // the Microsoft Store (MSIX) build: no Send to entry yet
+};
+
+inline std::vector<CardRow> sendToRows(SendToSetup setup) {
+    std::vector<CardRow> rows;
+    switch (setup) {
+    case SendToSetup::Installed:
+        rows.push_back({pcToMac(),
+                        "Right-click files \xE2\x80\xBA Send to \xE2\x80\xBA JerisLink (Windows 11: Show more "
+                        "options first). They go to Downloads/JerisLink on the Mac.",
+                        false});
+        break;
+    case SendToSetup::StorePackage:
+        rows.push_back({pcToMac(), "Not in the Microsoft Store version yet. Drag files onto this window instead.", true});
+        break;
+    default:
+        rows.push_back({pcToMac(), "Not set up on this PC. Install JerisLink with its installer to add it.", true});
+        break;
+    }
+    // F5b: Finder's Send to JerisLink needs a newer Mac host.
+    rows.push_back({macToPc(), "Right-click in Finder: coming with the next JerisLink update on the Mac.", true});
+    return rows;
 }
 
 inline std::string tipLine(Host h) {
@@ -110,26 +151,47 @@ inline std::vector<Button> buttons(const State& s) {
     return b;
 }
 
+// A card: border box, heading, then two rows (label line, text block).
+struct Card {
+    ov::Rect box, heading;
+    ov::Rect label[2], text[2];
+};
+
 struct Layout {
     int width = 0, height = 0;
-    ov::Rect title, heading, guide, tip, progress, cancel, last, openFolder;
+    ov::Rect title;
+    Card copyPaste, sendTo;  // side by side, (1) left and (2) right
+    ov::Rect tip, progress, cancel, last, openFolder;
 };
 
 inline Layout layoutFor(unsigned dpi) {
     const auto s = [dpi](int v) { return ov::scale(v, dpi); };
     Layout l;
-    l.width = s(500);
-    l.height = s(300);
+    l.width = s(720);
+    l.height = s(400);
     const int x0 = s(20), x1 = l.width - s(20);
     l.title = {x0, s(14), x1, s(38)};
-    l.heading = {x0, s(46), x1, s(66)};
-    l.guide = {x0 + s(4), s(68), x1, s(148)};
-    l.tip = {x0, s(156), x1, s(194)};
+    const auto card = [&](int left, int right) {
+        Card c;
+        c.box = {left, s(46), right, s(264)};
+        const int il = left + s(12), ir = right - s(12);
+        c.heading = {il, s(56), ir, s(78)};
+        for (int i = 0; i < 2; ++i) {
+            const int y = s(84 + 88 * i);
+            c.label[i] = {il, y, ir, y + s(18)};
+            c.text[i] = {il, y + s(18), ir, y + s(82)};  // four lines of the small font
+        }
+        return c;
+    };
+    const int gap = s(12), cw = (x1 - x0 - gap) / 2;  // equal widths at every scale
+    l.copyPaste = card(x0, x0 + cw);
+    l.sendTo = card(x1 - cw, x1);
+    l.tip = {x0, s(272), x1, s(306)};
     const int bw = s(110), bh = s(30);
-    l.progress = {x0, s(204), x1 - bw - s(10), s(236)};
-    l.cancel = {x1 - bw, s(205), x1, s(205) + bh};
-    l.last = {x0, s(246), x1 - bw - s(10), s(278)};
-    l.openFolder = {x1 - bw, s(247), x1, s(247) + bh};
+    l.progress = {x0, s(314), x1 - bw - s(10), s(346)};
+    l.cancel = {x1 - bw, s(315), x1, s(315) + bh};
+    l.last = {x0, s(356), x1 - bw - s(10), s(388)};
+    l.openFolder = {x1 - bw, s(357), x1, s(357) + bh};
     return l;
 }
 
