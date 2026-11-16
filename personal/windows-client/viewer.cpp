@@ -2092,9 +2092,13 @@ static void overlayReposition() {
     const ov::Layout l = ov::layoutFor(dpi);
     RECT c{};
     GetClientRect(gViewerHwnd, &c);
+    // Just below the remote Mac menu bar as drawn now (stream size, client
+    // size and letterboxing), so the bar never covers it.
+    const int top = ov::overlayTopOffset(c.right - c.left, c.bottom - c.top, gRemoteWidth,
+                                         gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
     const ov::Point p = ov::placeInClient({c.left, c.top, c.right, c.bottom}, l.size.width(),
-                                          l.size.height(), ov::scale(16, dpi));
+                                          l.size.height(), top);
     SetWindowPos(gOverlay, nullptr, p.x, p.y, l.size.width(), l.size.height(),
                  SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -2565,6 +2569,38 @@ static void overlayDestroy() {
     gOverlaySwallowUp.reset();
 }
 
+// The bottom-left hover zone in screen coordinates, on whatever monitor the
+// viewer is: the corner of the client area that is on that monitor's work
+// area (not off-screen, not behind the taskbar), sized for the viewer's dpi.
+static ov::Rect gOverlayLastZone;
+
+static ov::Rect overlayHoverZone() {
+    RECT c{};
+    GetClientRect(gViewerHwnd, &c);
+    MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    RECT work = c;
+    if (GetMonitorInfoW(MonitorFromWindow(gViewerHwnd, MONITOR_DEFAULTTONEAREST), &mi))
+        work = mi.rcWork;
+    const ov::Rect zone =
+        ov::hoverZone({c.left, c.top, c.right, c.bottom},
+                      {work.left, work.top, work.right, work.bottom},
+                      ov::scale(ov::kHoverZone, jl::ui::windowDpi(gViewerHwnd)));
+    // Geometry only (never the pointer), once per change, debug runs only.
+    if (debugMode() && (zone.left != gOverlayLastZone.left || zone.top != gOverlayLastZone.top ||
+                        zone.right != gOverlayLastZone.right ||
+                        zone.bottom != gOverlayLastZone.bottom)) {
+        gOverlayLastZone = zone;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "overlay.hover_zone=%d,%d,%d,%d work=%ld,%ld,%ld,%ld",
+                      zone.left, zone.top, zone.right, zone.bottom, work.left, work.top,
+                      work.right, work.bottom);
+        logLine(buf);
+    }
+    return zone;
+}
+
 // Every 100 ms: the bottom-left hover fallback and the auto-hide.
 static void overlayHoverTick() {
     if (!gOverlay || !gViewerHwnd) return;
@@ -2581,12 +2617,8 @@ static void overlayHoverTick() {
         HWND under = WindowFromPoint(pt);
         overOverlay = under == gOverlay;
         if (under == gViewerHwnd) {
-            POINT cp = pt;
-            ScreenToClient(gViewerHwnd, &cp);
-            RECT c{};
-            GetClientRect(gViewerHwnd, &c);
-            inZone = ov::inCornerZone(cp.x, cp.y, c.right, c.bottom,
-                                      ov::scale(ov::kHoverZone, overlayDpi()));
+            const ov::Rect zone = overlayHoverZone();
+            inZone = zone.contains(pt.x, pt.y);
         }
     }
     if (gOverlayDwell.update(inZone, now) && !overlayVisible()) overlayShow(false, "hover", 0);
@@ -3897,6 +3929,7 @@ static void applyVideoInfo(HWND hwnd) {
         gConnectionInfo.adapter = ad;
     }
     if (size || backend) updateViewerTitle(hwnd);
+    if (size) overlayReposition();  // the menu bar offset follows the stream size
 }
 
 static std::vector<std::string> commandArgs(int argc, char** argv) {
