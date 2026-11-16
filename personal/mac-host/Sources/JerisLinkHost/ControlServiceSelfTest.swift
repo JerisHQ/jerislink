@@ -543,10 +543,10 @@ enum ControlServiceSelfTest {
         _ = file.send(type: 0x50, payload: [1, 0, 0])                // FILE_HELLO proto 1, caps 0
         if let ack = file.receive(timeout: 3), ack.type == 0x51,
            case let .helloAck(proto, caps, maxChunk, maxTotal)? = FileProto.decode(type: ack.type, payload: ack.payload) {
-            expect(proto == 1 && caps == FileProto.Caps.upload && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
-                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
+            expect(proto == 1 && caps == FileProto.Caps.host && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
+                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
         } else {
-            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
+            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
         }
         _ = file.send(type: 0x5B, payload: [9, 8, 7, 6])
         let pong = file.receive(timeout: 3)

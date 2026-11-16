@@ -104,7 +104,7 @@ enum FileAnnounceSelfTest {
         expect(collect(a, t, 1, 4096, 10).msgs == [failed], "serve: out of sequence offset is refused")
         expect(collect(a, t, 0, 0, 10).msgs == [failed], "serve: a folder entry is refused")
         expect(collect(a, t, 9, 0, 10).msgs == [failed], "serve: an unknown index is refused")
-        expect(collect(a, t &+ 2, 1, 0, 10).msgs == [failed], "serve: an unknown transfer is refused")
+        expect(collect(a, t &+ 2, 1, 0, 10).msgs == [.reply(transfer: t &+ 2, status: FileProto.Status.failed)], "serve: an unknown transfer is refused")
         let capped = collect(a, t, 1, 0, UInt32.max)
         expect(capped.bytes.count == big.count, "serve: request length is capped, file size bounds it")
 

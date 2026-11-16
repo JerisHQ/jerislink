@@ -555,6 +555,7 @@ static bool physicalKeyDown(int vk) {
 
 // F2 file upload state (UI thread). The UI itself is further down, after the overlay.
 static FileSession* gFileSession = nullptr;  // set while a session runs
+static FileSession* gFilePullSession = nullptr;  // F3 Mac->Windows paste, same lifetime
 static jl::fileup::PasteGate gPasteGate;
 static HWND gFileConfirm = nullptr;
 static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileConfirm); }
@@ -2691,7 +2692,8 @@ static FileSession::UploadProgress currentUpload() {
 }
 
 static bool fileTransferRunning() {
-    return gFileUiSample || (gFileSession && gFileSession->uploadRunning());
+    return gFileUiSample || (gFileSession && gFileSession->uploadRunning()) ||
+           (gFilePullSession && gFilePullSession->pullRunning());
 }
 
 static uint32_t readFileTransferMaxMbps() {
@@ -2966,12 +2968,22 @@ static void paintFileConfirm(HWND hwnd) {
     const ConfirmLayout l = confirmLayout(dpi, client);
     overlayText(dc, utf8ToWide(fu::confirmTitle()), l.title, t.label, c::kText, DT_LEFT | DT_VCENTER);
     const auto p = currentUpload();
-    const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
+    // Explorer pasting Mac files into this PC, with no upload running (F3).
+    const bool pulling = !(gFileSession && gFileSession->uploadRunning()) && gFilePullSession &&
+                         gFilePullSession->pullRunning();
     {
         RECT body = l.body;
         HGDIOBJ old = SelectObject(dc, t.text);
         SetTextColor(dc, c::kMuted);
-        const std::wstring text = utf8ToWide(fu::confirmBody(left, p.committed, p.total));
+        std::string bodyText;
+        if (pulling) {
+            const auto q = gFilePullSession->pullProgress();
+            bodyText = fu::confirmBodyPull(q.files > q.filesDone ? q.files - q.filesDone : 0, q.received, q.total);
+        } else {
+            const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
+            bodyText = fu::confirmBody(left, p.committed, p.total);
+        }
+        const std::wstring text = utf8ToWide(bodyText);
         DrawTextW(dc, text.c_str(), -1, &body, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(dc, old);
     }
@@ -2981,7 +2993,8 @@ static void paintFileConfirm(HWND hwnd) {
     overlayText(dc, L"Keep transferring", l.keep, t.text, c::kText, DT_CENTER | DT_VCENTER);
     jl::ui::roundRect(dc, l.disconnect, ov::scale(8, dpi), gConfirmHot == 1 ? c::kSecondaryDown : c::kSecondary,
                       c::kBorder, 1);
-    overlayText(dc, L"Disconnect and remove", l.disconnect, t.text, c::kError, DT_CENTER | DT_VCENTER);
+    overlayText(dc, pulling ? L"Disconnect" : L"Disconnect and remove", l.disconnect, t.text, c::kError,
+                DT_CENTER | DT_VCENTER);
     // Keep shows as the default; the ring follows Tab.
     overlayFocusFrame(dc, focusKeep ? l.keep : l.disconnect, dpi);
     BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -3139,6 +3152,7 @@ static void fileUiDestroy() {
 
 static void fileUiEndSession() {
     gFileSession = nullptr;
+    gFilePullSession = nullptr;
     gPasteGate = fu::PasteGate{};
     gPendingRoots.clear();
     gLastUploadClipSeq = 0;
@@ -4959,6 +4973,7 @@ static int appMain(int argc, char** argv) {
         std::unique_ptr<ControlChannel> control;
         std::unique_ptr<ClipboardChannel> clipboard;
         std::unique_ptr<FileSession> fileSession;
+        std::unique_ptr<FileSession> filePullSession;  // F3: Mac->Windows paste
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
         // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
         std::unique_ptr<jl::audio::AudioPlayer> audio;
@@ -5073,6 +5088,14 @@ static int appMain(int argc, char** argv) {
             });
             fileSession->start();
             gFileSession = fileSession.get();
+            // F3: a second file session that receives Finder copies and puts
+            // them on the Windows clipboard for Explorer to paste.
+            filePullSession = std::make_unique<FileSession>(
+                o.bindIp, o.sourceIp, o.controlPort,
+                [](const std::string& message) { logLine(message); }, FileSession::Role::Pull);
+            filePullSession->setMaxMbps(readFileTransferMaxMbps());
+            filePullSession->start();
+            gFilePullSession = filePullSession.get();
         } else {
             gControl = nullptr;
             gMouseMoveUdp = nullptr;
@@ -5755,6 +5778,7 @@ static int appMain(int argc, char** argv) {
                 << " file_cap=" << (fileSession ? (fileSession->capability() == FileSession::Capability::Yes ? "yes" : fileSession->capability() == FileSession::Capability::No ? "no" : "unknown") : "off")
                 << " file_sessions=" << (fileSession ? fileSession->sessions() : 0)
                 << " file_tx_bytes=" << (fileSession ? fileSession->txBytes() : 0)
+                << " file_rx_bytes=" << (filePullSession ? filePullSession->rxBytes() : 0)
                 << " audio=" << (audio ? "on" : "off")
                 << " audio_codec=" << jl::audio::codecName(audioStats.jb.codec)
                 << " audio_bitrate_kbps=" << (audioStats.jb.framesPlayed + audioStats.jb.framesSilence > 0
@@ -5798,12 +5822,16 @@ static int appMain(int argc, char** argv) {
         // independent from this second TCP session.
         if (clipboard) clipboard->stop();
         gFileSession = nullptr;
+        gFilePullSession = nullptr;
         if (fileSession) fileSession->stop();
+        // Also clears Windows clipboard if it still holds a Mac copy.
+        if (filePullSession) filePullSession->stop();
 
         // Release Media Foundation / D3D objects before MFShutdown/CoUninitialize.
         video.reset();
         clipboard.reset();
         fileSession.reset();
+        filePullSession.reset();
         mouseMoveUdp.reset();
         control.reset();
 

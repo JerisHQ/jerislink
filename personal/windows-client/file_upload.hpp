@@ -208,6 +208,15 @@ inline std::string confirmBody(uint64_t filesLeft, uint64_t done, uint64_t total
            "Files that already finished are kept.";
 }
 
+// Same, while Explorer is pasting Mac files into this PC (F3). Explorer
+// owns the files it writes; the viewer only stops feeding them.
+inline std::string confirmBodyPull(uint64_t filesLeft, uint64_t done, uint64_t total) {
+    return std::to_string(filesLeft) + " file(s) are still being pasted into this PC (" + formatBytes(std::min(done, total)) +
+           " of " + formatBytes(total) +
+           "). If you disconnect now, the paste stops and Explorer reports the unfinished files. "
+           "Files that already finished are kept.";
+}
+
 // Disconnect confirm keys. Keep is the default; Esc and Enter keep;
 // "Disconnect and remove" needs Tab (or an arrow) to it, then Space.
 class ConfirmKeys {
