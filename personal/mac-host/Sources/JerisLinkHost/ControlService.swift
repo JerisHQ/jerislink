@@ -33,7 +33,8 @@ enum ControlService {
 
     /// Start the direct listener on bindIP:port and, unless it is the same
     /// socket, the loopback relay listener on 127.0.0.1:relayPort. Both use
-    /// `helper`. On failure, servers already started are stopped.
+    /// `helper`. Only the direct listener answers FILE_HELLO (0x50). On
+    /// failure, servers already started are stopped.
     static func startServers(bindIP: String, clientIP: String, port: UInt16, relayPort: UInt16,
                              inject: Bool, helper: InputHelperClient) throws -> [ControlServer] {
         var servers: [ControlServer] = []
@@ -41,7 +42,7 @@ enum ControlService {
             let direct = ControlServer(bindIP: bindIP, allowedClientIP: clientIP,
                                        port: port, inject: inject,
                                        settingsClientIP: { clientIP }, acceptProxy: false,
-                                       inputHelper: helper)
+                                       inputHelper: helper, allowFileSessions: true)
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port

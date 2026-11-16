@@ -30,6 +30,8 @@ final class ControlServer: @unchecked Sendable {
     private(set) var clipboardReceived: UInt64 = 0
     private(set) var rejectedClients: UInt64 = 0
     private(set) var settingsRejected: UInt64 = 0
+    private(set) var fileSessions: UInt64 = 0
+    private(set) var fileRefused: UInt64 = 0
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
     private let settingsClientIP: () -> String?
@@ -41,6 +43,9 @@ final class ControlServer: @unchecked Sendable {
     /// off for the loopback relay, whose client is the long-lived video
     /// service.
     private let announceInputSessions: Bool
+    /// Answer FILE_HELLO (0x50). Only the viewer-facing direct listener;
+    /// the loopback relay and the legacy listeners refuse it (design D13).
+    private let allowFileSessions: Bool
     private static let maxClipboardBytes = 60 * 1024
     /// Pasteboard access for clipboard sessions (a fake in the self-test).
     private let clipboard: ClipboardBackend
@@ -53,12 +58,14 @@ final class ControlServer: @unchecked Sendable {
          acceptProxy: Bool = true,
          inputHelper: InputHelperClient? = nil,
          announceInputSessions: Bool = true,
+         allowFileSessions: Bool = false,
          clipboard: ClipboardBackend = SystemClipboard.shared,
          inputSources: InputSourceCache = .shared) {
         self.bindIP = bindIP
         self.clipboard = clipboard
         self.inputSources = inputSources
         self.announceInputSessions = announceInputSessions
+        self.allowFileSessions = allowFileSessions
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -156,7 +163,7 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) file_sessions=\(fileSessions) file_refused=\(fileRefused) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
     }
 
     private func acceptLoop() {
@@ -240,6 +247,7 @@ final class ControlServer: @unchecked Sendable {
         var sessionStarted = false
         defer { if sessionStarted { endInputSession(sessionID) } }
         var firstHeader: [UInt8]? = pending
+        var connectionMessages = 0
         while true {
             let next: [UInt8]?
             if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8) }
@@ -253,12 +261,23 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
+            connectionMessages += 1
             if !sessionStarted && announceInputSessions && Self.isInputMessage(type) {
                 sessionStarted = startInputSession(sessionID)
                 if !sessionStarted { continue }
             }
 
             switch type {
+            case FileProto.MsgType.hello: // FILE_HELLO: dedicate this TCP session to file transfer.
+                // Only as the first message, and only on the direct listener.
+                guard allowFileSessions, connectionMessages == 1,
+                      case .hello(let proto, _)? = FileProto.decode(type: type, payload: payload), proto >= 1 else {
+                    fileRefused += 1
+                    print("file.session=refused")
+                    return
+                }
+                handleFileSession(fd)
+                return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
                 print("Clipboard session connected")
@@ -358,6 +377,67 @@ final class ControlServer: @unchecked Sendable {
         }
     }
     private static let sessionIDs = SessionIDCounter()
+
+    /// A file session (F1): HELLO_ACK with this build's caps, PING echo, and
+    /// REJECT `denied` for every request until F2-F5 implement them. Any
+    /// malformed or unexpected message closes the session. Runs on this
+    /// client's own thread; it never touches the main thread. Logs carry no
+    /// file names (D15): only open/closed and counts.
+    private func handleFileSession(_ fd: Int32) {
+        fileSessions += 1
+        let ack = FileProto.Message.helloAck(proto: FileProto.version, caps: FileProto.Caps.host,
+                                             maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
+        guard let ackBytes = ack.encode(), sendPacket(fd, type: ack.type, payload: ackBytes) else { return }
+        print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16))")
+        var received = 0
+        var refused = 0
+        var reason = "peer_closed"
+        defer { print("file.session=closed reason=\(reason) messages=\(received) refused=\(refused)") }
+        var lastMessage = Date()
+
+        while true {
+            lock.lock(); let shouldStop = stopping; lock.unlock()
+            if shouldStop { reason = "stopping"; return }
+            if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
+
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = Darwin.poll(&pfd, 1, 100)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                reason = "poll_error"; return
+            }
+            if ready == 0 { continue }
+            if (pfd.revents & Int16(POLLERR | POLLNVAL)) != 0 { reason = "socket_error"; return }
+
+            guard let header = recvExact(fd, count: 8) else { return }
+            guard header[0] == 0x4d, header[1] == 0x52, header[2] == 0x43, header[3] == 0x31, header[4] == 1 else {
+                reason = "bad_header"; return
+            }
+            let type = header[5]
+            let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
+            guard length <= FileProto.maxPayload else { reason = "too_long"; return }
+            guard let payload = recvExact(fd, count: length) else { return }
+            received += 1
+            lastMessage = Date()
+
+            guard let msg = FileProto.decode(type: type, payload: payload) else { reason = "malformed"; return }
+            switch msg {
+            case .ping:
+                guard sendPacket(fd, type: type, payload: payload) else { reason = "send_failed"; return }
+            case .offer(let transfer, _, _, _), .reveal(let transfer):
+                refused += 1
+                let reply = FileProto.Message.reply(transfer: transfer, status: FileProto.Status.denied)
+                guard let bytes = reply.encode(), sendPacket(fd, type: reply.type, payload: bytes) else {
+                    reason = "send_failed"; return
+                }
+            case .hello, .helloAck:
+                reason = "unexpected"; return
+            case .entry, .reply, .data, .fileEnd, .result, .cancel, .request, .progress:
+                // No transfer can exist yet: these refer to nothing. Ignore.
+                break
+            }
+        }
+    }
 
     private func handleClipboardSession(_ fd: Int32) {
         // Each 100 ms poll reads only the change count, on this thread. The

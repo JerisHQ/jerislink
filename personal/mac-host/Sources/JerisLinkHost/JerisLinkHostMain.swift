@@ -199,7 +199,8 @@ struct JerisLinkHostMain {
             let audio = AudioSelfTest.run()
             let display = await DisplayFollowerSelfTest.run()
             let video = VideoDiagSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && video == 0 ? 0 : 1)
+            let files = FileProtocolSelfTest.run()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && video == 0 && files == 0 ? 0 : 1)
         }
         // H.264 encode -> decode check on the hardware encoder at the capped
         // sizes. No screen capture, no network, no settings change.
