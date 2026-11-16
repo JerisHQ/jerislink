@@ -5520,7 +5520,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     overlayShow(true, "snapshot", 0);
     snapshotWindow(viewer, dir, L"overlay-open");
     const bool overlayShown = overlayVisible();
-    // Placement and translucency: top centre of the client area, a layered
+    // Placement and translucency: top centre, below the remote menu bar, a layered
     // window at ov::kSessionUiAlpha.
     bool overlayPlaced = false;
     BYTE overlayAlpha = 0;
@@ -5536,8 +5536,12 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         GetWindowRect(gOverlay, &o);
         const LONG gapL = o.left - c.left, gapR = c.right - o.right;
         const LONG topGap = o.top - c.top;
+        // Just below the remote menu bar for this stream and client size.
+        const int wantTop = ov::overlayTopOffset(c.right - c.left, c.bottom - c.top, gRemoteWidth,
+                                                 gRemoteHeight,
+                                                 ov::scale(ov::kMenuBarGap, overlayDpi()));
         overlayPlaced = gapL >= 0 && gapR >= 0 && std::abs(gapL - gapR) <= 1 &&
-                        topGap == ov::scale(16, overlayDpi());
+                        topGap == wantTop && topGap > ov::scale(ov::kMenuBarGap, overlayDpi());
         std::wcout << L"overlay_place=" << (overlayPlaced ? L"top-centre" : L"FAIL")
                    << L" gap_l=" << gapL << L" gap_r=" << gapR << L" top=" << topGap
                    << L" layered=" << layered
