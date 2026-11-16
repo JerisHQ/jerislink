@@ -183,8 +183,9 @@ inline Layout layoutFor(unsigned dpi) {
         }
         return c;
     };
-    l.copyPaste = card(x0, s(354));
-    l.sendTo = card(s(366), x1);
+    const int gap = s(12), cw = (x1 - x0 - gap) / 2;  // equal widths at every scale
+    l.copyPaste = card(x0, x0 + cw);
+    l.sendTo = card(x1 - cw, x1);
     l.tip = {x0, s(272), x1, s(306)};
     const int bw = s(110), bh = s(30);
     l.progress = {x0, s(314), x1 - bw - s(10), s(346)};
