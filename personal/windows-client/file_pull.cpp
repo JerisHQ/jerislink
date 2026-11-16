@@ -256,7 +256,9 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
         const size_t cut = item.rel.find(L'\\');
         const std::wstring top = cut == std::wstring::npos ? item.rel : item.rel.substr(0, cut);
         const std::wstring rest = cut == std::wstring::npos ? L"" : item.rel.substr(cut);
-        bool found = false;
+        // Counted once per item: the same file can be reached through two
+        // folder spellings (a short 8.3 path and its long name).
+        bool found = false, wrote = false, existed = false, failed = false;
         for (const auto& folder : folders) {
             for (const auto& name : topNames(top)) {
                 const std::wstring path = folder + L"\\" + name + rest;
@@ -267,12 +269,15 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
                 if (size != item.size || !sameOrLater(a.ftCreationTime, since)) continue;
                 found = true;
                 switch (writeInternetZone(path)) {
-                case ZoneWrite::Written: ++stats.written; break;
-                case ZoneWrite::Exists: ++stats.existed; break;
-                case ZoneWrite::Failed: ++stats.failed; break;
+                case ZoneWrite::Written: wrote = true; break;
+                case ZoneWrite::Exists: existed = true; break;
+                case ZoneWrite::Failed: failed = true; break;
                 }
             }
         }
+        if (wrote) ++stats.written;
+        else if (failed) ++stats.failed;
+        else if (existed) ++stats.existed;
         if (found) {
             done.insert(i);
             it = want.erase(it);
@@ -603,7 +608,8 @@ struct FileClipboard::Impl {
     }
 
     void delivered(uint32_t t, uint32_t index) {
-        if (!job || job->m.transfer != t || job->done.count(index)) return;
+        if (!job || job->m.transfer != t) return;
+        job->done.erase(index);   // the same copy pasted again somewhere else
         job->want.insert(index);
         job->misses = 0;
         SetTimer(hwnd, kMarkTimer, kMarkDelayMs, nullptr);

@@ -235,11 +235,33 @@ void endToEnd() {
     expect(readFile(p2) == files[2], "e2e: box*/inner.bin pasted as box_\\inner.bin with the right bytes");
     expect(readZoneId(p0) == 3, "e2e: report_.txt carries Zone.Identifier ZoneId=3");
     expect(readZoneId(p2) == 3, "e2e: box_\\inner.bin carries Zone.Identifier ZoneId=3");
+    // The same Mac copy pasted a second time, into another folder.
+    const std::wstring dir2 = tempDir(L"paste2");
+    clip.addSearchFolder(dir2);
+    obj = nullptr;
+    dt = nullptr;
+    if (SUCCEEDED(OleGetClipboard(&obj)) && obj && (dt = folderDropTarget(dir2)) != nullptr) {
+        POINTL pt{0, 0};
+        DWORD effect = DROPEFFECT_COPY;
+        dt->DragEnter(obj, MK_LBUTTON, pt, &effect);
+        effect = DROPEFFECT_COPY;
+        expect(SUCCEEDED(dt->Drop(obj, MK_LBUTTON, pt, &effect)), "e2e: a second paste of the same copy");
+    } else {
+        expect(false, "e2e: a second paste of the same copy");
+    }
+    if (dt) dt->Release();
+    if (obj) obj->Release();
+    const std::wstring q0 = dir2 + L"\\report_.txt";
+    const std::wstring q2 = dir2 + L"\\box_\\inner.bin";
+    for (int i = 0; i < 400 && (readZoneId(q0) != 3 || readZoneId(q2) != 3); ++i) pump(100);
+    expect(readZoneId(q2) == 3, "e2e: the second paste's folder file is marked too");
+    expect(readFile(q0) == files[0] && readZoneId(q0) == 3, "e2e: the second paste is marked too");
+
     const auto zs = clip.zoneStats();
     std::printf("  zone stats: written=%llu existed=%llu failed=%llu (existed>0 means the shell marked them itself)\n",
                 static_cast<unsigned long long>(zs.written), static_cast<unsigned long long>(zs.existed),
                 static_cast<unsigned long long>(zs.failed));
-    expect(zs.written + zs.existed == 2 && zs.failed == 0, "e2e: both files accounted for, none failed");
+    expect(zs.written == 4 && zs.failed == 0, "e2e: four delivered files marked once each, none failed");
     {
         std::lock_guard<std::mutex> lock(logMu);
         bool named = false;
