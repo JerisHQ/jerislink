@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <appmodel.h>
 #include <dwmapi.h>
 #include <iphlpapi.h>
 #include <mfapi.h>
@@ -34,6 +36,7 @@
 #include "ui_theme.hpp"
 #include "ui_overlay.hpp"
 #include "file_panel.hpp"
+#include "send_to_win.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
 
@@ -41,6 +44,7 @@
 #include <atomic>
 #include <bitset>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -375,6 +379,7 @@ static constexpr UINT WM_MR_WIN_SPACE = WM_APP + 44;
 static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
 static constexpr UINT WM_MR_FILE_PULL_NOTICE = WM_APP + 47;  // F3 r2, wParam = FileSession::PullNotice
+static constexpr UINT WM_MR_SEND_TO = WM_APP + 48;           // F5a, lParam = new std::shared_ptr<SendToRequest>
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -3195,6 +3200,23 @@ namespace fp = jl::filepanel;
 static fp::Keys gPanelKeys;
 static fp::Button gPanelHot = fp::Button::None;
 static fp::Last gLastUpload;  // this session's last Windows->Mac transfer
+
+// Card (2) of the Files panel: is "Send to > JerisLink" on this PC?
+static fp::SendToSetup gSendToSetup = fp::SendToSetup::NotInstalled;
+
+static fp::SendToSetup detectSendToSetup() {
+    UINT32 len = 0;
+    if (GetCurrentPackageFullName(&len, nullptr) != APPMODEL_ERROR_NO_PACKAGE) return fp::SendToSetup::StorePackage;
+    PWSTR dir = nullptr;
+    fp::SendToSetup s = fp::SendToSetup::NotInstalled;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SendTo, 0, nullptr, &dir)) && dir) {
+        const std::wstring lnk = std::wstring(dir) + L"\\JerisLink.lnk";
+        if (GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES) s = fp::SendToSetup::Installed;
+    }
+    if (dir) CoTaskMemFree(dir);
+    return s;
+}
+
 static constexpr UINT_PTR kFilePanelTimer = 2;
 
 static fp::Host currentHost() {
@@ -3259,7 +3281,6 @@ static void paintFilePanel(HWND hwnd) {
 
     overlayText(dc, utf8ToWide(fp::title()), toRECT(l.title), t.label, c::kText, DT_LEFT | DT_VCENTER);
     overlayText(dc, L"Esc to close", toRECT(l.title), t.smallText, c::kMuted, DT_RIGHT | DT_VCENTER);
-    overlayText(dc, utf8ToWide(fp::guideHeading()), toRECT(l.heading), t.label, a.accent, DT_LEFT | DT_VCENTER);
     const auto block = [&](const std::string& text, const ov::Rect& r, HFONT font, COLORREF color) {
         RECT rr = toRECT(r);
         HGDIOBJ old = SelectObject(dc, font);
@@ -3268,7 +3289,19 @@ static void paintFilePanel(HWND hwnd) {
         DrawTextW(dc, w.c_str(), -1, &rr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(dc, old);
     };
-    block(fp::guideBody(), l.guide, t.text, c::kText);
+    // Two cards side by side: (1) copy & paste, (2) right-click Send to.
+    const auto card = [&](const fp::Card& k, const char* heading, const std::vector<fp::CardRow>& rows) {
+        jl::ui::roundRect(dc, toRECT(k.box), ov::scale(8, dpi), c::kBody, c::kBorder, 1);
+        overlayText(dc, utf8ToWide(heading), toRECT(k.heading), t.label, a.accent, DT_LEFT | DT_VCENTER | DT_NOPREFIX);
+        for (size_t i = 0; i < rows.size() && i < 2; ++i) {
+            const COLORREF color = rows[i].muted ? c::kMuted : c::kText;
+            overlayText(dc, utf8ToWide(rows[i].label), toRECT(k.label[i]), t.label, color,
+                        DT_LEFT | DT_VCENTER | DT_NOPREFIX);
+            block(rows[i].text, k.text[i], t.smallText, color);
+        }
+    };
+    card(l.copyPaste, fp::guideHeading(), fp::copyPasteRows());
+    card(l.sendTo, fp::sendToHeading(), fp::sendToRows(gSendToSetup));
     block(fp::tipLine(s.host), l.tip, t.smallText, s.host == fp::Host::Full ? c::kMuted : c::kError);
 
     // Progress: the running upload (with Cancel), else a running Mac paste.
@@ -3369,6 +3402,8 @@ static void filePanelShow(const char* source) {
         if (!gFilePanel) return;
         SetTimer(gFilePanel, kFilePanelTimer, 250, nullptr);
     }
+    // Looked up each time: the installer may have run since the viewer started.
+    if (!gFileUiSample) gSendToSetup = detectSendToSetup();
     gPanelKeys.reset();
     gPanelHot = fp::Button::None;
     // Nothing goes to the Mac while it is open: lift what is held there now.
@@ -3387,7 +3422,10 @@ static void filePanelShow(const char* source) {
     case fp::Host::None: host = "none"; break;
     default: break;
     }
-    logLine(std::string("file.panel=shown source=") + source + " host=" + host);
+    logLine(std::string("file.panel=shown source=") + source + " host=" + host +
+            " send_to=" + (gSendToSetup == fp::SendToSetup::Installed      ? "installed"
+                           : gSendToSetup == fp::SendToSetup::StorePackage ? "store"
+                                                                           : "not_installed"));
 }
 
 static void filePanelToggle(const char* source) {
@@ -3441,6 +3479,94 @@ static void onFileDrop(HDROP drop) {
     }
     logLine("file.drop=started items=" + std::to_string(count));
     fileChipShow(ChipMode::Running, 0);
+}
+
+// ---- F5a: Explorer > Send to > JerisLink ----
+//
+// "Jerislink.exe --send-to <paths>" (send_to_win.cpp) hands the paths over
+// this viewer's named pipe. The pipe thread posts them here and waits
+// (bounded) for the answer; the send itself is a drop (purpose=send), so the
+// Mac needs nothing new. No file names are logged.
+
+namespace st = jl::sendto;
+
+struct SendToRequest {
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<std::wstring> items;
+    bool done = false;
+    bool abandoned = false;  // the pipe thread gave up waiting
+    st::Reply reply = st::Reply::Failed;
+};
+
+static st::Server gSendToServer;
+static std::atomic<HWND> gSendToHwnd{nullptr};
+static std::atomic<bool> gSendToStopping{false};
+
+// UI thread: the same checks and start as a drop.
+static st::Reply startSendTo(std::vector<std::wstring>&& items) {
+    const size_t n = items.size();
+    const bool busy = fileTransferRunning();
+    st::Reply r = st::decide(gFileSession != nullptr, currentHost(), busy, gFileSession && gFileSession->canSend());
+    if (r == st::Reply::Started &&
+        !gFileSession->startUpload(std::move(items), readFileTransferMaxMbps(), FileSession::Purpose::Send)) {
+        r = st::Reply::Failed;
+    }
+    logLine(std::string("file.send_to=") + st::name(r) + " items=" + std::to_string(n));
+    if (r == st::Reply::Started) fileChipShow(ChipMode::Running, 0);
+    return r;
+}
+
+static void onSendTo(LPARAM lParam) {
+    std::unique_ptr<std::shared_ptr<SendToRequest>> holder(reinterpret_cast<std::shared_ptr<SendToRequest>*>(lParam));
+    if (!holder || !*holder) return;
+    SendToRequest& req = **holder;
+    std::lock_guard<std::mutex> lock(req.m);
+    if (req.abandoned) {
+        logLine("file.send_to=late");  // the client was already told it failed: do not send
+        return;
+    }
+    req.reply = startSendTo(std::move(req.items));
+    req.done = true;
+    req.cv.notify_all();
+}
+
+// Pipe thread.
+static st::Reply sendToFromPipe(std::vector<std::wstring>&& items) {
+    const HWND w = gSendToHwnd.load();
+    if (!w || gSendToStopping.load()) return st::Reply::NotConnected;
+    auto req = std::make_shared<SendToRequest>();
+    req->items = std::move(items);
+    auto* holder = new std::shared_ptr<SendToRequest>(req);
+    if (!PostMessageW(w, WM_MR_SEND_TO, 0, reinterpret_cast<LPARAM>(holder))) {
+        delete holder;
+        return st::Reply::Failed;
+    }
+    std::unique_lock<std::mutex> lock(req->m);
+    for (int i = 0; i < 100 && !req->done && !gSendToStopping.load(); ++i) {  // about 5 s
+        req->cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
+    if (!req->done) {
+        req->abandoned = true;
+        return st::Reply::Failed;
+    }
+    return req->reply;
+}
+
+static void sendToServerStart(HWND hwnd) {
+    gSendToStopping = false;
+    gSendToHwnd = hwnd;
+    const std::wstring name = st::currentPipeName();
+    const bool ok = !name.empty() && gSendToServer.start(name, sendToFromPipe);
+    // Taken: another JerisLink viewer of this user already gets Send to.
+    logLine(std::string("file.send_to_pipe=") + (ok ? "listening" : "unavailable") +
+            " error=" + std::to_string(ok ? 0 : gSendToServer.error()));
+}
+
+static void sendToServerStop() {
+    gSendToStopping = true;
+    gSendToHwnd = nullptr;
+    gSendToServer.stop();
 }
 
 // A send (drop) ended: the chip says how, and Finder on the Mac shows it.
@@ -3611,6 +3737,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_MR_FILE_PULL_NOTICE:
         onFilePullNotice(wParam);
+        return 0;
+    case WM_MR_SEND_TO:
+        onSendTo(lParam);
         return 0;
     case WM_QUERYENDSESSION:
         // Logoff or shutdown: no confirm; cancel so the Mac cleans up.
@@ -3829,6 +3958,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_DESTROY:
         gWindowClosed = true;
+        sendToServerStop();
         if (gKeyboardHook) {
             UnhookWindowsHookEx(gKeyboardHook);
             gKeyboardHook = nullptr;
@@ -3893,6 +4023,8 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
     gRemoteCursorShape = 0;
     // F4: files dropped on the picture are sent to the Mac.
     DragAcceptFiles(hwnd, TRUE);
+    // F5a: Explorer Send to > JerisLink reaches this viewer over its pipe.
+    sendToServerStart(hwnd);
     gRemoteCursor = LoadCursorW(nullptr, IDC_ARROW);
     gKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, ViewerKeyboardHook, hi, 0);
     if (gKeyboardHook) logLine("keyboard_hook=installed");
@@ -6611,7 +6743,8 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     gOverlaySwallowUp.reset();
     std::wcout << L"file_ui chip=" << (gFileChip != nullptr) << L" confirm_shown=" << confirmShown
                << L" esc_keeps=" << confirmKept << L"\n";
-    // F4 Files panel: the guide, the sample upload with Cancel, Open folder.
+    // F4/F5a Files panel: both cards, the sample upload with Cancel, Open folder.
+    gSendToSetup = fp::SendToSetup::Installed;
     overlayActivate(ov::Item::Files, "snapshot");
     const bool panelShown = filePanelVisible();
     snapshotWindow(viewer, dir, L"file-panel");
@@ -6621,8 +6754,77 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     const bool panelClosed = !filePanelVisible() && IsWindow(viewer) && !gWindowClosed;
     gOverlaySwallowUp.reset();
     std::wcout << L"file_panel shown=" << panelShown << L" esc_closes=" << panelClosed << L"\n";
+    // Card (2) without the Send to shortcut, and in the Store build.
+    for (const auto& [setup, shot] : {std::pair{fp::SendToSetup::NotInstalled, L"file-panel-sendto-missing"},
+                                      std::pair{fp::SendToSetup::StorePackage, L"file-panel-sendto-store"}}) {
+        gSendToSetup = setup;
+        overlayActivate(ov::Item::Files, "snapshot");
+        snapshotWindow(viewer, dir, shot);
+        filePanelKey(VK_ESCAPE, 0);
+        gOverlaySwallowUp.reset();
+    }
+    // Every card text fits its box in the real fonts (no clipped line).
+    bool panelTextFits = gFilePanel != nullptr && gOverlayTheme.text != nullptr;
+    if (panelTextFits) {
+        HDC pdc = GetDC(gFilePanel);
+        const fp::Layout pl = fp::layoutFor(fileUiDpi());
+        const auto fits = [&](const std::string& text, const ov::Rect& r, HFONT font, bool wrap, const char* what) {
+            HGDIOBJ old = SelectObject(pdc, font);
+            RECT rr{0, 0, r.width(), 0};
+            const std::wstring w = utf8ToWide(text);
+            DrawTextW(pdc, w.c_str(), -1, &rr,
+                      DT_CALCRECT | DT_NOPREFIX | DT_LEFT | (wrap ? DT_WORDBREAK : DT_SINGLELINE));
+            SelectObject(pdc, old);
+            const bool ok = rr.right <= r.width() && rr.bottom <= r.height();
+            std::wcout << L"panel_text " << what << L" w=" << rr.right << L"/" << r.width() << L" h=" << rr.bottom
+                       << L"/" << r.height() << L" ok=" << ok << L"\n";
+            if (!ok) panelTextFits = false;
+        };
+        const auto cardFits = [&](const fp::Card& k, const char* heading, const std::vector<fp::CardRow>& rows,
+                                  const char* what) {
+            fits(heading, k.heading, gOverlayTheme.label, false, what);
+            for (size_t i = 0; i < rows.size() && i < 2; ++i) {
+                fits(rows[i].label, k.label[i], gOverlayTheme.label, false, what);
+                fits(rows[i].text, k.text[i], gOverlayTheme.smallText, true, what);
+            }
+        };
+        cardFits(pl.copyPaste, fp::guideHeading(), fp::copyPasteRows(), "card1");
+        cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::Installed), "card2_installed");
+        cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::NotInstalled), "card2_missing");
+        cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::StorePackage), "card2_store");
+        for (fp::Host h : {fp::Host::Full, fp::Host::PasteOnly, fp::Host::None, fp::Host::Unknown}) {
+            fits(fp::tipLine(h), pl.tip, gOverlayTheme.smallText, true, "tip");
+        }
+        ReleaseDC(gFilePanel, pdc);
+    }
+    std::wcout << L"file_panel text_fits=" << panelTextFits << L"\n";
     fileChipHide();
     gFileUiSample = false;
+
+    // F5a: the viewer's Send to pipe, end to end through the real handler.
+    // There is no Mac session here, so the answer must be "not connected".
+    bool sendToPipeOk = false;
+    {
+        const std::wstring pipe = jl::sendto::currentPipeName();
+        jl::sendto::Server second;
+        const bool secondRefused = !second.start(pipe, [](std::vector<std::wstring>&&) {
+            return jl::sendto::Reply::Started;
+        });
+        std::atomic<int> answer{-1};
+        std::thread client([&] {
+            answer = static_cast<int>(jl::sendto::sendItems(pipe, {L"C:\\Windows\\win.ini"}, 8000));
+        });
+        const double until = steadyMsNow() + 9000.0;
+        while (answer.load() < 0 && steadyMsNow() < until) pumpFor(20);
+        client.join();
+        const auto empty = jl::sendto::sendItems(pipe, {}, 2000);
+        sendToPipeOk = gSendToServer.running() && secondRefused &&
+                       answer.load() == static_cast<int>(jl::sendto::Reply::NotConnected) &&
+                       empty == jl::sendto::Reply::NothingSelected;
+        std::wcout << L"send_to pipe_listening=" << gSendToServer.running() << L" second_refused=" << secondRefused
+                   << L" answer=" << answer.load() << L" empty=" << static_cast<int>(empty) << L" ok=" << sendToPipeOk
+                   << L"\n";
+    }
 
     // Every in-session action, timed, with modal loops counted.
     std::thread watchdog(snapshotWatchdog);
@@ -6755,6 +6957,8 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     if (!codeTabBlocks || !launchError) return 11;
     if (!accentSaved) return 12;
     if (!keymapLive || !keymapBack) return 13;
+    if (!panelTextFits) return 14;
+    if (!sendToPipeOk) return 15;
     return 0;
 }
 #endif
@@ -6762,6 +6966,15 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* wideArgv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    // F5a: Explorer's Send to > JerisLink. No window, no log, no settings:
+    // hand the paths (kept wide) to the running viewer and exit.
+    if (wideArgv && argc >= 2) {
+        const auto sendTo = jl::sendto::parseArgs(std::vector<std::wstring>(wideArgv, wideArgv + argc));
+        if (sendTo.sendTo) {
+            LocalFree(wideArgv);
+            return jl::sendto::runSendTo(sendTo.items);
+        }
+    }
 #ifdef JERISLINK_UI_SNAPSHOT
     if (wideArgv && argc >= 2) {
         const std::wstring dir = wideArgv[1];

@@ -87,6 +87,18 @@ Jerislink.exe --codec h264 --bitrate-mbps 25
 Jerislink.exe --codec hevc --bitrate-mbps 18
 Jerislink.exe --codec auto --bitrate-mbps 0
 
+Send to JerisLink (Windows -> Mac)
+----------------------------------
+The installer adds JerisLink to Explorer's Send to menu. While JerisLink is
+connected to your Mac, select files or folders in Explorer, right-click, and
+pick Send to > JerisLink (Windows 11: Show more options first). They go to
+Downloads/JerisLink on the Mac, the same as dragging them onto the viewer.
+At most 1,000 items at a time. Uninstalling JerisLink removes the entry.
+
+Not connected: a dialog says so and nothing is sent. The Microsoft Store
+version and the bare Jerislink.exe have no Send to entry yet: drag files onto
+the viewer instead.
+
 Logs
 ----
 %TEMP%\jerislink-viewer.log

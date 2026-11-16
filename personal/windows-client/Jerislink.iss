@@ -45,6 +45,10 @@ Source: "..\third_party\opus\COPYING"; DestDir: "{app}"; DestName: "COPYING-opus
 [Icons]
 Name: "{autoprograms}\Jerislink"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\Jerislink"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; F5a: Explorer > right-click > Send to > JerisLink sends the selected items to the
+; connected Mac (~/Downloads/JerisLink). The viewer looks for exactly this file name.
+; Uninstall removes it.
+Name: "{sendto}\JerisLink"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--send-to"; Comment: "Send to the Mac connected in JerisLink"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
