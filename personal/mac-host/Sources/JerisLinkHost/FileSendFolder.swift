@@ -129,7 +129,10 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
         let recent = last
         lock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            done?(revealNow(transfer: transfer, known: known, recent: recent))
+            // Not `done?(revealNow(...))`: optional chaining would skip the
+            // reveal itself when no callback is given.
+            let opened = revealNow(transfer: transfer, known: known, recent: recent)
+            done?(opened)
         }
     }
 
