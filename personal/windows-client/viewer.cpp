@@ -19,6 +19,7 @@
 #include "control_channel.hpp"
 #include <cstdlib>
 #include "clipboard_channel.hpp"
+#include "file_session.hpp"
 #include "hardware_video_pipeline.hpp"
 #include "resource.h"
 #include "viewer_options.hpp"
@@ -4411,6 +4412,7 @@ static int appMain(int argc, char** argv) {
 
         std::unique_ptr<ControlChannel> control;
         std::unique_ptr<ClipboardChannel> clipboard;
+        std::unique_ptr<FileSession> fileSession;
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
         // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
         std::unique_ptr<jl::audio::AudioPlayer> audio;
@@ -4516,6 +4518,11 @@ static int appMain(int argc, char** argv) {
                 [](const std::string& message) { logLine(message); });
             clipboard->start();
             logLine("clipboard.enabled mode=unicode-text max_bytes=61440");
+            // File transfer (F1): capability probe on its own TCP connection.
+            fileSession = std::make_unique<FileSession>(
+                o.bindIp, o.sourceIp, o.controlPort,
+                [](const std::string& message) { logLine(message); });
+            fileSession->start();
         } else {
             gControl = nullptr;
             gMouseMoveUdp = nullptr;
@@ -5194,6 +5201,8 @@ static int appMain(int argc, char** argv) {
                 << " clipboard_rx=" << (clipboard ? clipboard->received() : 0)
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
                 << " clipboard_oversize=" << (clipboard ? clipboard->skippedOversize() : 0)
+                << " file_cap=" << (fileSession ? (fileSession->capability() == FileSession::Capability::Yes ? "yes" : fileSession->capability() == FileSession::Capability::No ? "no" : "unknown") : "off")
+                << " file_sessions=" << (fileSession ? fileSession->sessions() : 0)
                 << " audio=" << (audio ? "on" : "off")
                 << " audio_codec=" << jl::audio::codecName(audioStats.jb.codec)
                 << " audio_bitrate_kbps=" << (audioStats.jb.framesPlayed + audioStats.jb.framesSilence > 0
@@ -5236,10 +5245,12 @@ static int appMain(int argc, char** argv) {
         // control channel is released. Video/keyboard/mouse paths remain
         // independent from this second TCP session.
         if (clipboard) clipboard->stop();
+        if (fileSession) fileSession->stop();
 
         // Release Media Foundation / D3D objects before MFShutdown/CoUninitialize.
         video.reset();
         clipboard.reset();
+        fileSession.reset();
         mouseMoveUdp.reset();
         control.reset();
 

@@ -141,6 +141,7 @@ enum ControlServiceSelfTest {
         failures += clipboardPollReadsOnlyChangeCount(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
+        failures += fileSessions(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -502,6 +503,83 @@ enum ControlServiceSelfTest {
         spinMain(until: { done.wait(timeout: .now()) == .success }, seconds: 5)
         expect(box.afterCounts == before, "main hops: 100 change-count reads off the main thread make 0 hops")
         expect(box.afterRead == before + 1, "main hops: one content read off the main thread makes 1 hop")
+        return 0
+    }
+
+    /// F1 file sessions on the real listeners: the direct listener answers
+    /// FILE_HELLO, echoes PING and refuses requests; malformed input, a late
+    /// HELLO and the loopback relay get no answer. No file session is an
+    /// input session.
+    private static func fileSessions(_ expect: (Bool, String) -> Void) -> Int {
+        guard let fake = FakeInputHelper.start() else { expect(false, "file e2e: fake input helper listens"); return 0 }
+        defer { fake.stop() }
+        guard let directPort = freeLoopbackPort(), let relayPort = freeLoopbackPort(), directPort != relayPort else {
+            expect(false, "file e2e: free loopback ports"); return 0
+        }
+        let started = DispatchSemaphore(value: 0)
+        let result = StartResult()
+        Thread.detachNewThread {
+            do {
+                result.servers = try ControlService.startServers(bindIP: ListenConfig.loopbackIP, clientIP: ListenConfig.loopbackIP,
+                                                                 port: directPort, relayPort: relayPort, inject: true,
+                                                                 helper: InputHelperClient(port: fake.port))
+            } catch {
+                result.error = error
+            }
+            started.signal()
+        }
+        guard started.wait(timeout: .now() + 10) == .success, result.error == nil, result.servers.count == 2 else {
+            expect(false, "file e2e: listeners start"); return 0
+        }
+        let servers = result.servers
+        defer { servers.forEach { $0.stop() } }
+
+        guard let file = MRC1Client(port: directPort) else { expect(false, "file e2e: viewer connects"); return 0 }
+        _ = file.send(type: 0x50, payload: [1, 0, 0])                // FILE_HELLO proto 1, caps 0
+        if let ack = file.receive(timeout: 3), ack.type == 0x51,
+           case let .helloAck(proto, caps, maxChunk, maxTotal)? = FileProto.decode(type: ack.type, payload: ack.payload) {
+            expect(proto == 1 && caps == 0 && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
+                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=0 chunk=32K total=20G")
+        } else {
+            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=0 chunk=32K total=20G")
+        }
+        _ = file.send(type: 0x5B, payload: [9, 8, 7, 6])
+        let pong = file.receive(timeout: 3)
+        expect(pong?.type == 0x5B && pong?.payload == [9, 8, 7, 6], "file e2e: PING echoed with its token")
+        _ = file.send(type: 0x52, payload: FileProto.Message.offer(transfer: 42, purpose: FileProto.Purpose.send,
+                                                                    entries: 1, total: 10).encode()!)
+        let rej = file.receive(timeout: 3)
+        expect(rej?.type == 0x54 && rej?.payload == [0, 0, 0, 42, FileProto.Status.denied], "file e2e: OFFER refused with REJECT denied")
+        _ = file.send(type: 0x5C, payload: [0, 0, 0, 43])
+        let rev = file.receive(timeout: 3)
+        expect(rev?.type == 0x54 && rev?.payload == [0, 0, 0, 43, FileProto.Status.denied], "file e2e: REVEAL refused with REJECT denied")
+        _ = file.send(type: 0x10, payload: [1, 0, 65])               // a KEY inside a file session
+        expect(file.receive(timeout: 3) == nil, "file e2e: non-file message closes the file session")
+        file.close()
+
+        let badHello = MRC1Client(port: directPort)
+        _ = badHello?.send(type: 0x50, payload: [1, 0])              // 2 bytes: malformed
+        expect(badHello != nil && badHello?.receive(timeout: 2) == nil, "file e2e: malformed HELLO gets no ACK and is closed")
+        badHello?.close()
+
+        let late = MRC1Client(port: directPort)
+        _ = late?.send(type: 0x01, payload: [1, 2, 3, 4])            // PING first, then HELLO
+        _ = late?.send(type: 0x50, payload: [1, 0, 0])
+        let latePong = late?.receive(timeout: 2)
+        expect(latePong?.type == 0x02 && late?.receive(timeout: 2) == nil, "file e2e: HELLO after another message is refused")
+        late?.close()
+
+        let relay = MRC1Client(port: relayPort)
+        _ = relay?.send(type: 0x50, payload: [1, 0, 0])
+        expect(relay != nil && relay?.receive(timeout: 2) == nil, "file e2e: loopback relay refuses FILE_HELLO")
+        relay?.close()
+
+        usleep(300_000)
+        expect(fake.count(type: InputHelperClient.sessionStartType) == 0 && fake.snapshot().isEmpty,
+               "file e2e: file sessions start no input session and inject nothing")
+        let stats = servers[0].statsLine()
+        expect(stats.contains("file_sessions=1 file_refused=2"), "file e2e: direct stats count 1 session, 2 refused (\(stats))")
+        expect(servers[1].statsLine().contains("file_sessions=0 file_refused=1"), "file e2e: relay stats count 1 refused")
         return 0
     }
 

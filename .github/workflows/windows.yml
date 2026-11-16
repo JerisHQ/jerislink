@@ -96,6 +96,14 @@ jobs:
         run: cmake --build build --config Release --target JerislinkKeymapTest
       - name: Keymap golden test (Mac and Windows presets, Ctrl+A/C/V/X/Z/S/F, Ctrl+Y redo, Win+C / Win+Space, Alt+Tab, viewer hotkeys, focus-loss release, live preset switch)
         run: build\Release\JerislinkKeymapTest.exe
+      - name: Build file wire codec test
+        run: cmake --build build --config Release --target JerislinkFileProtoTest
+      - name: Build received-path safety test
+        run: cmake --build build --config Release --target JerislinkFilePathTest
+      - name: File wire codec test (0x50-0x5C round trip, strict lengths, byte layout shared with the Mac host)
+        run: build\Release\JerislinkFileProtoTest.exe
+      - name: Received-path safety test (traversal, absolute, drive, reserved names and chars, NFC, length and depth limits, clash names)
+        run: build\Release\JerislinkFilePathTest.exe
       - name: No always-on shortcut or key log lines in the viewer
         shell: pwsh
         run: |
