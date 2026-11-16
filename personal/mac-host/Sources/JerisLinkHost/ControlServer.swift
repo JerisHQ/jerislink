@@ -60,6 +60,8 @@ final class ControlServer: @unchecked Sendable {
     private let allowFileSessions: Bool
     /// Where paste uploads are staged (a temp folder in the self-test).
     private let fileStagingRoot: URL
+    /// Where drops land and what REVEAL opens (a temp folder in the self-test).
+    private let fileSendFolder: FileSendFolder
     private static let maxClipboardBytes = 60 * 1024
     /// Pasteboard access for clipboard sessions (a fake in the self-test).
     private let clipboard: ClipboardBackend
@@ -74,6 +76,7 @@ final class ControlServer: @unchecked Sendable {
          announceInputSessions: Bool = true,
          allowFileSessions: Bool = false,
          fileStagingRoot: URL = FileUploadReceiver.defaultRoot,
+         fileSendFolder: FileSendFolder = .shared,
          clipboard: ClipboardBackend = SystemClipboard.shared,
          inputSources: InputSourceCache = .shared) {
         self.bindIP = bindIP
@@ -82,6 +85,7 @@ final class ControlServer: @unchecked Sendable {
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
         self.fileStagingRoot = fileStagingRoot
+        self.fileSendFolder = fileSendFolder
         self.inputHelper = inputHelper
         self.acceptProxy = acceptProxy
         self.allowedClientIP = allowedClientIP
@@ -405,8 +409,9 @@ final class ControlServer: @unchecked Sendable {
     }
 
     /// A file session: HELLO_ACK with this build's caps, PING echo, paste
-    /// uploads through `FileUploadReceiver` (F2), and REJECT `denied` for
-    /// every other request until F4-F5 implement them. A viewer whose HELLO
+    /// and send uploads through `FileUploadReceiver` (F2, F4), REVEAL (F4,
+    /// no reply), and REJECT `denied` for every other request until F5
+    /// implements them. A viewer whose HELLO
     /// carries caps `announce` gets Finder copies announced on this session
     /// and pulls their bytes with REQUEST (F3, `FileAnnouncer`); the
     /// pasteboard is checked on each 100 ms poll by its change count only. Any malformed or
@@ -416,7 +421,7 @@ final class ControlServer: @unchecked Sendable {
     /// carry no file names (D15): only open/closed and counts.
     private func handleFileSession(_ fd: Int32, peerCaps: UInt16) {
         fileSessions += 1
-        let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard)
+        let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard, sendFolder: fileSendFolder)
         let announcer: FileAnnouncer? = (peerCaps & FileProto.Caps.announce) != 0 ? FileAnnouncer() : nil
         // A copy made before the session opened is not announced: the viewer
         // connecting must not replace what the Windows clipboard holds.
@@ -511,7 +516,8 @@ final class ControlServer: @unchecked Sendable {
                 // The viewer dropped the announce (cleared, or names Windows
                 // cannot take).
                 announcer?.cancel(t)
-            case .offer(_, FileProto.Purpose.paste, _, _), .entry, .data, .fileEnd, .cancel:
+            case .offer(_, FileProto.Purpose.paste, _, _), .offer(_, FileProto.Purpose.send, _, _),
+                 .entry, .data, .fileEnd, .cancel:
                 let step = receiver.handle(msg)
                 for out in step.send {
                     guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else {
@@ -519,7 +525,10 @@ final class ControlServer: @unchecked Sendable {
                     }
                 }
                 if let why = step.close { reason = why; return }
-            case .offer(let transfer, _, _, _), .reveal(let transfer):
+            case .reveal(let transfer):
+                // F4: Finder opens the folder that send went to. No reply.
+                receiver.reveal(transfer)
+            case .offer(let transfer, _, _, _):
                 refused += 1
                 let reply = FileProto.Message.reply(transfer: transfer, status: FileProto.Status.denied)
                 guard let bytes = reply.encode(), sendPacket(fd, type: reply.type, payload: bytes) else {

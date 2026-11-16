@@ -33,6 +33,7 @@
 #include "audio_player.hpp"
 #include "ui_theme.hpp"
 #include "ui_overlay.hpp"
+#include "file_panel.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
 
@@ -560,13 +561,15 @@ static FileSession* gFilePullSession = nullptr;  // F3 Mac->Windows paste, same 
 static jl::fileup::PasteGate gPasteGate;
 static HWND gFileConfirm = nullptr;
 static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileConfirm); }
+static HWND gFilePanel = nullptr;  // F4 Files panel
+static bool filePanelVisible() { return gFilePanel && IsWindowVisible(gFilePanel); }
 static bool pasteEligible();
 static void startPasteUpload();
 
 static bool viewerHasInteractiveFocus(HWND hwnd) {
     if (!hwnd) return false;
-    // The disconnect confirm owns keys and mouse while it is open.
-    if (fileConfirmVisible()) return false;
+    // The disconnect confirm and the Files panel own keys and mouse while open.
+    if (fileConfirmVisible() || filePanelVisible()) return false;
     return gViewerFocused || GetFocus() == hwnd || GetForegroundWindow() == hwnd;
 }
 
@@ -2138,6 +2141,7 @@ static const char* overlayItemName(ov::Item item) {
     case ov::Item::Volume: return "volume";
     case ov::Item::Info: return "info";
     case ov::Item::Settings: return "settings";
+    case ov::Item::Files: return "files";
     case ov::Item::Disconnect: return "disconnect";
     default: return "none";
     }
@@ -2222,6 +2226,8 @@ static void requestDisconnect(const char* source) {
     disconnectNow(source);
 }
 
+static void filePanelToggle(const char* source);  // F4, below
+
 static void overlayActivate(ov::Item item, const char* source) {
     logLine(std::string("overlay.action item=") + overlayItemName(item) + " source=" + source);
     switch (item) {
@@ -2240,6 +2246,10 @@ static void overlayActivate(ov::Item item, const char* source) {
         overlayHide("action");
         logLine("video.settings.command source=overlay");
         showVideoSettings(gViewerHwnd);
+        break;
+    case ov::Item::Files:
+        overlayHide("action");
+        filePanelToggle(source);
         break;
     case ov::Item::Disconnect:
         requestDisconnect("overlay");
@@ -2483,6 +2493,7 @@ static void paintOverlay(HWND hwnd) {
 
     overlayButton(dc, toRECT(l.info), L"Info", ov::Item::Info, c::kText, dpi);
     overlayButton(dc, toRECT(l.settings), L"Settings", ov::Item::Settings, c::kText, dpi);
+    overlayButton(dc, toRECT(l.files), L"Files", ov::Item::Files, c::kText, dpi);
     overlayButton(dc, toRECT(l.disconnect), L"Disconnect", ov::Item::Disconnect, c::kError, dpi);
 
     if (gOverlayKeyboard) {
@@ -2492,6 +2503,7 @@ static void paintOverlay(HWND hwnd) {
         case ov::Item::Volume: f = RECT{vl.left - s(4), vl.top, sl.right + s(2), sl.bottom}; break;
         case ov::Item::Info: f = toRECT(l.info); break;
         case ov::Item::Settings: f = toRECT(l.settings); break;
+        case ov::Item::Files: f = toRECT(l.files); break;
         case ov::Item::Disconnect: f = toRECT(l.disconnect); break;
         default: break;
         }
@@ -2781,6 +2793,8 @@ static bool fileChipFloats() {
     return IsIconic(gViewerHwnd) || GetForegroundWindow() != gViewerHwnd;
 }
 
+static void filePanelPlace();  // F4, below
+
 static void fileUiReposition() {
     if (!gViewerHwnd) return;
     const UINT dpi = fileUiDpi();
@@ -2806,6 +2820,7 @@ static void fileUiReposition() {
                          l.height, SWP_NOACTIVATE);
         }
     }
+    filePanelPlace();
     if (gFileConfirm) {
         const int w = ov::scale(460, dpi), h = ov::scale(200, dpi);
         SetWindowPos(gFileConfirm, HWND_TOP, c.left + (cw - w) / 2, c.top + (ch - h) / 2, w, h, SWP_NOACTIVATE);
@@ -2896,6 +2911,8 @@ static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (gChipMode == ChipMode::Running && PtInRect(&l.cancel, pt) && gFileSession) {
             gFileSession->cancelUpload();
             logLine("file.upload_cancel source=chip");
+        } else if (gChipMode == ChipMode::Running && PtInRect(&l.text, pt)) {
+            filePanelToggle("chip");  // F4: the chip opens the Files panel
         }
         return 0;
     }
@@ -3162,9 +3179,294 @@ static void fileConfirmKey(WPARAM vk, LPARAM lParam) {
     fileConfirmChoose(action);
 }
 
+// ---- F4 Files panel and drop ----
+//
+// The overlay's Files button opens a small panel (non-activating popup like
+// the chip): how copy & paste works, the running transfer with Cancel, and
+// the last transfer with Open folder (REVEAL). It owns keys and clicks while
+// open (nothing goes to the Mac); Esc, a click outside or Files again closes
+// it. Files dropped on the viewer are sent to the Mac (purpose=send) when
+// the host has caps reveal. Texts and layout: file_panel.hpp.
+
+namespace fp = jl::filepanel;
+
+static fp::Keys gPanelKeys;
+static fp::Button gPanelHot = fp::Button::None;
+static fp::Last gLastUpload;  // this session's last Windows->Mac transfer
+static constexpr UINT_PTR kFilePanelTimer = 2;
+
+static fp::Host currentHost() {
+    if (!gFileSession) return fp::Host::None;
+    const auto cap = gFileSession->capability();
+    return fp::hostFromCaps(cap != FileSession::Capability::Unknown, cap == FileSession::Capability::Yes,
+                            gFileSession->hostCaps());
+}
+
+static fp::State panelState() {
+    fp::State s;
+    s.host = gFileUiSample ? fp::Host::Full : currentHost();
+    s.uploadRunning = gFileUiSample || (gFileSession && gFileSession->uploadRunning());
+    s.pullRunning = gFilePullSession && gFilePullSession->pullRunning();
+    s.last = gFileUiSample ? fp::lastFrom(2, true, 0, 3) : gLastUpload;
+    return s;
+}
+
+static void filePanelPlace() {
+    if (!gFilePanel || !gViewerHwnd) return;
+    const UINT dpi = fileUiDpi();
+    const fp::Layout l = fp::layoutFor(dpi);
+    RECT c{};
+    GetClientRect(gViewerHwnd, &c);
+    const int cw = c.right - c.left, ch = c.bottom - c.top;
+    MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
+    const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+    SetWindowPos(gFilePanel, HWND_TOP, c.left + (cw - l.width) / 2, c.top + top, l.width, l.height, SWP_NOACTIVATE);
+}
+
+static void panelButton(HDC dc, const RECT& r, const wchar_t* text, bool hot, bool focus, UINT dpi) {
+    namespace c = jl::ui::color;
+    jl::ui::roundRect(dc, r, ov::scale(8, dpi), hot ? c::kSecondaryDown : c::kSecondary, c::kBorder, 1);
+    overlayText(dc, text, r, gOverlayTheme.text, c::kText, DT_CENTER | DT_VCENTER);
+    if (focus) overlayFocusFrame(dc, r, dpi);
+}
+
+static void paintFilePanel(HWND hwnd) {
+    namespace c = jl::ui::color;
+    PAINTSTRUCT ps{};
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max<LONG>(1, client.right), std::max<LONG>(1, client.bottom));
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    const UINT dpi = fileUiDpi();
+    if (gOverlayThemeDpi != dpi || !gOverlayTheme.text) {
+        gOverlayTheme.build(hwnd, 9);
+        gOverlayThemeDpi = dpi;
+    }
+    const auto& t = gOverlayTheme;
+    const auto& a = jl::ui::accent();
+    const fp::Layout l = fp::layoutFor(dpi);
+    const fp::State s = panelState();
+    SetBkMode(dc, TRANSPARENT);
+    jl::ui::fillRect(dc, client, c::kBody);
+    jl::ui::roundRect(dc, client, ov::scale(12, dpi), c::kBody, c::kBorder, 1);
+
+    overlayText(dc, utf8ToWide(fp::title()), toRECT(l.title), t.label, c::kText, DT_LEFT | DT_VCENTER);
+    overlayText(dc, L"Esc to close", toRECT(l.title), t.smallText, c::kMuted, DT_RIGHT | DT_VCENTER);
+    overlayText(dc, utf8ToWide(fp::guideHeading()), toRECT(l.heading), t.label, a.accent, DT_LEFT | DT_VCENTER);
+    const auto block = [&](const std::string& text, const ov::Rect& r, HFONT font, COLORREF color) {
+        RECT rr = toRECT(r);
+        HGDIOBJ old = SelectObject(dc, font);
+        SetTextColor(dc, color);
+        const std::wstring w = utf8ToWide(text);
+        DrawTextW(dc, w.c_str(), -1, &rr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+    };
+    block(fp::guideBody(), l.guide, t.text, c::kText);
+    block(fp::tipLine(s.host), l.tip, t.smallText, s.host == fp::Host::Full ? c::kMuted : c::kError);
+
+    // Progress: the running upload (with Cancel), else a running Mac paste.
+    std::string progress = "No transfer running";
+    COLORREF progressColor = c::kMuted;
+    if (s.uploadRunning) {
+        const auto p = currentUpload();
+        progress = fu::chipText(p.files, p.committed, p.total, p.bytesPerSec);
+        progressColor = c::kText;
+    } else if (s.pullRunning) {
+        const auto q = gFilePullSession->pullProgress();
+        progress = "Pasting into this PC: " + fu::formatPair(q.received, q.total);
+        progressColor = c::kText;
+    }
+    overlayText(dc, utf8ToWide(progress), toRECT(l.progress), t.label, progressColor, DT_LEFT | DT_VCENTER);
+    const fp::Button focus = gPanelKeys.focus(s);
+    for (fp::Button b : fp::buttons(s)) {
+        if (b == fp::Button::Cancel)
+            panelButton(dc, toRECT(l.cancel), L"Cancel", gPanelHot == b, focus == b, dpi);
+        if (b == fp::Button::OpenFolder)
+            panelButton(dc, toRECT(l.openFolder), L"Open folder", gPanelHot == b, focus == b, dpi);
+    }
+    const std::string last = fp::lastLine(s.last);
+    const bool lastBad = s.last.kind == fp::LastKind::Failed || s.last.kind == fp::LastKind::MacPermission;
+    overlayText(dc, utf8ToWide(last.empty() ? "Nothing sent from this PC yet" : last), toRECT(l.last), t.label,
+                last.empty() ? c::kMuted : (lastBad ? c::kError : c::kText), DT_LEFT | DT_VCENTER);
+
+    BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static void filePanelHide(const char* source) {
+    if (!filePanelVisible()) return;
+    ShowWindow(gFilePanel, SW_HIDE);
+    gPanelHot = fp::Button::None;
+    logLine(std::string("file.panel=closed source=") + source);
+}
+
+static void filePanelPress(fp::Button b, const char* source) {
+    if (b == fp::Button::Cancel && gFileSession && gFileSession->uploadRunning()) {
+        gFileSession->cancelUpload();
+        logLine(std::string("file.upload_cancel source=panel_") + source);
+    } else if (b == fp::Button::OpenFolder && gFileSession) {
+        const bool sent = gFileSession->requestReveal();
+        logLine(std::string("file.reveal_request=") + (sent ? "sent" : "unavailable") + " source=" + source);
+    }
+    if (gFilePanel) InvalidateRect(gFilePanel, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK FilePanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const POINT pt{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;  // keys keep going to the viewer, which routes them here
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paintFilePanel(hwnd);
+        return 0;
+    case WM_TIMER:
+        if (wParam == kFilePanelTimer && IsWindowVisible(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEMOVE: {
+        const fp::Button h = fp::hit(fp::layoutFor(fileUiDpi()), panelState(), pt.x, pt.y);
+        if (h != gPanelHot) {
+            gPanelHot = h;
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        gPanelHot = fp::Button::None;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        const fp::Button h = fp::hit(fp::layoutFor(fileUiDpi()), panelState(), pt.x, pt.y);
+        if (h != fp::Button::None) filePanelPress(h, "mouse");
+        return 0;
+    }
+    case WM_DESTROY:
+        KillTimer(hwnd, kFilePanelTimer);
+        if (gFilePanel == hwnd) gFilePanel = nullptr;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void filePanelShow(const char* source) {
+    if (!gFilePanel) {
+        gFilePanel = createFilePopup(L"JerislinkFilePanel", FilePanelWndProc, L"JerisLink files");
+        if (!gFilePanel) return;
+        SetTimer(gFilePanel, kFilePanelTimer, 250, nullptr);
+    }
+    gPanelKeys.reset();
+    gPanelHot = fp::Button::None;
+    // Nothing goes to the Mac while it is open: lift what is held there now.
+    gHookFilter.reset();
+    gKeys.reset();
+    releaseRemoteButtons("file_panel");
+    releaseRemoteModifiers();
+    if (GetCapture() == gViewerHwnd) ReleaseCapture();
+    filePanelPlace();
+    ShowWindow(gFilePanel, SW_SHOWNOACTIVATE);
+    InvalidateRect(gFilePanel, nullptr, FALSE);
+    const char* host = "unknown";
+    switch (currentHost()) {
+    case fp::Host::Full: host = "full"; break;
+    case fp::Host::PasteOnly: host = "paste_only"; break;
+    case fp::Host::None: host = "none"; break;
+    default: break;
+    }
+    logLine(std::string("file.panel=shown source=") + source + " host=" + host);
+}
+
+static void filePanelToggle(const char* source) {
+    if (filePanelVisible()) filePanelHide(source);
+    else filePanelShow(source);
+}
+
+// WM_KEYDOWN / WM_SYSKEYDOWN while the panel is open. Every key stays here.
+static void filePanelKey(WPARAM vk, LPARAM lParam) {
+    if (vk < 256) gOverlaySwallowUp.set(static_cast<size_t>(vk));
+    if ((lParam & (1LL << 30)) != 0) return;  // auto-repeat
+    const auto r = gPanelKeys.key(static_cast<uint32_t>(vk), panelState(), (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+    if (r.action == fp::Keys::Action::Close) filePanelHide("key");
+    else if (r.action == fp::Keys::Action::Press) filePanelPress(r.button, "key");
+    else if (gFilePanel) InvalidateRect(gFilePanel, nullptr, FALSE);
+}
+
+static void fileChipNotice(const std::string& text, bool error, double ms) {
+    gChipNotice = utf8ToWide(text);
+    gChipNoticeError = error;
+    fileChipShow(ChipMode::Notice, ms);
+}
+
+// Files dropped on the viewer (WM_DROPFILES): send them to the Mac.
+static void onFileDrop(HDROP drop) {
+    std::vector<std::wstring> roots;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < count; ++i) {
+        const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+        if (len == 0) continue;
+        std::wstring path(len + 1, L'\0');
+        if (DragQueryFileW(drop, i, path.data(), len + 1) == len) {
+            path.resize(len);
+            roots.push_back(std::move(path));
+        }
+    }
+    DragFinish(drop);
+    if (roots.empty()) return;
+    const fp::Host host = currentHost();
+    const bool busy = fileTransferRunning();
+    if (host != fp::Host::Full || busy || !gFileSession || !gFileSession->canSend()) {
+        logLine(std::string("file.drop=refused reason=") + (busy ? "busy" : "host") +
+                " items=" + std::to_string(roots.size()));
+        fileChipNotice(fp::dropRefused(host, busy), true, 6000);
+        return;
+    }
+    if (!gFileSession->startUpload(std::move(roots), readFileTransferMaxMbps(), FileSession::Purpose::Send)) {
+        logLine("file.drop=not_started");
+        fileChipNotice(fp::dropFailed(), true, 6000);
+        return;
+    }
+    logLine("file.drop=started items=" + std::to_string(count));
+    fileChipShow(ChipMode::Running, 0);
+}
+
+// A send (drop) ended: the chip says how, and Finder on the Mac shows it.
+static void onFileSendDone(const FileSession::UploadProgress& p) {
+    using S = FileSession::UploadState;
+    if (p.state == S::Done) {
+        fileChipNotice(fp::dropDone(p.filesOk ? p.filesOk : p.files), false, 4000);
+        logLine("file.drop=done");
+    } else if (p.state == S::Cancelled) {
+        fileChipShow(ChipMode::Cancelled, 3000);
+        logLine("file.drop=cancelled");
+    } else if (p.hostStatus == jl::file::status::kMacPermission) {
+        fileChipNotice(fp::dropMacPermission(), true, 10000);
+        logLine("file.drop=mac_permission");
+    } else {
+        fileChipNotice(fp::dropFailed(), true, 6000);
+        logLine("file.drop=failed status=" + std::to_string(p.hostStatus));
+    }
+}
+
 // The upload ended (FileSession thread posted WM_MR_FILE_UPLOAD_DONE).
 static void onFileUploadDone() {
     const auto p = gFileSession ? gFileSession->uploadProgress() : FileSession::UploadProgress{};
+    const bool send = p.purpose == FileSession::Purpose::Send;
+    gLastUpload = fp::lastFrom(static_cast<int>(p.state), send, p.hostStatus, p.filesOk ? p.filesOk : p.files);
+    if (gFilePanel) InvalidateRect(gFilePanel, nullptr, FALSE);
+    if (send) {
+        onFileSendDone(p);
+        if (fileConfirmVisible()) fileConfirmHide();
+        return;
+    }
     const bool ok = p.state == FileSession::UploadState::Done;
     if (ok) gLastUploadClipSeq = gPendingClipSeq;
     auto f = gPasteGate.finish(ok, steadyMsNow());
@@ -3194,9 +3496,11 @@ static void onFileUploadDone() {
 
 static void fileUiDestroy() {
     if (gFileChip && IsWindow(gFileChip)) DestroyWindow(gFileChip);
+    if (gFilePanel && IsWindow(gFilePanel)) DestroyWindow(gFilePanel);
     if (gFileConfirm && IsWindow(gFileConfirm)) DestroyWindow(gFileConfirm);
     gFileChip = nullptr;
     gFileConfirm = nullptr;
+    gFilePanel = nullptr;
     gChipMode = ChipMode::Hidden;
     gChipHideAtMs = 0.0;
 }
@@ -3207,6 +3511,7 @@ static void fileUiEndSession() {
     gPasteGate = fu::PasteGate{};
     gPendingRoots.clear();
     gLastUploadClipSeq = 0;
+    gLastUpload = fp::Last{};
     fileUiDestroy();
 }
 
@@ -3346,6 +3651,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             fileConfirmKey(wParam, lParam);
             return 0;
         }
+        if (filePanelVisible()) {
+            filePanelKey(wParam, lParam);
+            return 0;
+        }
         // Viewer shortcuts (Ctrl+Alt+O/M/V) and the keyboard-driven overlay
         // are handled before anything is forwarded to the Mac.
         if (viewerHasInteractiveFocus(hwnd) && overlayHandleKeyDown(wParam, lParam)) return 0;
@@ -3409,8 +3718,16 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gHaveMouse = true;
         return 0;
     }
+    case WM_DROPFILES:
+        onFileDrop(reinterpret_cast<HDROP>(wParam));
+        return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
+        // A click on the picture closes the Files panel; it does not reach the Mac.
+        if (filePanelVisible()) {
+            filePanelHide("outside");
+            return 0;
+        }
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
@@ -3423,6 +3740,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
+        if (filePanelVisible()) {
+            filePanelHide("outside");
+            return 0;
+        }
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             const uint8_t button = msg == WM_RBUTTONDOWN ? 1 : 2;
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
@@ -3565,6 +3886,8 @@ static HWND createViewerWindow(UINT32 clientW, UINT32 clientH) {
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(wc.hIconSm));
     gViewerHwnd = hwnd;
     gRemoteCursorShape = 0;
+    // F4: files dropped on the picture are sent to the Mac.
+    DragAcceptFiles(hwnd, TRUE);
     gRemoteCursor = LoadCursorW(nullptr, IDC_ARROW);
     gKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, ViewerKeyboardHook, hi, 0);
     if (gKeyboardHook) logLine("keyboard_hook=installed");
@@ -6283,6 +6606,16 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     gOverlaySwallowUp.reset();
     std::wcout << L"file_ui chip=" << (gFileChip != nullptr) << L" confirm_shown=" << confirmShown
                << L" esc_keeps=" << confirmKept << L"\n";
+    // F4 Files panel: the guide, the sample upload with Cancel, Open folder.
+    overlayActivate(ov::Item::Files, "snapshot");
+    const bool panelShown = filePanelVisible();
+    snapshotWindow(viewer, dir, L"file-panel");
+    filePanelKey(VK_TAB, 0);
+    snapshotWindow(viewer, dir, L"file-panel-tab");
+    filePanelKey(VK_ESCAPE, 0);
+    const bool panelClosed = !filePanelVisible() && IsWindow(viewer) && !gWindowClosed;
+    gOverlaySwallowUp.reset();
+    std::wcout << L"file_panel shown=" << panelShown << L" esc_closes=" << panelClosed << L"\n";
     fileChipHide();
     gFileUiSample = false;
 

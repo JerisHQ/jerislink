@@ -1,7 +1,8 @@
 #pragma once
 
 // In-session overlay (B1): a thin translucent bar at the top centre of the
-// viewer, just below the remote Mac menu bar, with the connection status, mute, volume, Info, Settings and Disconnect.
+// viewer, just below the remote Mac menu bar, with the connection status, mute, volume, Info, Settings,
+// Files (F4) and Disconnect.
 // Layout, hit-testing, keyboard focus order, slider maths and the hover
 // fallback live here without Win32 so ui_overlay_test.cpp can check them.
 // viewer.cpp paints and drives the real window.
@@ -11,7 +12,7 @@
 
 namespace jl::overlay {
 
-enum class Item { None, Status, Mute, Volume, Info, Settings, Disconnect };
+enum class Item { None, Status, Mute, Volume, Info, Settings, Files, Disconnect };
 
 struct Rect {
     int left = 0, top = 0, right = 0, bottom = 0;
@@ -31,7 +32,7 @@ inline int scale(int logical, unsigned dpi) {
 struct Layout {
     Rect size;
     Rect bar;
-    Rect status, mute, volumeLabel, slider, info, settings, disconnect;
+    Rect status, mute, volumeLabel, slider, info, settings, files, disconnect;
     Rect hint;
     int sep1 = 0, sep2 = 0;  // x of the two vertical separators
 };
@@ -39,7 +40,7 @@ struct Layout {
 inline Layout layoutFor(unsigned dpi) {
     const auto s = [dpi](int v) { return scale(v, dpi); };
     Layout l;
-    const int barH = s(56), hintH = s(22), w = s(648);
+    const int barH = s(56), hintH = s(22), w = s(712);
     l.size = {0, 0, w, barH + hintH};
     l.bar = {0, 0, w, barH};
     const int top = s(8), bottom = barH - s(8);
@@ -52,7 +53,8 @@ inline Layout layoutFor(unsigned dpi) {
     l.sep2 = s(396);
     l.info = {s(408), top, s(472), bottom};
     l.settings = {s(476), top, s(548), bottom};
-    l.disconnect = {s(552), top, s(636), bottom};
+    l.files = {s(552), top, s(616), bottom};
+    l.disconnect = {s(620), top, s(704), bottom};
     l.hint = {s(16), barH, w - s(16), barH + hintH - s(4)};
     return l;
 }
@@ -64,13 +66,14 @@ inline Item hitTest(const Layout& l, int x, int y) {
     if (l.slider.contains(x, y) || l.volumeLabel.contains(x, y)) return Item::Volume;
     if (l.info.contains(x, y)) return Item::Info;
     if (l.settings.contains(x, y)) return Item::Settings;
+    if (l.files.contains(x, y)) return Item::Files;
     if (l.disconnect.contains(x, y)) return Item::Disconnect;
     return Item::None;
 }
 
 // Tab / arrow order of the interactive items.
-constexpr std::array<Item, 5> kFocusOrder{Item::Mute, Item::Volume, Item::Info, Item::Settings,
-                                          Item::Disconnect};
+constexpr std::array<Item, 6> kFocusOrder{Item::Mute, Item::Volume, Item::Info, Item::Settings,
+                                          Item::Files, Item::Disconnect};
 
 // Next item in kFocusOrder (dir +1) or previous (dir -1), wrapping. From
 // None, +1 starts at the first item and -1 at the last.

@@ -140,6 +140,7 @@ enum ControlServiceSelfTest {
         failures += recoveryWindow(expect)
         failures += clipboardPollReadsOnlyChangeCount(expect)
         failures += fileUploadEndToEnd(expect)
+        failures += fileSendEndToEnd(expect)
         failures += fileAnnounceEndToEnd(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
@@ -361,7 +362,8 @@ enum ControlServiceSelfTest {
 
     private static func startServer(inject: Bool, helperPort: UInt16?, clipboard: ClipboardBackend,
                                     inputSources: InputSourceCache,
-                                    fileStagingRoot: URL? = nil) -> (ControlServer, UInt16)? {
+                                    fileStagingRoot: URL? = nil,
+                                    fileSendFolder: FileSendFolder = .shared) -> (ControlServer, UInt16)? {
         guard let port = freeLoopbackPort() else { return nil }
         let server = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                    port: port, inject: inject,
@@ -369,6 +371,7 @@ enum ControlServiceSelfTest {
                                    inputHelper: helperPort.map { InputHelperClient(port: $0) },
                                    allowFileSessions: fileStagingRoot != nil,
                                    fileStagingRoot: fileStagingRoot ?? FileUploadReceiver.defaultRoot,
+                                   fileSendFolder: fileSendFolder,
                                    clipboard: clipboard, inputSources: inputSources)
         do { try server.start() } catch { return nil }
         return (server, port)
@@ -544,20 +547,19 @@ enum ControlServiceSelfTest {
         if let ack = file.receive(timeout: 3), ack.type == 0x51,
            case let .helloAck(proto, caps, maxChunk, maxTotal)? = FileProto.decode(type: ack.type, payload: ack.payload) {
             expect(proto == 1 && caps == FileProto.Caps.host && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
-                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
+                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+reveal+announce chunk=32K total=20G")
         } else {
-            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
+            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+reveal+announce chunk=32K total=20G")
         }
         _ = file.send(type: 0x5B, payload: [9, 8, 7, 6])
         let pong = file.receive(timeout: 3)
         expect(pong?.type == 0x5B && pong?.payload == [9, 8, 7, 6], "file e2e: PING echoed with its token")
-        _ = file.send(type: 0x52, payload: FileProto.Message.offer(transfer: 42, purpose: FileProto.Purpose.send,
+        _ = file.send(type: 0x52, payload: FileProto.Message.offer(transfer: 42, purpose: FileProto.Purpose.push,
                                                                     entries: 1, total: 10).encode()!)
         let rej = file.receive(timeout: 3)
-        expect(rej?.type == 0x54 && rej?.payload == [0, 0, 0, 42, FileProto.Status.denied], "file e2e: OFFER refused with REJECT denied")
-        _ = file.send(type: 0x5C, payload: [0, 0, 0, 43])
-        let rev = file.receive(timeout: 3)
-        expect(rev?.type == 0x54 && rev?.payload == [0, 0, 0, 43, FileProto.Status.denied], "file e2e: REVEAL refused with REJECT denied")
+        expect(rej?.type == 0x54 && rej?.payload == [0, 0, 0, 42, FileProto.Status.denied], "file e2e: OFFER push refused with REJECT denied (F5)")
+        // REVEAL is covered by fileSendEndToEnd with a temp folder: here it
+        // would open the real ~/Downloads/JerisLink in Finder.
         _ = file.send(type: 0x10, payload: [1, 0, 65])               // a KEY inside a file session
         expect(file.receive(timeout: 3) == nil, "file e2e: non-file message closes the file session")
         file.close()
@@ -643,6 +645,70 @@ enum ControlServiceSelfTest {
         wait(until: { server.statsLine().contains("file_uploads=1 file_upload_failed=1") })
         expect(server.statsLine().contains("file_uploads=1 file_upload_failed=1 file_rx_bytes=\(body.count + 32768)"),
                "upload e2e: stats file_uploads=1 failed=1 rx bytes (\(server.statsLine()))")
+        return 0
+    }
+
+    /// F4 over a real socket: a drop (purpose=send) lands in the send folder,
+    /// a second drop of the same name becomes "name 2.ext", the folder opens
+    /// after each, REVEAL opens it again with no reply, and staging is gone.
+    private static func fileSendEndToEnd(_ expect: (Bool, String) -> Void) -> Int {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("jl-send-e2e-\(getpid())", isDirectory: true)
+        defer { try? fm.removeItem(at: base) }
+        try? fm.createDirectory(at: base.appendingPathComponent("Downloads"), withIntermediateDirectories: true)
+        let opened = OpenedFolders()
+        let folder = FileSendFolder(primary: base.appendingPathComponent("Downloads/JerisLink", isDirectory: true),
+                                    fallback: base.appendingPathComponent("JerisLink Received", isDirectory: true),
+                                    openFolder: { opened.add($0) })
+        let staging = base.appendingPathComponent("staging", isDirectory: true)
+        let board = FakeClipboard(text: "before-send")
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.send.\(getpid())")
+        guard let (server, port) = startServer(inject: false, helperPort: nil, clipboard: board, inputSources: cache,
+                                               fileStagingRoot: staging, fileSendFolder: folder),
+              let file = MRC1Client(port: port) else {
+            expect(false, "send e2e: server and session start")
+            return 0
+        }
+        defer { file.close(); server.stop() }
+        _ = file.send(type: 0x50, payload: [1, 0, 0])
+        expect(file.receive(timeout: 3)?.type == 0x51, "send e2e: HELLO_ACK")
+
+        typealias M = FileProto.Message
+        let body = (0..<70_000).map { UInt8(($0 * 13) & 0xff) }
+        func drop(_ t: UInt32) -> [M] {
+            var msgs: [M] = [.offer(transfer: t, purpose: FileProto.Purpose.send, entries: 1, total: UInt64(body.count)),
+                             FileUploadSelfTest.entry(t, 0, "photo.jpg", size: body.count)]
+            msgs += FileUploadSelfTest.chunks(t, 0, body)
+            msgs.append(.fileEnd(transfer: t, index: 0, sha256: FileUploadSelfTest.sha(body)))
+            for m in msgs { _ = file.send(type: m.type, payload: m.encode()!) }
+            var got: [M] = []
+            while let p = file.receive(timeout: 5), let m = FileProto.decode(type: p.type, payload: p.payload) {
+                got.append(m)
+                if case .result = m { break }
+            }
+            return got
+        }
+        let first = drop(21)
+        expect(first.first == .reply(transfer: 21, status: FileProto.Status.ok) &&
+               first.last == .result(transfer: 21, status: FileProto.Status.ok, filesOK: 1), "send e2e: first drop REPLY ok, RESULT ok")
+        let second = drop(22)
+        expect(second.last == .result(transfer: 22, status: FileProto.Status.ok, filesOK: 1), "send e2e: second drop RESULT ok")
+        let dest = folder.primary
+        let names = ((try? fm.contentsOfDirectory(atPath: dest.path)) ?? []).sorted()
+        expect(names == ["photo 2.jpg", "photo.jpg"], "send e2e: same name twice gives photo.jpg and photo 2.jpg (\(names))")
+        expect((try? Data(contentsOf: dest.appendingPathComponent("photo 2.jpg"))).map(Array.init) == body,
+               "send e2e: bytes match")
+        expect(board.fileURLs.isEmpty, "send e2e: a drop leaves the pasteboard alone")
+        expect(FileUploadSelfTest.transferDirs(staging).isEmpty, "send e2e: no staging left after a send")
+        wait(until: { opened.count == 2 })
+        expect(opened.all == [dest, dest], "send e2e: the folder opens after each drop (\(opened.count))")
+        _ = file.send(type: 0x5C, payload: [0, 0, 0, 21])            // REVEAL
+        wait(until: { opened.count == 3 })
+        expect(opened.count == 3 && opened.all.last == dest, "send e2e: REVEAL opens the folder again")
+        _ = file.send(type: 0x5B, payload: [1, 2, 3, 4])
+        let pong = file.receive(timeout: 3)
+        expect(pong?.type == 0x5B, "send e2e: REVEAL gets no reply; the next answer is the PING echo")
         return 0
     }
 
