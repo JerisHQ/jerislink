@@ -188,6 +188,59 @@ void hoverZoneTests() {
     expect(same(z, Rect{0, 0, 30, 20}), "client smaller than the zone: the whole client");
 }
 
+// Hand test r1: on a wide external monitor the zone sat in the left black
+// bar. It is now the bottom-left corner of the drawn video (remote picture).
+void videoHoverZoneTests() {
+    // Pillarboxed: maximized 1920-wide client, 1001 rows, 16:9 stream. The
+    // video is 1779 wide, starting 70 px in.
+    const Rect extWork{1920, 0, 3840, 1032};
+    Rect z = videoHoverZone(Rect{1920, 31, 3840, 1032}, 3840, 2160, extWork, 48);
+    expect(same(z, Rect{1990, 984, 2038, 1032}), "pillarboxed: zone starts at the video left edge");
+    expect(z.contains(1995, 1000), "pillarboxed: Mac picture bottom-left is in");
+    expect(!z.contains(1950, 1000) && !z.contains(1920, 1031), "pillarboxed: left black bar is out");
+
+    // Same on a monitor left of the primary (negative origin).
+    z = videoHoverZone(Rect{-1920, 31, 0, 1032}, 3840, 2160, Rect{-1920, 0, 0, 1032}, 48);
+    expect(same(z, Rect{-1850, 984, -1802, 1032}), "pillarboxed, negative origin: video corner");
+
+    // 150% dpi: 72 px zone, still at the video edge.
+    z = videoHoverZone(Rect{1920, 31, 3840, 1032}, 3840, 2160, extWork, scale(kHoverZone, 144));
+    expect(z.left == 1990 && z.width() == 72 && z.height() == 72 && z.bottom == 1032,
+           "pillarboxed, 150% dpi: 72 px zone at the video corner");
+
+    // Letterboxed: 16:10 client, 16:9 stream. Zone bottom is the video
+    // bottom (1140), not the window bottom (1200).
+    z = videoHoverZone(Rect{0, 0, 1920, 1200}, 3840, 2160, Rect{0, 0, 1920, 1200}, 48);
+    expect(same(z, Rect{0, 1092, 48, 1140}), "letterboxed: zone bottom is the video bottom");
+    expect(!z.contains(10, 1150) && !z.contains(10, 1199), "letterboxed: bottom black bar is out");
+
+    // Letterboxed with the taskbar over the video bottom: zone above it.
+    z = videoHoverZone(Rect{0, 0, 1920, 1200}, 3840, 2160, Rect{0, 0, 1920, 1100}, 48);
+    expect(same(z, Rect{0, 1052, 48, 1100}), "letterboxed under the taskbar: zone above it");
+
+    // Video partly off-screen: client hangs off the monitor's left edge; the
+    // video's left part is off-screen, so the zone is at the visible part.
+    z = videoHoverZone(Rect{-1000, 0, 1560, 1000}, 1920, 1080, Rect{0, 0, 1920, 1040}, 48);
+    expect(same(z, Rect{0, 952, 48, 1000}), "video partly off-screen: visible video corner");
+
+    // Window larger than the monitor, exact 16:9: the r1 visible corner.
+    z = videoHoverZone(Rect{2600, 100, 5160, 1540}, 3840, 2160, Rect{2560, 0, 4480, 1040}, 48);
+    expect(same(z, Rect{2600, 992, 2648, 1040}), "window larger than the monitor: visible corner");
+
+    // No visible video at all (only black bar on the monitor): fall back to
+    // the visible client corner.
+    z = videoHoverZone(Rect{-3000, 0, 1000, 500}, 1920, 1080, Rect{0, 0, 1920, 1040}, 48);
+    expect(same(z, Rect{0, 452, 48, 500}), "no visible video: visible client corner");
+
+    // Unknown stream size: the whole client is the video.
+    const Rect c{100, 100, 1380, 820}, w{0, 0, 1920, 1040};
+    expect(same(videoHoverZone(c, 0, 0, w, 48), hoverZone(c, w, 48)), "no stream size: client corner");
+
+    // Stream size change moves the zone (16:9 to 4:3 in a 16:9 client).
+    z = videoHoverZone(Rect{0, 0, 1920, 1080}, 1024, 768, Rect{0, 0, 1920, 1080}, 48);
+    expect(same(z, Rect{240, 1032, 288, 1080}), "4:3 stream in a 16:9 window: zone moves to video left");
+}
+
 // Bug: the bar covered the Mac menu bar. The top offset is the remote menu
 // bar mapped into client pixels plus a gap; it never falls short of the
 // real bar (24 pt x scale) at any size below.
@@ -246,6 +299,7 @@ int main() {
     zoneTests();
     placementTests();
     hoverZoneTests();
+    videoHoverZoneTests();
     menuBarOffsetTests();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -2570,8 +2570,10 @@ static void overlayDestroy() {
 }
 
 // The bottom-left hover zone in screen coordinates, on whatever monitor the
-// viewer is: the corner of the client area that is on that monitor's work
-// area (not off-screen, not behind the taskbar), sized for the viewer's dpi.
+// viewer is: the bottom-left corner of the remote picture (the drawn video,
+// not the black bars) that is on that monitor's work area (not off-screen,
+// not behind the taskbar), sized for the viewer's dpi. Computed every tick,
+// so resizes and stream size changes apply at once.
 static ov::Rect gOverlayLastZone;
 
 static ov::Rect overlayHoverZone() {
@@ -2584,9 +2586,9 @@ static ov::Rect overlayHoverZone() {
     if (GetMonitorInfoW(MonitorFromWindow(gViewerHwnd, MONITOR_DEFAULTTONEAREST), &mi))
         work = mi.rcWork;
     const ov::Rect zone =
-        ov::hoverZone({c.left, c.top, c.right, c.bottom},
-                      {work.left, work.top, work.right, work.bottom},
-                      ov::scale(ov::kHoverZone, jl::ui::windowDpi(gViewerHwnd)));
+        ov::videoHoverZone({c.left, c.top, c.right, c.bottom}, gRemoteWidth, gRemoteHeight,
+                           {work.left, work.top, work.right, work.bottom},
+                           ov::scale(ov::kHoverZone, jl::ui::windowDpi(gViewerHwnd)));
     // Geometry only (never the pointer), once per change, debug runs only.
     if (debugMode() && (zone.left != gOverlayLastZone.left || zone.top != gOverlayLastZone.top ||
                         zone.right != gOverlayLastZone.right ||

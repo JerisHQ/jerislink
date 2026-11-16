@@ -106,8 +106,8 @@ inline int sliderKnobX(const Rect& slider, int value, unsigned dpi) {
 inline int volumeStep(int value, int dir) { return std::clamp(value + 5 * dir, 0, 100); }
 
 // Hover fallback in client coordinates: the bottom-left corner of a cw x ch
-// client area (zone x zone pixels). The viewer uses hoverZone() below, which
-// also keeps the corner on screen. The overlay itself opens at the top centre.
+// client area (zone x zone pixels). The viewer uses videoHoverZone() below,
+// which anchors the corner to the remote picture and keeps it on screen. The overlay itself opens at the top centre.
 inline bool inCornerZone(int x, int y, int clientW, int clientH, int zone) {
     return x >= 0 && y < clientH && x < std::min(zone, clientW) && y >= clientH - zone;
 }
@@ -239,6 +239,22 @@ inline int overlayTopOffset(int cw, int ch, unsigned streamW, unsigned streamH, 
     const long long bar = static_cast<long long>(remoteMenuBarStreamPx(streamH)) * v.height();
     const int barPx = static_cast<int>((bar + streamH - 1) / streamH);
     return v.top + barPx + gapPx;
+}
+
+// Bottom-left hover zone on the remote picture, in screen coordinates: the
+// bottom-left corner of (displayed video rect, same aspect fit as the
+// renderer) and client area and monitor work area. On a pillarboxed or
+// letterboxed window it starts at the video's left edge and ends at the
+// video's bottom edge, never in the black bars. Only when no part of the
+// video is visible does it fall back to the visible client corner.
+inline Rect videoHoverZone(const Rect& clientScreen, unsigned streamW, unsigned streamH,
+                           const Rect& workArea, int zone) {
+    const Rect fit = fitVideo(clientScreen.width(), clientScreen.height(), streamW, streamH);
+    const Rect video{clientScreen.left + fit.left, clientScreen.top + fit.top,
+                     clientScreen.left + fit.right, clientScreen.top + fit.bottom};
+    const Rect z = hoverZone(intersect(video, clientScreen), workArea, zone);
+    if (z.width() > 0 && z.height() > 0) return z;
+    return hoverZone(clientScreen, workArea, zone);
 }
 
 }  // namespace jl::overlay
