@@ -1,12 +1,20 @@
 #pragma once
 
-// File session (F1): a probe on its own TCP connection to the control port.
+// File session (F1, F2): its own TCP connection to the control port.
 // It sends FILE_HELLO, waits up to 2 s for HELLO_ACK and logs
 // file.capability=yes|no. With a capable host it keeps the session open with
 // a PING every 15 s and reconnects with backoff if it drops. An old host
 // (no ACK) is probed once per viewer session and never again, so it does not
-// log an unknown message every few seconds. No file data moves in F1, and
-// nothing here runs on the UI, render or input threads.
+// log an unknown message every few seconds. Nothing here runs on the UI,
+// render or input threads.
+//
+// F2: startUpload() hands a Windows->Mac paste to the session thread. It
+// walks the copied files and folders (symlinks and junctions skipped),
+// sends OFFER + ENTRY, waits for the host to accept, then streams each file
+// in 32 KiB DATA chunks with its SHA-256 in FILE_END, paced to
+// FileTransferMaxMbps with at most 4 MiB not yet acknowledged by PROGRESS.
+// The host sets the Mac pasteboard and answers RESULT. File names are never
+// logged.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -19,9 +27,24 @@
 #include <thread>
 #include <vector>
 
+#include "file_proto.hpp"
+#include "file_upload.hpp"
+
 class FileSession {
 public:
     using LogFn = std::function<void(const std::string&)>;
+    // Called on the session thread when an upload started with startUpload()
+    // ends, whatever the outcome. Post to the UI thread; do not block.
+    using UploadDoneFn = std::function<void()>;
+    enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
+    struct UploadProgress {
+        UploadState state = UploadState::Idle;
+        uint64_t files = 0;      // file entries (folders not counted)
+        uint64_t filesDone = 0;  // files fully sent
+        uint64_t total = 0;      // bytes
+        uint64_t committed = 0;  // bytes the Mac has written
+        uint64_t bytesPerSec = 0;
+    };
     enum class Capability : int { Unknown = 0, Yes = 1, No = 2 };
 
     FileSession(std::string localIp, std::string remoteIp, uint16_t port, LogFn logFn);
@@ -38,6 +61,18 @@ public:
     uint64_t sessions() const { return sessions_.load(); }
     uint64_t pings() const { return pings_.load(); }
 
+    // UI thread. roots: full paths from the clipboard. False when the host
+    // cannot receive or an upload is already running (no callback then).
+    bool startUpload(std::vector<std::wstring> roots, uint32_t maxMbps);
+    void cancelUpload() { uploadCancel_ = true; }
+    bool uploadRunning() const { return uploadRunning_.load(); }
+    bool canUpload() const {
+        return capability() == Capability::Yes && (hostCaps() & jl::file::caps::kUpload) && !uploadRunning();
+    }
+    UploadProgress uploadProgress() const;
+    void setUploadDoneCallback(UploadDoneFn fn) { uploadDone_ = std::move(fn); }  // before start()
+    uint64_t txBytes() const { return txBytes_.load(); }
+
 private:
     void run();
     SOCKET connectSocket();
@@ -50,6 +85,19 @@ private:
     // Sleeps up to ms, waking early on stop(). Returns false if stopping.
     bool sleepFor(int ms);
     void log(const std::string& message) const;
+    struct UploadEntry {
+        bool dir = false;
+        uint64_t size = 0;
+        int64_t mtime = 0;
+        std::vector<uint8_t> path;  // UTF-8, / separated
+        std::wstring full;
+    };
+    // Runs a pending upload on the open session. Returns "" when the session
+    // is still usable, else the reason it must close.
+    std::string runUpload(SOCKET s);
+    bool walk(const std::vector<std::wstring>& roots, std::vector<UploadEntry>& out, uint64_t& total,
+              uint32_t& skipped, std::string& error);
+    void endUpload(UploadState state);
 
     std::string localIp_;
     std::string remoteIp_;
@@ -63,4 +111,19 @@ private:
     std::atomic<uint16_t> hostCaps_{0};
     std::atomic<uint64_t> sessions_{0};
     std::atomic<uint64_t> pings_{0};
+
+    UploadDoneFn uploadDone_;
+    std::mutex uploadMutex_;
+    std::vector<std::wstring> uploadRoots_;  // guarded by uploadMutex_
+    uint32_t uploadMbps_ = jl::fileup::kDefaultMaxMbps;
+    std::atomic<bool> uploadPending_{false};
+    std::atomic<bool> uploadRunning_{false};
+    std::atomic<bool> uploadCancel_{false};
+    std::atomic<int> uploadState_{0};
+    std::atomic<uint64_t> upFiles_{0};
+    std::atomic<uint64_t> upFilesDone_{0};
+    std::atomic<uint64_t> upTotal_{0};
+    std::atomic<uint64_t> upCommitted_{0};
+    std::atomic<uint64_t> upRate_{0};
+    std::atomic<uint64_t> txBytes_{0};
 };

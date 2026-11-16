@@ -139,6 +139,7 @@ enum ControlServiceSelfTest {
         failures += eofMonitor(expect)
         failures += recoveryWindow(expect)
         failures += clipboardPollReadsOnlyChangeCount(expect)
+        failures += fileUploadEndToEnd(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
@@ -358,12 +359,15 @@ enum ControlServiceSelfTest {
     }
 
     private static func startServer(inject: Bool, helperPort: UInt16?, clipboard: ClipboardBackend,
-                                    inputSources: InputSourceCache) -> (ControlServer, UInt16)? {
+                                    inputSources: InputSourceCache,
+                                    fileStagingRoot: URL? = nil) -> (ControlServer, UInt16)? {
         guard let port = freeLoopbackPort() else { return nil }
         let server = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                    port: port, inject: inject,
                                    settingsClientIP: { ListenConfig.loopbackIP }, acceptProxy: false,
                                    inputHelper: helperPort.map { InputHelperClient(port: $0) },
+                                   allowFileSessions: fileStagingRoot != nil,
+                                   fileStagingRoot: fileStagingRoot ?? FileUploadReceiver.defaultRoot,
                                    clipboard: clipboard, inputSources: inputSources)
         do { try server.start() } catch { return nil }
         return (server, port)
@@ -538,10 +542,10 @@ enum ControlServiceSelfTest {
         _ = file.send(type: 0x50, payload: [1, 0, 0])                // FILE_HELLO proto 1, caps 0
         if let ack = file.receive(timeout: 3), ack.type == 0x51,
            case let .helloAck(proto, caps, maxChunk, maxTotal)? = FileProto.decode(type: ack.type, payload: ack.payload) {
-            expect(proto == 1 && caps == 0 && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
-                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=0 chunk=32K total=20G")
+            expect(proto == 1 && caps == FileProto.Caps.upload && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
+                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
         } else {
-            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=0 chunk=32K total=20G")
+            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
         }
         _ = file.send(type: 0x5B, payload: [9, 8, 7, 6])
         let pong = file.receive(timeout: 3)
@@ -580,6 +584,64 @@ enum ControlServiceSelfTest {
         let stats = servers[0].statsLine()
         expect(stats.contains("file_sessions=1 file_refused=2"), "file e2e: direct stats count 1 session, 2 refused (\(stats))")
         expect(servers[1].statsLine().contains("file_sessions=0 file_refused=1"), "file e2e: relay stats count 1 refused")
+        return 0
+    }
+
+    /// F2 over a real socket: a paste upload lands in staging, the pasteboard
+    /// gets the file URLs, the clipboard text session does not echo that
+    /// change, and a dropped session removes its partial upload.
+    private static func fileUploadEndToEnd(_ expect: (Bool, String) -> Void) -> Int {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("jl-upload-e2e-\(getpid())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let board = FakeClipboard(text: "before-upload")
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.upload.\(getpid())")
+        guard let (server, port) = startServer(inject: false, helperPort: nil, clipboard: board, inputSources: cache,
+                                               fileStagingRoot: root),
+              let text = MRC1Client(port: port), let file = MRC1Client(port: port) else {
+            expect(false, "upload e2e: server and sessions start")
+            return 0
+        }
+        defer { text.close(); file.close(); server.stop() }
+        _ = text.send(type: 0x30, payload: [])                       // CLIPBOARD_HELLO
+        wait(until: { board.counts.changeCountReads >= 2 })
+        _ = file.send(type: 0x50, payload: [1, 0, 0])
+        expect(file.receive(timeout: 3)?.type == 0x51, "upload e2e: HELLO_ACK")
+
+        typealias M = FileProto.Message
+        let body = (0..<100_000).map { UInt8(($0 * 7) & 0xff) }
+        var msgs: [M] = [.offer(transfer: 9, purpose: FileProto.Purpose.paste, entries: 1, total: UInt64(body.count)),
+                         FileUploadSelfTest.entry(9, 0, "report.bin", size: body.count)]
+        msgs += FileUploadSelfTest.chunks(9, 0, body)
+        msgs.append(.fileEnd(transfer: 9, index: 0, sha256: FileUploadSelfTest.sha(body)))
+        for m in msgs { _ = file.send(type: m.type, payload: m.encode()!) }
+        var got: [M] = []
+        while let p = file.receive(timeout: 5), let m = FileProto.decode(type: p.type, payload: p.payload) {
+            got.append(m)
+            if case .result = m { break }
+        }
+        expect(got.first == .reply(transfer: 9, status: FileProto.Status.ok), "upload e2e: REPLY ok")
+        expect(got.last == .result(transfer: 9, status: FileProto.Status.ok, filesOK: 1), "upload e2e: RESULT ok files=1")
+        let url = board.fileURLs.first
+        expect(board.fileURLs.count == 1 && url.flatMap { try? Data(contentsOf: $0) }.map(Array.init) == body,
+               "upload e2e: pasteboard file URL points at the staged bytes")
+        expect(text.receive(timeout: 0.8) == nil, "upload e2e: clipboard session does not echo the file-URL change")
+        expect(server.statsLine().contains("file_uploads=0"), "upload e2e: session stats fold in at session end")
+
+        // A second upload dropped halfway removes its partial file.
+        let half: [M] = [.offer(transfer: 10, purpose: FileProto.Purpose.paste, entries: 1, total: UInt64(body.count)),
+                         FileUploadSelfTest.entry(10, 0, "half.bin", size: body.count)] + Array(FileUploadSelfTest.chunks(10, 0, body).prefix(1))
+        for m in half { _ = file.send(type: m.type, payload: m.encode()!) }
+        expect(file.receive(timeout: 3).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+               == .reply(transfer: 10, status: FileProto.Status.ok), "upload e2e: second offer accepted")
+        wait(until: { FileUploadSelfTest.jlparts(root) == 1 })
+        file.close()
+        wait(until: { FileUploadSelfTest.jlparts(root) == 0 && FileUploadSelfTest.transferDirs(root).count == 1 })
+        expect(FileUploadSelfTest.jlparts(root) == 0 && FileUploadSelfTest.transferDirs(root).count == 1,
+               "upload e2e: drop removes the partial upload, the finished paste stays for Finder")
+        wait(until: { server.statsLine().contains("file_uploads=1 file_upload_failed=1") })
+        expect(server.statsLine().contains("file_uploads=1 file_upload_failed=1 file_rx_bytes=\(body.count + 32768)"),
+               "upload e2e: stats file_uploads=1 failed=1 rx bytes (\(server.statsLine()))")
         return 0
     }
 
@@ -702,6 +764,25 @@ private final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
         count += 1
         text = value
         return count
+    }
+
+    private var urls: [URL] = []
+    private var fileMark: Int?
+    var fileURLs: [URL] { lock.lock(); defer { lock.unlock() }; return urls }
+
+    /// Like NSPasteboard: file URLs also read back as a string.
+    func writeFileURLs(_ value: [URL]) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        urls = value
+        count += 1
+        text = value.first?.path
+        fileMark = count
+        return count
+    }
+
+    func ownFileWriteChangeCount() -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return fileMark
     }
 }
 

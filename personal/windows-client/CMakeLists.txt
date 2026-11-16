@@ -39,7 +39,7 @@ if(MSVC)
     target_compile_options(opus PRIVATE /w)
 endif()
 
-set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt)
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt)
 
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -113,3 +113,6 @@ add_executable(JerislinkFileProtoTest file_proto_test.cpp)
 add_executable(JerislinkFilePathTest file_path_safety_test.cpp)
 target_compile_definitions(JerislinkFilePathTest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(JerislinkFilePathTest PRIVATE normaliz)
+
+# Console test for the Windows -> Mac paste hold, pacer, chip and disconnect confirm (file_upload.hpp).
+add_executable(JerislinkFileUploadTest file_upload_test.cpp)

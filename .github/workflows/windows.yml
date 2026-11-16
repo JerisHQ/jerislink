@@ -104,6 +104,10 @@ jobs:
         run: build\Release\JerislinkFileProtoTest.exe
       - name: Received-path safety test (traversal, absolute, drive, reserved names and chars, NFC, length and depth limits, clash names)
         run: build\Release\JerislinkFilePathTest.exe
+      - name: Build paste upload test
+        run: cmake --build build --config Release --target JerislinkFileUploadTest
+      - name: Paste upload test (Cmd+V hold in both presets, 3 s window, focus loss, pacer, chip and confirm text, confirm keys)
+        run: build\Release\JerislinkFileUploadTest.exe
       - name: No always-on shortcut or key log lines in the viewer
         shell: pwsh
         run: |

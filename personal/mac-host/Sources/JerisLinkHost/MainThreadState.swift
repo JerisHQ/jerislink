@@ -37,6 +37,12 @@ protocol ClipboardBackend: AnyObject, Sendable {
     /// Replace the contents with `text`; returns the new change count, or nil
     /// when the write failed. May hop to the main thread.
     func writeText(_ text: String) -> Int?
+    /// Replace the contents with file URLs (a Windows->Mac paste); returns the
+    /// new change count, or nil. May hop to the main thread.
+    func writeFileURLs(_ urls: [URL]) -> Int?
+    /// The change count of this host's own last file-URL write, so the text
+    /// clipboard session does not send the staging path back to Windows.
+    func ownFileWriteChangeCount() -> Int?
 }
 
 /// `NSPasteboard.general`. `changeCount` is read on the calling thread: it is
@@ -62,6 +68,27 @@ final class SystemClipboard: ClipboardBackend, @unchecked Sendable {
             guard pasteboard.setString(text, forType: .string) else { return nil }
             return pasteboard.changeCount
         }
+    }
+
+    private let markLock = NSLock()
+    private var fileMark: Int?
+
+    func writeFileURLs(_ urls: [URL]) -> Int? {
+        MainThreadHops.sync {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.writeObjects(urls as [NSURL]) else { return nil }
+            let count = pasteboard.changeCount
+            // Set before the hop returns: a text session that saw the count
+            // move reads contents through the main thread, so it sees this.
+            markLock.lock(); fileMark = count; markLock.unlock()
+            return count
+        }
+    }
+
+    func ownFileWriteChangeCount() -> Int? {
+        markLock.lock(); defer { markLock.unlock() }
+        return fileMark
     }
 }
 
