@@ -2864,6 +2864,7 @@ static void fileChipHide() {
     gChipMode = ChipMode::Hidden;
     gChipHideAtMs = 0.0;
     if (gFileChip) ShowWindow(gFileChip, SW_HIDE);
+    filePanelPlace();
 }
 
 static void fileConfirmHide();
@@ -2959,6 +2960,7 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
     fileUiReposition();
     if (gViewerHwnd && (!IsIconic(gViewerHwnd) || fileChipFloats())) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    filePanelPlace();  // now that the chip is up, keep the panel clear of it
     InvalidateRect(gFileChip, nullptr, FALSE);
 }
 
@@ -3219,7 +3221,10 @@ static void filePanelPlace() {
     GetClientRect(gViewerHwnd, &c);
     const int cw = c.right - c.left, ch = c.bottom - c.top;
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
-    const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+    int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+    // The chip docks top right at the same height: on a narrow viewer it
+    // would cover the panel, so the panel goes below it.
+    if (gFileChip && IsWindowVisible(gFileChip) && !fileChipFloats()) top += chipLayout(dpi).height + ov::scale(8, dpi);
     SetWindowPos(gFilePanel, HWND_TOP, c.left + (cw - l.width) / 2, c.top + top, l.width, l.height, SWP_NOACTIVATE);
 }
 
