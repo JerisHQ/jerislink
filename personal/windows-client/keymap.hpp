@@ -12,11 +12,23 @@
 // decides which semantic key events go on the wire (control_channel.hpp
 // sendKey: MRC1 type 0x10, [down, semantic_hi, semantic_lo]).
 //
-// Today's layout is positional: Ctrl -> Control, Alt -> Option,
-// Win -> Command, plus the Ctrl+A/C/V/Z -> Command compat shortcuts and the
-// Win+C / Win+Space escapes. A preset parameter is added in a later change;
-// Translator is the one place it will plug in.
+// Two presets (Settings > Keyboard, saved as KeyboardPreset):
+// - Mac layout (default, positional): Ctrl -> Control, Alt -> Option,
+//   Win -> Command, plus the Ctrl+A/C/V/X/Z/S/F -> Command compat shortcuts,
+//   Ctrl+Y -> Command+Shift+Z, and the Win+C / Win+Space escapes.
+// - Windows layout: Ctrl -> Command, Win -> Control, Alt -> Option. Ctrl+C
+//   is Command+C with no special case; Ctrl+Y -> Command+Shift+Z.
+// In both, Alt+Tab stays with Windows and the viewer hotkeys (physical
+// Ctrl+Alt+O/M/V) never reach the Mac.
 namespace jl::keymap {
+
+enum class Preset { Mac, Windows };
+
+// Saved value (REG_SZ) and log name. Anything but "windows" is the default.
+inline const char* presetName(Preset p) { return p == Preset::Windows ? "windows" : "mac"; }
+inline Preset presetFromSaved(const std::string& value) {
+    return value == "windows" ? Preset::Windows : Preset::Mac;
+}
 
 // Wire semantics for modifiers (the host maps 1 Control, 2 Option,
 // 3 Command, 4 Shift). Every other key uses its Windows VK value.
@@ -56,6 +68,7 @@ struct Held {
     bool ctrl = false;
     bool alt = false;
     bool win = false;
+    bool shift = false;
 };
 
 struct Output {
@@ -68,12 +81,14 @@ struct Output {
     std::string debugTag;
 };
 
-// Semantic wire code for a Windows VK; 0 = not forwarded.
-inline uint16_t semanticKey(uint32_t key) {
+// Semantic wire code for a Windows VK; 0 = not forwarded. The preset only
+// swaps what Ctrl and Win send.
+inline uint16_t semanticKey(uint32_t key, Preset preset = Preset::Mac) {
+    const bool swap = preset == Preset::Windows;
     switch (key) {
-    case vk::Control: case vk::LControl: case vk::RControl: return kCtrl;
+    case vk::Control: case vk::LControl: case vk::RControl: return swap ? kWin : kCtrl;
     case vk::Menu: case vk::LMenu: case vk::RMenu: return kAlt;
-    case vk::LWin: case vk::RWin: return kWin;
+    case vk::LWin: case vk::RWin: return swap ? kCtrl : kWin;
     case vk::Shift: case vk::LShift: case vk::RShift: return kShift;
     case vk::Capital: return static_cast<uint16_t>(vk::Capital);
 
@@ -102,10 +117,15 @@ inline uint16_t semanticKey(uint32_t key) {
     }
 }
 
-// Ctrl+letter shortcuts sent as Command+letter in the positional layout.
+// Ctrl+letter shortcuts sent as Command+letter in the Mac layout: select
+// all, copy, paste, cut, undo, save, find.
 inline bool isWindowsCtrlCompatShortcut(uint32_t key) {
-    return key == 'A' || key == 'C' || key == 'V' || key == 'Z';
+    return key == 'A' || key == 'C' || key == 'V' || key == 'X' || key == 'Z' || key == 'S' ||
+           key == 'F';
 }
+
+// Ctrl+Y (Windows redo) is sent as Command+Shift+Z in both presets.
+inline bool isWindowsRedo(uint32_t key) { return key == 'Y'; }
 
 // Physical Ctrl+Alt+O (overlay), M (mute), V (volume) stay on the viewer.
 inline bool isViewerHotkey(uint32_t key, const Held& held) {
@@ -129,6 +149,14 @@ inline std::vector<KeyEvent> releaseAllModifiers() {
 // shortcut until its physical key-up" state.
 class Translator {
 public:
+    // Switching preset forgets any half-done shortcut; the viewer releases
+    // the remote modifiers at the same time (releaseAllModifiers).
+    void setPreset(Preset p) {
+        preset_ = p;
+        reset();
+    }
+    Preset preset() const { return preset_; }
+
     // The key went to a viewer hotkey: swallow its repeats and key-up. Ctrl
     // and Alt were already sent as plain modifier downs and release normally.
     void suppressUntilUp(uint32_t key) {
@@ -147,10 +175,12 @@ public:
     // WM_KEYDOWN / WM_SYSKEYDOWN, after the viewer hotkey and overlay checks.
     Output keyDown(uint32_t key, bool repeat, const Held& held) {
         Output out;
-        // Windows+Space is native macOS Control+Space (input source switch),
-        // Windows+C is a true Control+C. Win normally maps to Command, so
-        // release it remotely before the Control chord.
-        if (!repeat && held.win && (key == vk::Space || key == 'C')) {
+        const bool mac = preset_ == Preset::Mac;
+        // Mac layout: Windows+Space is native macOS Control+Space (input
+        // source switch), Windows+C is a true Control+C. Win maps to Command
+        // there, so release it remotely before the Control chord. In the
+        // Windows layout Win already is Control: no special case.
+        if (mac && !repeat && held.win && (key == vk::Space || key == 'C')) {
             out.handled = true;
             out.events.push_back({false, kWin});
             appendChord(out.events, kCtrl, static_cast<uint16_t>(key));
@@ -161,10 +191,30 @@ public:
             return out;
         }
 
-        // Windows editing muscle memory: Ctrl+A/C/V/Z become Command+A/C/V/Z.
-        // The physical Ctrl was already forwarded as Control, so release it
-        // remotely while emitting the Command chord.
-        if (!repeat && held.ctrl && isWindowsCtrlCompatShortcut(key)) {
+        // Ctrl+Y (Windows redo) -> Command+Shift+Z. Mac layout: the physical
+        // Ctrl went out as Control, so release it and send Command; Windows
+        // layout: Ctrl already is Command. Shift is added only if not held.
+        if (!repeat && held.ctrl && isWindowsRedo(key)) {
+            out.handled = true;
+            if (mac) {
+                out.events.push_back({false, kCtrl});
+                out.events.push_back({true, kWin});
+            }
+            if (!held.shift) out.events.push_back({true, kShift});
+            out.events.push_back({true, static_cast<uint16_t>('Z')});
+            out.events.push_back({false, static_cast<uint16_t>('Z')});
+            if (!held.shift) out.events.push_back({false, kShift});
+            if (mac) out.events.push_back({false, kWin});
+            suppressedKey_ = key;
+            releasedModifier_ = mac ? kCtrl : 0;
+            out.debugTag = "shortcut.ctrl_y=command_shift_z";
+            return out;
+        }
+
+        // Mac layout, Windows editing muscle memory: Ctrl+A/C/V/X/Z/S/F become
+        // Command+letter. The physical Ctrl was already forwarded as Control,
+        // so release it remotely while emitting the Command chord.
+        if (mac && !repeat && held.ctrl && isWindowsCtrlCompatShortcut(key)) {
             out.handled = true;
             out.events.push_back({false, kCtrl});
             appendChord(out.events, kWin, static_cast<uint16_t>(key));
@@ -183,7 +233,7 @@ public:
             return out;
         }
 
-        const uint16_t sem = semanticKey(key);
+        const uint16_t sem = semanticKey(key, preset_);
         if (!sem) return out;
         out.handled = true;
         out.events.push_back({true, sem});
@@ -195,6 +245,8 @@ public:
         Output out;
         if (suppressedKey_ != 0 && key == suppressedKey_) {
             out.handled = true;
+            // Only the Mac layout releases a modifier for a shortcut, and
+            // there semantic Control is physical Ctrl, Command is Win.
             if (releasedModifier_ == kCtrl && held.ctrl) {
                 out.events.push_back({true, kCtrl});
             } else if (releasedModifier_ == kWin && held.win) {
@@ -203,7 +255,7 @@ public:
             reset();
             return out;
         }
-        const uint16_t sem = semanticKey(key);
+        const uint16_t sem = semanticKey(key, preset_);
         if (!sem) return out;
         out.handled = true;
         out.events.push_back({false, sem});
@@ -212,16 +264,21 @@ public:
 
     // Messages posted by the low-level hook, which owns the Windows key and
     // Caps Lock while the viewer is focused.
-    static Output hookWinDown() {
+    Output hookWinDown() const {
+        if (preset_ == Preset::Windows) return {true, {{true, kCtrl}}, "shortcut.win_hook=control_down"};
         return {true, {{true, kWin}}, "shortcut.win_hook=command_down"};
     }
-    static Output hookWinUp() {
+    Output hookWinUp() const {
+        if (preset_ == Preset::Windows) return {true, {{false, kCtrl}}, "shortcut.win_hook=control_up"};
         return {true, {{false, kWin}}, "shortcut.win_hook=command_up"};
     }
-    // Momentarily release remote Command, emit true Control+C / Control+Space,
-    // then restore Command while the Windows key is still held.
-    static Output hookWinC(bool winStillHeld) { return hookWinChord('C', winStillHeld, "shortcut.win_c_hook=control_c"); }
-    static Output hookWinSpace(bool winStillHeld) {
+    // Mac layout: momentarily release remote Command, emit true Control+C /
+    // Control+Space, then restore Command while the Windows key is still
+    // held. Windows layout: remote Control is already down, send the key.
+    Output hookWinC(bool winStillHeld) const {
+        return hookWinChord('C', winStillHeld, "shortcut.win_c_hook=control_c");
+    }
+    Output hookWinSpace(bool winStillHeld) const {
         return hookWinChord(static_cast<uint16_t>(vk::Space), winStillHeld, "shortcut.win_space_hook=control_space");
     }
     static Output hookCapsLock() {
@@ -231,13 +288,15 @@ public:
     }
 
 private:
-    static Output hookWinChord(uint16_t key, bool winStillHeld, const char* tag) {
+    Output hookWinChord(uint16_t key, bool winStillHeld, const char* tag) const {
+        if (preset_ == Preset::Windows) return {true, {{true, key}, {false, key}}, tag};
         Output out{true, {{false, kWin}}, tag};
         appendChord(out.events, kCtrl, key);
         if (winStillHeld) out.events.push_back({true, kWin});
         return out;
     }
 
+    Preset preset_ = Preset::Mac;
     uint32_t suppressedKey_ = 0;
     uint16_t releasedModifier_ = 0;
 };
