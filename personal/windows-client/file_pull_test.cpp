@@ -98,7 +98,7 @@ void manifests() {
     expect(m.items[1].rel == L"Photos\\a.jpg" && m.items[0].dir && !m.items[1].dir, "manifest: Windows separators, kinds");
     // "Cafe" + combining acute arrives NFC.
     expect(buildManifest(file::Offer{4, 3, 1, 1}, {entry(4, 0, false, 1, "Cafe\xCC\x81.txt")}, m).empty() &&
-               m.items[0].rel == L"Café.txt",
+               m.items[0].rel == L"Caf\u00e9.txt",
            "manifest: names normalised to NFC");
 
     expect(build(ok, 10, 2, 4) == "count", "manifest: entry count must match the offer");
