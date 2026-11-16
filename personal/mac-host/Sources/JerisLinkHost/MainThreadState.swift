@@ -43,6 +43,13 @@ protocol ClipboardBackend: AnyObject, Sendable {
     /// The change count of this host's own last file-URL write, so the text
     /// clipboard session does not send the staging path back to Windows.
     func ownFileWriteChangeCount() -> Int?
+    /// The file URLs on the pasteboard (a Finder copy), or nil when it holds
+    /// none. May hop to the main thread.
+    func readFileURLs() -> [URL]?
+}
+
+extension ClipboardBackend {
+    func readFileURLs() -> [URL]? { nil }
 }
 
 /// `NSPasteboard.general`. `changeCount` is read on the calling thread: it is
@@ -89,6 +96,15 @@ final class SystemClipboard: ClipboardBackend, @unchecked Sendable {
     func ownFileWriteChangeCount() -> Int? {
         markLock.lock(); defer { markLock.unlock() }
         return fileMark
+    }
+
+    func readFileURLs() -> [URL]? {
+        MainThreadHops.sync {
+            let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self],
+                                                        options: [.urlReadingFileURLsOnly: true]) as? [URL]
+            guard let urls, !urls.isEmpty else { return nil }
+            return urls
+        }
     }
 }
 
