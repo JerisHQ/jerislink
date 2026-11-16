@@ -14,6 +14,7 @@ namespace {
 constexpr int kAckTimeoutMs = 2000;
 constexpr int kPingIntervalMs = 15000;
 constexpr int kPollMs = 250;
+constexpr int kPullPollMs = 5;
 constexpr int kBackoffMinMs = 1000;
 constexpr int kBackoffMaxMs = 30000;
 
@@ -26,8 +27,13 @@ std::string hex4(uint16_t v) {
 }
 }  // namespace
 
-FileSession::FileSession(std::string localIp, std::string remoteIp, uint16_t port, LogFn logFn)
-    : localIp_(std::move(localIp)), remoteIp_(std::move(remoteIp)), port_(port), logFn_(std::move(logFn)) {}
+FileSession::FileSession(std::string localIp, std::string remoteIp, uint16_t port, LogFn logFn, Role role)
+    : localIp_(std::move(localIp)), remoteIp_(std::move(remoteIp)), port_(port), logFn_(std::move(logFn)), role_(role) {
+    if (role_ == Role::Pull) {
+        hub_ = std::make_unique<jl::filepull::PullHub>(jl::filepull::sha256Digest());
+        clip_ = std::make_unique<jl::filepull::FileClipboard>(*hub_, logFn_);
+    }
+}
 
 FileSession::~FileSession() {
     stop();
@@ -36,6 +42,7 @@ FileSession::~FileSession() {
 void FileSession::start() {
     if (worker_.joinable()) return;
     stopRequested_ = false;
+    if (clip_) clip_->start();
     worker_ = std::thread([this] { run(); });
 }
 
@@ -46,6 +53,9 @@ void FileSession::stop() {
     }
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
+    // Clears Windows clipboard if it still holds a Mac copy: with no session
+    // nobody could paste it.
+    if (clip_) clip_->stop();
 }
 
 void FileSession::log(const std::string& message) const {
@@ -187,7 +197,8 @@ void FileSession::run() {
         Outcome outcome = Outcome::ConnectFailed;
         if (s != INVALID_SOCKET) {
             using namespace jl::file;
-            const auto hello = encode(Hello{kVersion, caps::kViewer});
+            const uint16_t ours = role_ == Role::Pull ? caps::kAnnounce : caps::kViewer;
+            const auto hello = encode(Hello{kVersion, ours});
             if (hello && sendPacket(s, type::kHello, *hello)) {
                 outcome = Outcome::NoAck;
                 // Wait for HELLO_ACK in short slices so stop() is prompt.
@@ -207,12 +218,20 @@ void FileSession::run() {
                 if (stopRequested_) outcome = Outcome::Stopped;
                 else if (acked) outcome = Outcome::Closed;
             }
+            if (outcome == Outcome::Closed && role_ == Role::Pull && !(hostCaps_.load() & caps::kAnnounce)) {
+                // A host without F3: Finder copies stay text-only, as before.
+                capability_ = static_cast<int>(Capability::No);
+                log("file.pull=unsupported caps=0x" + hex4(hostCaps_.load()));
+                closeSocket(s);
+                break;
+            }
             if (outcome == Outcome::Closed) {
                 ++sessions_;
                 backoffMs = kBackoffMinMs;
                 if (capability() != Capability::Yes) {
                     capability_ = static_cast<int>(Capability::Yes);
-                    log("file.capability=yes caps=0x" + hex4(hostCaps_.load()));
+                    log(std::string(role_ == Role::Pull ? "file.pull=ready" : "file.capability=yes") + " caps=0x" +
+                        hex4(hostCaps_.load()));
                 }
                 // Keepalive: PING every 15 s; the next PING finds the last
                 // one unanswered only if the host stopped answering.
@@ -234,6 +253,7 @@ void FileSession::run() {
                         outstanding = false;
                         continue;
                     }
+                    if (role_ == Role::Pull && !pumpRequests(s)) { reason = "send_failed"; break; }
                     if (std::chrono::steady_clock::now() - lastPing >= std::chrono::milliseconds(kPingIntervalMs)) {
                         if (outstanding) { reason = "ping_timeout"; break; }
                         ++token;
@@ -243,20 +263,27 @@ void FileSession::run() {
                         outstanding = true;
                         lastPing = std::chrono::steady_clock::now();
                     }
-                    if (!waitReadable(s, kPollMs)) continue;
+                    // While Explorer is pulling, poll fast so REQUESTs follow reads.
+                    const int poll = hub_ && hub_->wantsService() ? kPullPollMs : kPollMs;
+                    if (!waitReadable(s, poll)) continue;
                     uint8_t t = 0;
                     std::vector<uint8_t> p;
                     if (!recvPacket(s, t, p)) break;
                     const auto msg = decode(t, p);
                     if (!msg) { reason = "malformed"; break; }
+                    if (role_ == Role::Pull) {
+                        const std::string why = handlePull(s, *msg);
+                        if (!why.empty()) { reason = why; break; }
+                    }
                     if (const Ping* pong = std::get_if<Ping>(&*msg)) {
                         const uint32_t got = (uint32_t(pong->token[0]) << 24) | (uint32_t(pong->token[1]) << 16) |
                                              (uint32_t(pong->token[2]) << 8) | uint32_t(pong->token[3]);
                         if (got == token) outstanding = false;
                     }
-                    // F1: nothing else is expected yet; anything well-formed is ignored.
+                    // Anything else well-formed is ignored.
                 }
-                log("file.session=closed reason=" + reason);
+                log(std::string(role_ == Role::Pull ? "file.pull" : "file.session") + "=closed reason=" + reason);
+                if (role_ == Role::Pull) dropAnnounce();
             }
             closeSocket(s);
         }
@@ -686,6 +713,107 @@ std::string FileSession::runUpload(SOCKET s) {
         finish(UploadState::Cancelled, "cancelled");
     } else {
         finish(UploadState::Failed, std::string("failed:") + statusName(hostStatus));
+    }
+    return "";
+}
+
+// ---- F3: Mac->Windows paste pull -----------------------------------------
+
+void FileSession::dropAnnounce() {
+    collecting_.reset();
+    entries_.clear();
+    if (hub_) hub_->disconnect();
+    if (clip_) clip_->withdraw(0);
+}
+
+bool FileSession::pumpRequests(SOCKET s) {
+    using namespace jl::file;
+    pullPacer_.setMbps(pullMbps_.load());
+    while (true) {
+        const double now = nowMs();
+        if (now < pullReadyMs_) return true;
+        const auto q = hub_->nextRequest();
+        if (!q) return true;
+        const auto pkt = encode(*q);
+        if (!pkt || !sendPacket(s, type::kRequest, *pkt)) return false;
+        // Paced when asked for, so bytes arrive at about the configured rate.
+        pullReadyMs_ = now + pullPacer_.delayMs(q->length, now);
+    }
+}
+
+std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
+    using namespace jl::file;
+    const auto refuse = [&](uint32_t t, const std::string& why, uint8_t status) {
+        log("file.announce=refused transfer=" + std::to_string(t) + " reason=" + why);
+        if (pullNotice_) pullNotice_(PullNotice::NotOffered);
+        const auto pkt = encode(Reply{t, status});
+        return pkt && sendPacket(s, type::kReply, *pkt) ? std::string() : std::string("send_failed");
+    };
+    if (const Offer* o = std::get_if<Offer>(&msg)) {
+        if (o->purpose != purpose::kAnnounce) return "";
+        // A new Finder copy replaces whatever this PC was offered before.
+        collecting_.reset();
+        entries_.clear();
+        if (const uint32_t old = hub_->current()) {
+            hub_->cancel(old);
+            clip_->withdraw(old);
+        }
+        if (o->entries == 0 || o->entries > kMaxEntries) return refuse(o->transfer, "too_many", status::kTooBig);
+        if (o->total > kMaxTotalBytes) return refuse(o->transfer, "too_big", status::kTooBig);
+        collecting_ = *o;
+        entries_.reserve(std::min<uint32_t>(o->entries, 1024));
+        return "";
+    }
+    if (const Entry* e = std::get_if<Entry>(&msg)) {
+        if (!collecting_ || e->transfer != collecting_->transfer) return "";
+        entries_.push_back(*e);
+        if (entries_.size() < collecting_->entries) return "";
+        const Offer offer = *collecting_;
+        collecting_.reset();
+        jl::filepull::Manifest m;
+        const std::string why = jl::filepull::buildManifest(offer, entries_, m);
+        entries_.clear();
+        if (!why.empty()) return refuse(offer.transfer, why, status::kBadPath);
+        hub_->announce(m);
+        clip_->offer(m);
+        log("file.announce=received transfer=" + std::to_string(m.transfer) + " entries=" +
+            std::to_string(m.items.size()) + " files=" + std::to_string(m.files) + " bytes=" + std::to_string(m.total) +
+            " renamed=" + std::to_string(m.renamed));
+        return "";
+    }
+    if (const Cancel* c = std::get_if<Cancel>(&msg)) {
+        if (collecting_ && collecting_->transfer == c->transfer) {
+            collecting_.reset();
+            entries_.clear();
+        }
+        if (hub_->current() == c->transfer) {
+            hub_->cancel(c->transfer);
+            clip_->withdraw(c->transfer);
+            log("file.announce=cancelled transfer=" + std::to_string(c->transfer));
+        }
+        return "";
+    }
+    if (const Data* d = std::get_if<Data>(&msg)) {
+        hub_->onData(*d);
+        return "";
+    }
+    if (const FileEnd* f = std::get_if<FileEnd>(&msg)) {
+        hub_->onFileEnd(*f);
+        return "";
+    }
+    if (const Reply* r = std::get_if<Reply>(&msg)) {
+        if (r->status != status::kOk && hub_->current() == r->transfer) {
+            hub_->onFailed(r->transfer);
+            const bool mac = r->status == status::kMacPermission;
+            log("file.pull=failed transfer=" + std::to_string(r->transfer) + " status=" + std::to_string(r->status) +
+                (mac ? " reason=mac_permission" : ""));
+            // Once per copy: Explorer may ask for several files and fail each.
+            if (pullNotice_ && noticedTransfer_ != r->transfer) {
+                noticedTransfer_ = r->transfer;
+                pullNotice_(mac ? PullNotice::MacPermission : PullNotice::PullFailed);
+            }
+        }
+        return "";
     }
     return "";
 }

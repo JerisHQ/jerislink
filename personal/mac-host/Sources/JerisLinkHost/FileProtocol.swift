@@ -8,8 +8,9 @@ import Foundation
 /// whose length does not match its type is rejected, and the session closes.
 ///
 /// F1 ships the codec for every type so later PRs add behaviour only, never
-/// wire. The host answers HELLO and PING, receives paste uploads (F2) and
-/// refuses every other request.
+/// wire. The host answers HELLO and PING, receives paste uploads (F2),
+/// announces Finder copies and serves REQUEST pulls (F3), and refuses every
+/// other request.
 enum FileProto {
     static let version: UInt8 = 1
 
@@ -44,8 +45,9 @@ enum FileProto {
         static let pushService: UInt16 = 1 << 1  // F5b: Finder Send to JerisLink
         static let reveal: UInt16 = 1 << 2       // F4: 0x5C opens the received folder
         static let announce: UInt16 = 1 << 3     // F3: Cmd+C manifests, serves REQUEST
-        /// What this build implements. F2: paste uploads.
-        static let host: UInt16 = upload
+        /// What this build implements. F2: paste uploads. F3: Cmd+C
+        /// announces and REQUEST pulls, on sessions whose viewer asks for them.
+        static let host: UInt16 = upload | announce
     }
 
     enum Status {
@@ -57,6 +59,9 @@ enum FileProto {
         static let badPath: UInt8 = 5
         static let failed: UInt8 = 6
         static let cancelled: UInt8 = 7
+        /// F3 r2: macOS privacy settings (TCC Files & Folders) blocked the read,
+        /// or a prompt asking for it is still open on the Mac. Additive.
+        static let macPermission: UInt8 = 8
     }
 
     enum EntryKind {

@@ -140,6 +140,7 @@ enum ControlServiceSelfTest {
         failures += recoveryWindow(expect)
         failures += clipboardPollReadsOnlyChangeCount(expect)
         failures += fileUploadEndToEnd(expect)
+        failures += fileAnnounceEndToEnd(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
@@ -542,10 +543,10 @@ enum ControlServiceSelfTest {
         _ = file.send(type: 0x50, payload: [1, 0, 0])                // FILE_HELLO proto 1, caps 0
         if let ack = file.receive(timeout: 3), ack.type == 0x51,
            case let .helloAck(proto, caps, maxChunk, maxTotal)? = FileProto.decode(type: ack.type, payload: ack.payload) {
-            expect(proto == 1 && caps == FileProto.Caps.upload && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
-                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
+            expect(proto == 1 && caps == FileProto.Caps.host && maxChunk == 32 * 1024 && maxTotal == 20 * 1024 * 1024 * 1024,
+                   "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
         } else {
-            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload chunk=32K total=20G")
+            expect(false, "file e2e: direct listener answers HELLO_ACK proto=1 caps=upload+announce chunk=32K total=20G")
         }
         _ = file.send(type: 0x5B, payload: [9, 8, 7, 6])
         let pong = file.receive(timeout: 3)
@@ -642,6 +643,73 @@ enum ControlServiceSelfTest {
         wait(until: { server.statsLine().contains("file_uploads=1 file_upload_failed=1") })
         expect(server.statsLine().contains("file_uploads=1 file_upload_failed=1 file_rx_bytes=\(body.count + 32768)"),
                "upload e2e: stats file_uploads=1 failed=1 rx bytes (\(server.statsLine()))")
+        return 0
+    }
+
+    /// F3 over a real socket: a Finder copy is announced only on a session
+    /// that asked for announces, the text session does not send the
+    /// filename text while it is open, REQUEST pulls the bytes, and a later
+    /// text copy cancels the announce.
+    private static func fileAnnounceEndToEnd(_ expect: (Bool, String) -> Void) -> Int {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("jl-announce-e2e-\(getpid())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let src = root.appendingPathComponent("src/report.bin")
+        try? FileManager.default.createDirectory(at: src.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let body = FileAnnounceSelfTest.body(90_000)
+        FileManager.default.createFile(atPath: src.path, contents: Data(body))
+        let board = FakeClipboard(text: "before-announce")
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.announce.\(getpid())")
+        guard let (server, port) = startServer(inject: false, helperPort: nil, clipboard: board, inputSources: cache,
+                                               fileStagingRoot: root.appendingPathComponent("staging")),
+              let text = MRC1Client(port: port), let upload = MRC1Client(port: port), let pull = MRC1Client(port: port) else {
+            expect(false, "announce e2e: server and sessions start")
+            return 0
+        }
+        defer { text.close(); upload.close(); pull.close(); server.stop() }
+        typealias M = FileProto.Message
+        func next(_ c: MRC1Client, _ timeout: Double = 3) -> M? {
+            c.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+        }
+        _ = text.send(type: 0x30, payload: [])
+        _ = upload.send(type: 0x50, payload: [1, 0, 0])                                   // caps 0: uploads only
+        _ = pull.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+        expect(next(upload) == .helloAck(proto: 1, caps: FileProto.Caps.host, maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes),
+               "announce e2e: HELLO_ACK advertises upload|announce")
+        _ = next(pull)
+        wait(until: { board.counts.changeCountReads >= 6 })
+
+        board.localCopyFiles([src])
+        guard case let .offer(t, purpose, entries, total)? = next(pull) else {
+            expect(false, "announce e2e: Finder copy is announced")
+            return 0
+        }
+        expect(purpose == FileProto.Purpose.announce && entries == 1 && total == UInt64(body.count), "announce e2e: OFFER purpose=announce")
+        var st = stat()
+        let mtime: Int64 = lstat(src.path, &st) == 0 ? Int64(st.st_mtimespec.tv_sec) : -1
+        expect(next(pull) == .entry(transfer: t, index: 0, kind: FileProto.EntryKind.file, size: UInt64(body.count),
+                                    mtime: mtime, path: Array("report.bin".utf8)),
+               "announce e2e: ENTRY with the name, size and mtime")
+        expect(upload.receive(timeout: 0.5) == nil, "announce e2e: a session without the announce cap gets nothing")
+        expect(text.receive(timeout: 0.5) == nil, "announce e2e: text session does not send the filename text")
+
+        _ = pull.send(type: FileProto.MsgType.request, payload: M.request(transfer: t, index: 0, offset: 0, length: 1 << 20).encode()!)
+        var got: [UInt8] = []
+        var end: M?
+        while let m = next(pull) {
+            if case let .data(_, _, off, b) = m, off == UInt64(got.count) { got += b }
+            if case .fileEnd = m { end = m; break }
+        }
+        expect(got == body && end == .fileEnd(transfer: t, index: 0, sha256: FileUploadSelfTest.sha(body)),
+               "announce e2e: REQUEST pulls the bytes and FILE_END")
+
+        board.localCopy("plain text")
+        expect(next(pull) == .cancel(transfer: t, reason: FileProto.Status.cancelled), "announce e2e: a text copy cancels the announce")
+        expect(text.receive(timeout: 2)?.payload == Array("plain text".utf8), "announce e2e: and the text still syncs")
+        pull.close()
+        wait(until: { server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)") })
+        expect(server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)"),
+               "announce e2e: stats (\(server.statsLine()))")
         return 0
     }
 
@@ -743,7 +811,7 @@ private final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
 
     /// A copy made on the Mac itself.
     func localCopy(_ value: String) {
-        lock.lock(); count += 1; text = value; lock.unlock()
+        lock.lock(); count += 1; text = value; copied = nil; lock.unlock()
     }
 
     func changeCount() -> Int {
@@ -783,6 +851,18 @@ private final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
     func ownFileWriteChangeCount() -> Int? {
         lock.lock(); defer { lock.unlock() }
         return fileMark
+    }
+
+    private var copied: [URL]?
+
+    /// A Finder copy on the Mac itself: file URLs plus the filename text.
+    func localCopyFiles(_ value: [URL]) {
+        lock.lock(); count += 1; copied = value; text = value.first?.lastPathComponent; lock.unlock()
+    }
+
+    func readFileURLs() -> [URL]? {
+        lock.lock(); defer { lock.unlock() }
+        return copied
     }
 }
 

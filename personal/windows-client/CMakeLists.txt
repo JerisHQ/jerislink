@@ -39,9 +39,9 @@ if(MSVC)
     target_compile_options(opus PRIVATE /w)
 endif()
 
-set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt)
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt normaliz shell32 oleaut32 shlwapi uuid)
 
-add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(Jerislink PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS} opus comctl32)
@@ -51,7 +51,7 @@ endif()
 
 # CI-only: the real settings / volume dialogs rendered to BMP for review.
 # Not installed or packaged.
-add_executable(JerislinkUiSnapshot WIN32 EXCLUDE_FROM_ALL viewer.cpp clipboard_channel.cpp file_session.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+add_executable(JerislinkUiSnapshot WIN32 EXCLUDE_FROM_ALL viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(JerislinkUiSnapshot PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX JERISLINK_UI_SNAPSHOT)
 target_include_directories(JerislinkUiSnapshot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(JerislinkUiSnapshot PRIVATE ${JERISLINK_LIBS} opus comctl32)
@@ -116,3 +116,13 @@ target_link_libraries(JerislinkFilePathTest PRIVATE normaliz)
 
 # Console test for the Windows -> Mac paste hold, pacer, chip and disconnect confirm (file_upload.hpp).
 add_executable(JerislinkFileUploadTest file_upload_test.cpp)
+
+# Console test for the Mac -> Windows paste manifest checks and pull buffer (file_pull.hpp).
+add_executable(JerislinkFilePullTest file_pull_test.cpp)
+target_compile_definitions(JerislinkFilePullTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkFilePullTest PRIVATE normaliz user32)
+
+# Windows test for Mark of the Web on Mac -> Windows paste (F3 r2): zone helpers and an end-to-end shell paste.
+add_executable(JerislinkFileZoneTest file_zone_test.cpp file_pull.cpp)
+target_compile_definitions(JerislinkFileZoneTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkFileZoneTest PRIVATE ole32 oleaut32 shell32 shlwapi bcrypt uuid normaliz user32)

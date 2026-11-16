@@ -35,6 +35,14 @@ final class ControlServer: @unchecked Sendable {
     private(set) var fileUploads: UInt64 = 0
     private(set) var fileUploadsFailed: UInt64 = 0
     private(set) var fileRxBytes: UInt64 = 0
+    private var fileAnnounces: UInt64 = 0
+    private var filePulls: UInt64 = 0
+    private var fileTxBytes: UInt64 = 0
+    /// Open file sessions that announce Finder copies (F3). While one is
+    /// open the text clipboard session leaves file copies alone, so the
+    /// filename text Finder also puts on the pasteboard does not replace the
+    /// file object on the Windows clipboard.
+    private var announceSessions = 0
     private let fileStatsLock = NSLock()
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
@@ -279,12 +287,12 @@ final class ControlServer: @unchecked Sendable {
             case FileProto.MsgType.hello: // FILE_HELLO: dedicate this TCP session to file transfer.
                 // Only as the first message, and only on the direct listener.
                 guard allowFileSessions, connectionMessages == 1,
-                      case .hello(let proto, _)? = FileProto.decode(type: type, payload: payload), proto >= 1 else {
+                      case .hello(let proto, let peerCaps)? = FileProto.decode(type: type, payload: payload), proto >= 1 else {
                     fileRefused += 1
                     print("file.session=refused")
                     return
                 }
-                handleFileSession(fd)
+                handleFileSession(fd, peerCaps: peerCaps)
                 return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
@@ -386,34 +394,62 @@ final class ControlServer: @unchecked Sendable {
     }
     private static let sessionIDs = SessionIDCounter()
 
+    private func announceSessionsOpen() -> Bool {
+        fileStatsLock.lock(); defer { fileStatsLock.unlock() }
+        return announceSessions > 0
+    }
+
     private func fileStatsText() -> String {
         fileStatsLock.lock(); defer { fileStatsLock.unlock() }
-        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes)"
+        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes)"
     }
 
     /// A file session: HELLO_ACK with this build's caps, PING echo, paste
     /// uploads through `FileUploadReceiver` (F2), and REJECT `denied` for
-    /// every other request until F3-F5 implement them. Any malformed or
+    /// every other request until F4-F5 implement them. A viewer whose HELLO
+    /// carries caps `announce` gets Finder copies announced on this session
+    /// and pulls their bytes with REQUEST (F3, `FileAnnouncer`); the
+    /// pasteboard is checked on each 100 ms poll by its change count only. Any malformed or
     /// unexpected message closes the session, and a session that ends with
     /// an upload running removes its partial files. Runs on this client's own
     /// thread; only the final pasteboard write hops to the main thread. Logs
     /// carry no file names (D15): only open/closed and counts.
-    private func handleFileSession(_ fd: Int32) {
+    private func handleFileSession(_ fd: Int32, peerCaps: UInt16) {
         fileSessions += 1
         let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard)
+        let announcer: FileAnnouncer? = (peerCaps & FileProto.Caps.announce) != 0 ? FileAnnouncer() : nil
+        // A copy made before the session opened is not announced: the viewer
+        // connecting must not replace what the Windows clipboard holds.
+        var lastChangeCount = clipboard.changeCount()
+        if announcer != nil {
+            fileStatsLock.lock(); announceSessions += 1; fileStatsLock.unlock()
+        }
         let ack = FileProto.Message.helloAck(proto: FileProto.version, caps: FileProto.Caps.host,
                                              maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
         guard let ackBytes = ack.encode(), sendPacket(fd, type: ack.type, payload: ackBytes) else { return }
-        print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16))")
+        print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16)) peer_caps=0x\(String(peerCaps, radix: 16))")
+        func sendAll(_ msgs: [FileProto.Message]) -> Bool {
+            for out in msgs {
+                guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else { return false }
+            }
+            return true
+        }
         var received = 0
         var refused = 0
         var reason = "peer_closed"
         defer {
             receiver.abort(reason: reason)
+            announcer?.close()
             fileStatsLock.lock()
             fileUploads += receiver.completed
             fileUploadsFailed += receiver.failed
             fileRxBytes += receiver.bytesIn
+            if let announcer {
+                announceSessions -= 1
+                fileAnnounces += announcer.announces
+                filePulls += announcer.filesServed
+                fileTxBytes += announcer.bytesOut
+            }
             fileStatsLock.unlock()
             print("file.session=closed reason=\(reason) messages=\(received) refused=\(refused)")
         }
@@ -423,6 +459,16 @@ final class ControlServer: @unchecked Sendable {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { reason = "stopping"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
+            if let announcer {
+                let changeCount = clipboard.changeCount()
+                if changeCount != lastChangeCount {
+                    lastChangeCount = changeCount
+                    // This host's own F2 paste holds staging files Windows
+                    // already has: never announce them back.
+                    let urls = clipboard.ownFileWriteChangeCount() == changeCount ? nil : clipboard.readFileURLs()
+                    guard sendAll(announcer.announce(urls: urls)) else { reason = "send_failed"; return }
+                }
+            }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -448,6 +494,23 @@ final class ControlServer: @unchecked Sendable {
             switch msg {
             case .ping:
                 guard sendPacket(fd, type: type, payload: payload) else { reason = "send_failed"; return }
+            case .request(let t, let index, let offset, let length):
+                guard let announcer else {
+                    refused += 1
+                    guard sendAll([.reply(transfer: t, status: FileProto.Status.denied)]) else { reason = "send_failed"; return }
+                    continue
+                }
+                guard announcer.serve(transfer: t, index: index, offset: offset, length: length,
+                                      send: { m in m.encode().map { sendPacket(fd, type: m.type, payload: $0) } ?? false }) else {
+                    reason = "send_failed"; return
+                }
+                // Serving can take a while on a slow link; it is activity.
+                lastMessage = Date()
+            case .cancel(let t, _) where announcer != nil && t == announcer?.current,
+                 .reply(let t, _) where announcer != nil && t == announcer?.current:
+                // The viewer dropped the announce (cleared, or names Windows
+                // cannot take).
+                announcer?.cancel(t)
             case .offer(_, FileProto.Purpose.paste, _, _), .entry, .data, .fileEnd, .cancel:
                 let step = receiver.handle(msg)
                 for out in step.send {
@@ -464,8 +527,8 @@ final class ControlServer: @unchecked Sendable {
                 }
             case .hello, .helloAck:
                 reason = "unexpected"; return
-            case .reply, .result, .request, .progress:
-                // Host-to-viewer messages, or pulls (F3): nothing to answer yet.
+            case .reply, .result, .progress:
+                // Host-to-viewer messages: nothing to answer.
                 break
             }
         }
@@ -529,6 +592,9 @@ final class ControlServer: @unchecked Sendable {
             // Our own file-URL write (Windows->Mac paste): Windows already
             // holds those files; never send the staging path back as text.
             if clipboard.ownFileWriteChangeCount() == changeCount { continue }
+            // A Finder copy goes to Windows as files on the file session
+            // (F3); its filename text must not overwrite them there.
+            if announceSessionsOpen(), clipboard.readFileURLs() != nil { continue }
             let text = clipboard.readText()
             let settled = clipboard.changeCount()
             if clipboard.ownFileWriteChangeCount() == settled { lastChangeCount = settled; continue }

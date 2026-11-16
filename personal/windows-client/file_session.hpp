@@ -15,6 +15,12 @@
 // FileTransferMaxMbps with at most 4 MiB not yet acknowledged by PROGRESS.
 // The host sets the Mac pasteboard and answers RESULT. File names are never
 // logged.
+//
+// F3: a second FileSession in the Pull role says HELLO caps=announce. The
+// host then sends a manifest whenever the user copies files in Finder; the
+// session checks it, puts a lazy file object on the Windows clipboard
+// (FileClipboard) and, only when Explorer pastes, pulls the bytes with
+// REQUEST, paced like an upload. The upload session never sees announces.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -28,7 +34,11 @@
 #include <vector>
 
 #include "file_proto.hpp"
+#include "file_pull.hpp"
 #include "file_upload.hpp"
+
+#include <memory>
+#include <optional>
 
 class FileSession {
 public:
@@ -36,6 +46,10 @@ public:
     // Called on the session thread when an upload started with startUpload()
     // ends, whatever the outcome. Post to the UI thread; do not block.
     using UploadDoneFn = std::function<void()>;
+    // Pull role: something the user should see about a Mac copy (F3 r2).
+    // Called on the session thread; post to the UI thread, do not block.
+    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3 };
+    using PullNoticeFn = std::function<void(PullNotice)>;
     enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
     struct UploadProgress {
         UploadState state = UploadState::Idle;
@@ -46,8 +60,10 @@ public:
         uint64_t bytesPerSec = 0;
     };
     enum class Capability : int { Unknown = 0, Yes = 1, No = 2 };
+    // Upload: Windows->Mac (F2). Pull: Mac->Windows paste (F3).
+    enum class Role { Upload, Pull };
 
-    FileSession(std::string localIp, std::string remoteIp, uint16_t port, LogFn logFn);
+    FileSession(std::string localIp, std::string remoteIp, uint16_t port, LogFn logFn, Role role = Role::Upload);
     ~FileSession();
 
     FileSession(const FileSession&) = delete;
@@ -72,6 +88,16 @@ public:
     UploadProgress uploadProgress() const;
     void setUploadDoneCallback(UploadDoneFn fn) { uploadDone_ = std::move(fn); }  // before start()
     uint64_t txBytes() const { return txBytes_.load(); }
+
+    // Pull role (F3).
+    Role role() const { return role_; }
+    bool pullRunning() const { return hub_ && hub_->progress().active; }
+    jl::filepull::PullHub::Progress pullProgress() const {
+        return hub_ ? hub_->progress() : jl::filepull::PullHub::Progress{};
+    }
+    uint64_t rxBytes() const { return hub_ ? hub_->rxBytes() : 0; }
+    void setMaxMbps(uint32_t mbps) { pullMbps_ = mbps; }
+    void setPullNoticeCallback(PullNoticeFn fn) { pullNotice_ = std::move(fn); }  // before start()
 
 private:
     void run();
@@ -98,6 +124,12 @@ private:
     bool walk(const std::vector<std::wstring>& roots, std::vector<UploadEntry>& out, uint64_t& total,
               uint32_t& skipped, std::string& error);
     void endUpload(UploadState state);
+    // Pull role: one message from the host. Returns "" or why the session
+    // must close.
+    std::string handlePull(SOCKET s, const jl::file::Message& msg);
+    // Pull role: sends the REQUESTs the hub wants and the pacer allows.
+    bool pumpRequests(SOCKET s);
+    void dropAnnounce();
 
     std::string localIp_;
     std::string remoteIp_;
@@ -126,4 +158,15 @@ private:
     std::atomic<uint64_t> upCommitted_{0};
     std::atomic<uint64_t> upRate_{0};
     std::atomic<uint64_t> txBytes_{0};
+
+    Role role_ = Role::Upload;
+    std::unique_ptr<jl::filepull::PullHub> hub_;
+    std::unique_ptr<jl::filepull::FileClipboard> clip_;
+    std::atomic<uint32_t> pullMbps_{jl::fileup::kDefaultMaxMbps};
+    PullNoticeFn pullNotice_;
+    uint32_t noticedTransfer_ = 0;  // session thread
+    jl::fileup::Pacer pullPacer_;
+    double pullReadyMs_ = 0.0;
+    std::optional<jl::file::Offer> collecting_;   // session thread only
+    std::vector<jl::file::Entry> entries_;
 };

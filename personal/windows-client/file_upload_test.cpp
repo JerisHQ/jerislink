@@ -175,6 +175,10 @@ void text() {
                "2 file(s) are still transferring (1.2 GB of 4.0 GB). If you disconnect now, the transfer "
                "stops and unfinished files are removed from the Mac. Files that already finished are kept.",
            "confirm: body text per doc");
+    expect(confirmBodyPull(1, 70000, 4000000000ull) ==
+               "1 file(s) are still being pasted into this PC (70 KB of 4.0 GB). If you disconnect now, the paste "
+               "stops and Explorer reports the unfinished files. Files that already finished are kept.",
+           "confirm: Mac->Windows paste variant");
 }
 
 void confirmKeys() {

@@ -373,6 +373,7 @@ static constexpr UINT WM_MR_WIN_UP = WM_APP + 43;
 static constexpr UINT WM_MR_WIN_SPACE = WM_APP + 44;
 static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
+static constexpr UINT WM_MR_FILE_PULL_NOTICE = WM_APP + 47;  // F3 r2, wParam = FileSession::PullNotice
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -555,6 +556,7 @@ static bool physicalKeyDown(int vk) {
 
 // F2 file upload state (UI thread). The UI itself is further down, after the overlay.
 static FileSession* gFileSession = nullptr;  // set while a session runs
+static FileSession* gFilePullSession = nullptr;  // F3 Mac->Windows paste, same lifetime
 static jl::fileup::PasteGate gPasteGate;
 static HWND gFileConfirm = nullptr;
 static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileConfirm); }
@@ -2660,12 +2662,16 @@ static void overlayDestroy() {
 
 namespace fu = jl::fileup;
 
-enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled };
+// Notice: a one-line message about a Mac copy pasted here (F3 r2), shown
+// even when Explorer covers the viewer.
+enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled, Notice };
 static HWND gFileChip = nullptr;
 static ChipMode gChipMode = ChipMode::Hidden;
 static double gChipHideAtMs = 0.0;
 static bool gChipCancelHot = false;
 static uint64_t gChipPastedFiles = 0;
+static std::wstring gChipNotice;
+static bool gChipNoticeError = false;
 static DWORD gLastUploadClipSeq = 0;  // clipboard sequence of the last good upload
 static DWORD gPendingClipSeq = 0;
 static std::vector<std::wstring> gPendingRoots;
@@ -2691,7 +2697,8 @@ static FileSession::UploadProgress currentUpload() {
 }
 
 static bool fileTransferRunning() {
-    return gFileUiSample || (gFileSession && gFileSession->uploadRunning());
+    return gFileUiSample || (gFileSession && gFileSession->uploadRunning()) ||
+           (gFilePullSession && gFilePullSession->pullRunning());
 }
 
 static uint32_t readFileTransferMaxMbps() {
@@ -2744,7 +2751,7 @@ struct ChipLayout {
 static ChipLayout chipLayout(UINT dpi) {
     const auto s = [dpi](int v) { return ov::scale(v, dpi); };
     ChipLayout l;
-    l.width = s(360);
+    l.width = s(gChipMode == ChipMode::Notice ? 500 : 360);
     l.height = s(36);
     const bool cancel = gChipMode == ChipMode::Running;
     l.cancel = cancel ? RECT{l.width - s(84), s(5), l.width - s(6), l.height - s(5)} : RECT{0, 0, 0, 0};
@@ -2763,8 +2770,15 @@ static std::wstring chipLabel() {
     case ChipMode::Ready: return L"Ready, press Cmd+V again";
     case ChipMode::Failed: return L"Paste to the Mac failed";
     case ChipMode::Cancelled: return L"Upload cancelled";
+    case ChipMode::Notice: return gChipNotice;
     default: return L"";
     }
+}
+
+// A Mac-copy notice while the viewer is minimised or not in front.
+static bool fileChipFloats() {
+    if (gChipMode != ChipMode::Notice || !gViewerHwnd) return false;
+    return IsIconic(gViewerHwnd) || GetForegroundWindow() != gViewerHwnd;
 }
 
 static void fileUiReposition() {
@@ -2776,9 +2790,21 @@ static void fileUiReposition() {
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
     if (gFileChip) {
         const ChipLayout l = chipLayout(dpi);
-        const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
-        SetWindowPos(gFileChip, nullptr, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width, l.height,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (fileChipFloats()) {
+            // Explorer (or anything) is in front of the viewer: show the
+            // notice on top, bottom right of the screen the mouse is on.
+            POINT pt{};
+            GetCursorPos(&pt);
+            MONITORINFO mi{sizeof(mi)};
+            GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+            const int gap = ov::scale(16, dpi);
+            SetWindowPos(gFileChip, HWND_TOPMOST, mi.rcWork.right - l.width - gap, mi.rcWork.bottom - l.height - gap,
+                         l.width, l.height, SWP_NOACTIVATE);
+        } else {
+            const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+            SetWindowPos(gFileChip, HWND_NOTOPMOST, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width,
+                         l.height, SWP_NOACTIVATE);
+        }
     }
     if (gFileConfirm) {
         const int w = ov::scale(460, dpi), h = ov::scale(200, dpi);
@@ -2804,7 +2830,8 @@ static void paintFileChip(HWND hwnd) {
     jl::ui::fillRect(dc, client, c::kBody);
     jl::ui::roundRect(dc, client, ov::scale(10, dpi), c::kBody, c::kBorder, 1);
     const ChipLayout l = chipLayout(dpi);
-    const COLORREF fg = gChipMode == ChipMode::Failed ? c::kError : c::kText;
+    const COLORREF fg =
+        gChipMode == ChipMode::Failed || (gChipMode == ChipMode::Notice && gChipNoticeError) ? c::kError : c::kText;
     overlayText(dc, chipLabel(), l.text, gOverlayTheme.label, fg, DT_LEFT | DT_VCENTER);
     if (gChipMode == ChipMode::Running) {
         jl::ui::roundRect(dc, l.cancel, ov::scale(8, dpi), gChipCancelHot ? c::kSecondaryDown : c::kSecondary,
@@ -2828,6 +2855,8 @@ static void fileConfirmHide();
 
 static void fileChipTick() {
     if (gChipMode == ChipMode::Running && gFileChip) InvalidateRect(gFileChip, nullptr, FALSE);
+    // A notice follows the viewer coming to the front or going behind.
+    if (gChipMode == ChipMode::Notice && gFileChip) fileUiReposition();
     if (fileConfirmVisible()) InvalidateRect(gFileConfirm, nullptr, FALSE);
     if (gChipHideAtMs > 0.0 && steadyMsNow() >= gChipHideAtMs) fileChipHide();
 }
@@ -2912,8 +2941,32 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     gChipCancelHot = false;
     gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
     fileUiReposition();
-    if (gViewerHwnd && !IsIconic(gViewerHwnd)) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    if (gViewerHwnd && (!IsIconic(gViewerHwnd) || fileChipFloats())) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
     InvalidateRect(gFileChip, nullptr, FALSE);
+}
+
+// The pull session saw something about a Mac copy the user must know (F3 r2).
+static void onFilePullNotice(WPARAM kind) {
+    using N = FileSession::PullNotice;
+    // An upload's own chip wins; its result follows shortly anyway.
+    if (gChipMode == ChipMode::Running) return;
+    switch (static_cast<N>(kind)) {
+    case N::MacPermission:
+        gChipNotice = L"Mac blocked file access — click Allow on the Mac and copy again";
+        logLine("file.pull_notice=mac_permission");
+        break;
+    case N::PullFailed:
+        gChipNotice = L"Paste from the Mac failed — copy on the Mac and try again";
+        logLine("file.pull_notice=failed");
+        break;
+    case N::NotOffered:
+        gChipNotice = L"This Mac copy can't be pasted on Windows";
+        logLine("file.pull_notice=not_offered");
+        break;
+    default: return;
+    }
+    gChipNoticeError = true;
+    fileChipShow(ChipMode::Notice, 8000);
 }
 
 static void startPasteUpload() {
@@ -2966,12 +3019,22 @@ static void paintFileConfirm(HWND hwnd) {
     const ConfirmLayout l = confirmLayout(dpi, client);
     overlayText(dc, utf8ToWide(fu::confirmTitle()), l.title, t.label, c::kText, DT_LEFT | DT_VCENTER);
     const auto p = currentUpload();
-    const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
+    // Explorer pasting Mac files into this PC, with no upload running (F3).
+    const bool pulling = !(gFileSession && gFileSession->uploadRunning()) && gFilePullSession &&
+                         gFilePullSession->pullRunning();
     {
         RECT body = l.body;
         HGDIOBJ old = SelectObject(dc, t.text);
         SetTextColor(dc, c::kMuted);
-        const std::wstring text = utf8ToWide(fu::confirmBody(left, p.committed, p.total));
+        std::string bodyText;
+        if (pulling) {
+            const auto q = gFilePullSession->pullProgress();
+            bodyText = fu::confirmBodyPull(q.files > q.filesDone ? q.files - q.filesDone : 0, q.received, q.total);
+        } else {
+            const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
+            bodyText = fu::confirmBody(left, p.committed, p.total);
+        }
+        const std::wstring text = utf8ToWide(bodyText);
         DrawTextW(dc, text.c_str(), -1, &body, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(dc, old);
     }
@@ -2981,7 +3044,8 @@ static void paintFileConfirm(HWND hwnd) {
     overlayText(dc, L"Keep transferring", l.keep, t.text, c::kText, DT_CENTER | DT_VCENTER);
     jl::ui::roundRect(dc, l.disconnect, ov::scale(8, dpi), gConfirmHot == 1 ? c::kSecondaryDown : c::kSecondary,
                       c::kBorder, 1);
-    overlayText(dc, L"Disconnect and remove", l.disconnect, t.text, c::kError, DT_CENTER | DT_VCENTER);
+    overlayText(dc, pulling ? L"Disconnect" : L"Disconnect and remove", l.disconnect, t.text, c::kError,
+                DT_CENTER | DT_VCENTER);
     // Keep shows as the default; the ring follows Tab.
     overlayFocusFrame(dc, focusKeep ? l.keep : l.disconnect, dpi);
     BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -3139,6 +3203,7 @@ static void fileUiDestroy() {
 
 static void fileUiEndSession() {
     gFileSession = nullptr;
+    gFilePullSession = nullptr;
     gPasteGate = fu::PasteGate{};
     gPendingRoots.clear();
     gLastUploadClipSeq = 0;
@@ -3233,6 +3298,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     case WM_MR_FILE_UPLOAD_DONE:
         onFileUploadDone();
+        return 0;
+    case WM_MR_FILE_PULL_NOTICE:
+        onFilePullNotice(wParam);
         return 0;
     case WM_QUERYENDSESSION:
         // Logoff or shutdown: no confirm; cancel so the Mac cleans up.
@@ -4959,6 +5027,7 @@ static int appMain(int argc, char** argv) {
         std::unique_ptr<ControlChannel> control;
         std::unique_ptr<ClipboardChannel> clipboard;
         std::unique_ptr<FileSession> fileSession;
+        std::unique_ptr<FileSession> filePullSession;  // F3: Mac->Windows paste
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
         // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
         std::unique_ptr<jl::audio::AudioPlayer> audio;
@@ -5073,6 +5142,17 @@ static int appMain(int argc, char** argv) {
             });
             fileSession->start();
             gFileSession = fileSession.get();
+            // F3: a second file session that receives Finder copies and puts
+            // them on the Windows clipboard for Explorer to paste.
+            filePullSession = std::make_unique<FileSession>(
+                o.bindIp, o.sourceIp, o.controlPort,
+                [](const std::string& message) { logLine(message); }, FileSession::Role::Pull);
+            filePullSession->setMaxMbps(readFileTransferMaxMbps());
+            filePullSession->setPullNoticeCallback([](FileSession::PullNotice n) {
+                if (HWND w = gViewerHwnd) PostMessageW(w, WM_MR_FILE_PULL_NOTICE, WPARAM(n), 0);
+            });
+            filePullSession->start();
+            gFilePullSession = filePullSession.get();
         } else {
             gControl = nullptr;
             gMouseMoveUdp = nullptr;
@@ -5755,6 +5835,7 @@ static int appMain(int argc, char** argv) {
                 << " file_cap=" << (fileSession ? (fileSession->capability() == FileSession::Capability::Yes ? "yes" : fileSession->capability() == FileSession::Capability::No ? "no" : "unknown") : "off")
                 << " file_sessions=" << (fileSession ? fileSession->sessions() : 0)
                 << " file_tx_bytes=" << (fileSession ? fileSession->txBytes() : 0)
+                << " file_rx_bytes=" << (filePullSession ? filePullSession->rxBytes() : 0)
                 << " audio=" << (audio ? "on" : "off")
                 << " audio_codec=" << jl::audio::codecName(audioStats.jb.codec)
                 << " audio_bitrate_kbps=" << (audioStats.jb.framesPlayed + audioStats.jb.framesSilence > 0
@@ -5798,12 +5879,16 @@ static int appMain(int argc, char** argv) {
         // independent from this second TCP session.
         if (clipboard) clipboard->stop();
         gFileSession = nullptr;
+        gFilePullSession = nullptr;
         if (fileSession) fileSession->stop();
+        // Also clears Windows clipboard if it still holds a Mac copy.
+        if (filePullSession) filePullSession->stop();
 
         // Release Media Foundation / D3D objects before MFShutdown/CoUninitialize.
         video.reset();
         clipboard.reset();
         fileSession.reset();
+        filePullSession.reset();
         mouseMoveUdp.reset();
         control.reset();
 
