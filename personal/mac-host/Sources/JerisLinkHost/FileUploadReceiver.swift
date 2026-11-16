@@ -2,13 +2,15 @@ import Foundation
 import Darwin
 import CryptoKit
 
-/// Receives Windows->Mac paste uploads on one file session (design r2, F2).
+/// Receives Windows->Mac uploads on one file session (design r2): pastes
+/// (F2) and drops on the viewer (purpose=send, F4).
 ///
 /// Wire order, sender (viewer) -> receiver (host):
 ///   OFFER(paste) ENTRY x entries   -> REPLY ok | REJECT status
 ///   DATA... FILE_END per file, files in entry order, dirs carry no data
 ///                                  <- PROGRESS(committed) every 1 MiB and per FILE_END
 ///                                  <- RESULT(ok, files) once the pasteboard holds the URLs
+///                                     (paste), or the items are in the send folder (send)
 /// Either side may CANCEL; the host answers RESULT(cancelled).
 ///
 /// Staging: `<root>/<uuid>/parts/<index>.jlpart` is written with O_EXCL,
@@ -17,10 +19,13 @@ import CryptoKit
 /// transfer folder is opened relative to its parent with O_NOFOLLOW, so a
 /// received path can never leave it. Partial transfers are removed at once;
 /// the last completed paste stays until the next one (Finder copies from
-/// it) or the 24 h startup sweep.
+/// it) or the 24 h startup sweep. A send resolves its folder
+/// (`FileSendFolder`, ~/Downloads/JerisLink) before it accepts, then moves
+/// the top-level items there with RENAME_EXCL and `name 2.ext` on clash,
+/// removes its staging and has Finder open the folder.
 ///
 /// Runs on the file session's own thread. The only main-thread work is the
-/// pasteboard write, through `ClipboardBackend`. Logs carry no names (D15).
+/// pasteboard write, through `ClipboardBackend`, and Finder opening a folder. Logs carry no names (D15).
 final class FileUploadReceiver {
     typealias Message = FileProto.Message
 
@@ -44,12 +49,13 @@ final class FileUploadReceiver {
 
     private enum State {
         case idle
-        case collecting(transfer: UInt32, entries: UInt32, total: UInt64, list: [Entry], keys: Set<String>)
+        case collecting(transfer: UInt32, purpose: UInt8, entries: UInt32, total: UInt64, list: [Entry], keys: Set<String>)
         case receiving(Transfer)
     }
 
     private final class Transfer {
         let id: UInt32
+        let purpose: UInt8
         let entries: [Entry]
         let total: UInt64
         let dir: URL
@@ -63,9 +69,12 @@ final class FileUploadReceiver {
         var committed: UInt64 = 0
         var lastProgress: UInt64 = 0
         var filesOK: UInt32 = 0
+        /// Send only: the open destination folder.
+        var destFD: Int32 = -1
+        var destURL: URL?
 
-        init(id: UInt32, entries: [Entry], total: UInt64, dir: URL, dirFD: Int32, partsFD: Int32, filesFD: Int32) {
-            self.id = id; self.entries = entries; self.total = total
+        init(id: UInt32, purpose: UInt8, entries: [Entry], total: UInt64, dir: URL, dirFD: Int32, partsFD: Int32, filesFD: Int32) {
+            self.id = id; self.purpose = purpose; self.entries = entries; self.total = total
             self.dir = dir; self.dirFD = dirFD; self.partsFD = partsFD; self.filesFD = filesFD
         }
     }
@@ -80,6 +89,7 @@ final class FileUploadReceiver {
     private let root: URL
     private let clipboard: ClipboardBackend
     private let freeSpace: (URL) -> UInt64?
+    private let sendFolder: FileSendFolder
     private var state = State.idle
     /// A transfer this side ended (failed or cancelled): the sender may still
     /// have DATA in flight for it, which is dropped instead of closing.
@@ -95,10 +105,12 @@ final class FileUploadReceiver {
     private(set) var bytesIn: UInt64 = 0
 
     init(root: URL = FileUploadReceiver.defaultRoot, clipboard: ClipboardBackend,
-         freeSpace: @escaping (URL) -> UInt64? = FileUploadReceiver.availableBytes) {
+         freeSpace: @escaping (URL) -> UInt64? = FileUploadReceiver.availableBytes,
+         sendFolder: FileSendFolder = .shared) {
         self.root = root
         self.clipboard = clipboard
         self.freeSpace = freeSpace
+        self.sendFolder = sendFolder
         Self.sweepOnce(root)
     }
 
@@ -153,17 +165,19 @@ final class FileUploadReceiver {
     private func offer(_ t: UInt32, purpose: UInt8, entries: UInt32, total: UInt64) -> Step {
         func reject(_ status: UInt8) -> Step { Step(send: [.reply(transfer: t, status: status)]) }
         guard case .idle = state else { return reject(FileProto.Status.busy) }
-        guard purpose == FileProto.Purpose.paste else { return reject(FileProto.Status.denied) }
+        guard purpose == FileProto.Purpose.paste || purpose == FileProto.Purpose.send else {
+            return reject(FileProto.Status.denied)
+        }
         guard entries >= 1, entries <= FileProto.maxEntries, total <= FileProto.maxTotalBytes else {
             return reject(FileProto.Status.tooBig)
         }
         ended = nil
-        state = .collecting(transfer: t, entries: entries, total: total, list: [], keys: [])
+        state = .collecting(transfer: t, purpose: purpose, entries: entries, total: total, list: [], keys: [])
         return Step()
     }
 
     private func entry(_ t: UInt32, index: UInt32, kind: UInt8, size: UInt64, mtime: Int64, raw: [UInt8]) -> Step {
-        guard case .collecting(let id, let count, let total, var list, var keys) = state, id == t else {
+        guard case .collecting(let id, let purpose, let count, let total, var list, var keys) = state, id == t else {
             return Step(close: "unexpected_entry")
         }
         func reject(_ status: UInt8) -> Step {
@@ -188,7 +202,7 @@ final class FileUploadReceiver {
         keys.insert(key)
         list.append(Entry(kind: kind, size: size, mtime: mtime, path: path))
         if UInt32(list.count) < count {
-            state = .collecting(transfer: id, entries: count, total: total, list: list, keys: keys)
+            state = .collecting(transfer: id, purpose: purpose, entries: count, total: total, list: list, keys: keys)
             return Step()
         }
         // Last entry: check the offer as a whole, then accept.
@@ -201,9 +215,28 @@ final class FileUploadReceiver {
         guard sum == total else { return reject(FileProto.Status.badPath) }
         // A file whose path is under another file's path is caught by mkdirat at write time.
         if let free = freeSpace(root), free < total &+ Self.freeSpaceMargin { return reject(FileProto.Status.noSpace) }
-        guard let tr = makeTransfer(id: t, entries: list, total: total) else { return reject(FileProto.Status.failed) }
+        // A send opens its folder now, so a macOS privacy prompt shows before
+        // any data moves and never holds the session for long.
+        var dest: (Int32, URL)?
+        if purpose == FileProto.Purpose.send {
+            switch sendFolder.resolve() {
+            case .fd(let fd, let url): dest = (fd, url)
+            case .pending:
+                print("file.send_folder=pending transfer=\(t)")
+                return reject(FileProto.Status.macPermission)
+            case .failed:
+                print("file.send_folder=failed transfer=\(t)")
+                return reject(FileProto.Status.failed)
+            }
+        }
+        guard let tr = makeTransfer(id: t, purpose: purpose, entries: list, total: total) else {
+            if let dest { Darwin.close(dest.0) }
+            return reject(FileProto.Status.failed)
+        }
+        if let dest { tr.destFD = dest.0; tr.destURL = dest.1 }
         state = .receiving(tr)
-        print("file.upload=accepted transfer=\(t) entries=\(list.count) bytes=\(total)")
+        let destNote = dest.map { $0.1 == sendFolder.primary ? " dest=downloads" : " dest=fallback" } ?? ""
+        print("file.upload=accepted transfer=\(t) purpose=\(purpose) entries=\(list.count) bytes=\(total)\(destNote)")
         var step = Step(send: [.reply(transfer: t, status: FileProto.Status.ok)])
         step.send += advance(tr)
         return step
@@ -260,7 +293,7 @@ final class FileUploadReceiver {
 
     private func cancel(_ t: UInt32) -> Step {
         switch state {
-        case .collecting(let id, _, _, _, _) where id == t:
+        case .collecting(let id, _, _, _, _, _) where id == t:
             state = .idle
         case .receiving(let tr) where tr.id == t:
             discard(tr)
@@ -284,6 +317,7 @@ final class FileUploadReceiver {
             let first = String(e.path.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)[0])
             if !tops.contains(first) { tops.append(first) }
         }
+        if tr.purpose == FileProto.Purpose.send { return finishSend(tr, tops: tops) }
         let filesDir = tr.dir.appendingPathComponent("files", isDirectory: true)
         let urls = tops.map { filesDir.appendingPathComponent($0) }
         guard clipboard.writeFileURLs(urls) != nil else { return [failMessage(tr, "pasteboard")] }
@@ -295,6 +329,28 @@ final class FileUploadReceiver {
         print("file.upload=done transfer=\(tr.id) files=\(ok) bytes=\(tr.committed)")
         return [.result(transfer: tr.id, status: FileProto.Status.ok, filesOK: ok)]
     }
+
+    /// Send: move the items into the folder, drop the staging, open Finder.
+    private func finishSend(_ tr: Transfer, tops: [String]) -> [Message] {
+        guard let url = tr.destURL, tr.destFD >= 0 else { return [failMessage(tr, "dest")] }
+        let (moved, renamed, err) = FileSendFolder.moveAll(tops, from: tr.filesFD, to: tr.destFD)
+        guard moved == tops.count else {
+            // Items already moved stay; the rest go with the staging folder.
+            print("file.send_move=failed transfer=\(tr.id) moved=\(moved) of=\(tops.count) errno=\(err)")
+            if moved > 0 { sendFolder.completed(transfer: tr.id, folder: url) }
+            return [failMessage(tr, err == EXDEV ? "exdev" : "move")]
+        }
+        let ok = tr.filesOK
+        discard(tr)
+        state = .idle
+        completed += 1
+        print("file.upload=done transfer=\(tr.id) purpose=send files=\(ok) bytes=\(tr.committed) items=\(moved) renamed=\(renamed)")
+        sendFolder.completed(transfer: tr.id, folder: url)
+        return [.result(transfer: tr.id, status: FileProto.Status.ok, filesOK: ok)]
+    }
+
+    /// REVEAL (0x5C): open the folder a send went to (no reply).
+    func reveal(_ t: UInt32) { sendFolder.reveal(transfer: t) }
 
     private func fail(_ tr: Transfer, _ why: String) -> Step {
         Step(send: [failMessage(tr, why)])
@@ -311,7 +367,7 @@ final class FileUploadReceiver {
 
     // MARK: Disk
 
-    private func makeTransfer(id: UInt32, entries: [Entry], total: UInt64) -> Transfer? {
+    private func makeTransfer(id: UInt32, purpose: UInt8, entries: [Entry], total: UInt64) -> Transfer? {
         guard Self.mkdirs(root) else { return nil }
         let rootFD = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard rootFD >= 0 else { return nil }
@@ -326,13 +382,16 @@ final class FileUploadReceiver {
         }
         let partsFD = openat(dirFD, "parts", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         let filesFD = openat(dirFD, "files", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        let tr = Transfer(id: id, entries: entries, total: total, dir: dir, dirFD: dirFD, partsFD: partsFD, filesFD: filesFD)
+        let tr = Transfer(id: id, purpose: purpose, entries: entries, total: total, dir: dir, dirFD: dirFD, partsFD: partsFD, filesFD: filesFD)
         guard partsFD >= 0, filesFD >= 0 else { discard(tr); return nil }
         // Folders first, so empty ones survive and files find their parents.
         for e in entries where e.kind == FileProto.EntryKind.dir {
             guard let fd = Self.openDir(filesFD, components: Self.components(e.path), create: true) else {
                 discard(tr); return nil
             }
+            // Folders get the download mark too: Gatekeeper checks a received
+            // .app by its bundle folder.
+            Self.setQuarantine(fd)
             Darwin.close(fd)
         }
         return tr
@@ -359,8 +418,9 @@ final class FileUploadReceiver {
     }
 
     private func closeFDs(_ tr: Transfer) {
-        for fd in [tr.fileFD, tr.partsFD, tr.filesFD, tr.dirFD] where fd >= 0 { Darwin.close(fd) }
+        for fd in [tr.fileFD, tr.partsFD, tr.filesFD, tr.dirFD, tr.destFD] where fd >= 0 { Darwin.close(fd) }
         tr.fileFD = -1
+        tr.destFD = -1
     }
 
     private func discard(_ tr: Transfer) {

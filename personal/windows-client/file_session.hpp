@@ -21,6 +21,11 @@
 // session checks it, puts a lazy file object on the Windows clipboard
 // (FileClipboard) and, only when Explorer pastes, pulls the bytes with
 // REQUEST, paced like an upload. The upload session never sees announces.
+//
+// F4: startUpload(..., Purpose::Send) is a drop on the viewer: the same
+// upload with purpose=send, which the host puts in ~/Downloads/JerisLink and
+// shows in Finder. requestReveal() sends 0x5C REVEAL for the last send so
+// Finder shows that folder again. Both need a host with caps reveal.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -51,6 +56,8 @@ public:
     enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3 };
     using PullNoticeFn = std::function<void(PullNotice)>;
     enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
+    // Paste: Cmd+V in Finder (F2). Send: a drop on the viewer (F4).
+    enum class Purpose : int { Paste = 0, Send = 1 };
     struct UploadProgress {
         UploadState state = UploadState::Idle;
         uint64_t files = 0;      // file entries (folders not counted)
@@ -58,6 +65,9 @@ public:
         uint64_t total = 0;      // bytes
         uint64_t committed = 0;  // bytes the Mac has written
         uint64_t bytesPerSec = 0;
+        Purpose purpose = Purpose::Paste;
+        uint8_t hostStatus = 0;  // the host's REJECT or RESULT status when not ok
+        uint32_t filesOk = 0;    // files the host confirmed (Done)
     };
     enum class Capability : int { Unknown = 0, Yes = 1, No = 2 };
     // Upload: Windows->Mac (F2). Pull: Mac->Windows paste (F3).
@@ -79,13 +89,18 @@ public:
 
     // UI thread. roots: full paths from the clipboard. False when the host
     // cannot receive or an upload is already running (no callback then).
-    bool startUpload(std::vector<std::wstring> roots, uint32_t maxMbps);
+    bool startUpload(std::vector<std::wstring> roots, uint32_t maxMbps, Purpose purpose = Purpose::Paste);
     void cancelUpload() { uploadCancel_ = true; }
     bool uploadRunning() const { return uploadRunning_.load(); }
     bool canUpload() const {
         return capability() == Capability::Yes && (hostCaps() & jl::file::caps::kUpload) && !uploadRunning();
     }
+    // A drop needs an F4 host: one that answers REVEAL takes purpose=send.
+    bool canSend() const { return canUpload() && (hostCaps() & jl::file::caps::kReveal); }
     UploadProgress uploadProgress() const;
+    // F4: Finder shows the folder the last send went to. False when no send
+    // finished on this session or the host cannot reveal.
+    bool requestReveal();
     void setUploadDoneCallback(UploadDoneFn fn) { uploadDone_ = std::move(fn); }  // before start()
     uint64_t txBytes() const { return txBytes_.load(); }
 
@@ -157,6 +172,11 @@ private:
     std::atomic<uint64_t> upTotal_{0};
     std::atomic<uint64_t> upCommitted_{0};
     std::atomic<uint64_t> upRate_{0};
+    std::atomic<int> upPurpose_{0};
+    std::atomic<int> upHostStatus_{0};
+    std::atomic<uint32_t> upFilesOk_{0};
+    std::atomic<uint32_t> lastSend_{0};       // last send the host finished
+    std::atomic<uint32_t> revealPending_{0};  // REVEAL to send on the session thread
     std::atomic<uint64_t> txBytes_{0};
 
     Role role_ = Role::Upload;

@@ -9,7 +9,8 @@ import Foundation
 ///
 /// F1 ships the codec for every type so later PRs add behaviour only, never
 /// wire. The host answers HELLO and PING, receives paste uploads (F2),
-/// announces Finder copies and serves REQUEST pulls (F3), and refuses every
+/// announces Finder copies and serves REQUEST pulls (F3), receives drops
+/// into ~/Downloads/JerisLink and answers REVEAL (F4), and refuses every
 /// other request.
 enum FileProto {
     static let version: UInt8 = 1
@@ -47,7 +48,8 @@ enum FileProto {
         static let announce: UInt16 = 1 << 3     // F3: Cmd+C manifests, serves REQUEST
         /// What this build implements. F2: paste uploads. F3: Cmd+C
         /// announces and REQUEST pulls, on sessions whose viewer asks for them.
-        static let host: UInt16 = upload | announce
+        /// F4: send uploads (drop on the viewer) and REVEAL.
+        static let host: UInt16 = upload | reveal | announce
     }
 
     enum Status {

@@ -2,8 +2,9 @@ import Foundation
 import CryptoKit
 import Darwin
 
-/// `JerisLinkHost --self-test` part for paste uploads (F2): the receiver
-/// state machine against a temp staging folder and a fake pasteboard. The
+/// `JerisLinkHost --self-test` part for paste uploads (F2) and drops
+/// (purpose=send, F4): the receiver state machine against a temp staging
+/// folder, a fake pasteboard and a temp send folder. The
 /// socket end-to-end case is in ControlServiceSelfTest.
 enum FileUploadSelfTest {
     typealias M = FileProto.Message
@@ -16,6 +17,7 @@ enum FileUploadSelfTest {
         rejections(base.appendingPathComponent("reject"), expect)
         failures(base.appendingPathComponent("fail"), expect)
         sweep(base.appendingPathComponent("sweep"), expect)
+        sends(base.appendingPathComponent("send"), expect)
     }
 
     // MARK: Helpers
@@ -134,8 +136,8 @@ enum FileUploadSelfTest {
         expect(big == [.reply(transfer: 1, status: FileProto.Status.tooBig)], "upload: over 20 GiB rejected too_big")
         let many = feed(fresh(), [offer(1, FileProto.maxEntries + 1, 0)]).sent
         expect(many == [.reply(transfer: 1, status: FileProto.Status.tooBig)], "upload: over 10000 entries rejected too_big")
-        let send = feed(fresh(), [offer(1, 1, 1, purpose: FileProto.Purpose.send)]).sent
-        expect(send == [.reply(transfer: 1, status: FileProto.Status.denied)], "upload: purpose send still denied in F2")
+        let push = feed(fresh(), [offer(1, 1, 1, purpose: FileProto.Purpose.push)]).sent
+        expect(push == [.reply(transfer: 1, status: FileProto.Status.denied)], "upload: purpose push still denied until F5")
         let busy = feed(fresh(), [offer(1, 2, 2), offer(2, 1, 1)]).sent
         expect(busy == [.reply(transfer: 2, status: FileProto.Status.busy)], "upload: second offer while one runs is busy")
         let order = feed(fresh(), [offer(1, 2, 2), entry(1, 1, "a", size: 1)])
@@ -204,6 +206,116 @@ enum FileUploadSelfTest {
         let removed = FileUploadReceiver.sweep(root)
         expect(removed == 1 && transferDirs(root).map(\.lastPathComponent) == ["new"], "upload: startup sweep removes staging older than 24 h only")
     }
+}
+
+extension FileUploadSelfTest {
+    /// One file drop, start to RESULT.
+    static func dropOne(_ r: FileUploadReceiver, _ t: UInt32, _ path: String, _ body: [UInt8]) -> [M] {
+        feed(r, [.offer(transfer: t, purpose: FileProto.Purpose.send, entries: 1, total: UInt64(body.count)),
+                 entry(t, 0, path, size: body.count)] + chunks(t, 0, body) +
+                [.fileEnd(transfer: t, index: 0, sha256: sha(body))]).sent
+    }
+
+    static func hasQuarantine(_ url: URL) -> Bool {
+        getxattr(url.path, "com.apple.quarantine", nil, 0, 0, XATTR_NOFOLLOW) > 0
+    }
+
+    fileprivate static func sends(_ base: URL, _ expect: (Bool, String) -> Void) {
+        let fm = FileManager.default
+        let staging = base.appendingPathComponent("staging")
+        try? fm.createDirectory(at: base.appendingPathComponent("Downloads"), withIntermediateDirectories: true)
+        let primary = base.appendingPathComponent("Downloads/JerisLink", isDirectory: true)
+        let fallback = base.appendingPathComponent("JerisLink Received", isDirectory: true)
+        let board = UploadFakeClipboard()
+
+        // Downloads allowed: a folder and files, clash numbering, quarantine.
+        let opened = OpenedFolders()
+        let folder = FileSendFolder(primary: primary, fallback: fallback, openFolder: { opened.add($0) })
+        let r = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: folder)
+        let one = dropOne(r, 1, "report.pdf", [1, 2, 3])
+        expect(one.first == .reply(transfer: 1, status: FileProto.Status.ok) &&
+               one.last == .result(transfer: 1, status: FileProto.Status.ok, filesOK: 1), "send: drop accepted and done")
+        _ = dropOne(r, 2, "report.pdf", [4])
+        _ = dropOne(r, 3, "report.pdf", [5])
+        _ = dropOne(r, 4, ".profile", [6])
+        _ = dropOne(r, 5, ".profile", [7])
+        _ = dropOne(r, 6, "README", [8])
+        _ = dropOne(r, 7, "README", [9])
+        let tree: [M] = [.offer(transfer: 8, purpose: FileProto.Purpose.send, entries: 3, total: 1),
+                         entry(8, 0, "My.app", size: 0, dir: true), entry(8, 1, "My.app/Contents", size: 0, dir: true),
+                         entry(8, 2, "My.app/Contents/run", size: 1)] + chunks(8, 2, [42]) +
+                        [.fileEnd(transfer: 8, index: 2, sha256: sha([42]))]
+        let treeOut = feed(r, tree).sent
+        _ = feed(r, [.offer(transfer: 9, purpose: FileProto.Purpose.send, entries: 1, total: 0), entry(9, 0, "My.app", size: 0, dir: true)])
+        expect(treeOut.last == .result(transfer: 8, status: FileProto.Status.ok, filesOK: 1), "send: a folder drop is done")
+        let names = Set((try? fm.contentsOfDirectory(atPath: primary.path)) ?? [])
+        let want: Set<String> = ["report.pdf", "report 2.pdf", "report 3.pdf", ".profile", ".profile 2", "README", "README 2",
+                                 "My.app", "My 2.app"]
+        expect(names == want, "send: Finder-style clash names, dotfiles and no extension (\(names.sorted()))")
+        expect((try? Data(contentsOf: primary.appendingPathComponent("report 3.pdf"))).map(Array.init) == [5],
+               "send: nothing already there is replaced")
+        expect(hasQuarantine(primary.appendingPathComponent("report 2.pdf")) && hasQuarantine(primary.appendingPathComponent("My.app")) &&
+               hasQuarantine(primary.appendingPathComponent("My.app/Contents/run")),
+               "send: files and the .app folder carry com.apple.quarantine")
+        expect(transferDirs(staging).isEmpty, "send: no staging left after sends")
+        expect(board.fileURLs.isEmpty, "send: the pasteboard is left alone")
+        expect(opened.count == 9 && Set(opened.all) == [primary], "send: Finder opens the folder after every send (\(opened.count))")
+        let revealed = DispatchSemaphore(value: 0)
+        let hit = OpenedFolders()
+        folder.reveal(transfer: 2) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        _ = revealed.wait(timeout: .now() + 3)
+        folder.reveal(transfer: 999) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        _ = revealed.wait(timeout: .now() + 3)
+        expect(hit.count == 2 && opened.count == 11, "send: REVEAL opens the folder for a known and an unknown transfer")
+
+        // Downloads refused: the home fallback, which needs no permission.
+        let deniedOpened = OpenedFolders()
+        let denied = FileSendFolder(primary: base.appendingPathComponent("Downloads/Refused", isDirectory: true), fallback: fallback,
+                                    primaryOpener: { _ in (-1, EPERM) }, openFolder: { deniedOpened.add($0) })
+        let r2 = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: denied)
+        let out2 = dropOne(r2, 1, "a.txt", [1])
+        expect(out2.last == .result(transfer: 1, status: FileProto.Status.ok, filesOK: 1) &&
+               fm.fileExists(atPath: fallback.appendingPathComponent("a.txt").path) && deniedOpened.all == [fallback],
+               "send: Downloads refused falls back to ~/JerisLink Received and opens it")
+
+        // Prompt still up: mac_permission, nothing staged, then a retry works.
+        let release = DispatchSemaphore(value: 0)
+        let slow = FileSendFolder(primary: primary, fallback: fallback,
+                                  primaryOpener: { p in
+                                      _ = release.wait(timeout: .now() + 5); release.signal()  // once released, stays released
+                                      return FileSendFolder.folderOpener(p)
+                                  },
+                                  openFolder: { _ in })
+        let r3 = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: slow)
+        let t0 = Date()
+        let pend = feed(r3, [.offer(transfer: 1, purpose: FileProto.Purpose.send, entries: 1, total: 1), entry(1, 0, "b.txt", size: 1)]).sent
+        let waited = Date().timeIntervalSince(t0)
+        expect(pend == [.reply(transfer: 1, status: FileProto.Status.macPermission)] && waited < 4,
+               "send: a pending privacy prompt answers mac_permission within the wait (\(String(format: "%.1f", waited)) s)")
+        expect(transferDirs(staging).isEmpty, "send: mac_permission leaves no staging")
+        release.signal()
+        var retry: [M] = []
+        for _ in 0..<20 where retry.last != .result(transfer: 2, status: FileProto.Status.ok, filesOK: 1) {
+            retry = dropOne(r3, 2, "b.txt", [1])
+            if retry.last != .result(transfer: 2, status: FileProto.Status.ok, filesOK: 1) { usleep(100_000) }
+        }
+        expect(retry.last == .result(transfer: 2, status: FileProto.Status.ok, filesOK: 1), "send: after Allow, the next drop goes through")
+
+        // Paste still uses the pasteboard, not the send folder.
+        let p = feed(r, [.offer(transfer: 30, purpose: FileProto.Purpose.paste, entries: 1, total: 1), entry(30, 0, "p.txt", size: 1),
+                         .data(transfer: 30, index: 0, offset: 0, bytes: [3]), .fileEnd(transfer: 30, index: 0, sha256: sha([3]))]).sent
+        expect(p.last == .result(transfer: 30, status: FileProto.Status.ok, filesOK: 1) && board.fileURLs.count == 1 &&
+               !fm.fileExists(atPath: primary.appendingPathComponent("p.txt").path), "send: a paste still goes to the pasteboard")
+    }
+}
+
+/// Folders a test FileSendFolder was asked to open.
+final class OpenedFolders: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+    func add(_ u: URL) { lock.lock(); urls.append(u); lock.unlock() }
+    var all: [URL] { lock.lock(); defer { lock.unlock() }; return urls }
+    var count: Int { all.count }
 }
 
 /// Pasteboard stand-in for the upload cases.

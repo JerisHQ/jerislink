@@ -117,6 +117,9 @@ target_link_libraries(JerislinkFilePathTest PRIVATE normaliz)
 # Console test for the Windows -> Mac paste hold, pacer, chip and disconnect confirm (file_upload.hpp).
 add_executable(JerislinkFileUploadTest file_upload_test.cpp)
 
+# Console test for the F4 Files panel: texts, buttons, layout, keys (file_panel.hpp).
+add_executable(JerislinkFilePanelTest file_panel_test.cpp)
+
 # Console test for the Mac -> Windows paste manifest checks and pull buffer (file_pull.hpp).
 add_executable(JerislinkFilePullTest file_pull_test.cpp)
 target_compile_definitions(JerislinkFilePullTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

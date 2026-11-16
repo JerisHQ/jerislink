@@ -108,6 +108,10 @@ jobs:
         run: cmake --build build --config Release --target JerislinkFileUploadTest
       - name: Paste upload test (Cmd+V hold in both presets, 3 s window, focus loss, pacer, chip and confirm text, confirm keys)
         run: build\Release\JerislinkFileUploadTest.exe
+      - name: Build Files panel test
+        run: cmake --build build --config Release --target JerislinkFilePanelTest
+      - name: Files panel test (F4 guide, tip by host caps, last transfer, Cancel / Open folder, layout at 96-288 dpi, keys)
+        run: build\Release\JerislinkFilePanelTest.exe
       - name: Build paste pull test
         run: cmake --build build --config Release --target JerislinkFilePullTest
       - name: Paste pull test (announce checks, Windows names, request window, stale drain, hold-back until SHA-256, cancel and failure)

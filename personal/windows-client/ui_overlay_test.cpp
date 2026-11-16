@@ -29,7 +29,7 @@ void layoutTests() {
     for (unsigned dpi : {96u, 120u, 144u, 192u}) {
         const Layout l = layoutFor(dpi);
         const Rect items[] = {l.status, l.mute, l.volumeLabel, l.slider, l.info, l.settings,
-                              l.disconnect};
+                              l.files, l.disconnect};
         bool allInBar = true, ordered = true;
         for (size_t i = 0; i < std::size(items); ++i) {
             allInBar = allInBar && inside(l.bar, items[i]) && items[i].width() > 0;
@@ -40,7 +40,7 @@ void layoutTests() {
         expect(l.sep1 > l.status.right && l.sep1 < l.mute.left, "first separator between status and mute");
         expect(l.sep2 > l.slider.right && l.sep2 < l.info.left, "second separator between slider and Info");
         expect(inside(l.size, l.hint) && l.hint.top >= l.bar.bottom, "hint row under the bar");
-        expect(l.size.width() == scale(648, dpi), "width scales with dpi");
+        expect(l.size.width() == scale(712, dpi), "width scales with dpi");
     }
 }
 
@@ -57,6 +57,8 @@ void hitTests() {
     expect(hitTest(l, c[0], c[1]) == Item::Info, "hit Info");
     c = mid(l.settings);
     expect(hitTest(l, c[0], c[1]) == Item::Settings, "hit Settings");
+    c = mid(l.files);
+    expect(hitTest(l, c[0], c[1]) == Item::Files, "hit Files");
     c = mid(l.disconnect);
     expect(hitTest(l, c[0], c[1]) == Item::Disconnect, "hit Disconnect");
     c = mid(l.status);
@@ -70,7 +72,8 @@ void focusTests() {
     expect(nextFocus(Item::None, 1) == Item::Mute, "Tab from nothing starts at mute");
     expect(nextFocus(Item::None, -1) == Item::Disconnect, "Shift+Tab from nothing starts at Disconnect");
     expect(nextFocus(Item::Mute, 1) == Item::Volume, "mute -> volume");
-    expect(nextFocus(Item::Settings, 1) == Item::Disconnect, "Settings -> Disconnect");
+    expect(nextFocus(Item::Settings, 1) == Item::Files, "Settings -> Files");
+    expect(nextFocus(Item::Files, 1) == Item::Disconnect, "Files -> Disconnect");
     expect(nextFocus(Item::Disconnect, 1) == Item::Mute, "wraps forward");
     expect(nextFocus(Item::Mute, -1) == Item::Disconnect, "wraps back");
     // A full lap visits every item once.
@@ -81,8 +84,8 @@ void focusTests() {
         seen |= 1 << static_cast<int>(it);
     }
     expect(seen == ((1 << int(Item::Mute)) | (1 << int(Item::Volume)) | (1 << int(Item::Info)) |
-                    (1 << int(Item::Settings)) | (1 << int(Item::Disconnect))),
-           "one lap visits all five items");
+                    (1 << int(Item::Settings)) | (1 << int(Item::Files)) | (1 << int(Item::Disconnect))),
+           "one lap visits all six items");
 }
 
 void sliderTests() {

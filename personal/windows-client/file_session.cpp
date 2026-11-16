@@ -253,6 +253,12 @@ void FileSession::run() {
                         outstanding = false;
                         continue;
                     }
+                    if (const uint32_t rv = revealPending_.exchange(0); rv != 0) {
+                        // F4: no reply; Finder shows the folder on the Mac.
+                        const auto pkt = encode(Reveal{rv});
+                        if (!pkt || !sendPacket(s, type::kReveal, *pkt)) { reason = "send_failed"; break; }
+                        log("file.reveal transfer=" + std::to_string(rv));
+                    }
                     if (role_ == Role::Pull && !pumpRequests(s)) { reason = "send_failed"; break; }
                     if (std::chrono::steady_clock::now() - lastPing >= std::chrono::milliseconds(kPingIntervalMs)) {
                         if (outstanding) { reason = "ping_timeout"; break; }
@@ -381,13 +387,15 @@ const char* statusName(uint8_t s) {
     case kBadPath: return "bad_path";
     case kFailed: return "failed";
     case kCancelled: return "cancelled";
+    case kMacPermission: return "mac_permission";
     default: return "unknown";
     }
 }
 }  // namespace
 
-bool FileSession::startUpload(std::vector<std::wstring> roots, uint32_t maxMbps) {
+bool FileSession::startUpload(std::vector<std::wstring> roots, uint32_t maxMbps, Purpose purpose) {
     if (roots.empty() || !canUpload()) return false;
+    if (purpose == Purpose::Send && !canSend()) return false;
     std::lock_guard<std::mutex> lock(uploadMutex_);
     if (uploadRunning_) return false;
     uploadRoots_ = std::move(roots);
@@ -398,6 +406,9 @@ bool FileSession::startUpload(std::vector<std::wstring> roots, uint32_t maxMbps)
     upTotal_ = 0;
     upCommitted_ = 0;
     upRate_ = 0;
+    upPurpose_ = static_cast<int>(purpose);
+    upHostStatus_ = 0;
+    upFilesOk_ = 0;
     uploadState_ = static_cast<int>(UploadState::Running);
     uploadRunning_ = true;
     uploadPending_ = true;
@@ -412,7 +423,21 @@ FileSession::UploadProgress FileSession::uploadProgress() const {
     p.total = upTotal_.load();
     p.committed = upCommitted_.load();
     p.bytesPerSec = upRate_.load();
+    p.purpose = static_cast<Purpose>(upPurpose_.load());
+    p.hostStatus = static_cast<uint8_t>(upHostStatus_.load());
+    p.filesOk = upFilesOk_.load();
     return p;
+}
+
+bool FileSession::requestReveal() {
+    const uint32_t t = lastSend_.load();
+    if (t == 0 || capability() != Capability::Yes || !(hostCaps() & jl::file::caps::kReveal)) return false;
+    revealPending_ = t;
+    {
+        std::lock_guard<std::mutex> lock(wakeMutex_);
+    }
+    wake_.notify_all();
+    return true;
 }
 
 void FileSession::endUpload(UploadState state) {
@@ -497,6 +522,8 @@ std::string FileSession::runUpload(SOCKET s) {
     const double started = nowMs();
     std::vector<std::wstring> roots;
     uint32_t mbps = jl::fileup::kDefaultMaxMbps;
+    const bool send = static_cast<Purpose>(upPurpose_.load()) == Purpose::Send;
+    const uint8_t wirePurpose = send ? purpose::kSend : purpose::kPaste;
     {
         std::lock_guard<std::mutex> lock(uploadMutex_);
         roots = uploadRoots_;
@@ -504,7 +531,7 @@ std::string FileSession::runUpload(SOCKET s) {
     }
     static std::mt19937 rng{std::random_device{}()};
     const uint32_t transfer = static_cast<uint32_t>(rng()) | 1u;
-    const std::string tag = "file.tx transfer=" + std::to_string(transfer);
+    const std::string tag = "file.tx transfer=" + std::to_string(transfer) + (send ? " purpose=send" : "");
 
     std::vector<UploadEntry> entries;
     uint64_t total = 0;
@@ -605,7 +632,7 @@ std::string FileSession::runUpload(SOCKET s) {
     };
 
     // OFFER + every ENTRY, then the host's single REPLY.
-    if (!sendMsg(Offer{transfer, purpose::kPaste, uint32_t(entries.size()), total}, type::kOffer)) {
+    if (!sendMsg(Offer{transfer, wirePurpose, uint32_t(entries.size()), total}, type::kOffer)) {
         finish(UploadState::Failed, "failed:send");
         return "send_failed";
     }
@@ -633,6 +660,7 @@ std::string FileSession::runUpload(SOCKET s) {
             }
         }
         if (hostResult) {
+            upHostStatus_ = hostStatus;
             finish(UploadState::Failed, std::string("rejected:") + statusName(hostStatus));
             return "";
         }
@@ -706,8 +734,11 @@ std::string FileSession::runUpload(SOCKET s) {
         if (!pump(100)) { finish(UploadState::Failed, "failed:closed"); return "peer_closed"; }
     }
     if (!hostResult) { finish(UploadState::Failed, "failed:no_result"); return "no_result"; }
+    upHostStatus_ = hostStatus;
     if (hostStatus == status::kOk) {
         upCommitted_ = total;
+        upFilesOk_ = filesOk;
+        if (send) lastSend_ = transfer;
         finish(UploadState::Done, "ok files_ok=" + std::to_string(filesOk));
     } else if (hostStatus == status::kCancelled) {
         finish(UploadState::Cancelled, "cancelled");
