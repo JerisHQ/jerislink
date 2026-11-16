@@ -569,6 +569,8 @@ static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileC
 static HWND gFilePanel = nullptr;  // F4 Files panel
 static bool filePanelVisible() { return gFilePanel && IsWindowVisible(gFilePanel); }
 static bool pasteEligible();
+static bool pasteBusy();
+static void pasteRefusedBusy();
 static void startPasteUpload();
 
 static bool viewerHasInteractiveFocus(HWND hwnd) {
@@ -621,9 +623,10 @@ static jl::keymap::Held heldModifiers() {
 // A Cmd+V with copied Windows files is held here while they upload (F2).
 static void sendKeyOutput(const jl::keymap::Output& out) {
     if (!gControl) return;
-    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible);
+    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible, pasteBusy);
     for (const auto& e : f.events) gControl->sendKey(e.down, e.semantic);
     if (f.startUpload) startPasteUpload();
+    if (f.refusedBusy) pasteRefusedBusy();
     if (!out.debugTag.empty() && debugMode()) logLine(out.debugTag);
 }
 
@@ -2730,9 +2733,11 @@ static uint32_t readFileTransferMaxMbps() {
 
 // Asked by the gate only when a Cmd+V is about to go out. Reads the copied
 // paths (CF_HDROP) now, so a clipboard that cannot be opened lets the key
-// pass through instead of eating it.
+// pass through instead of eating it. True even while a transfer runs: the
+// gate then asks pasteBusy() and refuses, instead of letting the Mac paste
+// whatever stale thing its pasteboard holds.
 static bool pasteEligible() {
-    if (!gFileSession || !gFileSession->canUpload()) return false;
+    if (!gFileSession || !gFileSession->canReceiveUploads()) return false;
     if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
     const DWORD seq = GetClipboardSequenceNumber();
     if (seq == gLastUploadClipSeq) return false;
@@ -2757,6 +2762,9 @@ static bool pasteEligible() {
     gPendingClipSeq = seq;
     return true;
 }
+
+// Any transfer at all: a paste or Send to upload, or a Mac->Windows pull.
+static bool pasteBusy() { return fileTransferRunning(); }
 
 static UINT fileUiDpi() { return jl::ui::windowDpi(gViewerHwnd); }
 
@@ -3447,6 +3455,15 @@ static void fileChipNotice(const std::string& text, bool error, double ms) {
     gChipNotice = utf8ToWide(text);
     gChipNoticeError = error;
     fileChipShow(ChipMode::Notice, ms);
+}
+
+// Cmd+V with new copied files while a transfer runs: the V was eaten, so the
+// Mac pastes nothing. The clipboard stays unclaimed (the next Cmd+V after
+// the transfer pastes it).
+static void pasteRefusedBusy() {
+    gPendingRoots.clear();
+    logLine("file.paste=refused reason=busy");
+    fileChipNotice(fu::pasteBusy(), true, 6000);
 }
 
 // Files dropped on the viewer (WM_DROPFILES): send them to the Mac.
