@@ -104,3 +104,6 @@ add_executable(JerislinkOverlayTest ui_overlay_test.cpp)
 
 # Console unit test for the H.264 slice / NAL summary and its log budget (h264_nal_summary.hpp).
 add_executable(JerislinkNalSummaryTest h264_nal_summary_test.cpp)
+
+# Console golden test for the Windows -> Mac key mapping (keymap.hpp).
+add_executable(JerislinkKeymapTest keymap_test.cpp)

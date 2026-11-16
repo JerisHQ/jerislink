@@ -33,6 +33,7 @@
 #include "ui_theme.hpp"
 #include "ui_overlay.hpp"
 #include "h264_nal_summary.hpp"
+#include "keymap.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -98,6 +99,7 @@ static std::atomic<bool> gHardwarePresenterActive{false};
 static bool gHardwareRepaintRequested = false;
 static void paintCpuFrame(HWND hwnd);
 static void logLine(const std::string& s);
+static bool debugMode();
 
 class MouseMoveUdpChannel {
 public:
@@ -361,18 +363,17 @@ static UINT32 gRemoteWidth = 1760;
 static UINT32 gRemoteHeight = 990;
 static HWND gViewerHwnd = nullptr;
 static HHOOK gKeyboardHook = nullptr;
-static bool gHookWinDown = false;
-static bool gHookInterceptingWinC = false;
-static bool gHookInterceptingWinSpace = false;
-static bool gHookCapsDown = false;
+// Low-level hook state (Win, Win+C, Win+Space, Caps Lock); keymap.hpp.
+static jl::keymap::HookFilter gHookFilter;
 static bool gLoggedFirstInput = false;
 static constexpr UINT WM_MR_WIN_C = WM_APP + 41;
 static constexpr UINT WM_MR_WIN_DOWN = WM_APP + 42;
 static constexpr UINT WM_MR_WIN_UP = WM_APP + 43;
 static constexpr UINT WM_MR_WIN_SPACE = WM_APP + 44;
 static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
-static WPARAM gSuppressedShortcutKey = 0;
-static uint16_t gTemporarilyReleasedModifier = 0;
+// Remapped-shortcut state: the key owned until its physical key-up and the
+// remote modifier released for it; keymap.hpp.
+static jl::keymap::Translator gKeys;
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -561,18 +562,44 @@ static void logFirstInput(const char* kind) {
     logLine(std::string("input.first=") + kind);
 }
 
-static bool sendRemoteChord(uint16_t modifier, uint16_t key) {
-    if (!gControl) return false;
-    bool ok = true;
-    ok = gControl->sendKey(true, modifier) && ok;
-    ok = gControl->sendKey(true, key) && ok;
-    ok = gControl->sendKey(false, key) && ok;
-    ok = gControl->sendKey(false, modifier) && ok;
-    return ok;
+// keymap.hpp uses its own VK constants so it builds without <windows.h>.
+static_assert(jl::keymap::vk::Back == VK_BACK && jl::keymap::vk::Tab == VK_TAB &&
+              jl::keymap::vk::Return == VK_RETURN && jl::keymap::vk::Shift == VK_SHIFT &&
+              jl::keymap::vk::Control == VK_CONTROL && jl::keymap::vk::Menu == VK_MENU &&
+              jl::keymap::vk::Capital == VK_CAPITAL && jl::keymap::vk::Escape == VK_ESCAPE &&
+              jl::keymap::vk::Space == VK_SPACE && jl::keymap::vk::Prior == VK_PRIOR &&
+              jl::keymap::vk::Next == VK_NEXT && jl::keymap::vk::End == VK_END &&
+              jl::keymap::vk::Home == VK_HOME && jl::keymap::vk::Left == VK_LEFT &&
+              jl::keymap::vk::Up == VK_UP && jl::keymap::vk::Right == VK_RIGHT &&
+              jl::keymap::vk::Down == VK_DOWN && jl::keymap::vk::Insert == VK_INSERT &&
+              jl::keymap::vk::Delete == VK_DELETE && jl::keymap::vk::LWin == VK_LWIN &&
+              jl::keymap::vk::RWin == VK_RWIN, "keymap.hpp VK constants");
+static_assert(jl::keymap::vk::Numpad0 == VK_NUMPAD0 && jl::keymap::vk::Numpad9 == VK_NUMPAD9 &&
+              jl::keymap::vk::Multiply == VK_MULTIPLY && jl::keymap::vk::Add == VK_ADD &&
+              jl::keymap::vk::Subtract == VK_SUBTRACT && jl::keymap::vk::Decimal == VK_DECIMAL &&
+              jl::keymap::vk::Divide == VK_DIVIDE && jl::keymap::vk::F1 == VK_F1 &&
+              jl::keymap::vk::F12 == VK_F12 && jl::keymap::vk::LShift == VK_LSHIFT &&
+              jl::keymap::vk::RShift == VK_RSHIFT && jl::keymap::vk::LControl == VK_LCONTROL &&
+              jl::keymap::vk::RControl == VK_RCONTROL && jl::keymap::vk::LMenu == VK_LMENU &&
+              jl::keymap::vk::RMenu == VK_RMENU, "keymap.hpp VK constants");
+static_assert(jl::keymap::vk::Oem1 == VK_OEM_1 && jl::keymap::vk::OemPlus == VK_OEM_PLUS &&
+              jl::keymap::vk::OemComma == VK_OEM_COMMA && jl::keymap::vk::OemMinus == VK_OEM_MINUS &&
+              jl::keymap::vk::OemPeriod == VK_OEM_PERIOD && jl::keymap::vk::Oem2 == VK_OEM_2 &&
+              jl::keymap::vk::Oem3 == VK_OEM_3 && jl::keymap::vk::Oem4 == VK_OEM_4 &&
+              jl::keymap::vk::Oem5 == VK_OEM_5 && jl::keymap::vk::Oem6 == VK_OEM_6 &&
+              jl::keymap::vk::Oem7 == VK_OEM_7, "keymap.hpp VK constants");
+
+static jl::keymap::Held heldModifiers() {
+    return {physicalKeyDown(VK_CONTROL), physicalKeyDown(VK_MENU),
+            physicalKeyDown(VK_LWIN) || physicalKeyDown(VK_RWIN)};
 }
 
-static bool isWindowsCtrlCompatShortcut(WPARAM vk) {
-    return vk == 'A' || vk == 'C' || vk == 'V' || vk == 'Z';
+// Sends a keymap result to the host. The shortcut name is logged only with
+// JERISLINK_DEBUG=1; ordinary keys are never logged.
+static void sendKeyOutput(const jl::keymap::Output& out) {
+    if (!gControl) return;
+    for (const auto& e : out.events) gControl->sendKey(e.down, e.semantic);
+    if (!out.debugTag.empty() && debugMode()) logLine(out.debugTag);
 }
 
 static LRESULT viewerKeyboardHookImpl(int code, WPARAM wParam, LPARAM lParam) {
@@ -581,55 +608,19 @@ static LRESULT viewerKeyboardHookImpl(int code, WPARAM wParam, LPARAM lParam) {
         if (k) {
             const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
             const bool keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
-
-            if (k->vkCode == VK_CAPITAL) {
-                if (keyDown && !gHookCapsDown) {
-                    gHookCapsDown = true;
-                    PostMessageW(gViewerHwnd, WM_MR_CAPS_LOCK, 0, 0);
-                } else if (keyUp) {
-                    gHookCapsDown = false;
-                }
-                return 1;
+            using Post = jl::keymap::HookFilter::Post;
+            const auto d = gHookFilter.onKey(k->vkCode, keyDown, keyUp);
+            UINT msg = 0;
+            switch (d.post) {
+            case Post::CapsLock: msg = WM_MR_CAPS_LOCK; break;
+            case Post::WinDown: msg = WM_MR_WIN_DOWN; break;
+            case Post::WinUp: msg = WM_MR_WIN_UP; break;
+            case Post::WinC: msg = WM_MR_WIN_C; break;
+            case Post::WinSpace: msg = WM_MR_WIN_SPACE; break;
+            case Post::None: break;
             }
-
-            if (k->vkCode == VK_LWIN || k->vkCode == VK_RWIN) {
-                if (keyDown && !gHookWinDown) {
-                    gHookWinDown = true;
-                    PostMessageW(gViewerHwnd, WM_MR_WIN_DOWN, 0, 0);
-                } else if (keyUp && gHookWinDown) {
-                    gHookWinDown = false;
-                    PostMessageW(gViewerHwnd, WM_MR_WIN_UP, 0, 0);
-                }
-                return 1;
-            }
-
-            if (k->vkCode == 'C' && gHookWinDown) {
-                if (keyDown) {
-                    if (!gHookInterceptingWinC) {
-                        gHookInterceptingWinC = true;
-                        PostMessageW(gViewerHwnd, WM_MR_WIN_C, 0, 0);
-                    }
-                    return 1;
-                }
-                if (keyUp && gHookInterceptingWinC) {
-                    gHookInterceptingWinC = false;
-                    return 1;
-                }
-            }
-
-            if (k->vkCode == VK_SPACE && gHookWinDown) {
-                if (keyDown) {
-                    if (!gHookInterceptingWinSpace) {
-                        gHookInterceptingWinSpace = true;
-                        PostMessageW(gViewerHwnd, WM_MR_WIN_SPACE, 0, 0);
-                    }
-                    return 1;
-                }
-                if (keyUp && gHookInterceptingWinSpace) {
-                    gHookInterceptingWinSpace = false;
-                    return 1;
-                }
-            }
+            if (msg) PostMessageW(gViewerHwnd, msg, 0, 0);
+            if (d.swallow) return 1;
         }
     }
     return CallNextHookEx(gKeyboardHook, code, wParam, lParam);
@@ -668,47 +659,9 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
-static uint16_t semanticKey(WPARAM vk) {
-    switch (vk) {
-    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return 1;
-    case VK_MENU: case VK_LMENU: case VK_RMENU: return 2;
-    case VK_LWIN: case VK_RWIN: return 3;
-    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: return 4;
-    case VK_CAPITAL: return static_cast<uint16_t>(VK_CAPITAL);
-
-    // Editing/navigation keys. For non-modifiers we keep the Windows VK value
-    // as the semantic code; the Mac side maps that semantic to a CGKeyCode.
-    case VK_BACK: case VK_TAB: case VK_RETURN: case VK_ESCAPE: case VK_SPACE:
-    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
-    case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
-    case VK_INSERT: case VK_DELETE:
-
-    // Number pad.
-    case VK_NUMPAD0: case VK_NUMPAD1: case VK_NUMPAD2: case VK_NUMPAD3: case VK_NUMPAD4:
-    case VK_NUMPAD5: case VK_NUMPAD6: case VK_NUMPAD7: case VK_NUMPAD8: case VK_NUMPAD9:
-    case VK_MULTIPLY: case VK_ADD: case VK_SUBTRACT: case VK_DECIMAL: case VK_DIVIDE:
-
-    // Function keys.
-    case VK_F1: case VK_F2: case VK_F3: case VK_F4: case VK_F5: case VK_F6:
-    case VK_F7: case VK_F8: case VK_F9: case VK_F10: case VK_F11: case VK_F12:
-
-    // US/HK physical punctuation keys. Shift state is carried separately, so
-    // these naturally produce ! @ # ... and other shifted symbols.
-    case VK_OEM_1: case VK_OEM_PLUS: case VK_OEM_COMMA: case VK_OEM_MINUS:
-    case VK_OEM_PERIOD: case VK_OEM_2: case VK_OEM_3: case VK_OEM_4:
-    case VK_OEM_5: case VK_OEM_6: case VK_OEM_7:
-        return static_cast<uint16_t>(vk);
-    default:
-        if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
-            return static_cast<uint16_t>(vk);
-        }
-        return 0;
-    }
-}
-
 static void releaseRemoteModifiers() {
     if (!gControl) return;
-    for (uint16_t k = 1; k <= 4; ++k) gControl->sendKey(false, k);
+    for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
 }
 
 static void sendRemoteButtonUp(uint8_t button) {
@@ -2231,8 +2184,7 @@ static bool viewerHotkey(WPARAM vk, const char* source) {
 }
 
 static bool isViewerHotkey(WPARAM vk) {
-    return (vk == 'O' || vk == 'M' || vk == 'V') && physicalKeyDown(VK_CONTROL) &&
-           physicalKeyDown(VK_MENU);
+    return jl::keymap::isViewerHotkey(static_cast<uint32_t>(vk), heldModifiers());
 }
 
 static void overlaySetVolume(int pct) {
@@ -2283,11 +2235,10 @@ static void overlayKey(WPARAM vk, bool repeat) {
 static bool overlayHandleKeyDown(WPARAM vk, LPARAM lParam) {
     const bool repeat = (lParam & (1LL << 30)) != 0;
     if (isViewerHotkey(vk)) {
-        // The key-up is swallowed via gSuppressedShortcutKey. Ctrl and Alt
-        // were already sent as plain modifier downs and are released normally.
+        // The key-up is swallowed by the keymap. Ctrl and Alt were already
+        // sent as plain modifier downs and are released normally.
         if (!repeat) viewerHotkey(vk, "shortcut");
-        gSuppressedShortcutKey = vk;
-        gTemporarilyReleasedModifier = 0;
+        gKeys.suppressUntilUp(static_cast<uint32_t>(vk));
         return true;
     }
     if (!gOverlayKeyboard || !overlayVisible()) return false;
@@ -2677,12 +2628,8 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_KILLFOCUS:
         gViewerFocused = false;
         gHaveMouse = false;
-        gHookWinDown = false;
-        gHookInterceptingWinC = false;
-        gHookInterceptingWinSpace = false;
-        gHookCapsDown = false;
-        gSuppressedShortcutKey = 0;
-        gTemporarilyReleasedModifier = 0;
+        gHookFilter.reset();
+        gKeys.reset();
         releaseRemoteButtons("focus_kill");
         releaseRemoteModifiers();
         logLine("focus.kill");
@@ -2710,55 +2657,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         logFirstInput("keyboard");
         const bool repeat = (lParam & (1LL << 30)) != 0;
-
-        // Windows+C is Jerislink's explicit native macOS Control+C escape hatch.
-        // The Windows key normally maps to macOS Command, so release it remotely
-        // before sending the true Control+C chord.
-        const bool winDown = physicalKeyDown(VK_LWIN) || physicalKeyDown(VK_RWIN);
-        if (!repeat && wParam == VK_SPACE && winDown) {
-            gControl->sendKey(false, 3);
-            sendRemoteChord(1, VK_SPACE);
-            gSuppressedShortcutKey = VK_SPACE;
-            gTemporarilyReleasedModifier = 3;
-            logLine("shortcut.win_space=control_space");
-            return 0;
-        }
-        if (!repeat && wParam == 'C' && winDown) {
-            gControl->sendKey(false, 3);
-            sendRemoteChord(1, 'C');
-            gSuppressedShortcutKey = 'C';
-            gTemporarilyReleasedModifier = 3;
-            logLine("shortcut.win_c=control_c");
-            return 0;
-        }
-
-        // Preserve Windows editing muscle memory: Ctrl+A/C/V become macOS
-        // Command+A/C/V. The physical Ctrl key was already forwarded as Control,
-        // so temporarily release it remotely while emitting the Command chord.
-        const bool ctrlDown = physicalKeyDown(VK_CONTROL);
-        if (!repeat && ctrlDown && isWindowsCtrlCompatShortcut(wParam)) {
-            gControl->sendKey(false, 1);
-            sendRemoteChord(3, static_cast<uint16_t>(wParam));
-            gSuppressedShortcutKey = wParam;
-            gTemporarilyReleasedModifier = 1;
-            logLine(std::string("shortcut.ctrl_") + static_cast<char>(std::tolower(static_cast<unsigned char>(wParam))) + "=command");
-            return 0;
-        }
-
-        // Windows generates repeated WM_KEYDOWN / WM_SYSKEYDOWN messages while
-        // an ordinary key is held. Forward each repeat so the remote Mac keeps
-        // native key-repeat behaviour (Space, Backspace, arrows, etc.). A key
-        // currently owned by one of our remapped shortcuts must remain suppressed
-        // until its physical key-up; otherwise holding Ctrl+C/V/Z/A would leak the
-        // underlying letter after the first translated Command shortcut.
-        if (repeat && gSuppressedShortcutKey != 0 &&
-            wParam == gSuppressedShortcutKey) {
-            return 0;
-        }
-
-        const uint16_t key = semanticKey(wParam);
-        if (!key) break;
-        gControl->sendKey(true, key);
+        // Win+Space, Win+C, Ctrl+A/C/V/Z and plain keys: keymap.hpp.
+        const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());
+        if (!out.handled) break;
+        sendKeyOutput(out);
         return 0;
     }
     case WM_KEYUP:
@@ -2768,63 +2670,33 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
-        if (gSuppressedShortcutKey != 0 && wParam == gSuppressedShortcutKey) {
-            if (gTemporarilyReleasedModifier == 1 && physicalKeyDown(VK_CONTROL)) {
-                gControl->sendKey(true, 1);
-            } else if (gTemporarilyReleasedModifier == 3 &&
-                       (physicalKeyDown(VK_LWIN) || physicalKeyDown(VK_RWIN))) {
-                gControl->sendKey(true, 3);
-            }
-            gSuppressedShortcutKey = 0;
-            gTemporarilyReleasedModifier = 0;
-            return 0;
-        }
-        const uint16_t key = semanticKey(wParam);
-        if (!key) break;
-        gControl->sendKey(false, key);
+        const auto out = gKeys.keyUp(static_cast<uint32_t>(wParam), heldModifiers());
+        if (!out.handled) break;
+        sendKeyOutput(out);
         return 0;
     }
+    // Posted by the low-level hook, which owns the Windows key and Caps Lock
+    // while the viewer is focused.
     case WM_MR_WIN_DOWN:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            gControl->sendKey(true, 3);
-            logLine("shortcut.win_hook=command_down");
-        }
+        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookWinDown());
         return 0;
     case WM_MR_WIN_UP:
-        if (gControl) {
-            gControl->sendKey(false, 3);
-            logLine("shortcut.win_hook=command_up");
-        }
+        sendKeyOutput(jl::keymap::Translator::hookWinUp());
         return 0;
     case WM_MR_WIN_C:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            // The hook owns the Windows key while the Viewer is focused, so the
-            // Windows Shell never sees a Win press/release. Momentarily release
-            // remote Command, emit true macOS Control+C, then restore Command
-            // until the hook receives the Windows-key release.
-            gControl->sendKey(false, 3);
-            sendRemoteChord(1, 'C');
-            if (gHookWinDown) gControl->sendKey(true, 3);
-            logLine("shortcut.win_c_hook=control_c");
+        if (viewerHasInteractiveFocus(hwnd)) {
+            sendKeyOutput(jl::keymap::Translator::hookWinC(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_WIN_SPACE:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            // Preserve the user's Parsec muscle memory: Windows+Space becomes
-            // native macOS Control+Space for switching input sources. Other
-            // Windows-key combinations continue to map to Command unchanged.
-            gControl->sendKey(false, 3);
-            sendRemoteChord(1, VK_SPACE);
-            if (gHookWinDown) gControl->sendKey(true, 3);
-            logLine("shortcut.win_space_hook=control_space");
+        // Windows+Space becomes native macOS Control+Space for switching
+        // input sources (Parsec muscle memory).
+        if (viewerHasInteractiveFocus(hwnd)) {
+            sendKeyOutput(jl::keymap::Translator::hookWinSpace(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_CAPS_LOCK:
-        if (viewerHasInteractiveFocus(hwnd) && gControl) {
-            gControl->sendKey(true, VK_CAPITAL);
-            gControl->sendKey(false, VK_CAPITAL);
-            logLine("key.caps_lock=remote_only");
-        }
+        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookCapsLock());
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && gRemoteCursor) {
