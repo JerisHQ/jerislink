@@ -1,5 +1,6 @@
 // In-session overlay maths (ui_overlay.hpp): layout, hit-test, keyboard
-// focus order, slider, hover dwell, corner zone, opacity token and placement.
+// focus order, slider, hover dwell, corner zone, opacity token, placement,
+// the hover zone on any monitor and the offset below the remote menu bar.
 #include "ui_overlay.hpp"
 
 #include <array>
@@ -137,6 +138,156 @@ void placementTests() {
     expect(p.x == 0 && p.y == 16, "client exactly as wide: flush left, margin on top");
 }
 
+bool same(const Rect& a, const Rect& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
+
+// Bug: the hover zone never fired with the viewer on an external monitor.
+// The zone is now built in screen coordinates from the viewer's client
+// area and its monitor's work area, so any origin and any dpi work.
+void hoverZoneTests() {
+    // External monitor left of the primary (negative x, above: negative y),
+    // viewer maximized: client under the caption, down to the taskbar.
+    const Rect leftWork{-2560, -200, 0, 1200};
+    const Rect leftClient{-2560, -169, 0, 1200};
+    Rect z = hoverZone(leftClient, leftWork, 48);
+    expect(same(z, Rect{-2560, 1152, -2512, 1200}), "negative origin: zone at the client bottom-left");
+    expect(z.contains(-2560, 1199) && z.contains(-2513, 1152), "negative origin: corner and zone edge are in");
+    expect(!z.contains(-2512, 1180) && !z.contains(-2540, 1151), "negative origin: right of and above the zone are out");
+    expect(!z.contains(0, 1199) && !z.contains(10, 700), "negative origin: points on the primary are out");
+
+    // Monitor above the primary (negative y only).
+    z = hoverZone(Rect{0, -1049, 1920, -40}, Rect{0, -1080, 1920, -40}, 48);
+    expect(same(z, Rect{0, -88, 48, -40}), "monitor above the primary: zone in negative y");
+
+    // Different dpi on the external monitor: the zone is sized for it.
+    z = hoverZone(Rect{-1920, 31, 0, 1032}, Rect{-1920, 0, 0, 1032}, scale(kHoverZone, 144));
+    expect(z.width() == 72 && z.height() == 72 && z.left == -1920 && z.bottom == 1032,
+           "150% monitor: 72 px zone at its corner");
+
+    // Windowed and fully on the external monitor: the client corner itself.
+    z = hoverZone(Rect{2700, 200, 3980, 920}, Rect{2560, 0, 4480, 1040}, 48);
+    expect(same(z, Rect{2700, 872, 2748, 920}), "windowed on the external monitor: client corner");
+
+    // A window sized for a bigger panel, moved to a 1920x1080 external
+    // monitor: its client bottom-left is off-screen. The zone moves to the
+    // visible corner, above the taskbar.
+    const Rect smallWork{2560, 0, 4480, 1040};
+    z = hoverZone(Rect{2600, 100, 5160, 1540}, smallWork, 48);
+    expect(same(z, Rect{2600, 992, 2648, 1040}), "window larger than the monitor: visible corner");
+    expect(z.bottom <= smallWork.bottom && z.left >= smallWork.left, "zone stays reachable on that monitor");
+
+    // Client bottom behind the taskbar.
+    z = hoverZone(Rect{0, 0, 1920, 1080}, Rect{0, 0, 1920, 1032}, 48);
+    expect(same(z, Rect{0, 984, 48, 1032}), "client under the taskbar: zone above it");
+
+    // Nothing of the client on the monitor, or a tiny client.
+    z = hoverZone(Rect{5000, 0, 6000, 500}, smallWork, 48);
+    expect(z.width() <= 0 || z.height() <= 0, "client off the monitor: empty zone");
+    z = hoverZone(Rect{0, 0, 30, 20}, Rect{0, 0, 1920, 1040}, 48);
+    expect(same(z, Rect{0, 0, 30, 20}), "client smaller than the zone: the whole client");
+}
+
+// Hand test r1: on a wide external monitor the zone sat in the left black
+// bar. It is now the bottom-left corner of the drawn video (remote picture).
+void videoHoverZoneTests() {
+    // Pillarboxed: maximized 1920-wide client, 1001 rows, 16:9 stream. The
+    // video is 1779 wide, starting 70 px in.
+    const Rect extWork{1920, 0, 3840, 1032};
+    Rect z = videoHoverZone(Rect{1920, 31, 3840, 1032}, 3840, 2160, extWork, 48);
+    expect(same(z, Rect{1990, 984, 2038, 1032}), "pillarboxed: zone starts at the video left edge");
+    expect(z.contains(1995, 1000), "pillarboxed: Mac picture bottom-left is in");
+    expect(!z.contains(1950, 1000) && !z.contains(1920, 1031), "pillarboxed: left black bar is out");
+
+    // Same on a monitor left of the primary (negative origin).
+    z = videoHoverZone(Rect{-1920, 31, 0, 1032}, 3840, 2160, Rect{-1920, 0, 0, 1032}, 48);
+    expect(same(z, Rect{-1850, 984, -1802, 1032}), "pillarboxed, negative origin: video corner");
+
+    // 150% dpi: 72 px zone, still at the video edge.
+    z = videoHoverZone(Rect{1920, 31, 3840, 1032}, 3840, 2160, extWork, scale(kHoverZone, 144));
+    expect(z.left == 1990 && z.width() == 72 && z.height() == 72 && z.bottom == 1032,
+           "pillarboxed, 150% dpi: 72 px zone at the video corner");
+
+    // Letterboxed: 16:10 client, 16:9 stream. Zone bottom is the video
+    // bottom (1140), not the window bottom (1200).
+    z = videoHoverZone(Rect{0, 0, 1920, 1200}, 3840, 2160, Rect{0, 0, 1920, 1200}, 48);
+    expect(same(z, Rect{0, 1092, 48, 1140}), "letterboxed: zone bottom is the video bottom");
+    expect(!z.contains(10, 1150) && !z.contains(10, 1199), "letterboxed: bottom black bar is out");
+
+    // Letterboxed with the taskbar over the video bottom: zone above it.
+    z = videoHoverZone(Rect{0, 0, 1920, 1200}, 3840, 2160, Rect{0, 0, 1920, 1100}, 48);
+    expect(same(z, Rect{0, 1052, 48, 1100}), "letterboxed under the taskbar: zone above it");
+
+    // Video partly off-screen: client hangs off the monitor's left edge; the
+    // video's left part is off-screen, so the zone is at the visible part.
+    z = videoHoverZone(Rect{-1000, 0, 1560, 1000}, 1920, 1080, Rect{0, 0, 1920, 1040}, 48);
+    expect(same(z, Rect{0, 952, 48, 1000}), "video partly off-screen: visible video corner");
+
+    // Window larger than the monitor, exact 16:9: the r1 visible corner.
+    z = videoHoverZone(Rect{2600, 100, 5160, 1540}, 3840, 2160, Rect{2560, 0, 4480, 1040}, 48);
+    expect(same(z, Rect{2600, 992, 2648, 1040}), "window larger than the monitor: visible corner");
+
+    // No visible video at all (only black bar on the monitor): fall back to
+    // the visible client corner.
+    z = videoHoverZone(Rect{-3000, 0, 1000, 500}, 1920, 1080, Rect{0, 0, 1920, 1040}, 48);
+    expect(same(z, Rect{0, 452, 48, 500}), "no visible video: visible client corner");
+
+    // Unknown stream size: the whole client is the video.
+    const Rect c{100, 100, 1380, 820}, w{0, 0, 1920, 1040};
+    expect(same(videoHoverZone(c, 0, 0, w, 48), hoverZone(c, w, 48)), "no stream size: client corner");
+
+    // Stream size change moves the zone (16:9 to 4:3 in a 16:9 client).
+    z = videoHoverZone(Rect{0, 0, 1920, 1080}, 1024, 768, Rect{0, 0, 1920, 1080}, 48);
+    expect(same(z, Rect{240, 1032, 288, 1080}), "4:3 stream in a 16:9 window: zone moves to video left");
+}
+
+// Bug: the bar covered the Mac menu bar. The top offset is the remote menu
+// bar mapped into client pixels plus a gap; it never falls short of the
+// real bar (24 pt x scale) at any size below.
+void menuBarOffsetTests() {
+    expect(same(fitVideo(1920, 1200, 3840, 2160), Rect{0, 60, 1920, 1140}), "16:10 window: letterboxed fit");
+    expect(same(fitVideo(2560, 1080, 1920, 1080), Rect{320, 0, 2240, 1080}), "wide window: pillarboxed fit");
+    expect(same(fitVideo(1920, 1080, 1920, 1080), Rect{0, 0, 1920, 1080}), "exact fit");
+
+    expect(remoteMenuBarStreamPx(1080) == 24 && remoteMenuBarStreamPx(1440) == 24,
+           "1080 and 1440 row streams: 1x menu bar (24 rows)");
+    expect(remoteMenuBarStreamPx(2160) == 48 && remoteMenuBarStreamPx(1600) == 48,
+           "1600 and 2160 row streams: 2x menu bar (48 rows)");
+
+    const int gap = scale(kMenuBarGap, 96);
+    expect(gap == 6, "gap is 6 px at 96 dpi");
+    // 1920x1080 stream shown 1:1.
+    expect(overlayTopOffset(1920, 1080, 1920, 1080, gap) == 24 + 6, "1920x1080 1:1: 24 + gap");
+    // 2560x1440 stream in a 1920x1080 client: 24 x 1080/1440 = 18.
+    expect(overlayTopOffset(1920, 1080, 2560, 1440, gap) == 18 + 6, "2560x1440 in 1920x1080: 18 + gap");
+    expect(overlayTopOffset(2560, 1440, 2560, 1440, gap) == 24 + 6, "2560x1440 1:1: 24 + gap");
+    // 3840x2160 (4K, 2x): 48 rows.
+    expect(overlayTopOffset(3840, 2160, 3840, 2160, scale(kMenuBarGap, 192)) == 48 + 12,
+           "3840x2160 1:1 at 200%: 48 + gap");
+    expect(overlayTopOffset(1920, 1080, 3840, 2160, gap) == 24 + 6, "3840x2160 in 1920x1080: 24 + gap");
+    // 4352x2448 capped to 3840x2160: the real bar is 24 x 2 x 3840/4352 =
+    // 42.4 stream rows, 21.2 client rows at 1920x1080. The 2x estimate (24)
+    // clears it.
+    const int capped = overlayTopOffset(1920, 1080, 3840, 2160, gap);
+    expect(capped - gap >= 22, "4352x2448 capped to 3840x2160: clears the real 21.2 px bar");
+    expect(overlayTopOffset(3840, 2160, 3840, 2160, 0) >= 43, "capped stream 1:1: clears the real 42.4 row bar");
+    // Letterboxed: 16:10 window, black bars of 60 above and below.
+    expect(overlayTopOffset(1920, 1200, 3840, 2160, gap) == 60 + 24 + 6, "letterboxed 1920x1200: bar top + 24 + gap");
+    // Pillarboxed: no bar on top.
+    expect(overlayTopOffset(2560, 1080, 1920, 1080, gap) == 24 + 6, "pillarboxed 2560x1080: 24 + gap");
+    // Small window: follows the resize.
+    expect(overlayTopOffset(1280, 720, 3840, 2160, gap) == 16 + 6, "3840x2160 in 1280x720: 16 + gap");
+    expect(overlayTopOffset(1280, 720, 1920, 1080, gap) == 16 + 6, "1920x1080 in 1280x720: 16 + gap");
+    // No stream size yet: just the gap.
+    expect(overlayTopOffset(1280, 720, 0, 0, gap) == gap, "unknown stream size: gap only");
+
+    // Placed with the offset: below the menu bar, still centred.
+    const Point p = placeInClient(Rect{-2560, -169, 0, 1200}, 648, 78,
+                                  overlayTopOffset(2560, 1369, 3840, 2160, gap));
+    expect(p.x == -2560 + (2560 - 648) / 2, "negative-origin client: centred");
+    expect(p.y > -169 + 24, "negative-origin client: below the remote menu bar");
+}
+
 }  // namespace
 
 int main() {
@@ -147,6 +298,9 @@ int main() {
     dwellTests();
     zoneTests();
     placementTests();
+    hoverZoneTests();
+    videoHoverZoneTests();
+    menuBarOffsetTests();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

@@ -1,7 +1,7 @@
 #pragma once
 
 // In-session overlay (B1): a thin translucent bar at the top centre of the
-// viewer with the connection status, mute, volume, Info, Settings and Disconnect.
+// viewer, just below the remote Mac menu bar, with the connection status, mute, volume, Info, Settings and Disconnect.
 // Layout, hit-testing, keyboard focus order, slider maths and the hover
 // fallback live here without Win32 so ui_overlay_test.cpp can check them.
 // viewer.cpp paints and drives the real window.
@@ -105,8 +105,9 @@ inline int sliderKnobX(const Rect& slider, int value, unsigned dpi) {
 // Left / Right on the focused volume item: 5% steps, clamped.
 inline int volumeStep(int value, int dir) { return std::clamp(value + 5 * dir, 0, 100); }
 
-// Hover fallback: the pointer rests in the bottom-left corner of the viewer's
-// client area (zone x zone pixels). The overlay itself opens at the top centre.
+// Hover fallback in client coordinates: the bottom-left corner of a cw x ch
+// client area (zone x zone pixels). The viewer uses videoHoverZone() below,
+// which anchors the corner to the remote picture and keeps it on screen. The overlay itself opens at the top centre.
 inline bool inCornerZone(int x, int y, int clientW, int clientH, int zone) {
     return x >= 0 && y < clientH && x < std::min(zone, clientW) && y >= clientH - zone;
 }
@@ -165,6 +166,95 @@ inline Point placeInClient(const Rect& client, int w, int h, int margin) {
     p.x = std::max(client.left, std::min(p.x, client.right - w));
     p.y = std::max(client.top, std::min(p.y, client.bottom - h));
     return p;
+}
+
+// ---- Hover zone on any monitor ---------------------------------------------
+// Part of `a` that is also in `b`; empty (width or height <= 0) when apart.
+inline Rect intersect(const Rect& a, const Rect& b) {
+    Rect r{std::max(a.left, b.left), std::max(a.top, b.top), std::min(a.right, b.right),
+           std::min(a.bottom, b.bottom)};
+    if (r.right < r.left) r.right = r.left;
+    if (r.bottom < r.top) r.bottom = r.top;
+    return r;
+}
+
+// Bottom-left hover zone in screen coordinates. `clientScreen` is the
+// viewer's client area in screen coordinates (any monitor, negative origins
+// included); `workArea` is the work area of the monitor the viewer is on.
+// The zone is the bottom-left corner of the part of the client area that is
+// actually on that monitor and not under its taskbar, so it can always be
+// reached: a window larger than the monitor, or one whose bottom edge is
+// off-screen or behind the taskbar, still gets a reachable corner. Empty
+// when no part of the client area is visible.
+inline Rect hoverZone(const Rect& clientScreen, const Rect& workArea, int zone) {
+    const Rect v = intersect(clientScreen, workArea);
+    if (v.width() <= 0 || v.height() <= 0 || zone <= 0) return {};
+    return {v.left, std::max(v.top, v.bottom - zone), std::min(v.right, v.left + zone), v.bottom};
+}
+
+// ---- Overlay below the remote menu bar -------------------------------------
+// Where the stream is drawn in a cw x ch client area: aspect fit, centred,
+// black bars on the long side (same maths as the CPU and D3D paths).
+inline Rect fitVideo(int cw, int ch, unsigned streamW, unsigned streamH) {
+    cw = std::max(1, cw);
+    ch = std::max(1, ch);
+    if (streamW == 0 || streamH == 0) return {0, 0, cw, ch};
+    const double srcAspect = static_cast<double>(streamW) / streamH;
+    int dw = cw, dh = ch, dx = 0, dy = 0;
+    if (static_cast<double>(cw) / ch > srcAspect) {
+        dw = std::max(1, static_cast<int>(ch * srcAspect));
+        dx = (cw - dw) / 2;
+    } else {
+        dh = std::max(1, static_cast<int>(cw / srcAspect));
+        dy = (ch - dh) / 2;
+    }
+    return {dx, dy, dx + dw, dy + dh};
+}
+
+// macOS menu bar: 24 pt on displays without a notch (taller, about 37 pt,
+// on notch displays). The host does not send its menu bar height or backing
+// scale, so the viewer estimates it from the stream height: streams of 1500
+// rows or more come from a Retina / HiDPI (2x) mode, smaller ones from a 1x
+// mode. For a capped stream (4352x2448 sent as 3840x2160) 2x gives 48 rows
+// where the true bar is about 42, so the overlay sits a little lower and stays
+// clear. A 1x guess for a stream that is really 2x (under 1500 rows) would be
+// too small; the host sending its real menu bar height would fix that, which
+// needs a wire change.
+constexpr int kMacMenuBarPt = 24;
+constexpr unsigned kHiDpiStreamRows = 1500;
+
+inline int remoteMenuBarStreamPx(unsigned streamH) {
+    return kMacMenuBarPt * (streamH >= kHiDpiStreamRows ? 2 : 1);
+}
+
+// Gap between the remote menu bar and the overlay, logical pixels.
+constexpr int kMenuBarGap = 6;
+
+// Distance from the client top to the overlay top: the top of the drawn
+// video, plus the remote menu bar mapped into client pixels (menu bar rows
+// x displayed video height / stream height, rounded up), plus `gapPx`.
+inline int overlayTopOffset(int cw, int ch, unsigned streamW, unsigned streamH, int gapPx) {
+    const Rect v = fitVideo(cw, ch, streamW, streamH);
+    if (streamH == 0) return gapPx;
+    const long long bar = static_cast<long long>(remoteMenuBarStreamPx(streamH)) * v.height();
+    const int barPx = static_cast<int>((bar + streamH - 1) / streamH);
+    return v.top + barPx + gapPx;
+}
+
+// Bottom-left hover zone on the remote picture, in screen coordinates: the
+// bottom-left corner of (displayed video rect, same aspect fit as the
+// renderer) and client area and monitor work area. On a pillarboxed or
+// letterboxed window it starts at the video's left edge and ends at the
+// video's bottom edge, never in the black bars. Only when no part of the
+// video is visible does it fall back to the visible client corner.
+inline Rect videoHoverZone(const Rect& clientScreen, unsigned streamW, unsigned streamH,
+                           const Rect& workArea, int zone) {
+    const Rect fit = fitVideo(clientScreen.width(), clientScreen.height(), streamW, streamH);
+    const Rect video{clientScreen.left + fit.left, clientScreen.top + fit.top,
+                     clientScreen.left + fit.right, clientScreen.top + fit.bottom};
+    const Rect z = hoverZone(intersect(video, clientScreen), workArea, zone);
+    if (z.width() > 0 && z.height() > 0) return z;
+    return hoverZone(clientScreen, workArea, zone);
 }
 
 }  // namespace jl::overlay
