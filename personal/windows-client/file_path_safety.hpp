@@ -113,6 +113,45 @@ inline Rejection checkRules(const std::string& path) {
     return Rejection::None;
 }
 
+// F3 r2 (D14 revision): names a Mac allows but Windows cannot hold are
+// mapped, not refused, when Mac files are pasted on Windows, so the copy
+// still pastes. Only the Windows-only rules are mapped; every shared safety
+// rule (absolute, "..", empty part, backslash, control chars) still refuses.
+//   : * ? " < > |      -> _   (so a leading "C:" is "C_", not a drive)
+|      -> _
+//   trailing dots/spaces -> removed ("_" if nothing is left)
+//   CON, NUL, COM1 ...   -> "_" after the device stem: CON.txt -> CON_.txt
+// "." and ".." are left alone so checkRules() refuses them.
+inline std::string windowsComponent(const std::string& part) {
+    if (part == "." || part == "..") return part;
+    std::string out = part;
+    for (char& ch : out) {
+        if (ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|') ch = '_';
+    }
+    while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
+    if (out.empty()) return "_";
+    if (detail::isReservedName(out)) {
+        const size_t dot = out.find('.');
+        out.insert(dot == std::string::npos ? out.size() : dot, "_");
+    }
+    return out;
+}
+
+// windowsComponent() on every '/'-separated part. Empty parts stay empty.
+inline std::string windowsPath(const std::string& path) {
+    std::string out;
+    size_t start = 0;
+    while (true) {
+        const size_t slash = path.find('/', start);
+        const std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        out += part.empty() ? part : windowsComponent(part);
+        if (slash == std::string::npos) break;
+        out += '/';
+        start = slash + 1;
+    }
+    return out;
+}
+
 // Explorer-style name for the nth clash (n >= 2): "report (2).pdf",
 // "notes (3)", ".profile (2)". The extension is what follows the last dot
 // that is not the first character. The base is shortened on a code point
@@ -137,13 +176,17 @@ inline std::string clashName(const std::string& name, int n) {
 #ifdef _WIN32
 struct Verdict {
     Rejection why = Rejection::None;
-    std::string utf8;    // NFC, '/'-separated
+    std::string utf8;    // NFC, '/'-separated (after mapping, if asked)
     std::wstring wide;   // NFC, '\\'-separated, ready to join under a folder
+    std::string original;  // NFC as sent, before any mapping
+    bool renamed = false;  // mapWindowsNames changed it
     bool ok() const { return why == Rejection::None; }
 };
 
-// Validate the raw UTF-8 bytes of an ENTRY path.
-inline Verdict validate(const std::vector<uint8_t>& raw) {
+// Validate the raw UTF-8 bytes of an ENTRY path. mapWindowsNames (F3 Mac->
+// Windows paste only) maps Windows-only name problems with windowsPath()
+// instead of refusing them.
+inline Verdict validate(const std::vector<uint8_t>& raw, bool mapWindowsNames = false) {
     Verdict v;
     const std::string in(raw.begin(), raw.end());
     if (in.empty()) { v.why = Rejection::Empty; return v; }
@@ -169,8 +212,20 @@ inline Verdict validate(const std::vector<uint8_t>& raw) {
     if (un <= 0) { v.why = Rejection::NotUtf8; return v; }
     v.utf8.assign(size_t(un), '\0');
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, nfc.data(), int(nfc.size()), v.utf8.data(), un, nullptr, nullptr);
+    v.original = v.utf8;
+    if (mapWindowsNames) {
+        std::string mapped = windowsPath(v.utf8);
+        if (mapped != v.utf8) {
+            // ASCII-only edits: still NFC; rebuild the wide form from it.
+            v.renamed = true;
+            v.utf8 = std::move(mapped);
+            const int mn = MultiByteToWideChar(CP_UTF8, 0, v.utf8.data(), int(v.utf8.size()), nullptr, 0);
+            nfc.assign(size_t(mn > 0 ? mn : 0), L'\0');
+            if (mn > 0) MultiByteToWideChar(CP_UTF8, 0, v.utf8.data(), int(v.utf8.size()), nfc.data(), mn);
+        }
+    }
     v.why = checkRules(v.utf8);
-    if (!v.ok()) { v.utf8.clear(); return v; }
+    if (!v.ok()) { v.utf8.clear(); v.renamed = false; return v; }
     v.wide = nfc;
     for (wchar_t& ch : v.wide) if (ch == L'/') ch = L'\\';
     return v;

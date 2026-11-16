@@ -373,6 +373,7 @@ static constexpr UINT WM_MR_WIN_UP = WM_APP + 43;
 static constexpr UINT WM_MR_WIN_SPACE = WM_APP + 44;
 static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
+static constexpr UINT WM_MR_FILE_PULL_NOTICE = WM_APP + 47;  // F3 r2, wParam = FileSession::PullNotice
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -2661,12 +2662,16 @@ static void overlayDestroy() {
 
 namespace fu = jl::fileup;
 
-enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled };
+// Notice: a one-line message about a Mac copy pasted here (F3 r2), shown
+// even when Explorer covers the viewer.
+enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled, Notice };
 static HWND gFileChip = nullptr;
 static ChipMode gChipMode = ChipMode::Hidden;
 static double gChipHideAtMs = 0.0;
 static bool gChipCancelHot = false;
 static uint64_t gChipPastedFiles = 0;
+static std::wstring gChipNotice;
+static bool gChipNoticeError = false;
 static DWORD gLastUploadClipSeq = 0;  // clipboard sequence of the last good upload
 static DWORD gPendingClipSeq = 0;
 static std::vector<std::wstring> gPendingRoots;
@@ -2746,7 +2751,7 @@ struct ChipLayout {
 static ChipLayout chipLayout(UINT dpi) {
     const auto s = [dpi](int v) { return ov::scale(v, dpi); };
     ChipLayout l;
-    l.width = s(360);
+    l.width = s(gChipMode == ChipMode::Notice ? 500 : 360);
     l.height = s(36);
     const bool cancel = gChipMode == ChipMode::Running;
     l.cancel = cancel ? RECT{l.width - s(84), s(5), l.width - s(6), l.height - s(5)} : RECT{0, 0, 0, 0};
@@ -2765,8 +2770,15 @@ static std::wstring chipLabel() {
     case ChipMode::Ready: return L"Ready, press Cmd+V again";
     case ChipMode::Failed: return L"Paste to the Mac failed";
     case ChipMode::Cancelled: return L"Upload cancelled";
+    case ChipMode::Notice: return gChipNotice;
     default: return L"";
     }
+}
+
+// A Mac-copy notice while the viewer is minimised or not in front.
+static bool fileChipFloats() {
+    if (gChipMode != ChipMode::Notice || !gViewerHwnd) return false;
+    return IsIconic(gViewerHwnd) || GetForegroundWindow() != gViewerHwnd;
 }
 
 static void fileUiReposition() {
@@ -2778,9 +2790,21 @@ static void fileUiReposition() {
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
     if (gFileChip) {
         const ChipLayout l = chipLayout(dpi);
-        const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
-        SetWindowPos(gFileChip, nullptr, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width, l.height,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (fileChipFloats()) {
+            // Explorer (or anything) is in front of the viewer: show the
+            // notice on top, bottom right of the screen the mouse is on.
+            POINT pt{};
+            GetCursorPos(&pt);
+            MONITORINFO mi{sizeof(mi)};
+            GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+            const int gap = ov::scale(16, dpi);
+            SetWindowPos(gFileChip, HWND_TOPMOST, mi.rcWork.right - l.width - gap, mi.rcWork.bottom - l.height - gap,
+                         l.width, l.height, SWP_NOACTIVATE);
+        } else {
+            const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
+            SetWindowPos(gFileChip, HWND_NOTOPMOST, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width,
+                         l.height, SWP_NOACTIVATE);
+        }
     }
     if (gFileConfirm) {
         const int w = ov::scale(460, dpi), h = ov::scale(200, dpi);
@@ -2806,7 +2830,8 @@ static void paintFileChip(HWND hwnd) {
     jl::ui::fillRect(dc, client, c::kBody);
     jl::ui::roundRect(dc, client, ov::scale(10, dpi), c::kBody, c::kBorder, 1);
     const ChipLayout l = chipLayout(dpi);
-    const COLORREF fg = gChipMode == ChipMode::Failed ? c::kError : c::kText;
+    const COLORREF fg =
+        gChipMode == ChipMode::Failed || (gChipMode == ChipMode::Notice && gChipNoticeError) ? c::kError : c::kText;
     overlayText(dc, chipLabel(), l.text, gOverlayTheme.label, fg, DT_LEFT | DT_VCENTER);
     if (gChipMode == ChipMode::Running) {
         jl::ui::roundRect(dc, l.cancel, ov::scale(8, dpi), gChipCancelHot ? c::kSecondaryDown : c::kSecondary,
@@ -2830,6 +2855,8 @@ static void fileConfirmHide();
 
 static void fileChipTick() {
     if (gChipMode == ChipMode::Running && gFileChip) InvalidateRect(gFileChip, nullptr, FALSE);
+    // A notice follows the viewer coming to the front or going behind.
+    if (gChipMode == ChipMode::Notice && gFileChip) fileUiReposition();
     if (fileConfirmVisible()) InvalidateRect(gFileConfirm, nullptr, FALSE);
     if (gChipHideAtMs > 0.0 && steadyMsNow() >= gChipHideAtMs) fileChipHide();
 }
@@ -2914,8 +2941,32 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     gChipCancelHot = false;
     gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
     fileUiReposition();
-    if (gViewerHwnd && !IsIconic(gViewerHwnd)) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    if (gViewerHwnd && (!IsIconic(gViewerHwnd) || fileChipFloats())) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
     InvalidateRect(gFileChip, nullptr, FALSE);
+}
+
+// The pull session saw something about a Mac copy the user must know (F3 r2).
+static void onFilePullNotice(WPARAM kind) {
+    using N = FileSession::PullNotice;
+    // An upload's own chip wins; its result follows shortly anyway.
+    if (gChipMode == ChipMode::Running) return;
+    switch (static_cast<N>(kind)) {
+    case N::MacPermission:
+        gChipNotice = L"Mac blocked file access — click Allow on the Mac and copy again";
+        logLine("file.pull_notice=mac_permission");
+        break;
+    case N::PullFailed:
+        gChipNotice = L"Paste from the Mac failed — copy on the Mac and try again";
+        logLine("file.pull_notice=failed");
+        break;
+    case N::NotOffered:
+        gChipNotice = L"This Mac copy can't be pasted on Windows";
+        logLine("file.pull_notice=not_offered");
+        break;
+    default: return;
+    }
+    gChipNoticeError = true;
+    fileChipShow(ChipMode::Notice, 8000);
 }
 
 static void startPasteUpload() {
@@ -3247,6 +3298,9 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     case WM_MR_FILE_UPLOAD_DONE:
         onFileUploadDone();
+        return 0;
+    case WM_MR_FILE_PULL_NOTICE:
+        onFilePullNotice(wParam);
         return 0;
     case WM_QUERYENDSESSION:
         // Logoff or shutdown: no confirm; cancel so the Mac cleans up.
@@ -5094,6 +5148,9 @@ static int appMain(int argc, char** argv) {
                 o.bindIp, o.sourceIp, o.controlPort,
                 [](const std::string& message) { logLine(message); }, FileSession::Role::Pull);
             filePullSession->setMaxMbps(readFileTransferMaxMbps());
+            filePullSession->setPullNoticeCallback([](FileSession::PullNotice n) {
+                if (HWND w = gViewerHwnd) PostMessageW(w, WM_MR_FILE_PULL_NOTICE, WPARAM(n), 0);
+            });
             filePullSession->start();
             gFilePullSession = filePullSession.get();
         } else {

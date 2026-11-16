@@ -121,3 +121,8 @@ add_executable(JerislinkFileUploadTest file_upload_test.cpp)
 add_executable(JerislinkFilePullTest file_pull_test.cpp)
 target_compile_definitions(JerislinkFilePullTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(JerislinkFilePullTest PRIVATE normaliz user32)
+
+# Windows test for Mark of the Web on Mac -> Windows paste (F3 r2): zone helpers and an end-to-end shell paste.
+add_executable(JerislinkFileZoneTest file_zone_test.cpp file_pull.cpp)
+target_compile_definitions(JerislinkFileZoneTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkFileZoneTest PRIVATE ole32 oleaut32 shell32 shlwapi bcrypt uuid normaliz user32)

@@ -66,6 +66,9 @@ inline constexpr uint8_t kDenied = 4;
 inline constexpr uint8_t kBadPath = 5;
 inline constexpr uint8_t kFailed = 6;
 inline constexpr uint8_t kCancelled = 7;
+// F3 r2: macOS privacy settings (TCC Files & Folders) blocked the host's read,
+// or a prompt asking for it is still open on the Mac. Additive.
+inline constexpr uint8_t kMacPermission = 8;
 }  // namespace status
 
 namespace kind {

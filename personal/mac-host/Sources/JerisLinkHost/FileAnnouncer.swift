@@ -62,8 +62,16 @@ final class FileAnnouncer {
         deinit { Darwin.close(fd) }
     }
 
-    init(firstID: UInt32 = UInt32.random(in: 1...0x3fff_ffff)) {
+    /// Opens files off the session thread (macOS privacy prompts, F3 r2).
+    let gate: FileOpenGate
+    /// How long a REQUEST waits for its open before the viewer hears
+    /// `macPermission`.
+    let openWaitMs: Int
+
+    init(firstID: UInt32 = UInt32.random(in: 1...0x3fff_ffff), gate: FileOpenGate = .shared, openWaitMs: Int = 2500) {
         nextID = firstID
+        self.gate = gate
+        self.openWaitMs = openWaitMs
     }
 
     deinit { closeAll() }
@@ -98,6 +106,8 @@ final class FileAnnouncer {
             }
             let files = list.filter { $0.kind == FileProto.EntryKind.file }.count
             print("file.announce transfer=\(id) entries=\(list.count) files=\(files) bytes=\(total) skipped=\(skipped)")
+            // Surface a Files & Folders prompt now, at copy time, not mid-paste.
+            gate.probe(Self.probePaths(list))
         }
         return out
     }
@@ -126,16 +136,17 @@ final class FileAnnouncer {
 
     /// Answers one REQUEST through `send`. Returns false only when `send`
     /// failed (the session must close); a refused request is answered with
-    /// REPLY `failed` and the session goes on.
+    /// REPLY `failed`, or `macPermission` when macOS privacy settings or an
+    /// open prompt on the Mac hold the file (F3 r2), and the session goes on.
     func serve(transfer t: UInt32, index: UInt32, offset: UInt64, length: UInt32,
                send: (Message) -> Bool) -> Bool {
-        func refuse(_ why: String) -> Bool {
+        func refuse(_ why: String, _ status: UInt8 = FileProto.Status.failed) -> Bool {
             if t == current {
                 readers.removeValue(forKey: index)
                 readerOrder.removeAll { $0 == index }
             }
             print("file.pull transfer=\(t) result=failed:\(why)")
-            return send(.reply(transfer: t, status: FileProto.Status.failed))
+            return send(.reply(transfer: t, status: status))
         }
         guard t == current, Int(index) < items.count else { return refuse("unknown") }
         let item = items[Int(index)]
@@ -146,7 +157,13 @@ final class FileAnnouncer {
         if offset == 0 {
             readers.removeValue(forKey: index)
             readerOrder.removeAll { $0 == index }
-            guard let fd = Self.openChecked(item) else { return refuse("open") }
+            let fd: Int32
+            switch openChecked(item) {
+            case .fd(let f): fd = f
+            case .pending: return refuse("mac_permission_pending", FileProto.Status.macPermission)
+            case .denied: return refuse("mac_permission_denied", FileProto.Status.macPermission)
+            case .failed: return refuse("open")
+            }
             reader = Reader(fd: fd)
             readers[index] = reader
             readerOrder.append(index)
@@ -182,18 +199,36 @@ final class FileAnnouncer {
         return true
     }
 
-    /// Opens a manifest file for reading: no symlink at the leaf, and the
-    /// same file (device, inode, size) as when it was copied.
-    static func openChecked(_ item: Item) -> Int32? {
-        let fd = Darwin.open(item.full, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { return nil }
+    /// Opens a manifest file for reading through the gate: no symlink at the
+    /// leaf, and the same file (device, inode, size) as when it was copied.
+    /// `.fd` only for that file; a different file is `.failed`.
+    func openChecked(_ item: Item) -> FileOpenGate.Result {
+        let fd: Int32
+        switch gate.open(item.full, waitMs: openWaitMs) {
+        case .fd(let f): fd = f
+        case let other: return other
+        }
         var st = stat()
         guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG,
               UInt64(st.st_dev) == item.dev, UInt64(st.st_ino) == item.ino, UInt64(st.st_size) == item.size else {
             Darwin.close(fd)
-            return nil
+            return .failed
         }
-        return fd
+        return .fd(fd)
+    }
+
+    /// One file per distinct folder of the copy, at most four: enough for TCC
+    /// to ask about each protected place once.
+    static func probePaths(_ list: [Item]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for it in list where it.kind == FileProto.EntryKind.file {
+            let dir = (it.full as NSString).deletingLastPathComponent
+            guard seen.insert(dir).inserted else { continue }
+            out.append(it.full)
+            if out.count == 4 { break }
+        }
+        return out
     }
 
     // MARK: Manifest

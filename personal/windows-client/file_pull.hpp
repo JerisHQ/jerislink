@@ -55,46 +55,96 @@ struct Manifest {
     std::vector<Item> items;
     uint64_t total = 0;
     uint64_t files = 0;
+    uint64_t renamed = 0;  // entries whose name was mapped for Windows (F3 r2)
 };
 
 // Checks a complete announce. Returns "" and fills `out`, or the reason the
 // whole announce is refused (the viewer never offers part of a copy).
 // Reasons: count, transfer, index, kind, bad_path, name_too_long, duplicate,
 // no_parent, size, too_many, too_big, empty.
+//
+// F3 r2: a name Windows cannot hold (: * ? " < > |, trailing dot or space,
+// CON/NUL/COM1...) is mapped by path::windowsPath() instead of refusing the
+// copy; children follow their folder's new name, and a mapped name that
+// clashes with another gets " (2)", " (3)" ... like Explorer. out.renamed
+// counts mapped entries.
 inline std::string buildManifest(const file::Offer& offer, const std::vector<file::Entry>& entries, Manifest& out) {
     out = Manifest{};
     if (offer.entries == 0) return "empty";
     if (offer.entries > file::kMaxEntries) return "too_many";
     if (offer.total > file::kMaxTotalBytes) return "too_big";
     if (entries.size() != offer.entries) return "count";
-    std::set<std::wstring> seen;   // upper-cased: NTFS names are case-insensitive
-    std::set<std::wstring> dirs;
+    const auto upper = [](std::wstring s) {
+#ifdef _WIN32
+        CharUpperBuffW(s.data(), DWORD(s.size()));
+#endif
+        return s;
+    };
+    const auto wide = [](const std::string& u) {
+        std::wstring w;
+#ifdef _WIN32
+        const int n = MultiByteToWideChar(CP_UTF8, 0, u.data(), int(u.size()), nullptr, 0);
+        if (n > 0) {
+            w.assign(size_t(n), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, u.data(), int(u.size()), w.data(), n);
+        }
+#else
+        w.assign(u.begin(), u.end());
+#endif
+        for (wchar_t& ch : w) if (ch == L'/') ch = L'\\';
+        return w;
+    };
+    std::set<std::wstring> seen;               // upper-cased: NTFS names are case-insensitive
+    std::set<std::wstring> mappedKeys;         // keys of names that mapping produced
+    std::map<std::string, std::string> dirs;   // folder as sent -> its name here
     uint64_t total = 0;
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto& e = entries[i];
         if (e.transfer != offer.transfer) return "transfer";
         if (e.index != i) return "index";
         if (e.kind != file::kind::kFile && e.kind != file::kind::kDir) return "kind";
-        const auto v = file::path::validate(e.path);
+        const auto v = file::path::validate(e.path, /*mapWindowsNames=*/true);
         if (!v.ok()) return "bad_path";
-        if (v.wide.size() > kMaxNameChars) return "name_too_long";
-        std::wstring key = v.wide;
-#ifdef _WIN32
-        CharUpperBuffW(key.data(), DWORD(key.size()));
-#endif
-        if (!seen.insert(key).second) return "duplicate";
-        const size_t cut = key.find_last_of(L'\\');
-        if (cut != std::wstring::npos && !dirs.count(key.substr(0, cut))) return "no_parent";
+        // Parent as sent; this entry lives under whatever that folder became.
+        const size_t cutOrig = v.original.find_last_of('/');
+        const size_t cutMapped = v.utf8.find_last_of('/');
+        std::string parent;
+        if (cutOrig != std::string::npos) {
+            const auto it = dirs.find(v.original.substr(0, cutOrig));
+            if (it == dirs.end()) return "no_parent";
+            parent = it->second + "/";
+        }
+        const std::string leaf = cutMapped == std::string::npos ? v.utf8 : v.utf8.substr(cutMapped + 1);
+        std::string name = parent + leaf;
+        bool renamed = v.renamed || (cutOrig != std::string::npos && parent != v.original.substr(0, cutOrig) + "/");
+        std::wstring rel = wide(name);
+        if (!seen.insert(upper(rel)).second) {
+            // Two Mac names that differ only in case are a real duplicate on
+            // Windows; a clash that mapping caused (on either side) is
+            // renumbered.
+            if (!renamed && !mappedKeys.count(upper(rel))) return "duplicate";
+            bool placed = false;
+            for (int n = 2; n < 100 && !placed; ++n) {
+                name = parent + file::path::clashName(leaf, n);
+                rel = wide(name);
+                placed = seen.insert(upper(rel)).second;
+            }
+            if (!placed) return "duplicate";
+            renamed = true;
+        }
+        if (renamed) mappedKeys.insert(upper(rel));
+        if (rel.size() > kMaxNameChars) return "name_too_long";
         const bool dir = e.kind == file::kind::kDir;
         if (dir) {
             if (e.size != 0) return "size";
-            dirs.insert(key);
+            dirs[v.original] = name;
         } else {
             total += e.size;
             if (total > file::kMaxTotalBytes) return "too_big";
             ++out.files;
         }
-        out.items.push_back({dir, e.size, e.mtime, v.wide});
+        if (renamed) ++out.renamed;
+        out.items.push_back({dir, e.size, e.mtime, rel});
     }
     if (total != offer.total) return "size";
     out.transfer = offer.transfer;
@@ -429,6 +479,40 @@ private:
 // SHA-256 through BCrypt, for PullHub.
 DigestFactory sha256Digest();
 
+// ---- Mark of the Web for pasted Mac files (F3 r2) ----------------------
+//
+// Explorer writes a virtual-file paste (FileGroupDescriptorW + FileContents)
+// itself and, as the F3 hand test showed, adds no Zone.Identifier to it,
+// whatever the source says in "UntrustedDragDrop". The viewer never learns
+// the destination folder either. So once Explorer has read a file to its
+// end, FileClipboard looks for it: in folders where the shell reported new
+// items during the paste, in folders open in Explorer windows, and on the
+// Desktop. A file counts only when it has the manifest's path (or Explorer's
+// "name (2).ext" for the top item), the manifest's size, and was created
+// after the paste started. Each one found gets ZoneId=3 (Internet), the mark
+// a browser download gets. An existing Zone.Identifier is never replaced.
+
+enum class ZoneWrite { Written, Exists, Failed };
+
+// Writes "[ZoneTransfer]\r\nZoneId=3\r\n" to `path`:Zone.Identifier unless that
+// stream already exists. Failed on volumes without streams (FAT, exFAT).
+ZoneWrite writeInternetZone(const std::wstring& path);
+
+// Reads `path`:Zone.Identifier's ZoneId, or -1 if there is none.
+int readZoneId(const std::wstring& path);
+
+struct ZoneMarkStats {
+    uint32_t written = 0;  // Zone.Identifier added
+    uint32_t existed = 0;  // already had one (kept)
+    uint32_t failed = 0;   // found but could not be marked
+};
+
+// Marks the manifest files listed in `want` (indexes Explorer read to the
+// end) that are found under one of `folders`, created at or after `since`.
+// Found indexes move from `want` to `done`.
+ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
+                            std::set<uint32_t>& want, std::set<uint32_t>& done);
+
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.
 // Windows' clipboard is only cleared when it still holds our object, so a
@@ -445,6 +529,10 @@ public:
     void stop();               // withdraws our object if it is still current
     void offer(const Manifest& m);
     void withdraw(uint32_t transfer);  // 0: whatever we offered
+    // Also searched for pasted files to mark (tests: the drop folder).
+    void addSearchFolder(const std::wstring& folder);
+    // Totals of every mark pass so far (tests, stats).
+    ZoneMarkStats zoneStats() const;
 
     struct Impl;
 private:

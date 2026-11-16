@@ -59,6 +59,9 @@ enum FileProto {
         static let badPath: UInt8 = 5
         static let failed: UInt8 = 6
         static let cancelled: UInt8 = 7
+        /// F3 r2: macOS privacy settings (TCC Files & Folders) blocked the read,
+        /// or a prompt asking for it is still open on the Mac. Additive.
+        static let macPermission: UInt8 = 8
     }
 
     enum EntryKind {

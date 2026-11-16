@@ -105,8 +105,48 @@ void manifests() {
     expect(build({entry(2, 1, false, 1, "a")}, 1) == "index", "manifest: indices are sequential");
     expect(build({entry(3, 0, false, 1, "a")}, 1) == "transfer", "manifest: entries belong to the offer");
     expect(build({entry(2, 0, false, 1, "../a")}, 1) == "bad_path", "manifest: traversal refused");
-    expect(build({entry(2, 0, false, 1, "con.txt")}, 1) == "bad_path", "manifest: reserved Windows name refused");
-    expect(build({entry(2, 0, false, 1, "a:b")}, 1) == "bad_path", "manifest: Windows-reserved character refused");
+    expect(build({entry(2, 0, false, 1, "a\\b")}, 1) == "bad_path", "manifest: backslash still refused");
+    expect(build({entry(2, 0, false, 1, "/a")}, 1) == "bad_path", "manifest: absolute path still refused");
+    // F3 r2: names Windows cannot hold are mapped, not refused, so they paste.
+    {
+        Manifest r;
+        const auto rel = [&](const std::string& p) {
+            r = Manifest{};
+            const std::string why = buildManifest(file::Offer{2, file::purpose::kAnnounce, 1, 1}, {entry(2, 0, false, 1, p)}, r);
+            return why.empty() && r.items.size() == 1 && r.renamed == 1 ? r.items[0].rel : L"<refused:" + std::wstring(why.begin(), why.end()) + L">";
+        };
+        expect(rel("what?.txt") == L"what_.txt", "manifest: ? mapped to _");
+        expect(rel("a*b:c\"d<e>f|g.txt") == L"a_b_c_d_e_f_g.txt", "manifest: * : \" < > | mapped to _");
+        expect(rel("con.txt") == L"con_.txt", "manifest: reserved device name gets _ after the stem");
+        expect(rel("NUL") == L"NUL_" && rel("com1.tar.gz") == L"com1_.tar.gz", "manifest: NUL, COM1 mapped");
+        expect(rel("notes. ") == L"notes" && rel("...") == L"_", "manifest: trailing dots and spaces removed");
+        expect(rel("C:x") == L"C_x", "manifest: a leading drive letter becomes a plain name");
+        expect(buildManifest(file::Offer{2, file::purpose::kAnnounce, 1, 1}, {entry(2, 0, false, 1, "fine.txt")}, r).empty() &&
+                   r.renamed == 0 && r.items[0].rel == L"fine.txt",
+               "manifest: a valid name is left alone and not counted");
+    }
+    {
+        // A mapped folder: its children follow the new name.
+        Manifest r;
+        expect(buildManifest(file::Offer{2, file::purpose::kAnnounce, 3, 2},
+                             {entry(2, 0, true, 0, "Q?"), entry(2, 1, false, 1, "Q?/a.txt"), entry(2, 2, false, 1, "Q?/b|c")}, r)
+                       .empty() &&
+                   r.items[0].rel == L"Q_" && r.items[1].rel == L"Q_\\a.txt" && r.items[2].rel == L"Q_\\b_c" && r.renamed == 3,
+               "manifest: children of a mapped folder follow it");
+        // Two names that map to the same Windows name: the later one is numbered.
+        expect(buildManifest(file::Offer{2, file::purpose::kAnnounce, 3, 3},
+                             {entry(2, 0, false, 1, "a?.txt"), entry(2, 1, false, 1, "a*.txt"), entry(2, 2, false, 1, "a_.txt")}, r)
+                       .empty() &&
+                   r.items[0].rel == L"a_.txt" && r.items[1].rel == L"a_ (2).txt" && r.items[2].rel == L"a_ (3).txt",
+               "manifest: mapped names that clash are numbered like Explorer");
+        expect(buildManifest(file::Offer{2, file::purpose::kAnnounce, 4, 2},
+                             {entry(2, 0, true, 0, "d:"), entry(2, 1, true, 0, "d*"), entry(2, 2, false, 1, "d:/x"),
+                              entry(2, 3, false, 1, "d*/x")}, r)
+                       .empty() &&
+                   r.items[0].rel == L"d_" && r.items[1].rel == L"d_ (2)" && r.items[2].rel == L"d_\\x" &&
+                   r.items[3].rel == L"d_ (2)\\x",
+               "manifest: a numbered folder keeps its own children");
+    }
     std::vector<file::Entry> deep;
     std::string acc;
     uint32_t idx = 0;

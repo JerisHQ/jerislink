@@ -112,6 +112,11 @@ jobs:
         run: cmake --build build --config Release --target JerislinkFilePullTest
       - name: Paste pull test (announce checks, Windows names, request window, stale drain, hold-back until SHA-256, cancel and failure)
         run: build\Release\JerislinkFilePullTest.exe
+      - name: Build paste Mark of the Web test
+        run: cmake --build build --config Release --target JerislinkFileZoneTest
+      - name: Paste Mark of the Web test (Zone.Identifier helpers, shell paste of mapped names, ZoneId=3 on delivered files)
+        timeout-minutes: 3
+        run: build\Release\JerislinkFileZoneTest.exe
       - name: No always-on shortcut or key log lines in the viewer
         shell: pwsh
         run: |

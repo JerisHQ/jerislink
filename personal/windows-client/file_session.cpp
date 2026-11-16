@@ -745,6 +745,7 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
     using namespace jl::file;
     const auto refuse = [&](uint32_t t, const std::string& why, uint8_t status) {
         log("file.announce=refused transfer=" + std::to_string(t) + " reason=" + why);
+        if (pullNotice_) pullNotice_(PullNotice::NotOffered);
         const auto pkt = encode(Reply{t, status});
         return pkt && sendPacket(s, type::kReply, *pkt) ? std::string() : std::string("send_failed");
     };
@@ -776,7 +777,8 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         hub_->announce(m);
         clip_->offer(m);
         log("file.announce=received transfer=" + std::to_string(m.transfer) + " entries=" +
-            std::to_string(m.items.size()) + " files=" + std::to_string(m.files) + " bytes=" + std::to_string(m.total));
+            std::to_string(m.items.size()) + " files=" + std::to_string(m.files) + " bytes=" + std::to_string(m.total) +
+            " renamed=" + std::to_string(m.renamed));
         return "";
     }
     if (const Cancel* c = std::get_if<Cancel>(&msg)) {
@@ -802,7 +804,14 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
     if (const Reply* r = std::get_if<Reply>(&msg)) {
         if (r->status != status::kOk && hub_->current() == r->transfer) {
             hub_->onFailed(r->transfer);
-            log("file.pull=failed transfer=" + std::to_string(r->transfer));
+            const bool mac = r->status == status::kMacPermission;
+            log("file.pull=failed transfer=" + std::to_string(r->transfer) + " status=" + std::to_string(r->status) +
+                (mac ? " reason=mac_permission" : ""));
+            // Once per copy: Explorer may ask for several files and fail each.
+            if (pullNotice_ && noticedTransfer_ != r->transfer) {
+                noticedTransfer_ = r->transfer;
+                pullNotice_(mac ? PullNotice::MacPermission : PullNotice::PullFailed);
+            }
         }
         return "";
     }

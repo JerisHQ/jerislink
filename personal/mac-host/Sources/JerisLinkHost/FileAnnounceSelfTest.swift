@@ -16,6 +16,7 @@ enum FileAnnounceSelfTest {
         announces(base.appendingPathComponent("ann"), expect)
         serving(base.appendingPathComponent("serve"), expect)
         refusals(base.appendingPathComponent("refuse"), expect)
+        permission(base.appendingPathComponent("perm"), expect)
     }
 
     static func body(_ n: Int, seed: Int = 3) -> [UInt8] { (0..<n).map { UInt8(($0 * seed + 11) & 0xff) } }
@@ -132,5 +133,67 @@ enum FileAnnounceSelfTest {
         expect(a.current == t, "refuse: CANCEL of another transfer leaves the announce")
         expect(a.announce(urls: [root.appendingPathComponent("nope")]).count == 1 && a.current == nil && a.refusedAnnounces == 1,
                "refuse: a copy that cannot be announced still cancels the old one")
+    }
+
+    /// F3 r2: an open held by a macOS privacy prompt, or refused by privacy
+    /// settings, answers REPLY macPermission quickly and never blocks the
+    /// session thread.
+    private static func permission(_ root: URL, _ expect: (Bool, String) -> Void) {
+        write(root.appendingPathComponent("p.bin"), body(10))
+        write(root.appendingPathComponent("sub/q.bin"), body(3))
+        let url = root.appendingPathComponent("p.bin")
+
+        // A prompt nobody answers: open() blocks until released.
+        let release = DispatchSemaphore(value: 0)
+        let opened = DispatchSemaphore(value: 0)
+        let hung = FileOpenGate { path in
+            release.wait()
+            let r = FileOpenGate.systemOpener(path)
+            opened.signal()
+            return r
+        }
+        let a = FileAnnouncer(firstID: 40, gate: hung, openWaitMs: 200)
+        _ = a.announce(urls: [url])  // its probe is the first open, now stuck
+        guard let t = a.current else { expect(false, "permission: announce live"); return }
+        let started = Date()
+        let r = collect(a, t, 0, 0, 10)
+        let waited = Date().timeIntervalSince(started)
+        let wanted = M.reply(transfer: t, status: FileProto.Status.macPermission)
+        expect(r.ok && r.msgs == [wanted], "permission: a pending prompt answers REPLY macPermission (\(r.msgs))")
+        expect(waited < 2, "permission: the session thread waits only briefly (\(waited)s)")
+        // The user clicks Allow: the stuck probe finishes and closes its file.
+        release.signal()
+        _ = opened.wait(timeout: .now() + 5)
+        var idle = false
+        for _ in 0..<50 where !idle { idle = !hung.isBusy; if !idle { usleep(20_000) } }
+        expect(idle, "permission: the gate frees once the prompt is answered")
+        release.signal()  // let the next open through at once
+        let after = collect(a, t, 0, 0, 10)
+        expect(after.bytes == body(10), "permission: after Allow the same announce serves the file")
+
+        // Privacy settings say no: EPERM.
+        let refused = FileOpenGate { _ in (-1, EPERM) }
+        let b = FileAnnouncer(firstID: 60, gate: refused, openWaitMs: 500)
+        _ = b.announce(urls: [url])
+        if let tb = b.current {
+            expect(collect(b, tb, 0, 0, 10).msgs == [.reply(transfer: tb, status: FileProto.Status.macPermission)],
+                   "permission: EPERM answers REPLY macPermission")
+        } else { expect(false, "permission: second announce live") }
+
+        // Any other open error stays a plain failure.
+        let missing = FileOpenGate { _ in (-1, ENOENT) }
+        let c = FileAnnouncer(firstID: 80, gate: missing, openWaitMs: 500)
+        _ = c.announce(urls: [url])
+        if let tc = c.current {
+            expect(collect(c, tc, 0, 0, 10).msgs == [.reply(transfer: tc, status: FileProto.Status.failed)],
+                   "permission: other open errors stay REPLY failed")
+        } else { expect(false, "permission: third announce live") }
+
+        // One probe file per folder.
+        if case let .ok(items, _, _) = FileAnnouncer.build([url, root.appendingPathComponent("sub")]) {
+            let probes = FileAnnouncer.probePaths(items)
+            expect(probes.count == 2 && probes[0].hasSuffix("/p.bin") && probes[1].hasSuffix("/sub/q.bin"),
+                   "permission: copy-time probe opens one file per folder (\(probes))")
+        } else { expect(false, "permission: build for probes") }
     }
 }
