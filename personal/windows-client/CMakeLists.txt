@@ -39,7 +39,7 @@ if(MSVC)
     target_compile_options(opus PRIVATE /w)
 endif()
 
-set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt normaliz shell32)
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt normaliz shell32 oleaut32 shlwapi uuid)
 
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

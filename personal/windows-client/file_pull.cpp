@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <ole2.h>
 #include <shlobj.h>
+#include <shlguid.h>
 #include <shlwapi.h>
 #include <bcrypt.h>
 

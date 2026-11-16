@@ -19,7 +19,7 @@ import Darwin
 /// copies them in Finder, so a needed prompt shows at copy time, before
 /// anyone pastes on Windows. TCC remembers the answer per folder class for
 /// this bundle id and signing requirement, so updates keep it.
-final class FileOpenGate {
+final class FileOpenGate: @unchecked Sendable {  // state behind `cond`
     enum Result: Equatable {
         case fd(Int32)
         /// An open is still waiting, most likely on a Mac privacy prompt.
@@ -30,7 +30,7 @@ final class FileOpenGate {
     }
 
     /// open(2) stand-in: returns (fd, errno). Tests inject a slow or refusing one.
-    typealias Opener = (String) -> (Int32, Int32)
+    typealias Opener = @Sendable (String) -> (Int32, Int32)
 
     static let shared = FileOpenGate()
     static let systemOpener: Opener = { path in
@@ -47,7 +47,7 @@ final class FileOpenGate {
         self.opener = opener
     }
 
-    private final class Slot {
+    private final class Slot: @unchecked Sendable {  // fields behind `lock`
         let lock = NSLock()
         var done = false
         var abandoned = false

@@ -118,7 +118,6 @@ inline Rejection checkRules(const std::string& path) {
 // still pastes. Only the Windows-only rules are mapped; every shared safety
 // rule (absolute, "..", empty part, backslash, control chars) still refuses.
 //   : * ? " < > |      -> _   (so a leading "C:" is "C_", not a drive)
-|      -> _
 //   trailing dots/spaces -> removed ("_" if nothing is left)
 //   CON, NUL, COM1 ...   -> "_" after the device stem: CON.txt -> CON_.txt
 // "." and ".." are left alone so checkRules() refuses them.
