@@ -20,10 +20,13 @@ those two devices JerisLink sends:
 
 - **Screen video** from the Mac to the PC.
 - **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
-  Opus, only while a viewer with audio on is connected. The host captures it
-  through macOS Screen Recording and stops within about 10 seconds when the viewer
-  stops asking for it. Start the viewer with `--audio off` to never request
-  it. Audio is played and discarded; it is not recorded on either device.
+  Opus at 48 kHz, only while a viewer with audio on is connected. The host
+  captures it with Apple's ScreenCaptureKit (the Screen Recording permission),
+  leaves out the host's own sound, and stops within about 10 seconds when the
+  viewer stops asking for it. JerisLink does not install a virtual audio
+  device (such as BlackHole) and does not change the Mac's output device; the
+  Mac keeps playing sound as before. Start the viewer with `--audio off` to
+  never request it. Audio is played and discarded; it is not recorded on either device.
 - **Keyboard and mouse input** from the PC to the Mac, while the viewer
   window has focus.
 - **Clipboard text** in both directions (plain text only, up to 60 KB per
@@ -33,6 +36,9 @@ those two devices JerisLink sends:
   "Send to JerisLink" in Explorer or the Finder. The file names, sizes and
   contents go to the other device, with a SHA-256 check per file. Nothing is
   sent in the background and JerisLink never opens a received file.
+  Files sent from the Mac are received on the PC at once, with no confirm
+  click there, and are saved only in `Downloads\JerisLink`. One transfer is
+  limited to 20 GB in total.
 - **Session settings** (codec, bitrate, screen size) and connection
   statistics needed to keep the stream smooth.
 
@@ -55,7 +61,9 @@ clipboard and files are sent unencrypted. Use it only over your tailnet.
 On the Windows PC:
 
 - Settings in the registry under `HKEY_CURRENT_USER\Software\Jeris\Jerislink`:
-  the Mac's address, this PC's address (if set), codec and bitrate.
+  the Mac's address, codec and bitrate. This PC's address is chosen
+  automatically each time and is not saved; a value saved by an older
+  version is deleted when you save settings.
 - Diagnostic logs in your temporary folder (`%TEMP%`):
   `jerislink-viewer.log` and `jerislink-viewer-history.log` (each capped at
   about 10 MB). They contain connection details such as the two IP addresses,
@@ -110,7 +118,7 @@ variable `JERISLINK_DEBUG=1` before starting JerisLink. Only in debug mode:
   This image is a picture of the Mac screen;
 - the Mac input helper log records each mouse button press and release with
   a timestamp and which modifier keys (Shift, Control, Option, Command) were
-  held.
+  held, in `/tmp/jerislink-input-helper.err`. Key codes are never logged.
 
 These debug files also stay on your devices.
 
