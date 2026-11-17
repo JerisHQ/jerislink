@@ -5,8 +5,10 @@ The macOS host ships as one app, `JerisLink.app`:
 ```
 JerisLink.app/
   Contents/
-    MacOS/JerisLinkHost                     host: video, control service, launcher
+    MacOS/JerisLinkHost                     launcher and command line
     Helpers/JerisLink Input Helper.app/     input injection helper (own process, own bundle id)
+    Library/Helpers/JerisLink Service.app/  same host binary and bundle id: runs the video and control agents
+    Library/Helpers/JerisLink Send.app/     Finder Service "Send to JerisLink"
     Library/LaunchAgents/                   three agents registered with SMAppService
       org.jeris.jerislink.agent.input-helper.plist
       org.jeris.jerislink.agent.control.plist
@@ -22,8 +24,8 @@ The app registers its agents itself with `SMAppService` (macOS 13+; the app requ
 | Agent label | Runs | Replaces |
 |---|---|---|
 | `org.jeris.jerislink.agent.input-helper` | `Contents/Helpers/JerisLink Input Helper.app/Contents/MacOS/JerisLinkInputHelper` | `input-helper-watchdog.zsh` + `org.jeris.jerislink.input-helper-watchdog` |
-| `org.jeris.jerislink.agent.control` | `JerisLinkHost --service control --control-inject` | `org.jeris.jerislink.control` |
-| `org.jeris.jerislink.agent.video` | `JerisLinkHost --service video` | `video-watchdog.zsh` + `org.jeris.jerislink.video-watchdog` |
+| `org.jeris.jerislink.agent.control` | `JerisLink Service.app/.../JerisLinkHost --service control --control-inject` | `org.jeris.jerislink.control` |
+| `org.jeris.jerislink.agent.video` | `JerisLink Service.app/.../JerisLinkHost --service video` | `video-watchdog.zsh` + `org.jeris.jerislink.video-watchdog` |
 
 `JerisLinkHost --service video` does what the video watchdog did: it takes its addresses from the listen endpoint (see "Listen endpoint" below), waits until the bind address is up on this Mac, reads codec, bitrate, `fps` (30 or 60) and `keepDisplayAwake` from `video-settings.plist`, and runs the video host. At 60 fps it uses ScreenCaptureKit queue depth 5, at 30 fps depth 2. With `keepDisplayAwake` true it holds a display-sleep assertion while it runs. `JerisLinkHost --video-config` prints what it will use. When the control service changes codec or bitrate it restarts the video agent with `launchctl kickstart -k`.
 
@@ -36,7 +38,11 @@ JerisLink.app/Contents/MacOS/JerisLinkHost --status      # show each agent's sta
 JerisLink.app/Contents/MacOS/JerisLinkHost --version
 ```
 
-Opening `JerisLink.app` from Finder (no arguments) does the same as `--register`, asks for Screen Recording, and shows the agent status with a button to the right System Settings page.
+Opening `JerisLink.app` from Finder, Spotlight or the Dock (no arguments) does the same as `--register`, asks for Screen Recording, and shows the agent status with a button to the right System Settings page. This also works while the services run.
+
+Why the video and control agents run from `JerisLink Service.app`: ScreenCaptureKit and the Accessibility calls check those processes in with Launch Services as background apps that never answer an open request. Launch Services matches a running app by its bundle path. When the agents ran from `JerisLink.app` itself, opening the app was routed to them and macOS showed "The application “JerisLink” is not open anymore." `JerisLink Service.app` is a copy of the same binary with the same bundle id and signature, so Screen Recording and the defaults domain stay the same; only the path differs. Opening `JerisLink Service.app` directly opens `JerisLink.app`. Its `--register`, `--unregister` and `--status` refuse to run; use `JerisLink.app/Contents/MacOS/JerisLinkHost`.
+
+After installing a build that moves the agents (or back), run `--unregister` then `--register` so launchd picks up the new program path.
 
 ## Listen endpoint
 
