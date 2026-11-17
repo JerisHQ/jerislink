@@ -79,6 +79,45 @@ enum JerisLinkAgents {
     }
 }
 
+/// F5b: the Finder Service helper (JerisLink Send.app) inside this app.
+///
+/// The control agent calls this at every start, so the Finder item appears
+/// after an install without opening the app. Opening JerisLink.app is not
+/// reliable for this: while the video agent runs it is checked in with
+/// Launch Services under the app's bundle id, so Finder sends the open event
+/// to that agent instead of starting the launcher, and the launcher never runs.
+enum JerisLinkSendService {
+    static var helperURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
+    }
+
+    /// nil: this build has no helper. Otherwise whether Launch Services knows
+    /// the helper at this app's path.
+    static func ensureRegistered() -> Bool? {
+        let helper = helperURL
+        guard FileManager.default.fileExists(atPath: helper.path) else { return nil }
+        let known = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SendWire.helperBundleID)
+        if known?.standardizedFileURL.path == helper.standardizedFileURL.path { return true }
+        return LSRegisterURL(helper as CFURL, true) == noErr
+    }
+
+    /// Asks pbs to rebuild the Services menu from Launch Services. For the
+    /// control agent, which has no AppKit app to call NSUpdateDynamicServices.
+    /// Returns pbs's exit status, or nil if it could not run or took over 20 s.
+    static func refreshServicesMenu() -> Int32? {
+        let pbs = Process()
+        pbs.executableURL = URL(fileURLWithPath: "/System/Library/CoreServices/pbs")
+        pbs.arguments = ["-update"]
+        pbs.standardOutput = FileHandle.nullDevice
+        pbs.standardError = FileHandle.nullDevice
+        do { try pbs.run() } catch { return nil }
+        let deadline = Date().addingTimeInterval(20)
+        while pbs.isRunning && Date() < deadline { usleep(100_000) }
+        if pbs.isRunning { pbs.terminate(); return nil }
+        return pbs.terminationStatus
+    }
+}
+
 /// What happens when the user opens JerisLink.app from Finder (no arguments):
 /// register the background agents, ask for Screen Recording for this app, and
 /// show one dialog with the result. The app then quits; the agents keep running.
@@ -88,13 +127,7 @@ enum JerisLinkLauncher {
     /// inside this app, then refreshes the Services menu. Returns a status
     /// line, or nil when there is no helper (a development build).
     static func registerSendService() -> String? {
-        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
-        guard FileManager.default.fileExists(atPath: helper.path) else { return nil }
-        let known = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SendWire.helperBundleID)
-        var registered = known?.standardizedFileURL.path == helper.standardizedFileURL.path
-        if !registered {
-            registered = LSRegisterURL(helper as CFURL, true) == noErr
-        }
+        guard let registered = JerisLinkSendService.ensureRegistered() else { return nil }
         NSUpdateDynamicServices()
         return registered
             ? "Finder: right-click files > Quick Actions or Services > Send to JerisLink."

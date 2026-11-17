@@ -91,6 +91,16 @@ enum ControlService {
         raiseOpenFileLimit(to: 4096)
         let sendSocket = SendSocketServer()
         do { try sendSocket.start() } catch { log("send socket off: \(error.localizedDescription)") }
+        // Register the Finder Service helper off the main path; Launch Services
+        // and pbs calls can take a few seconds. Logs carry no paths.
+        Task.detached(priority: .utility) {
+            guard let registered = JerisLinkSendService.ensureRegistered() else {
+                log("file.push_service=absent")
+                return
+            }
+            let pbs = JerisLinkSendService.refreshServicesMenu()
+            log("file.push_service=\(registered ? "registered" : "register_failed") pbs_update=\(pbs.map(String.init) ?? "failed")")
+        }
         ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
         while true {
             try? await Task.sleep(for: .seconds(3600))
