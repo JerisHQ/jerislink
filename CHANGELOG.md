@@ -15,11 +15,15 @@ File transfer (Windows <-> Mac, inside the existing tailnet connection):
 - Files panel with drag-and-drop to send from Windows to the Mac (F4).
 - "Send to JerisLink" in Explorer (F5a) and in the Finder (F5b). Files sent to Windows land in `Downloads\JerisLink` and get the Internet zone mark (Zone.Identifier).
 - Cmd+V of files is refused while a transfer is running, with a busy notice.
+- "Send to JerisLink" in the Finder now reaches the viewer after a second viewer window replaced the first session; before, it said JerisLink was not open.
+- The Microsoft Store (MSIX) version has no "Send to" entry in Explorer. Drag files onto the viewer window or its Files panel instead.
 - New file session handshake (FILE_HELLO) with path safety checks.
 
 Windows viewer:
 
 - Launch screen and in-session overlay replace the menu bar; dark settings and volume dialogs.
+- Overlay "Force Quit" opens the Mac's Force Quit Applications window (Cmd+Option+Esc).
+- Settings no longer has address fields. The Mac address is typed on the launch screen, this PC's address is always chosen automatically, and both are shown read-only in Connection info.
 - Keyboard: Mac and Windows layout presets, Ctrl+X/S/F and Ctrl+Y mapping; key translation moved to `keymap.hpp` with golden tests.
 - Per-phase `loop.slow_iter` timing at 16 ms (PR-G5).
 - H.264 on capped displays: the encoded size is acknowledged correctly.
