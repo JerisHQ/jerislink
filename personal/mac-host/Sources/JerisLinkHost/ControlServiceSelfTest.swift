@@ -980,14 +980,21 @@ enum ControlServiceSelfTest {
                "push e2e: HELLO_ACK advertises the push service")
         wait(until: { broker.sessionCount == 1 })
         expect(submit([bigPath]) == "old_viewer", "push e2e: a viewer without the push cap answers old_viewer")
-        old.close()
-        wait(until: { broker.sessionCount == 0 })
+        // r4: keep this caps-0 session open. The viewer opens a caps-0
+        // upload session and a push-capable pull session in either order;
+        // `old` connects before the pull session, `upload` after it.
+        defer { old.close() }
 
         guard let pull = MRC1Client(port: port) else { expect(false, "push e2e: viewer connects"); return 0 }
         defer { pull.close() }
         _ = pull.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.pushService)])
         _ = next(pull)
-        wait(until: { broker.sessionCount == 1 })
+        wait(until: { broker.sessionCount == 2 })
+        guard let upload = MRC1Client(port: port) else { expect(false, "push e2e: upload session connects"); return 0 }
+        defer { upload.close() }
+        _ = upload.send(type: 0x50, payload: [1, 0, 0])
+        _ = next(upload)
+        wait(until: { broker.sessionCount == 3 })
         expect(submit([emptyPath], names: ["a/b"]) == "bad_name", "push e2e: a name with a slash is refused")
         expect(submit([emptyPath], names: [".."]) == "bad_name", "push e2e: a dot name is refused")
         expect(submit([root.path], names: ["folder"]) == "bad_name", "push e2e: a folder descriptor is refused")
@@ -1058,6 +1065,8 @@ enum ControlServiceSelfTest {
                "push e2e: a session closing before REPLY answers not_connected")
         wait(until: { broker.isIdle })
         expect(broker.isIdle, "push e2e: the broker is idle after the session closed")
+        wait(until: { broker.sessionCount == 2 })
+        expect(submit([bigPath]) == "old_viewer", "push e2e: with only caps-0 sessions left the push answers old_viewer")
         wait(until: { server.statsLine().contains("file_pushes=4") })
         expect(server.statsLine().contains("file_pushes=4"), "push e2e: stats (\(server.statsLine()))")
 

@@ -76,7 +76,9 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
     private var pending: (session: UInt64, job: PushJob)?
     private var running: PushJob?
 
-    /// A file session opened; the newest one receives pushes.
+    /// A file session opened. Pushes go to the newest session whose viewer
+    /// said HELLO caps=push_service: one viewer opens a caps-0 upload
+    /// session next to its push-capable pull session, in either order.
     func register(peerCaps: UInt16) -> UInt64 {
         lock.lock(); defer { lock.unlock() }
         nextSession += 1
@@ -94,11 +96,13 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         orphan?.release()
     }
 
-    /// Queues `job` for the newest session. Answers at once when it cannot.
+    /// Queues `job` for the newest push-capable session. Answers at once
+    /// when it cannot: no session at all is not_connected, sessions that
+    /// all lack push_service are old_viewer.
     func offer(_ job: PushJob) -> SendWire.Reply? {
         lock.lock(); defer { lock.unlock() }
-        guard let target = sessions.last else { return .notConnected }
-        guard (target.caps & FileProto.Caps.pushService) != 0 else { return .oldViewer }
+        guard !sessions.isEmpty else { return .notConnected }
+        guard let target = sessions.last(where: { ($0.caps & FileProto.Caps.pushService) != 0 }) else { return .oldViewer }
         guard pending == nil, running == nil else { return .busy }
         pending = (target.id, job)
         return nil
