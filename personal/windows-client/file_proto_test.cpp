@@ -41,6 +41,7 @@ int main() {
         Progress{7, 99},
         Ping{{1, 2, 3, 4}},
         Reveal{7},
+        Notice{notice::kPasteBusy},
     };
     for (size_t i = 0; i < all.size(); ++i) {
         const Message& m = all[i];
@@ -86,7 +87,11 @@ int main() {
     expect(!decode(type::kOffer, badPurpose), "OFFER purpose 0 rejected");
     badPurpose[4] = 5;
     expect(!decode(type::kOffer, badPurpose), "OFFER purpose 5 rejected");
-    expect(!decode(0x4F, {}) && !decode(0x5D, {}) && !decode(0x30, {}), "types outside 0x50-0x5C rejected");
+    expect(!decode(0x4F, {}) && !decode(0x5E, {}) && !decode(0x30, {}), "types outside 0x50-0x5D rejected");
+    expect(!decode(type::kNotice, {1, 0}), "NOTICE with 2 bytes rejected");
+    expect(*encode(Notice{notice::kPasteBusy}) == std::vector<uint8_t>{1}, "NOTICE layout: one code byte");
+    expect(caps::kNotice == 0x10 && !(caps::kNotice & (caps::kUpload | caps::kPushService | caps::kReveal | caps::kAnnounce)),
+           "NOTICE cap is bit 4, apart from the host caps");
     expect(!encode(FileEnd{1, 0, {1}}), "FILE_END needs a 32-byte hash");
     expect(!encode(Ping{{1, 2, 3}}), "PING needs a 4-byte token");
     expect(kMaxPayload == 16 + 32768, "largest payload is one DATA chunk");

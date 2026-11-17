@@ -15,6 +15,7 @@ enum FileProtocolSelfTest {
         clashNames(expect)
         FileUploadSelfTest.run(expect)
         FileAnnounceSelfTest.run(expect)
+        finderPasteGate(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -34,9 +35,10 @@ enum FileProtocolSelfTest {
             .progress(transfer: 7, committed: 99),
             .ping(token: [1, 2, 3, 4]),
             .reveal(transfer: 7),
+            .notice(code: FileProto.Notice.pasteBusy),
         ]
         let types = Set(all.map(\.type))
-        expect(types == Set((0x50...0x5C).map { UInt8($0) }), "file codec: one message per type 0x50-0x5C")
+        expect(types == Set((0x50...0x5D).map { UInt8($0) }), "file codec: one message per type 0x50-0x5D")
         for m in all {
             guard let bytes = m.encode() else { expect(false, "file codec: encode 0x\(String(m.type, radix: 16))"); continue }
             expect(FileProto.decode(type: m.type, payload: bytes) == m, "file codec: 0x\(String(m.type, radix: 16)) round trip")
@@ -68,10 +70,43 @@ enum FileProtocolSelfTest {
         expect(FileProto.decode(type: 0x52, payload: badPurpose) == nil, "file codec: OFFER purpose 0 rejected")
         badPurpose[4] = 5
         expect(FileProto.decode(type: 0x52, payload: badPurpose) == nil, "file codec: OFFER purpose 5 rejected")
-        expect(FileProto.decode(type: 0x5D, payload: []) == nil && FileProto.decode(type: 0x4F, payload: []) == nil,
-               "file codec: types outside 0x50-0x5C rejected")
+        expect(FileProto.decode(type: 0x5E, payload: []) == nil && FileProto.decode(type: 0x4F, payload: []) == nil,
+               "file codec: types outside 0x50-0x5D rejected")
+        expect(FileProto.decode(type: 0x5D, payload: [1, 0]) == nil, "file codec: NOTICE with 2 bytes rejected")
+        expect(M.notice(code: 1).encode() == [1], "file codec: NOTICE layout")
+        expect(FileProto.Caps.notice == 0x10 && FileProto.Caps.host & FileProto.Caps.notice == 0,
+               "file codec: notice is a viewer cap (0x10), not advertised by the host")
         expect(M.fileEnd(transfer: 1, index: 0, sha256: [1]).encode() == nil, "file codec: FILE_END needs 32-byte hash")
         expect(FileProto.Caps.host == FileProto.Caps.upload | FileProto.Caps.reveal | FileProto.Caps.announce, "file codec: F4 host advertises upload, reveal and announce")
+    }
+
+    /// FinderPasteGate: only a Cmd+V down that `refuse` approves is refused;
+    /// its repeats and V up are swallowed; `refuse` is asked only then.
+    private static func finderPasteGate(_ expect: (Bool, String) -> Void) {
+        typealias V = FinderPasteGate.Verdict
+        let cmd = FinderPasteGate.commandSemantic, v = FinderPasteGate.vSemantic
+        var asks = 0
+        var block = true
+        var g = FinderPasteGate()
+        func key(_ s: UInt16, _ down: Bool) -> V { g.key(semantic: s, down: down, refuse: { asks += 1; return block }) }
+
+        expect(key(v, true) == .pass && key(v, false) == .pass && asks == 0, "paste gate: V without Cmd passes, nothing asked")
+        expect(key(65, true) == .pass && key(65, false) == .pass, "paste gate: other keys pass")
+        expect(key(cmd, true) == .pass, "paste gate: Command itself passes")
+        expect(key(v, true) == .refused && asks == 1, "paste gate: Cmd+V while blocked is refused once")
+        expect(key(v, true) == .swallow && key(v, true) == .swallow && asks == 1, "paste gate: auto-repeat swallowed, not asked again")
+        expect(key(v, false) == .swallow, "paste gate: the refused V up is swallowed")
+        expect(key(cmd, false) == .pass, "paste gate: Command up passes")
+        expect(key(v, true) == .pass && key(v, false) == .pass && asks == 1, "paste gate: V after Command up passes")
+
+        block = false
+        expect(key(cmd, true) == .pass && key(v, true) == .pass && asks == 2, "paste gate: Cmd+V passes when not blocked")
+        block = true
+        expect(key(v, true) == .pass && asks == 2, "paste gate: repeat of a forwarded V stays forwarded")
+        expect(key(v, false) == .pass, "paste gate: forwarded V up passes, no stuck key")
+        expect(key(v, true) == .refused && asks == 3, "paste gate: the next V down while Cmd held is asked again")
+        expect(key(cmd, false) == .pass && key(v, false) == .swallow, "paste gate: V up after Command up is still swallowed")
+        expect(key(v, false) == .pass, "paste gate: a later lone V up passes")
     }
 
     private static func paths(_ expect: (Bool, String) -> Void) {

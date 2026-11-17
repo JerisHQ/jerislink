@@ -571,6 +571,7 @@ static bool filePanelVisible() { return gFilePanel && IsWindowVisible(gFilePanel
 static bool pasteEligible();
 static bool pasteBusy();
 static void pasteRefusedBusy();
+static void pasteRefusedFinder();
 static void startPasteUpload();
 
 static bool viewerHasInteractiveFocus(HWND hwnd) {
@@ -2988,6 +2989,10 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
 // The pull session saw something about a Mac copy the user must know (F3 r2).
 static void onFilePullNotice(WPARAM kind) {
     using N = FileSession::PullNotice;
+    if (static_cast<N>(kind) == N::PasteBusy) {
+        pasteRefusedFinder();  // shown over a running upload's chip, like a refused file paste
+        return;
+    }
     // An upload's own chip wins; its result follows shortly anyway.
     if (gChipMode == ChipMode::Running) return;
     switch (static_cast<N>(kind)) {
@@ -3471,6 +3476,14 @@ static void fileChipNotice(const std::string& text, bool error, double ms) {
 static void pasteRefusedBusy() {
     gPendingRoots.clear();
     logLine("file.paste=refused reason=busy");
+    fileChipNotice(fu::pasteBusy(), true, 6000);
+}
+
+// The Mac did not pass Cmd+V to Finder while a transfer runs (NOTICE 0x5D):
+// Finder would have saved the text clipboard as a .textClipping file. Same
+// notice as a refused file paste, so the V is never eaten silently.
+static void pasteRefusedFinder() {
+    logLine("file.paste=refused reason=busy_finder source=mac");
     fileChipNotice(fu::pasteBusy(), true, 6000);
 }
 

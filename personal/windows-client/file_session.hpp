@@ -53,7 +53,7 @@ public:
     using UploadDoneFn = std::function<void()>;
     // Pull role: something the user should see about a Mac copy (F3 r2).
     // Called on the session thread; post to the UI thread, do not block.
-    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3 };
+    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3, PasteBusy = 4 };
     using PullNoticeFn = std::function<void(PullNotice)>;
     enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
     // Paste: Cmd+V in Finder (F2). Send: a drop on the viewer (F4).

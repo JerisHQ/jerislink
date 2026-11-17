@@ -145,6 +145,7 @@ enum ControlServiceSelfTest {
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
+        failures += finderPasteRefused(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -363,7 +364,8 @@ enum ControlServiceSelfTest {
     private static func startServer(inject: Bool, helperPort: UInt16?, clipboard: ClipboardBackend,
                                     inputSources: InputSourceCache,
                                     fileStagingRoot: URL? = nil,
-                                    fileSendFolder: FileSendFolder = .shared) -> (ControlServer, UInt16)? {
+                                    fileSendFolder: FileSendFolder = .shared,
+                                    frontmostApp: @escaping () -> String? = { nil }) -> (ControlServer, UInt16)? {
         guard let port = freeLoopbackPort() else { return nil }
         let server = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                    port: port, inject: inject,
@@ -372,7 +374,8 @@ enum ControlServiceSelfTest {
                                    allowFileSessions: fileStagingRoot != nil,
                                    fileStagingRoot: fileStagingRoot ?? FileUploadReceiver.defaultRoot,
                                    fileSendFolder: fileSendFolder,
-                                   clipboard: clipboard, inputSources: inputSources)
+                                   clipboard: clipboard, inputSources: inputSources,
+                                   frontmostApp: frontmostApp)
         do { try server.start() } catch { return nil }
         return (server, port)
     }
@@ -588,6 +591,103 @@ enum ControlServiceSelfTest {
         expect(stats.contains("file_sessions=1 file_refused=2"), "file e2e: direct stats count 1 session, 2 refused (\(stats))")
         expect(servers[1].statsLine().contains("file_sessions=0 file_refused=1"), "file e2e: relay stats count 1 refused")
         return 0
+    }
+
+    /// r3: Cmd+V from the viewer while an upload runs and Finder is frontmost
+    /// never reaches the helper (Finder would save the text clipboard as a
+    /// .textClipping); the viewer's notice session gets NOTICE paste_busy.
+    /// Another frontmost app, no upload running, or no viewer that shows
+    /// NOTICE: Cmd+V passes as before.
+    private static func finderPasteRefused(_ expect: (Bool, String) -> Void) -> Int {
+        guard let helper = FakeInputHelper.start() else { expect(false, "finder paste: fake input helper listens"); return 0 }
+        defer { helper.stop() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("jl-finder-paste-\(getpid())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let front = FrontBox(FinderPasteGate.finderBundleID)
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.finderpaste.\(getpid())")
+        guard let (server, port) = startServer(inject: true, helperPort: helper.port, clipboard: FakeClipboard(text: nil),
+                                               inputSources: cache, fileStagingRoot: root, frontmostApp: { front.get() }),
+              let keys = MRC1Client(port: port), let upload = MRC1Client(port: port), let notice = MRC1Client(port: port) else {
+            expect(false, "finder paste: server and sessions start")
+            return 0
+        }
+        defer { keys.close(); upload.close(); notice.close(); server.stop() }
+        typealias M = FileProto.Message
+        func decoded(_ c: MRC1Client, _ timeout: Double) -> M? {
+            c.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+        }
+        func send(_ c: MRC1Client, _ m: M) { _ = c.send(type: m.type, payload: m.encode()!) }
+        func key(_ semantic: UInt8, _ down: Bool) { _ = keys.send(type: 0x10, payload: [down ? 1 : 0, 0, semantic]) }
+        func cmdV() { key(3, true); key(86, true); key(86, true); key(86, false); key(3, false) }
+        let vDown = FakeInputHelper.Event(type: 0x10, payload: [1, 0, 9])
+        let vUp = FakeInputHelper.Event(type: 0x10, payload: [0, 0, 9])
+        var marker: UInt8 = 65
+        /// Type a letter after the keys under test, so "nothing arrived" is
+        /// checked once the helper has seen everything sent before it.
+        func flush() {
+            let up = FakeInputHelper.Event(type: 0x10, payload: [0, 0, UInt8(Self.letterCode(marker))])
+            let before = helper.snapshot().filter { $0 == up }.count
+            key(marker, true); key(marker, false)
+            wait(until: { helper.snapshot().filter { $0 == up }.count > before })
+            marker += 1
+        }
+        func vCount() -> Int { helper.snapshot().filter { $0 == vDown || $0 == vUp }.count }
+
+        send(notice, .hello(proto: 1, caps: FileProto.Caps.notice))
+        expect(notice.receive(timeout: 3)?.type == 0x51, "finder paste: notice session HELLO_ACK")
+        send(upload, .hello(proto: 1, caps: 0))
+        expect(upload.receive(timeout: 3)?.type == 0x51, "finder paste: upload session HELLO_ACK")
+
+        // No upload yet: Cmd+V in Finder passes (a normal file paste).
+        cmdV(); flush()
+        expect(vCount() == 3, "finder paste: idle Cmd+V in Finder reaches the Mac (V down, repeat, up: \(vCount()))")
+
+        // A Send to is running.
+        let body = [UInt8](repeating: 7, count: 70_000)
+        send(upload, .offer(transfer: 11, purpose: FileProto.Purpose.send, entries: 1, total: UInt64(body.count)))
+        send(upload, FileUploadSelfTest.entry(11, 0, "big.bin", size: body.count))
+        expect(decoded(upload, 3) == .reply(transfer: 11, status: FileProto.Status.ok), "finder paste: send offer accepted")
+        send(upload, FileUploadSelfTest.chunks(11, 0, body)[0])
+
+        cmdV(); flush()
+        expect(vCount() == 3, "finder paste: Cmd+V in Finder mid-transfer never reaches the Mac (\(vCount()) V events)")
+        expect(helper.received(.init(type: 0x10, payload: [1, 0, 55])) && helper.received(.init(type: 0x10, payload: [0, 0, 55])),
+               "finder paste: Command down and up still pass")
+        expect(decoded(notice, 2) == .notice(code: FileProto.Notice.pasteBusy), "finder paste: viewer gets NOTICE paste_busy")
+        expect(notice.receive(timeout: 0.4) == nil, "finder paste: one NOTICE for one refused Cmd+V")
+        expect(server.statsLine().contains("finder_paste_refused=1"), "finder paste: stats count the refusal")
+
+        // Another app frontmost: text paste works mid-transfer.
+        front.set("com.apple.TextEdit")
+        cmdV(); flush()
+        expect(vCount() == 6, "finder paste: Cmd+V in another app mid-transfer passes (\(vCount()) V events)")
+        expect(notice.receive(timeout: 0.4) == nil, "finder paste: no NOTICE for another app")
+
+        // No viewer that shows NOTICE: never eaten silently.
+        front.set(FinderPasteGate.finderBundleID)
+        notice.close()
+        usleep(300_000)
+        cmdV(); flush()
+        expect(vCount() == 9, "finder paste: without a notice session Cmd+V passes (\(vCount()) V events)")
+
+        // Upload finished (cancelled): Cmd+V in Finder passes again.
+        send(upload, .cancel(transfer: 11, reason: FileProto.Status.cancelled))
+        guard let again = MRC1Client(port: port) else { expect(false, "finder paste: second notice session"); return 0 }
+        defer { again.close() }
+        send(again, .hello(proto: 1, caps: FileProto.Caps.notice))
+        expect(again.receive(timeout: 3)?.type == 0x51, "finder paste: second notice session HELLO_ACK")
+        _ = upload.receive(timeout: 1)                                // RESULT cancelled, if any
+        cmdV(); flush()
+        expect(vCount() == 12, "finder paste: after the transfer Cmd+V in Finder passes (\(vCount()) V events)")
+        expect(again.receive(timeout: 0.4) == nil, "finder paste: no NOTICE once idle")
+        return 0
+    }
+
+    /// CGKeyCode the host injects for semantic A-Z (macKeyCode), for flush markers.
+    private static func letterCode(_ semantic: UInt8) -> Int {
+        let codes: [UInt8: Int] = [65: 0, 66: 11, 67: 8, 68: 2, 69: 14, 70: 3, 71: 5, 72: 4]
+        return codes[semantic] ?? 0
     }
 
     /// F2 over a real socket: a paste upload lands in staging, the pasteboard
@@ -1136,4 +1236,13 @@ private final class FakeBox: @unchecked Sendable {
 private final class StartResult: @unchecked Sendable {
     var servers: [ControlServer] = []
     var error: Error?
+}
+
+/// The frontmost app the finder-paste self-test pretends to have.
+private final class FrontBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var id: String?
+    init(_ id: String?) { self.id = id }
+    func set(_ value: String?) { lock.lock(); id = value; lock.unlock() }
+    func get() -> String? { lock.lock(); defer { lock.unlock() }; return id }
 }

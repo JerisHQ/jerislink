@@ -53,6 +53,18 @@ final class ControlServer: @unchecked Sendable {
     /// asks again within milliseconds while it copies, so this only bridges
     /// the gap between files; the waiting copy syncs once it has passed.
     static let pullHoldSeconds: TimeInterval = 3
+    /// Uploads (paste or Send to) running in this server's file sessions.
+    private var uploadsActive = 0
+    /// Open file sessions whose viewer shows NOTICE (caps notice).
+    private var noticeSessions = 0
+    /// Bumped for each refused Cmd+V; every notice session sends one NOTICE
+    /// per bump on its next poll (it owns its socket, so no cross-thread send).
+    private var noticeSeq: UInt64 = 0
+    private var finderPastesRefused: UInt64 = 0
+    /// Cmd+V to Finder while a transfer runs (FinderPasteGate).
+    private var pasteGate = FinderPasteGate()
+    /// The frontmost Mac app (a fake in the self-test).
+    private let frontmostApp: () -> String?
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
     private let settingsClientIP: () -> String?
@@ -87,10 +99,12 @@ final class ControlServer: @unchecked Sendable {
          fileStagingRoot: URL = FileUploadReceiver.defaultRoot,
          fileSendFolder: FileSendFolder = .shared,
          clipboard: ClipboardBackend = SystemClipboard.shared,
-         inputSources: InputSourceCache = .shared) {
+         inputSources: InputSourceCache = .shared,
+         frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
         self.inputSources = inputSources
+        self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
         self.fileStagingRoot = fileStagingRoot
@@ -292,6 +306,7 @@ final class ControlServer: @unchecked Sendable {
             messages += 1
             connectionMessages += 1
             if !sessionStarted && announceInputSessions && Self.isInputMessage(type) {
+                pasteGate = FinderPasteGate()  // no Cmd held over from an earlier viewer
                 sessionStarted = startInputSession(sessionID)
                 if !sessionStarted { continue }
             }
@@ -422,9 +437,39 @@ final class ControlServer: @unchecked Sendable {
         return lastPullServe > 0 && ProcessInfo.processInfo.systemUptime - lastPullServe < Self.pullHoldSeconds
     }
 
+    /// Keep `uploadsActive` in step with one session's receiver.
+    private func noteUpload(_ was: inout Bool, active: Bool) {
+        guard was != active else { return }
+        was = active
+        fileStatsLock.lock(); uploadsActive += active ? 1 : -1; fileStatsLock.unlock()
+    }
+
+    /// A Cmd+V for Finder now would land mid-transfer: an upload is running
+    /// or a paste is pulling, a viewer can show the notice (so nothing is
+    /// eaten silently), and Finder is frontmost (checked last: a main-thread
+    /// hop).
+    private func finderPasteBlocked() -> Bool {
+        fileStatsLock.lock()
+        let running = uploadsActive > 0 || (lastPullServe > 0 &&
+            ProcessInfo.processInfo.systemUptime - lastPullServe < Self.pullHoldSeconds)
+        let canNotify = noticeSessions > 0
+        fileStatsLock.unlock()
+        guard running, canNotify else { return false }
+        return frontmostApp() == FinderPasteGate.finderBundleID
+    }
+
+    private func requestPasteBusyNotice() {
+        fileStatsLock.lock(); noticeSeq &+= 1; finderPastesRefused += 1; fileStatsLock.unlock()
+    }
+
+    private func currentNoticeSeq() -> UInt64 {
+        fileStatsLock.lock(); defer { fileStatsLock.unlock() }
+        return noticeSeq
+    }
+
     private func fileStatsText() -> String {
         fileStatsLock.lock(); defer { fileStatsLock.unlock() }
-        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes)"
+        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes) finder_paste_refused=\(finderPastesRefused)"
     }
 
     /// A file session: HELLO_ACK with this build's caps, PING echo, paste
@@ -458,11 +503,20 @@ final class ControlServer: @unchecked Sendable {
             }
             return true
         }
+        // r3: this viewer shows NOTICE; refused Finder pastes are told here.
+        let showsNotice = (peerCaps & FileProto.Caps.notice) != 0
+        var lastNotice: UInt64 = 0
+        if showsNotice {
+            fileStatsLock.lock(); noticeSessions += 1; lastNotice = noticeSeq; fileStatsLock.unlock()
+        }
+        var uploading = false
         var received = 0
         var refused = 0
         var reason = "peer_closed"
         defer {
             receiver.abort(reason: reason)
+            noteUpload(&uploading, active: false)
+            if showsNotice { fileStatsLock.lock(); noticeSessions -= 1; fileStatsLock.unlock() }
             announcer?.close()
             fileStatsLock.lock()
             fileUploads += receiver.completed
@@ -483,6 +537,13 @@ final class ControlServer: @unchecked Sendable {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { reason = "stopping"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
+            if showsNotice {
+                let seq = currentNoticeSeq()
+                if seq != lastNotice {
+                    lastNotice = seq
+                    guard sendAll([.notice(code: FileProto.Notice.pasteBusy)]) else { reason = "send_failed"; return }
+                }
+            }
             if let announcer {
                 let changeCount = clipboard.changeCount()
                 // Mid-paste the change waits (lastChangeCount stays), so the
@@ -541,6 +602,7 @@ final class ControlServer: @unchecked Sendable {
             case .offer(_, FileProto.Purpose.paste, _, _), .offer(_, FileProto.Purpose.send, _, _),
                  .entry, .data, .fileEnd, .cancel:
                 let step = receiver.handle(msg)
+                noteUpload(&uploading, active: receiver.isActive)
                 for out in step.send {
                     guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else {
                         reason = "send_failed"; return
@@ -556,7 +618,7 @@ final class ControlServer: @unchecked Sendable {
                 guard let bytes = reply.encode(), sendPacket(fd, type: reply.type, payload: bytes) else {
                     reason = "send_failed"; return
                 }
-            case .hello, .helloAck:
+            case .hello, .helloAck, .notice:
                 reason = "unexpected"; return
             case .reply, .result, .progress:
                 // Host-to-viewer messages: nothing to answer.
@@ -688,6 +750,18 @@ final class ControlServer: @unchecked Sendable {
     private func handleKey(semantic: UInt16, down: Bool) {
         // Keys are never logged (privacy): only keyEvents counts them.
         keyEvents += 1
+
+        switch pasteGate.key(semantic: semantic, down: down, refuse: { finderPasteBlocked() }) {
+        case .pass:
+            break
+        case .refused:
+            // Finder would save the text clipboard as a .textClipping file.
+            print("file.paste=refused reason=busy_finder")
+            requestPasteBusyNotice()
+            return
+        case .swallow:
+            return
+        }
 
         if semantic == 20 { // Windows VK_CAPITAL / Caps Lock.
             handleCapsLock(down: down)
