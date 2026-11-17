@@ -41,7 +41,7 @@ endif()
 
 set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt normaliz shell32 oleaut32 shlwapi uuid)
 
-add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp send_to_win.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp file_push_win.cpp send_to_win.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(Jerislink PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(Jerislink PRIVATE ${JERISLINK_LIBS} opus comctl32)
@@ -51,7 +51,7 @@ endif()
 
 # CI-only: the real settings / volume dialogs rendered to BMP for review.
 # Not installed or packaged.
-add_executable(JerislinkUiSnapshot WIN32 EXCLUDE_FROM_ALL viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp send_to_win.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
+add_executable(JerislinkUiSnapshot WIN32 EXCLUDE_FROM_ALL viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp file_push_win.cpp send_to_win.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(JerislinkUiSnapshot PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX JERISLINK_UI_SNAPSHOT)
 target_include_directories(JerislinkUiSnapshot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(JerislinkUiSnapshot PRIVATE ${JERISLINK_LIBS} opus comctl32)
@@ -129,6 +129,12 @@ target_link_libraries(JerislinkFilePullTest PRIVATE normaliz user32)
 add_executable(JerislinkFileZoneTest file_zone_test.cpp file_pull.cpp)
 target_compile_definitions(JerislinkFileZoneTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(JerislinkFileZoneTest PRIVATE ole32 oleaut32 shell32 shlwapi bcrypt uuid normaliz user32)
+
+# Test for F5b Mac "Send to JerisLink" pushes: checks, request window, hash, endings (file_push.hpp),
+# and on Windows the real Downloads\JerisLink writer in a temp folder (file_push_win.cpp).
+add_executable(JerislinkFilePushTest file_push_test.cpp file_push_win.cpp file_pull.cpp)
+target_compile_definitions(JerislinkFilePushTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkFilePushTest PRIVATE ole32 oleaut32 shell32 shlwapi bcrypt uuid normaliz user32)
 
 # Console test for F5a Send to JerisLink: arguments, decision, texts and pipe bytes (send_to.hpp).
 add_executable(JerislinkSendToTest send_to_test.cpp)

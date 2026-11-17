@@ -213,6 +213,15 @@ inline std::string chipText(uint64_t files, uint64_t done, uint64_t total, uint6
     return s;
 }
 
+// F5b: a Finder "Send to JerisLink" push coming into this PC.
+inline std::string chipTextReceive(uint64_t files, uint64_t done, uint64_t total) {
+    return "\xE2\x86\x93 " + plural(files, "file", "files") + " from the Mac \xC2\xB7 " + formatPair(done, total);
+}
+
+inline std::string receivedText(uint64_t files) {
+    return "Received " + plural(files, "file", "files") + " in Downloads\\JerisLink";
+}
+
 // Cmd+V with copied files while a transfer runs: nothing is pasted on the Mac.
 inline std::string pasteBusy() {
     return "A transfer is already running. Wait or cancel it in Files, then press Cmd+V again.";
@@ -236,6 +245,12 @@ inline std::string confirmBodyPull(uint64_t filesLeft, uint64_t done, uint64_t t
            " of " + formatBytes(total) +
            "). If you disconnect now, the paste stops and Explorer reports the unfinished files. "
            "Files that already finished are kept.";
+}
+
+inline std::string confirmBodyPush(uint64_t filesLeft, uint64_t done, uint64_t total) {
+    return std::to_string(filesLeft) + " file(s) from the Mac are still arriving in Downloads\\JerisLink (" +
+           formatBytes(std::min(done, total)) + " of " + formatBytes(total) +
+           "). If you disconnect now, the unfinished file is removed. Files that already arrived are kept.";
 }
 
 // Disconnect confirm keys. Keep is the default; Esc and Enter keep;

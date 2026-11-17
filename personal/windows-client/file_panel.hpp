@@ -77,7 +77,9 @@ enum class SendToSetup {
     StorePackage,  // the Microsoft Store (MSIX) build: no Send to entry yet
 };
 
-inline std::vector<CardRow> sendToRows(SendToSetup setup) {
+// macPush: the Mac host has Finder's Send to JerisLink (HELLO_ACK caps
+// push_service, F5b). Without it the Mac line is not shown at all.
+inline std::vector<CardRow> sendToRows(SendToSetup setup, bool macPush = false) {
     std::vector<CardRow> rows;
     switch (setup) {
     case SendToSetup::Installed:
@@ -93,8 +95,12 @@ inline std::vector<CardRow> sendToRows(SendToSetup setup) {
         rows.push_back({pcToMac(), "Not set up on this PC. Install JerisLink with its installer to add it.", true});
         break;
     }
-    // F5b: Finder's Send to JerisLink needs a newer Mac host.
-    rows.push_back({macToPc(), "Right-click in Finder: coming with the next JerisLink update on the Mac.", true});
+    if (macPush) {
+        rows.push_back({macToPc(),
+                        "Right-click files in Finder \xE2\x80\xBA Send to JerisLink (under Quick Actions or "
+                        "Services). They go to Downloads\\JerisLink here.",
+                        false});
+    }
     return rows;
 }
 

@@ -53,16 +53,22 @@ void cards() {
     expect(cp[1].text.find("Cmd+C in Finder here, then Ctrl+V in Explorer.") != std::string::npos && !cp[1].muted,
            "card 1: Mac to PC line");
 
-    auto st = sendToRows(SendToSetup::Installed);
+    auto st = sendToRows(SendToSetup::Installed, true);
     expect(st.size() == 2 && st[0].label == cp[0].label && st[1].label == cp[1].label, "card 2: same two directions");
     expectEq(st[0].text,
              "Right-click files \xE2\x80\xBA Send to \xE2\x80\xBA JerisLink (Windows 11: Show more options first). "
              "They go to Downloads/JerisLink on the Mac.",
              "card 2: installed, how to send");
     expect(!st[0].muted, "card 2: installed line is not grey");
-    expectEq(st[1].text, "Right-click in Finder: coming with the next JerisLink update on the Mac.",
-             "card 2: Mac -> This PC waits for F5b");
-    expect(st[1].muted, "card 2: Mac -> This PC is grey");
+    expectEq(st[1].text,
+             "Right-click files in Finder \xE2\x80\xBA Send to JerisLink (under Quick Actions or Services). "
+             "They go to Downloads\\JerisLink here.",
+             "card 2: F5b host, Mac -> This PC line");
+    expect(!st[1].muted, "card 2: Mac -> This PC is not grey");
+    st = sendToRows(SendToSetup::Installed);
+    expect(st.size() == 1 && st[0].label == cp[0].label, "card 2: host without push_service has no Mac line");
+    st = sendToRows(SendToSetup::Installed, false);
+    expect(st.size() == 1, "card 2: no Mac line when the bit is clear");
     st = sendToRows(SendToSetup::NotInstalled);
     expectEq(st[0].text, "Not set up on this PC. Install JerisLink with its installer to add it.",
              "card 2: no shortcut (zip / deleted)");
@@ -70,7 +76,9 @@ void cards() {
     st = sendToRows(SendToSetup::StorePackage);
     expectEq(st[0].text, "Not in the Microsoft Store version yet. Drag files onto this window instead.",
              "card 2: Store build degrades to drag");
-    expect(st[0].muted && st.size() == 2, "card 2: Store line is grey");
+    expect(st[0].muted && st.size() == 1, "card 2: Store line is grey");
+    st = sendToRows(SendToSetup::StorePackage, true);
+    expect(st.size() == 2 && !st[1].muted, "card 2: Store build still shows the Mac line");
 }
 
 void texts() {
