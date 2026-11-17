@@ -140,6 +140,19 @@ void busy() {
         expect(!r.refusedBusy && !r.startUpload && busyAsked == 0, "busy, no files: busy never asked, no refusal");
     }
     {
+        // Hand test r2, case 1: during a Send to, Ctrl+C inside the viewer
+        // goes to the Mac as Cmd+C; the Mac's text then syncs to the Windows
+        // clipboard (no files). The Cmd+V that follows is a text paste and
+        // passes, busy or not: Finder makes a text clipping of it.
+        PasteGate g;
+        int busyAsked = 0;
+        const uint16_t C = 'C';
+        auto r = g.filter({D(kWin), D(C), U(C), D(V), U(V), U(kWin)}, 0, no, [&] { ++busyAsked; return true; });
+        expectEvents(r.events, {D(kWin), D(C), U(C), D(V), U(V), U(kWin)},
+                     "busy, Mac copy then Cmd+V: both go to the Mac unchanged");
+        expect(!r.refusedBusy && busyAsked == 0, "busy, Mac text on the clipboard: not refused");
+    }
+    {
         PasteGate g;
         auto r = g.filter({D(kWin), D(V), U(V), U(kWin)}, 0, yes, no);
         expectEvents(r.events, {D(kWin), U(kWin)}, "not busy: Cmd+V held as before");

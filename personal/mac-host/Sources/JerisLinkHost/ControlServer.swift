@@ -44,6 +44,15 @@ final class ControlServer: @unchecked Sendable {
     /// file object on the Windows clipboard.
     private var announceSessions = 0
     private let fileStatsLock = NSLock()
+    /// When a Mac->Windows paste last pulled bytes (systemUptime seconds).
+    /// While that is recent, pasteboard changes wait: a Mac copy made
+    /// mid-paste must not cancel the announce Explorer is reading, nor
+    /// replace the Windows clipboard under it (F3 r3). 0: never.
+    private var lastPullServe: TimeInterval = 0
+    /// How long a paste counts as running after its last REQUEST. Explorer
+    /// asks again within milliseconds while it copies, so this only bridges
+    /// the gap between files; the waiting copy syncs once it has passed.
+    static let pullHoldSeconds: TimeInterval = 3
     /// The viewer allowed to change video settings (JERISLINK_CLIENT_IP),
     /// read for every request so a network.conf change applies at once.
     private let settingsClientIP: () -> String?
@@ -403,6 +412,16 @@ final class ControlServer: @unchecked Sendable {
         return announceSessions > 0
     }
 
+    private func notePullServe() {
+        fileStatsLock.lock(); lastPullServe = ProcessInfo.processInfo.systemUptime; fileStatsLock.unlock()
+    }
+
+    /// A paste is pulling now: leave the pasteboard change for later.
+    private func pullHeld() -> Bool {
+        fileStatsLock.lock(); defer { fileStatsLock.unlock() }
+        return lastPullServe > 0 && ProcessInfo.processInfo.systemUptime - lastPullServe < Self.pullHoldSeconds
+    }
+
     private func fileStatsText() -> String {
         fileStatsLock.lock(); defer { fileStatsLock.unlock() }
         return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes)"
@@ -466,7 +485,9 @@ final class ControlServer: @unchecked Sendable {
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
             if let announcer {
                 let changeCount = clipboard.changeCount()
-                if changeCount != lastChangeCount {
+                // Mid-paste the change waits (lastChangeCount stays), so the
+                // announce Explorer is reading stays served.
+                if changeCount != lastChangeCount, !pullHeld() {
                     lastChangeCount = changeCount
                     // This host's own F2 paste holds staging files Windows
                     // already has: never announce them back.
@@ -505,6 +526,7 @@ final class ControlServer: @unchecked Sendable {
                     guard sendAll([.reply(transfer: t, status: FileProto.Status.denied)]) else { reason = "send_failed"; return }
                     continue
                 }
+                if t == announcer.current { notePullServe() }
                 guard announcer.serve(transfer: t, index: index, offset: offset, length: length,
                                       send: { m in m.encode().map { sendPacket(fd, type: m.type, payload: $0) } ?? false }) else {
                     reason = "send_failed"; return
@@ -597,6 +619,9 @@ final class ControlServer: @unchecked Sendable {
 
             let changeCount = clipboard.changeCount()
             if changeCount == lastChangeCount { continue }
+            // Mid-paste, Windows keeps the file object Explorer is reading;
+            // this copy syncs once the paste is quiet.
+            if pullHeld() { continue }
             lastChangeCount = changeCount
             // Our own file-URL write (Windows->Mac paste): Windows already
             // holds those files; never send the staging path back as text.

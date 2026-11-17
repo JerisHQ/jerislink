@@ -714,8 +714,9 @@ enum ControlServiceSelfTest {
 
     /// F3 over a real socket: a Finder copy is announced only on a session
     /// that asked for announces, the text session does not send the
-    /// filename text while it is open, REQUEST pulls the bytes, and a later
-    /// text copy cancels the announce.
+    /// filename text while it is open, REQUEST pulls the bytes, and a text
+    /// copy made mid-paste waits until the paste is quiet, then cancels the
+    /// announce and syncs.
     private static func fileAnnounceEndToEnd(_ expect: (Bool, String) -> Void) -> Int {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("jl-announce-e2e-\(getpid())", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -759,19 +760,35 @@ enum ControlServiceSelfTest {
         expect(upload.receive(timeout: 0.5) == nil, "announce e2e: a session without the announce cap gets nothing")
         expect(text.receive(timeout: 0.5) == nil, "announce e2e: text session does not send the filename text")
 
-        _ = pull.send(type: FileProto.MsgType.request, payload: M.request(transfer: t, index: 0, offset: 0, length: 1 << 20).encode()!)
+        // Explorer pulls in parts. A Mac copy between two parts (F3 r3,
+        // Morris's Cmd+C mid-paste) must not cut the paste off: no CANCEL,
+        // the next part is served, and the Windows clipboard is not touched.
+        let half = body.count / 2
+        _ = pull.send(type: FileProto.MsgType.request, payload: M.request(transfer: t, index: 0, offset: 0, length: UInt32(half)).encode()!)
         var got: [UInt8] = []
         var end: M?
+        while got.count < half, let m = next(pull) {
+            if case let .data(_, _, off, b) = m, off == UInt64(got.count) { got += b }
+        }
+        expect(got.count == half, "announce e2e: the first part arrives")
+        board.localCopy("plain text")
+        expect(pull.receive(timeout: 1) == nil, "announce e2e: a Mac copy mid-paste sends no CANCEL")
+        expect(text.receive(timeout: 0.5) == nil, "announce e2e: and does not replace the Windows clipboard mid-paste")
+        _ = pull.send(type: FileProto.MsgType.request,
+                      payload: M.request(transfer: t, index: 0, offset: UInt64(half), length: UInt32(body.count - half)).encode()!)
         while let m = next(pull) {
             if case let .data(_, _, off, b) = m, off == UInt64(got.count) { got += b }
             if case .fileEnd = m { end = m; break }
+            if case .reply = m { break }
         }
         expect(got == body && end == .fileEnd(transfer: t, index: 0, sha256: FileUploadSelfTest.sha(body)),
-               "announce e2e: REQUEST pulls the bytes and FILE_END")
+               "announce e2e: the rest is served after the Mac copy, bytes and FILE_END match")
 
-        board.localCopy("plain text")
-        expect(next(pull) == .cancel(transfer: t, reason: FileProto.Status.cancelled), "announce e2e: a text copy cancels the announce")
-        expect(text.receive(timeout: 2)?.payload == Array("plain text".utf8), "announce e2e: and the text still syncs")
+        // Once the paste is quiet the waiting copy goes through.
+        expect(next(pull, ControlServer.pullHoldSeconds + 3) == .cancel(transfer: t, reason: FileProto.Status.cancelled),
+               "announce e2e: after the paste, the text copy cancels the announce")
+        expect(text.receive(timeout: ControlServer.pullHoldSeconds + 3)?.payload == Array("plain text".utf8),
+               "announce e2e: and the text then syncs")
         pull.close()
         wait(until: { server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)") })
         expect(server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)"),
