@@ -2832,6 +2832,12 @@ static void fileUiReposition() {
             SetWindowPos(gFileChip, HWND_NOTOPMOST, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width,
                          l.height, SWP_NOACTIVATE);
         }
+        // Restored after a transfer began while minimised: bring the chip up.
+        if (!IsWindowVisible(gFileChip) &&
+            jl::filepanel::chipOnScreen(gChipMode != ChipMode::Hidden, IsIconic(gViewerHwnd) != FALSE,
+                                        fileChipFloats())) {
+            ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+        }
     }
     filePanelPlace();
     if (gFileConfirm) {
@@ -2972,7 +2978,9 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     gChipCancelHot = false;
     gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
     fileUiReposition();
-    if (gViewerHwnd && (!IsIconic(gViewerHwnd) || fileChipFloats())) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    if (gViewerHwnd && jl::filepanel::chipOnScreen(true, IsIconic(gViewerHwnd) != FALSE, fileChipFloats())) {
+        ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    }
     filePanelPlace();  // now that the chip is up, keep the panel clear of it
     InvalidateRect(gFileChip, nullptr, FALSE);
 }

@@ -196,6 +196,16 @@ void keys() {
            "keys: Tab with no buttons is harmless");
 }
 
+void chipRestore() {
+    // Send to started while the viewer was minimised: no chip yet, but it must
+    // come up once the viewer is restored (hand test, 2026-11-17).
+    expect(!chipOnScreen(true, true, false), "chip: running bar stays hidden while minimised");
+    expect(chipOnScreen(true, false, false), "chip: running bar shows after restore");
+    expect(chipOnScreen(true, true, true), "chip: floating notice shows while minimised");
+    expect(!chipOnScreen(false, false, false), "chip: hidden chip never shows on restore");
+    expect(!chipOnScreen(false, true, true), "chip: hidden chip never floats");
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +215,7 @@ int main() {
     buttonSets();
     layouts();
     keys();
+    chipRestore();
     std::printf("file panel: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }
