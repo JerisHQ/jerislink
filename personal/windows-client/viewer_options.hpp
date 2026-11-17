@@ -5,9 +5,10 @@
 //
 // Priority, per value:
 //   host (Mac) IP : --source-ip  > saved HostIp > JERISLINK_SOURCE_IP
-//   this PC's IP  : --bind-ip    > saved BindIp (manual) > Auto: match the Mac
-//                   address (tailnet or Tailcat, see bind_choices.hpp), falling
-//                   back to the first active 100.64.0.0/10 address
+//   this PC's IP  : --bind-ip    > Auto: match the Mac address (tailnet or
+//                   Tailcat, see bind_choices.hpp), falling back to the first
+//                   active 100.64.0.0/10 address. A BindIp value saved by an
+//                   older build is ignored.
 //   codec/bitrate : --codec/--bitrate-mbps > saved > defaults (h264, 25)
 
 #include "bind_choices.hpp"
@@ -22,7 +23,6 @@ namespace jl {
 
 struct SavedSettings {
     std::string hostIp;   // empty = not set
-    std::string bindIp;   // empty = detect automatically
     std::string codec = "h264";
     uint16_t bitrateMbps = 25;
 };
@@ -64,8 +64,8 @@ struct LaunchRequest {
     bool openSettings = false;       // --settings: show the settings dialog first
     std::string printConfigPath;     // --print-config PATH: write the result and exit
     std::string hostSource = "none"; // cli | saved | env | none
-    std::string bindSource = "none"; // cli | saved | auto | none
-    std::string bindReason = "none"; // cli | manual | auto-tailnet | auto-tailcat | fallback | none
+    std::string bindSource = "none"; // cli | auto | none
+    std::string bindReason = "none"; // cli | auto-tailnet | auto-tailcat | fallback | none
     std::string error;
 };
 
@@ -150,11 +150,6 @@ inline LaunchRequest resolveLaunch(const std::vector<std::string>& args,
     if (o.sourceIp.empty() && !envSourceIp.empty()) { o.sourceIp = envSourceIp; r.hostSource = "env"; }
 
     if (!o.bindIp.empty()) r.bindReason = "cli";
-    if (o.bindIp.empty() && isIPv4(saved.bindIp)) {
-        o.bindIp = saved.bindIp;
-        r.bindSource = "saved";
-        r.bindReason = "manual";
-    }
     if (o.bindIp.empty()) {
         const AutoBind a = autoBindFor(o.sourceIp, detected);
         if (!a.ip.empty()) {

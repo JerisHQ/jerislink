@@ -56,7 +56,6 @@ int main() {
                "--codec", "hevc", "--bitrate-mbps", "18"};
         SavedSettings s;
         s.hostIp = "192.0.2.99";
-        s.bindIp = "192.0.2.98";
         s.codec = "h264";
         s.bitrateMbps = 40;
         auto r = resolveLaunch(a, s, "192.0.2.97", noTailnet);
@@ -65,13 +64,6 @@ int main() {
         CHECK(r.options.bindIp == "198.51.100.16" && r.bindSource == "cli");
         CHECK(r.options.codec == "hevc");
         CHECK(r.options.bitrateMbps == 18);
-    }
-    // Saved bind IP overrides auto-detect.
-    {
-        auto s = typicalSaved();
-        s.bindIp = "192.0.2.42";
-        auto r = resolveLaunch({}, s, "", tailnet);
-        CHECK(r.options.bindIp == "192.0.2.42" && r.bindSource == "saved");
     }
     // Saved host wins over JERISLINK_SOURCE_IP; env is used when nothing is saved.
     {
@@ -158,7 +150,7 @@ int main() {
         CHECK(!debugModeEnabled("1 "));
     }
 
-    // "This PC's address": Auto matches the Mac address; manual choices.
+    // "This PC's address": always automatic, matching the Mac address.
     {
         const std::string t = "100.64.0.25";     // this PC on the tailnet
         const std::string macT = "100.64.0.10";  // Mac on the tailnet
@@ -179,10 +171,9 @@ int main() {
         CHECK(autoBindFor("192.0.2.25", {t, true}).reason == "fallback");
         CHECK(autoBindFor("", {}).ip.empty());
 
-        // Launch: empty BindIp = Auto, saved IP = manual, --bind-ip wins.
+        // Launch: always Auto; only --bind-ip overrides it.
         SavedSettings s = typicalSaved();
         s.hostIp = macC;
-        s.bindIp = "";
         auto r = resolveLaunch({}, s, "", BindDetection{t, true});
         CHECK(r.status == LaunchStatus::Ok && r.options.bindIp == "127.0.0.1");
         CHECK(r.bindSource == "auto" && r.bindReason == "auto-tailcat");
@@ -191,38 +182,9 @@ int main() {
         CHECK(r.options.bindIp == t && r.bindReason == "auto-tailnet");
         r = resolveLaunch({}, s, "", BindDetection{std::nullopt, true});
         CHECK(r.status == LaunchStatus::NoTailnet && r.bindReason == "none");
-        s.bindIp = "127.0.0.1";
-        r = resolveLaunch({}, s, "", BindDetection{t, true});
-        CHECK(r.options.bindIp == "127.0.0.1" && r.bindSource == "saved" && r.bindReason == "manual");
         r = resolveLaunch({"--bind-ip", "192.0.2.9"}, s, "", BindDetection{t, true});
         CHECK(r.options.bindIp == "192.0.2.9" && r.bindReason == "cli");
         CHECK(describeLaunch(r).find("bind_reason=cli\n") != std::string::npos);
-
-        // Dialog choices.
-        auto none = bindChoices({}, "");
-        CHECK(none.size() == 1 && none[0].kind == BindKind::Auto);
-        CHECK(initialBindChoice(none, "") == 0);
-        CHECK(bindValueToSave(none, 0, "") == "");
-        CHECK(bindValueToSave(none, -1, "192.0.2.7") == "192.0.2.7");
-
-        auto both = bindChoices({t, true}, "");
-        CHECK(both.size() == 3);
-        CHECK(both[1].kind == BindKind::Tailnet && both[1].ip == t);
-        CHECK(both[2].kind == BindKind::Tailcat && both[2].ip == "127.0.0.1");
-        CHECK(initialBindChoice(both, "") == 0);
-        CHECK(bindValueToSave(both, 0, t) == "");  // back to Auto
-        CHECK(bindValueToSave(both, 1, "") == t);
-        CHECK(bindValueToSave(both, 2, "") == "127.0.0.1");
-        CHECK(bindValueToSave(both, 7, "x") == "x");
-        CHECK(initialBindChoice(bindChoices({t, true}, t), t) == 1);
-        CHECK(initialBindChoice(bindChoices({t, true}, "127.0.0.1"), "127.0.0.1") == 2);
-
-        // A saved manual IP not detected now stays selectable and is kept.
-        auto kept = bindChoices({t, false}, "192.0.2.7");
-        CHECK(kept.size() == 3 && kept[2].kind == BindKind::Saved);
-        const int k = initialBindChoice(kept, "192.0.2.7");
-        CHECK(k == 2 && bindValueToSave(kept, k, "192.0.2.7") == "192.0.2.7");
-        CHECK(bindChoices({t, false}, "junk").size() == 2);
     }
 
     // Launch screen: shown unless the host came on the command line.

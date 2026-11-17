@@ -61,8 +61,9 @@ Startup
 -------
 Double-click Jerislink.exe. No command line is needed.
 
-First start: a JerisLink Settings window opens. Enter the Mac host's
-Tailscale IPv4 address, pick the codec and bitrate, and press Connect.
+First start: the launch screen opens. Enter the Mac's address (its Tailscale
+IPv4 address, or 127.0.0.1 for Tailcat) and press Connect to Mac. Codec and
+bitrate are under Advanced settings.
 The settings are saved for this Windows user and used on every later start.
 
 Change settings later:
@@ -70,12 +71,14 @@ Change settings later:
 - in the running viewer: Settings > Connection Settings... (applies on the next start), or
 - start it once with: Jerislink.exe --settings
 
-"This PC's address" can stay empty: Jerislink then uses this PC's active
-Tailscale IPv4 address (100.64.0.0/10). Fill it in only to force one address.
+This PC's address is chosen automatically from the Mac address: a Tailscale
+Mac address uses this PC's Tailscale IPv4 (100.64.0.0/10), 127.0.0.1 uses the
+Tailcat bridge. There is no setting for it; --bind-ip still overrides it.
+Connection info (in the running viewer) shows both addresses, read-only.
 
-Saved values (HKCU\Software\Jeris\Jerislink): HostIp, BindIp, VideoCodec,
-VideoBitrateMbps. Priority per value: command line > saved setting >
-JERISLINK_SOURCE_IP (host only) / automatic Tailscale address (this PC only).
+Saved values (HKCU\Software\Jeris\Jerislink): HostIp, VideoCodec,
+VideoBitrateMbps (an old BindIp value is ignored). Priority per value:
+command line > saved setting > JERISLINK_SOURCE_IP (host only).
 
 Check what a start would use, without connecting:
   Jerislink.exe --print-config %TEMP%\jerislink-config.txt
