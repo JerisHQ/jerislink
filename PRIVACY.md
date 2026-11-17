@@ -1,6 +1,6 @@
 # JerisLink Privacy Policy
 
-Effective date: 2026-11-14
+Effective date: 2026-11-17
 
 This policy covers the JerisLink Windows viewer (including the Microsoft Store
 package) and the JerisLink Mac host in this repository.
@@ -18,15 +18,26 @@ The viewer connects only to the Mac address you enter (or start it with). The
 Mac host accepts only the one viewer address it is configured for. Between
 those two devices JerisLink sends:
 
-- **Screen video** from the Mac to the PC. Audio is not captured or sent.
+- **Screen video** from the Mac to the PC.
+- **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
+  Opus, only while a viewer with audio on is connected. The host captures it
+  through macOS Screen Recording and stops within about 10 seconds when the viewer
+  stops asking for it. Start the viewer with `--audio off` to never request
+  it. Audio is played and discarded; it is not recorded on either device.
 - **Keyboard and mouse input** from the PC to the Mac, while the viewer
   window has focus.
 - **Clipboard text** in both directions (plain text only, up to 60 KB per
   copy), while the viewer is connected with input enabled.
+- **Files you choose to send**, only when you act: copy and paste (Windows
+  to Mac or Mac to Windows), drop on the viewer or its Files panel, or
+  "Send to JerisLink" in Explorer or the Finder. The file names, sizes and
+  contents go to the other device, with a SHA-256 check per file. Nothing is
+  sent in the background and JerisLink never opens a received file.
 - **Session settings** (codec, bitrate, screen size) and connection
   statistics needed to keep the stream smooth.
 
-Nothing else is sent, and nothing is sent to any other address.
+Nothing else is sent, and nothing is sent to any other address. Audio and
+files use the same tailnet connection to the same Mac as the video.
 
 ## Encryption
 
@@ -36,8 +47,8 @@ protected by Tailscale's WireGuard encryption between your devices. Tailscale
 may relay that encrypted traffic through its relay servers when a direct path
 is not available; Tailscale's own privacy policy applies to Tailscale.
 
-If you point JerisLink at an address outside a tailnet, the stream and
-clipboard are sent unencrypted. Use it only over your tailnet.
+If you point JerisLink at an address outside a tailnet, the stream, audio,
+clipboard and files are sent unencrypted. Use it only over your tailnet.
 
 ## What is stored on your devices
 
@@ -59,6 +70,33 @@ On the Mac:
 - Service logs in `/tmp/jerislink-*.log` and `/tmp/jerislink-*.err`, with the
   same kind of content as the Windows logs: addresses, statistics and event
   counts, not clipboard text or typed keys.
+
+### Received files
+
+On the Windows PC:
+
+- Files sent from the Mac ("Send to JerisLink" in the Finder) are saved in
+  `Downloads\JerisLink` in your user folder. While a file arrives it is a
+  `.jlpart` file; it gets its real name only after its SHA-256 matches. An
+  existing file is never replaced (`name (2).ext` instead).
+- Every saved file is marked as downloaded from the internet
+  (`Zone.Identifier`, ZoneId=3), so Windows SmartScreen and Office
+  Protected View treat it like any other download.
+- Files pasted from the Finder are saved by Explorer where you paste them.
+
+On the Mac:
+
+- Files sent from Windows (drop or "Send to JerisLink") are saved in
+  `~/Downloads/JerisLink`, or in `~/JerisLink Received` if you refuse
+  macOS access to Downloads. An existing file is never replaced.
+- Received files carry the macOS quarantine mark (`com.apple.quarantine`).
+- While a transfer runs, the host stages it in
+  `~/Library/Caches/org.jeris.jerislink/incoming`. Partial transfers are
+  removed at once; the last completed paste stays there until the next paste
+  (Finder copies from it) or is removed at the next host start after 24 hours.
+
+The logs on both devices record transfer counts, sizes and results, never
+file names or contents.
 
 None of these files leave your devices. You can delete them at any time.
 
