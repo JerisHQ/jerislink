@@ -625,23 +625,39 @@ enum ControlServiceSelfTest {
         var marker: UInt8 = 65
         /// Type a letter after the keys under test, so "nothing arrived" is
         /// checked once the helper has seen everything sent before it.
-        func flush() {
+        @discardableResult func flush() -> Bool {
             let up = FakeInputHelper.Event(type: 0x10, payload: [0, 0, UInt8(Self.letterCode(marker))])
             let before = helper.snapshot().filter { $0 == up }.count
             key(marker, true); key(marker, false)
             wait(until: { helper.snapshot().filter { $0 == up }.count > before })
             marker += 1
+            return helper.snapshot().filter { $0 == up }.count > before
         }
         func vCount() -> Int { helper.snapshot().filter { $0 == vDown || $0 == vUp }.count }
+        /// What the helper and the server saw, printed only with a failure.
+        func diag() -> String {
+            let types = helper.snapshot().map { String($0.type, radix: 16) }.joined(separator: ",")
+            return " [helper connections=\(helper.connections) max_concurrent=\(helper.maxConcurrentConnections)"
+                + " events=\(types) \(server.statsLine())]"
+        }
+        func vMessage(_ want: Int, _ what: String) -> String {
+            let got = vCount()
+            return "finder paste: \(what) (\(got) V events)" + (got == want ? "" : diag())
+        }
 
         send(notice, .hello(proto: 1, caps: FileProto.Caps.notice))
         expect(notice.receive(timeout: 3)?.type == 0x51, "finder paste: notice session HELLO_ACK")
         send(upload, .hello(proto: 1, caps: 0))
         expect(upload.receive(timeout: 3)?.type == 0x51, "finder paste: upload session HELLO_ACK")
 
+        // The helper gets keys from this viewer before anything is tested:
+        // the first key opens the input session (SESSION_START).
+        let warm = flush()
+        expect(warm, "finder paste: helper receives keys from the viewer" + (warm ? "" : diag()))
+
         // No upload yet: Cmd+V in Finder passes (a normal file paste).
         cmdV(); flush()
-        expect(vCount() == 3, "finder paste: idle Cmd+V in Finder reaches the Mac (V down, repeat, up: \(vCount()))")
+        expect(vCount() == 3, vMessage(3, "idle Cmd+V in Finder reaches the Mac (V down, repeat, up)"))
 
         // A Send to is running.
         let body = [UInt8](repeating: 7, count: 70_000)
@@ -651,9 +667,9 @@ enum ControlServiceSelfTest {
         send(upload, FileUploadSelfTest.chunks(11, 0, body)[0])
 
         cmdV(); flush()
-        expect(vCount() == 3, "finder paste: Cmd+V in Finder mid-transfer never reaches the Mac (\(vCount()) V events)")
-        expect(helper.received(.init(type: 0x10, payload: [1, 0, 55])) && helper.received(.init(type: 0x10, payload: [0, 0, 55])),
-               "finder paste: Command down and up still pass")
+        expect(vCount() == 3, vMessage(3, "Cmd+V in Finder mid-transfer never reaches the Mac"))
+        let cmdPassed = helper.received(.init(type: 0x10, payload: [1, 0, 55])) && helper.received(.init(type: 0x10, payload: [0, 0, 55]))
+        expect(cmdPassed, "finder paste: Command down and up still pass" + (cmdPassed ? "" : diag()))
         expect(decoded(notice, 2) == .notice(code: FileProto.Notice.pasteBusy), "finder paste: viewer gets NOTICE paste_busy")
         expect(notice.receive(timeout: 0.4) == nil, "finder paste: one NOTICE for one refused Cmd+V")
         expect(server.statsLine().contains("finder_paste_refused=1"), "finder paste: stats count the refusal")
@@ -661,7 +677,7 @@ enum ControlServiceSelfTest {
         // Another app frontmost: text paste works mid-transfer.
         front.set("com.apple.TextEdit")
         cmdV(); flush()
-        expect(vCount() == 6, "finder paste: Cmd+V in another app mid-transfer passes (\(vCount()) V events)")
+        expect(vCount() == 6, vMessage(6, "Cmd+V in another app mid-transfer passes"))
         expect(notice.receive(timeout: 0.4) == nil, "finder paste: no NOTICE for another app")
 
         // No viewer that shows NOTICE: never eaten silently.
@@ -669,7 +685,7 @@ enum ControlServiceSelfTest {
         notice.close()
         usleep(300_000)
         cmdV(); flush()
-        expect(vCount() == 9, "finder paste: without a notice session Cmd+V passes (\(vCount()) V events)")
+        expect(vCount() == 9, vMessage(9, "without a notice session Cmd+V passes"))
 
         // Upload finished (cancelled): Cmd+V in Finder passes again.
         send(upload, .cancel(transfer: 11, reason: FileProto.Status.cancelled))
@@ -679,7 +695,7 @@ enum ControlServiceSelfTest {
         expect(again.receive(timeout: 3)?.type == 0x51, "finder paste: second notice session HELLO_ACK")
         _ = upload.receive(timeout: 1)                                // RESULT cancelled, if any
         cmdV(); flush()
-        expect(vCount() == 12, "finder paste: after the transfer Cmd+V in Finder passes (\(vCount()) V events)")
+        expect(vCount() == 12, vMessage(12, "after the transfer Cmd+V in Finder passes"))
         expect(again.receive(timeout: 0.4) == nil, "finder paste: no NOTICE once idle")
         return 0
     }
