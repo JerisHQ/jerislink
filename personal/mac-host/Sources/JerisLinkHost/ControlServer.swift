@@ -606,6 +606,7 @@ final class ControlServer: @unchecked Sendable {
             guard let payload = recvExact(fd, count: length) else { return }
             received += 1
             lastMessage = Date()
+            pushBroker.heard(pushSession)
 
             guard let msg = FileProto.decode(type: type, payload: payload) else { reason = "malformed"; return }
             switch msg {

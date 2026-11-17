@@ -20,6 +20,7 @@
 #include <wrl/client.h>
 #include "control_channel.hpp"
 #include <cstdlib>
+#include <utility>
 #include "clipboard_channel.hpp"
 #include "file_session.hpp"
 #include "hardware_video_pipeline.hpp"
@@ -5597,6 +5598,42 @@ static int appMain(int argc, char** argv) {
         logLine(std::string("video.capability.hevc=") + (hevcSupported ? "yes" : "no"));
         if (!h264Supported) throw std::runtime_error("Media Foundation H.264 decoder unavailable");
 
+        // The video port is bound before anything talks to the Mac. A second
+        // viewer on this PC stops here: had it connected first, its control
+        // and file sessions would take the Mac's video, audio and Finder
+        // "Send to JerisLink" routing from the window that keeps the port.
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) throw std::runtime_error("socket failed");
+        // Closes the port on any exception below; the paths that close it
+        // themselves reset `s` first.
+        struct VideoSocketCloser {
+            SOCKET& s;
+            ~VideoSocketCloser() { if (s != INVALID_SOCKET) closesocket(s); }
+        } videoSocketCloser{s};
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+        DWORD shortTimeout = 16;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&shortTimeout), sizeof(shortTimeout));
+        // Without SO_REUSEADDR, but exclusive as well so no other program
+        // can bind over this port either.
+        BOOL exclusive = TRUE;
+        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_port = htons(o.port);
+        if (inet_pton(AF_INET, o.bindIp.c_str(), &local.sin_addr) != 1) throw std::runtime_error("bad bind IP");
+        if (bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+            const int err = WSAGetLastError();
+            logLine("video.bind_failed port=" + std::to_string(o.port) + " wsa=" + std::to_string(err));
+            if (err == WSAEADDRINUSE || err == WSAEACCES) {
+                throw std::runtime_error("another JerisLink window on this PC is already connected. Use that window, or close it first.");
+            }
+            throw std::runtime_error("bind failed");
+        }
+        in_addr allowed{};
+        if (inet_pton(AF_INET, o.sourceIp.c_str(), &allowed) != 1) throw std::runtime_error("bad source IP");
+
         std::unique_ptr<ControlChannel> control;
         std::unique_ptr<ClipboardChannel> clipboard;
         std::unique_ptr<FileSession> fileSession;
@@ -5778,27 +5815,6 @@ static int appMain(int argc, char** argv) {
         logLine("viewer.title_status codec=" + effectiveCodec +
                 " bitrate_mbps=" + std::to_string(effectiveBitrateMbps));
 
-        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s == INVALID_SOCKET) throw std::runtime_error("socket failed");
-        int rcvbuf = 4 * 1024 * 1024;
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
-        DWORD shortTimeout = 16;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&shortTimeout), sizeof(shortTimeout));
-
-        sockaddr_in local{};
-        local.sin_family = AF_INET;
-        local.sin_port = htons(o.port);
-        if (inet_pton(AF_INET, o.bindIp.c_str(), &local.sin_addr) != 1 ||
-            bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            closesocket(s);
-            throw std::runtime_error("bind failed");
-        }
-        in_addr allowed{};
-        if (inet_pton(AF_INET, o.sourceIp.c_str(), &allowed) != 1) {
-            closesocket(s);
-            throw std::runtime_error("bad source IP");
-        }
-
         logLine("viewer.waiting_for_stream");
         const bool strictLossRecovery = o.lossRecovery == "strict";
         logLine("loss.recovery=" + o.lossRecovery);
@@ -5850,7 +5866,7 @@ static int appMain(int argc, char** argv) {
         WSAEVENT socketEvent = WSACreateEvent();
         if (socketEvent == WSA_INVALID_EVENT || WSAEventSelect(s, socketEvent, FD_READ) != 0) {
             if (socketEvent != WSA_INVALID_EVENT) WSACloseEvent(socketEvent);
-            closesocket(s);
+            closesocket(std::exchange(s, INVALID_SOCKET));
             throw std::runtime_error("WSAEventSelect failed");
         }
         // 1 ms timer while streaming, so the 1 ms / 5 ms waits below really
@@ -6257,7 +6273,7 @@ static int appMain(int argc, char** argv) {
                     continue;
                 }
                 WSACloseEvent(socketEvent);
-                closesocket(s);
+                closesocket(std::exchange(s, INVALID_SOCKET));
                 throw std::runtime_error("recvfrom failed");
             }
             if (!onDatagram(n, peer, now)) continue;
@@ -6277,7 +6293,7 @@ static int appMain(int argc, char** argv) {
                 " overflows=" + std::to_string(videoWorker.overflows()) +
                 " overflow_drops=" + std::to_string(videoWorker.overflowDrops()));
         WSACloseEvent(socketEvent);
-        closesocket(s);
+        closesocket(std::exchange(s, INVALID_SOCKET));
         pumpMessages();
 
         receiver.flushLoss();
