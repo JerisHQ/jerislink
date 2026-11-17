@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.0
+
+Remote audio, file transfer between Windows and the Mac, keyboard layout presets, and a new viewer launch screen.
+
+Audio:
+
+- The Mac host sends system audio to the Windows viewer, encoded with Opus, with drift control and audio-aware ABR (PR-A1, A2).
+- Output device changes on Windows are handled without a restart; the viewer has a volume slider.
+
+File transfer (Windows <-> Mac, inside the existing tailnet connection):
+
+- Copy files in Windows and paste them in Finder; copy in Finder and paste in Explorer (F2, F3).
+- Files panel with drag-and-drop to send from Windows to the Mac (F4).
+- "Send to JerisLink" in Explorer (F5a) and in the Finder (F5b). Files sent to Windows land in `Downloads\JerisLink` and get the Internet zone mark (Zone.Identifier).
+- Cmd+V of files is refused while a transfer is running, with a busy notice.
+- New file session handshake (FILE_HELLO) with path safety checks.
+
+Windows viewer:
+
+- Launch screen and in-session overlay replace the menu bar; dark settings and volume dialogs.
+- Keyboard: Mac and Windows layout presets, Ctrl+X/S/F and Ctrl+Y mapping; key translation moved to `keymap.hpp` with golden tests.
+- Per-phase `loop.slow_iter` timing at 16 ms (PR-G5).
+- H.264 on capped displays: the encoded size is acknowledged correctly.
+
+Packaging:
+
+- MSIX sideload test packages are signed with a fixed test certificate.
+- Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0`, and the build id `0.3.0 · <sha>`.
+
 ## v0.2.0
 
 Smoother streaming, a Microsoft Store package, and one signed macOS host app.
