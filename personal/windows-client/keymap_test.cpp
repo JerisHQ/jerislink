@@ -2,7 +2,7 @@
 // both presets. Mac layout (default, positional): Ctrl+A/C/V/X/Z/S/F compat,
 // Ctrl+Y redo, Win+C / Win+Space escapes. Windows layout: Ctrl = Command,
 // Win = Control. Both: viewer hotkeys, Alt+Tab left to Windows, focus-loss
-// release, live preset switch, overlay Force Quit chord.
+// release, live preset switch.
 #include "keymap.hpp"
 
 #include <cstdio>
@@ -572,52 +572,6 @@ void testPresetSwitch() {
     }
 }
 
-// Overlay Force Quit: the exact wire sequence, and replayed on a model of
-// the Mac's held keys (the Input Helper stamps the held modifiers on every
-// event) that Escape goes down with Command+Option only and nothing stays
-// held, even when Shift and Control were held on the Mac before.
-void testForceQuit() {
-    constexpr uint16_t ESC = static_cast<uint16_t>(vk::Escape);
-    expectEvents(forceQuitChord(),
-                 {U(1), U(2), U(3), U(4), D(3), D(2), D(ESC), U(ESC), U(2), U(3)},
-                 "force quit: release all, then Cmd down, Opt down, Esc down/up, Opt up, Cmd up");
-    expect(ESC == 0x1B, "force quit: Escape semantic is VK_ESCAPE 0x1B");
-
-    std::set<uint16_t> mac{kShift, kCtrl};  // stale modifiers held on the Mac
-    std::set<uint16_t> atEscape;
-    for (const auto& e : forceQuitChord()) {
-        if (e.down) {
-            if (e.semantic == ESC) atEscape = mac;
-            mac.insert(e.semantic);
-        } else {
-            mac.erase(e.semantic);
-        }
-    }
-    expect(atEscape == std::set<uint16_t>{kWin, kAlt},
-           "force quit: Escape goes down with exactly Command+Option held");
-    expect(mac.empty(), "force quit: nothing is left held on the Mac");
-
-    // r2: two halves with a hold between them. The press leaves exactly
-    // Command+Option+Escape held on the Mac (so loginwindow sees a held hot
-    // key), the release lifts exactly those, Escape first.
-    expectEvents(forceQuitPress(), {U(1), U(2), U(3), U(4), D(3), D(2), D(ESC)},
-                 "force quit press: release all, then Cmd down, Opt down, Esc down");
-    expectEvents(forceQuitRelease(), {U(ESC), U(2), U(3)},
-                 "force quit release: Esc up, Opt up, Cmd up");
-    std::set<uint16_t> held{kShift, kCtrl};
-    for (const auto& e : forceQuitPress()) {
-        if (e.down) held.insert(e.semantic); else held.erase(e.semantic);
-    }
-    expect(held == std::set<uint16_t>{kWin, kAlt, ESC},
-           "force quit: during the hold exactly Command+Option+Escape are held");
-    for (const auto& e : forceQuitRelease()) {
-        if (e.down) held.insert(e.semantic); else held.erase(e.semantic);
-    }
-    expect(held.empty(), "force quit: after the release nothing is held");
-    expect(kForceQuitHoldMs >= 100 && kForceQuitHoldMs <= 300,
-           "force quit: hold is a human-length press (100-300 ms)");
-}
-
 }  // namespace
 
 int main() {
@@ -631,7 +585,6 @@ int main() {
     testWindowsPreset();
     testAltTab();
     testPresetSwitch();
-    testForceQuit();
     std::printf("keymap: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

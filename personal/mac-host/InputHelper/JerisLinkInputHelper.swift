@@ -1,6 +1,8 @@
 import Foundation
 import Darwin
 import CoreGraphics
+import ApplicationServices
+import AppKit
 
 /// Decides when the status file may be rewritten: on connect/disconnect
 /// (`force`) and otherwise at most once per `minInterval`. Pure, so the
@@ -122,6 +124,82 @@ enum MRI1Session {
     static let end: UInt8 = 0x51
 }
 
+/// MRI1 0x60 FORCE_QUIT_OPEN: open the Force Quit Applications window.
+/// A synthetic Command+Option+Escape reaches loginwindow but does not open it
+/// (JerisLink hand tests r1/r2, 2026-11-17), so this presses
+/// Apple menu > Force Quit through Accessibility: first in the frontmost app,
+/// then in Finder. Never quits anything itself.
+enum ForceQuitMenu {
+    static let type: UInt8 = 0x60
+    private static let escapeKey = 53          // kVK_Escape
+    private static let escapeGlyph = 27        // kMenuEscapeGlyph
+    private static let optionOnly = 2          // kAXMenuItemModifierOption, Command implied
+
+    /// True for the Command+Option+Escape menu shortcut. Pure for the self-test.
+    static func isForceQuitShortcut(cmdChar: String?, virtualKey: Int?, glyph: Int?, modifiers: Int?) -> Bool {
+        guard modifiers == optionOnly else { return false }
+        return virtualKey == escapeKey || glyph == escapeGlyph || cmdChar == "\u{1b}"
+    }
+
+    private static func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value
+    }
+
+    private static func children(_ element: AXUIElement) -> [AXUIElement] {
+        attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    }
+
+    private static func int(_ element: AXUIElement, _ name: String) -> Int? {
+        (attribute(element, name) as? NSNumber)?.intValue
+    }
+
+    /// Presses the Force Quit item of `pid`'s Apple menu. Returns a log word.
+    private static func press(pid: pid_t) -> String {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        guard let barObj = attribute(app, kAXMenuBarAttribute) else { return "no_menubar" }
+        let bar = barObj as! AXUIElement
+        guard let appleItem = children(bar).first, let appleMenu = children(appleItem).first else { return "no_apple_menu" }
+        for item in children(appleMenu) {
+            let match = isForceQuitShortcut(cmdChar: attribute(item, kAXMenuItemCmdCharAttribute) as? String,
+                                            virtualKey: int(item, kAXMenuItemCmdVirtualKeyAttribute),
+                                            glyph: int(item, kAXMenuItemCmdGlyphAttribute),
+                                            modifiers: int(item, kAXMenuItemCmdModifiersAttribute))
+            guard match else { continue }
+            let err = AXUIElementPerformAction(item, kAXPressAction as CFString)
+            return err == .success ? "pressed" : "press_error_\(err.rawValue)"
+        }
+        return "no_item"
+    }
+
+    /// Frontmost app first (its menu bar is the one on screen), then Finder,
+    /// which is always running and answers when the front app hangs.
+    static func open() -> String {
+        guard AXIsProcessTrusted() else { return "ax_untrusted" }
+        var tried: [String] = []
+        // Asked of Accessibility, not NSWorkspace: the helper runs no AppKit
+        // run loop, so NSWorkspace's frontmost app could be stale.
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, 0.5)
+        var frontPid: pid_t = 0
+        if let focused = attribute(systemWide, kAXFocusedApplicationAttribute),
+           AXUIElementGetPid(focused as! AXUIElement, &frontPid) == .success, frontPid > 0 {
+            let r = press(pid: frontPid)
+            if r == "pressed" { return "pressed via=front" }
+            tried.append("front=\(r)")
+        }
+        if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
+           finder.processIdentifier != frontPid {
+            let r = press(pid: finder.processIdentifier)
+            if r == "pressed" { return "pressed via=finder " + tried.joined(separator: " ") }
+            tried.append("finder=\(r)")
+        }
+        return "failed " + tried.joined(separator: " ")
+    }
+}
+
 final class InputHelper {
     private let host = "127.0.0.1"
     private let port: UInt16 = 38410
@@ -160,14 +238,23 @@ final class InputHelper {
     /// Receives one line per injected button (see ButtonLog); debug mode only.
     private let log: (String) -> Void
     private let debug: Bool
+    private let openForceQuit: () -> Void
+    private(set) var forceQuitRequests: UInt64 = 0
 
     init(preflight: @escaping () -> Bool = { CGPreflightPostEventAccess() },
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          mouseLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
          statusURL: URL? = statusDirURL.appendingPathComponent("input-helper-status.txt"),
          log: @escaping (String) -> Void = { ButtonLog.writeStderr($0) },
-         debug: Bool = DebugMode.current) {
+         debug: Bool = DebugMode.current,
+         openForceQuit: @escaping () -> Void = {
+             // Off the socket thread: each Accessibility call may wait up to 0.5 s.
+             DispatchQueue.global(qos: .userInitiated).async {
+                 FileHandle.standardError.write(Data("force_quit=\(ForceQuitMenu.open())\n".utf8))
+             }
+         }) {
         self.debug = debug
+        self.openForceQuit = openForceQuit
         self.preflight = preflight
         self.postEvent = postEvent
         self.mouseLocation = mouseLocation
@@ -491,6 +578,11 @@ final class InputHelper {
             let nx = UInt16(p[0]) << 8 | UInt16(p[1])
             let ny = UInt16(p[2]) << 8 | UInt16(p[3])
             postMouseMoveNormalized(nx: nx, ny: ny)
+        case ForceQuitMenu.type:
+            // Only for a live viewer session, like every other input message.
+            guard p.isEmpty, !activeSessions.isEmpty else { return nil }
+            forceQuitRequests += 1
+            openForceQuit()
         default:
             break
         }
@@ -750,6 +842,30 @@ func inputHelperSelfTest() -> Bool {
           "debug off: all six button events still posted (got \(qPosted.count))")
     check(qLog.isEmpty, "debug off: no button log lines (got \(qLog.count))")
     print("input helper debug mode: \(DebugMode.current ? "on" : "off")")
+
+    // MRI1 0x60 FORCE_QUIT_OPEN: shortcut matcher and session gating.
+    check(ForceQuitMenu.isForceQuitShortcut(cmdChar: "\u{1b}", virtualKey: nil, glyph: nil, modifiers: 2), "Cmd+Opt+Esc by char")
+    check(ForceQuitMenu.isForceQuitShortcut(cmdChar: nil, virtualKey: 53, glyph: nil, modifiers: 2), "Cmd+Opt+Esc by virtual key")
+    check(ForceQuitMenu.isForceQuitShortcut(cmdChar: nil, virtualKey: nil, glyph: 27, modifiers: 2), "Cmd+Opt+Esc by glyph")
+    check(!ForceQuitMenu.isForceQuitShortcut(cmdChar: "\u{1b}", virtualKey: 53, glyph: 27, modifiers: 0), "Cmd+Esc is not Force Quit")
+    check(!ForceQuitMenu.isForceQuitShortcut(cmdChar: "\u{1b}", virtualKey: 53, glyph: 27, modifiers: 3), "Shift+Cmd+Opt+Esc is not Force Quit")
+    check(!ForceQuitMenu.isForceQuitShortcut(cmdChar: "Q", virtualKey: 12, glyph: nil, modifiers: 2), "Cmd+Opt+Q is not Force Quit")
+    check(!ForceQuitMenu.isForceQuitShortcut(cmdChar: nil, virtualKey: nil, glyph: nil, modifiers: nil), "item without shortcut")
+    var fqOpens = 0
+    var fqPosted: [CGEvent] = []
+    let fq = InputHelper(preflight: { true }, postEvent: { fqPosted.append($0) },
+                         mouseLocation: { CGPoint(x: 10, y: 10) }, statusURL: nil,
+                         openForceQuit: { fqOpens += 1 })
+    _ = fq.handle(type: ForceQuitMenu.type, payload: [])
+    check(fqOpens == 0, "FORCE_QUIT_OPEN without a session is ignored")
+    _ = fq.handle(type: MRI1Session.start, payload: sid(9))
+    _ = fq.handle(type: ForceQuitMenu.type, payload: [1])
+    check(fqOpens == 0, "FORCE_QUIT_OPEN with a payload is ignored")
+    _ = fq.handle(type: ForceQuitMenu.type, payload: [])
+    check(fqOpens == 1 && fq.forceQuitRequests == 1 && fqPosted.isEmpty, "FORCE_QUIT_OPEN in a session opens once, posts no events")
+    _ = fq.handle(type: MRI1Session.end, payload: sid(9))
+    _ = fq.handle(type: ForceQuitMenu.type, payload: [])
+    check(fqOpens == 1, "FORCE_QUIT_OPEN after the session ends is ignored")
 
     print(ok ? "input helper self-test: ok" : "input helper self-test: FAILED")
     return ok

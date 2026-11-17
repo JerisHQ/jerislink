@@ -90,6 +90,13 @@ public:
         return sendPacketRetry(0x22, p);
     }
 
+    // FORCE_QUIT_OPEN, empty payload: the host opens the Mac's Force Quit
+    // Applications window (Apple menu > Force Quit, through Accessibility).
+    static constexpr uint8_t kForceQuitOpenType = 0x60;
+    bool sendForceQuitOpen() {
+        return sendPacketRetry(kForceQuitOpenType, {});
+    }
+
     void setIoTimeoutMs(DWORD timeoutMs) {
         ioTimeoutMs_ = timeoutMs ? timeoutMs : 1;
         if (s_ != INVALID_SOCKET) {

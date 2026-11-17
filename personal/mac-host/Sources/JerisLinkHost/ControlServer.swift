@@ -391,6 +391,8 @@ final class ControlServer: @unchecked Sendable {
                     let ny = UInt16(payload[2]) << 8 | UInt16(payload[3])
                     handleMouseMoveNormalized(nx: nx, ny: ny)
                 }
+            case 0x60: // FORCE_QUIT_OPEN, empty payload
+                if payload.isEmpty { handleForceQuitOpen() }
             default:
                 print("Control unknown type=\(type) len=\(length)")
             }
@@ -399,7 +401,7 @@ final class ControlServer: @unchecked Sendable {
 
     private static func isInputMessage(_ type: UInt8) -> Bool {
         switch type {
-        case 0x10, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25: return true
+        case 0x10, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x60: return true
         default: return false
         }
     }
@@ -882,6 +884,16 @@ final class ControlServer: @unchecked Sendable {
         if !helper.sendMouseButtonExtended(button: button, down: down, clickCount: clickCount) {
             warnSendFailed("extended mouse-button")
         }
+    }
+
+    /// The viewer's Force Quit button. A synthetic Command+Option+Escape
+    /// reaches loginwindow but does not open the window, so the helper presses
+    /// Apple menu > Force Quit through Accessibility instead.
+    private func handleForceQuitOpen() {
+        guard injectRequested, let helper = inputHelper else { return }
+        let ok = helper.sendForceQuitOpen()
+        print("control.force_quit=requested ok=\(ok)")
+        if !ok { warnSendFailed("force-quit") }
     }
 
     private func handleScroll(dx: Int16, dy: Int16) {

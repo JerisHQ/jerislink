@@ -690,22 +690,7 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
-// Overlay Force Quit holds Command+Option+Escape down on the Mac for
-// keymap::kForceQuitHoldMs (see forceQuitMac). While that hold runs, the
-// release half is pending; any release of the remote modifiers sends it first.
-static constexpr UINT_PTR kForceQuitTimer = 0x4A4E;
-static bool gForceQuitPending = false;
-
-static void forceQuitFinish() {
-    if (!gForceQuitPending) return;
-    gForceQuitPending = false;
-    if (gViewerHwnd) KillTimer(gViewerHwnd, kForceQuitTimer);
-    if (!gControl) return;
-    for (const auto& e : jl::keymap::forceQuitRelease()) gControl->sendKey(e.down, e.semantic);
-}
-
 static void releaseRemoteModifiers() {
-    forceQuitFinish();
     gPasteGate.modifiersReleased();
     if (!gControl) return;
     for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
@@ -2267,25 +2252,21 @@ static void requestDisconnect(const char* source) {
 
 static void filePanelToggle(const char* source);  // F4, below
 
-// Overlay Force Quit: Command+Option+Escape to the Mac, which opens its
-// Force Quit Applications window. Uses the normal key path (MRC1 0x10), no
-// wire or host change. Every remote modifier is released before and after
-// (keymap::forceQuitPress/Release), and the local shortcut state is reset
-// like on focus loss, so no modifier stays held on either side. The keys are
-// held for kForceQuitHoldMs on a one-shot timer: a zero-length press reaches
-// loginwindow but does not open the window. Disconnect, focus loss and every
-// other remote-modifier release send the pending release at once. Keys are
-// not logged; overlay.action item=force_quit records that the button was used.
+// Overlay Force Quit: asks the Mac host to open its Force Quit Applications
+// window (MRC1 0x60 FORCE_QUIT_OPEN). A synthetic Command+Option+Escape does
+// not work: the Mac log showed WindowServer handing loginwindow the hot key,
+// held or not, and loginwindow never opening the window (hand tests r1/r2,
+// 2026-11-17). The host presses Apple menu > Force Quit through
+// Accessibility instead. Every remote modifier is released first and the
+// local shortcut state is reset like on focus loss, so nothing stays held on
+// either side. A host without 0x60 logs it as unknown and does nothing.
+// overlay.action item=force_quit records that the button was used.
 static void forceQuitMac() {
-    forceQuitFinish();  // a second click inside the hold ends the first press
     gKeys.reset();
     gPasteGate.modifiersReleased();
     if (!gControl) return;
-    for (const auto& e : jl::keymap::forceQuitPress()) gControl->sendKey(e.down, e.semantic);
-    gForceQuitPending = true;
-    if (!gViewerHwnd || !SetTimer(gViewerHwnd, kForceQuitTimer, jl::keymap::kForceQuitHoldMs, nullptr)) {
-        forceQuitFinish();  // no timer: release now rather than leave keys held
-    }
+    for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
+    gControl->sendForceQuitOpen();
 }
 
 static void overlayActivate(ov::Item item, const char* source) {
@@ -3914,10 +3895,6 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         if (wParam == kOverlayHoverTimer) {
             overlayHoverTick();
-            return 0;
-        }
-        if (wParam == kForceQuitTimer) {
-            forceQuitFinish();  // one-shot: kills its own timer
             return 0;
         }
         break;
