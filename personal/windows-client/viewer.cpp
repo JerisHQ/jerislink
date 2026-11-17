@@ -2901,6 +2901,12 @@ static void fileChipTick() {
     if (gChipMode == ChipMode::Notice && gFileChip) fileUiReposition();
     if (fileConfirmVisible()) InvalidateRect(gFileConfirm, nullptr, FALSE);
     if (gChipHideAtMs > 0.0 && steadyMsNow() >= gChipHideAtMs) fileChipHide();
+    // Belt and braces for the guard in FileChipWndProc: a Hidden chip that
+    // is on screen anyway goes away within one tick.
+    if (gChipMode == ChipMode::Hidden && gFileChip && IsWindowVisible(gFileChip)) {
+        ShowWindow(gFileChip, SW_HIDE);
+        logLine("file.chip_stray_hidden");
+    }
 }
 
 static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2908,6 +2914,19 @@ static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     switch (msg) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+    case WM_WINDOWPOSCHANGING: {
+        // F5b r3 (hand test: an empty chip stayed under the Mac menu bar).
+        // The chip is owned by the viewer, so Windows itself shows it again
+        // when the viewer is restored (SW_PARENTOPENING), even after
+        // fileChipHide(); with no transfer its label is "". Nothing may
+        // show it while it is Hidden: fileChipShow() sets the mode first.
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (gChipMode == ChipMode::Hidden && (wp->flags & SWP_SHOWWINDOW)) {
+            wp->flags &= ~UINT(SWP_SHOWWINDOW);
+            logLine("file.chip_show_blocked");
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:

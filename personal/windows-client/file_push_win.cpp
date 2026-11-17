@@ -61,6 +61,11 @@ public:
             if (h != INVALID_HANDLE_VALUE) {
                 file_ = h;
                 part_ = part;
+                // Mark of the Web goes on the partial file first: the stream
+                // moves with the rename, so the file never has its final name
+                // without it (a scanner opening a new .exe right after the
+                // rename can no longer make the mark fail). commit() checks.
+                filepull::writeInternetZone(longPath(part));
                 return true;
             }
             if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
@@ -93,7 +98,7 @@ public:
             const std::wstring target = folder_ + L"\\" + leaf;
             if (MoveFileExW(longPath(part_).c_str(), longPath(target).c_str(), MOVEFILE_WRITE_THROUGH)) {
                 part_.clear();
-                filepull::writeInternetZone(longPath(target));
+                ensureZone(longPath(target));
                 return true;
             }
             const DWORD e = GetLastError();
@@ -114,7 +119,24 @@ public:
         if (open_) open_(folder_);
     }
 
+    ZoneCounts zoneCounts() const override { return zone_; }
+
 private:
+    // The file must carry ZoneId=3 (Q1). Normally it came with the rename;
+    // otherwise write it, retrying for about a second while something
+    // (Defender scanning a new .exe) holds the file.
+    void ensureZone(const std::wstring& path) {
+        for (int i = 0; i < 20; ++i) {
+            if (filepull::readZoneId(path) == 3) {
+                ++zone_.marked;
+                return;
+            }
+            if (filepull::writeInternetZone(path) == filepull::ZoneWrite::Written) continue;
+            Sleep(50);
+        }
+        ++zone_.failed;
+    }
+
     bool dropPart() {
         if (!part_.empty()) DeleteFileW(longPath(part_).c_str());
         part_.clear();
@@ -126,6 +148,7 @@ private:
     std::wstring name_;
     std::wstring part_;
     HANDLE file_ = INVALID_HANDLE_VALUE;
+    ZoneCounts zone_;
 };
 
 }  // namespace

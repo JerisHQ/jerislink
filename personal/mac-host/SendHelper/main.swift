@@ -38,8 +38,7 @@ enum SendHelper {
             let leaf = (p as NSString).lastPathComponent.precomposedStringWithCanonicalMapping
             let fd = open(p, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else {
-                return fail(errno == ELOOP ? "\u{201C}\(leaf)\u{201D} is a link. Send the original file instead."
-                                           : "Couldn't read \u{201C}\(leaf)\u{201D}.")
+                return fail(openFailure(errno, leaf))
             }
             guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
                 close(fd)
@@ -48,6 +47,19 @@ enum SendHelper {
             out.append((Array(leaf.utf8), fd))
         }
         return .files(out)
+    }
+
+    /// The alert when a selected file can't be opened. EPERM/EACCES is
+    /// macOS privacy: the first send from Desktop, Documents, Downloads or
+    /// an external or network volume asks once per place (Files and
+    /// Folders); a "Don't Allow" there ends here.
+    static func openFailure(_ err: Int32, _ leaf: String) -> String {
+        switch err {
+        case ELOOP: return "\u{201C}\(leaf)\u{201D} is a link. Send the original file instead."
+        case EPERM, EACCES:
+            return "JerisLink Send isn't allowed to read \u{201C}\(leaf)\u{201D}. Allow it in System Settings > Privacy & Security > Files and Folders > JerisLink Send, then try again."
+        default: return "Couldn't read \u{201C}\(leaf)\u{201D}."
+        }
     }
 
     /// The alert for an agent reply; nil for ok.
@@ -116,6 +128,10 @@ enum SendHelper {
             expect(f.count == 1 && f[0].name == Array("Caf\u{00E9}.txt".utf8) && f[0].fd >= 0, "file opened, name NFC")
             f.forEach { close($0.fd) }
         } else { expect(false, "file opened") }
+        expect(openFailure(EPERM, "a.txt").contains("Files and Folders") && openFailure(EACCES, "a.txt").contains("Files and Folders"),
+               "privacy refusal points to Files and Folders")
+        expect(openFailure(ELOOP, "a.txt").contains("is a link") && openFailure(EIO, "a.txt").hasPrefix("Couldn"),
+               "link and other errors keep their messages")
         expect(message(for: "ok") == nil, "ok shows nothing")
         for r in SendWire.Reply.allCases where r != .ok {
             expect(message(for: r.rawValue) != nil, "\(r.rawValue) shows an alert")

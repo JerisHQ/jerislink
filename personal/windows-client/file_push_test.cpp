@@ -450,6 +450,38 @@ void realFolder() {
         expect(GetFileAttributesW((dir + L"\\broken.bin").c_str()) == INVALID_FILE_ATTRIBUTES && countParts(dir) == 0,
                "folder: bad file not named, .jlpart removed");
     }
+    // F5b r3 (hand test item 6): an .exe gets the mark too, and the
+    // receiver counts it for the log.
+    {
+        PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
+        auto exe = makePush(50, {{"setup.exe", 4096}, {"tool.exe", 0}});
+        offerAll(r, exe);
+        PushReceiver::Out last;
+        std::vector<uint64_t> sent(exe.contents.size(), 0);
+        while (auto q = r.nextRequest()) {
+            const auto& c = exe.contents[q->index];
+            const uint64_t end = std::min<uint64_t>(c.size(), q->offset + q->length);
+            if (end > sent[q->index]) {
+                last = r.onData({50, q->index, sent[q->index],
+                                 std::vector<uint8_t>(c.begin() + std::ptrdiff_t(sent[q->index]),
+                                                      c.begin() + std::ptrdiff_t(end))});
+                if (!last.empty()) break;
+                sent[q->index] = end;
+            }
+            if (sent[q->index] == c.size()) {
+                auto d = fpull::sha256Digest()();
+                d->update(c.data(), c.size());
+                last = r.onFileEnd({50, q->index, d->finish()});
+                if (!last.empty()) break;
+            }
+        }
+        const auto* res = only<file::Result>(last);
+        expect(res && res->status == file::status::kOk && res->filesOk == 2, "folder: .exe push done");
+        expect(fpull::readZoneId(dir + L"\\setup.exe") == 3 && fpull::readZoneId(dir + L"\\tool.exe") == 3,
+               "folder: pushed .exe files carry ZoneId=3");
+        const auto z = r.zoneCounts();
+        expect(z.marked == 2 && z.failed == 0, "folder: zone counts marked=2 failed=0");
+    }
     // Disconnect mid-file removes the partial file.
     {
         PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
@@ -458,6 +490,9 @@ void realFolder() {
         r.nextRequest();
         r.onData({48, 0, 0, std::vector<uint8_t>(half.contents[0].begin(), half.contents[0].begin() + 1000)});
         expect(countParts(dir) == 1, "folder: .jlpart while receiving");
+        // F5b r3: the mark is on the partial file already, while the
+        // receiver still holds it open, so it moves with the rename.
+        expect(fpull::readZoneId(dir + L"\\half.bin.jlpart") == 3, "folder: .jlpart carries ZoneId=3 while receiving");
         r.disconnect();
         expect(countParts(dir) == 0 && GetFileAttributesW((dir + L"\\half.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
                "folder: disconnect removes the .jlpart");

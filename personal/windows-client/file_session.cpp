@@ -930,8 +930,12 @@ void FileSession::pushEnded() {
     const char* how = p.last == jl::filepush::Outcome::Done        ? "done"
                       : p.last == jl::filepush::Outcome::Cancelled ? "cancelled"
                                                                     : "failed";
+    // Mark of the Web totals for this session: zone_failed>0 means a file
+    // in Downloads\JerisLink has no ZoneId=3.
+    const auto z = push_->zoneCounts();
     log(std::string("file.push=") + how + " files=" + std::to_string(p.lastFiles) +
-        (p.last == jl::filepush::Outcome::Done ? "" : " reason=" + push_->lastReason()));
+        (p.last == jl::filepush::Outcome::Done ? "" : " reason=" + push_->lastReason()) +
+        " zone_marked=" + std::to_string(z.marked) + " zone_failed=" + std::to_string(z.failed));
     if (pullNotice_) {
         pullNotice_(p.last == jl::filepush::Outcome::Done        ? PullNotice::PushDone
                     : p.last == jl::filepush::Outcome::Cancelled ? PullNotice::PushCancelled

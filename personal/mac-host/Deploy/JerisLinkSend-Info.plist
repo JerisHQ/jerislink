@@ -26,8 +26,18 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from your Desktop to copy them to your PC.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from Documents to copy them to your PC.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from Downloads to copy them to your PC.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>JerisLink Send reads the files you send from a network volume to copy them to your PC.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>JerisLink Send reads the files you send from an external drive to copy them to your PC.</string>
 	<key>NSServices</key>
 	<array>
 		<dict>

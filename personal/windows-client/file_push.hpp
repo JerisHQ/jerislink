@@ -51,6 +51,13 @@ public:
     virtual void abort() = 0;
     // Every file arrived: show the folder.
     virtual void finished(uint32_t files) = 0;
+    // Mark of the Web on committed files, for the log: files that carry
+    // ZoneId=3 and files that ended up without it.
+    struct ZoneCounts {
+        uint32_t marked = 0;
+        uint32_t failed = 0;
+    };
+    virtual ZoneCounts zoneCounts() const { return {}; }
 };
 
 enum class Outcome { None, Done, Failed, Cancelled };
@@ -115,6 +122,12 @@ public:
             p.received = received_;
         }
         return p;
+    }
+
+    // Mark of the Web results since the receiver was made.
+    Sink::ZoneCounts zoneCounts() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return sink_->zoneCounts();
     }
 
     // Why the last push was refused or failed, for the log ("" if none).
@@ -346,9 +359,10 @@ private:
 // Writes into `folder` (normally %USERPROFILE%\Downloads\JerisLink, see
 // downloadsFolder()). Partial files are "<name>.<n>.jlpart", created with
 // CREATE_NEW; a verified file is moved to "<name>" with no overwrite, and on
-// a clash to "name (2).ext", "name (3).ext" ... (up to 999). Then it gets
-// Zone.Identifier ZoneId=3 (an existing one is kept). `open` shows the folder
-// in Explorer when a push finished (tests pass a no-op).
+// a clash to "name (2).ext", "name (3).ext" ... (up to 999). Zone.Identifier
+// ZoneId=3 is written on the partial file and moves with the rename; after
+// the rename it is checked and, if missing, written again (zoneCounts()).
+// `open` shows the folder in Explorer when a push finished (tests pass a no-op).
 std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open);
 
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
