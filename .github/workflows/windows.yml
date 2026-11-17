@@ -185,6 +185,11 @@ jobs:
       - name: Paste Mark of the Web test (Zone.Identifier helpers, shell paste of mapped names, ZoneId=3 on delivered files)
         timeout-minutes: 3
         run: build\Release\JerislinkFileZoneTest.exe
+      - name: Build Mac push test
+        run: cmake --build build --config Release --target JerislinkFilePushTest
+      - name: Mac push test (files only, 1000 max, request window, hash before naming, busy, cancel, disconnect, name (2).ext, ZoneId=3, no .jlpart left)
+        timeout-minutes: 3
+        run: build\Release\JerislinkFilePushTest.exe
       - name: No always-on shortcut or key log lines in the viewer
         shell: pwsh
         run: |

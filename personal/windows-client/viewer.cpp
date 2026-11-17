@@ -24,6 +24,7 @@
 #include "file_session.hpp"
 #include "hardware_video_pipeline.hpp"
 #include "resource.h"
+#include "version.h"
 #include "viewer_options.hpp"
 #include "video_receiver.hpp"
 #include "abr.hpp"
@@ -1105,7 +1106,9 @@ static TextRole textRole(int id) {
     case IDC_UI_HINT_VOLUME:
     case IDC_UI_HINT_KEYBOARD:
     case IDC_BIND_HINT: return TextRole::Hint;
-    case IDC_APPLY_NOTE: return TextRole::Note;
+    case IDC_APPLY_NOTE:
+    case IDC_LAUNCH_BUILD:
+    case IDC_INFO_BUILD: return TextRole::Note;
     default: return TextRole::Other;
     }
 }
@@ -2025,6 +2028,7 @@ static INT_PTR CALLBACK InfoDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
     case WM_INITDIALOG:
         initThemedDialog(dlg, 13, kInfoFooterTop);
+        SetDlgItemTextW(dlg, IDC_INFO_BUILD, L"Build " JERISLINK_BUILD_ID_WSTR);
         fillConnectionInfo(dlg);
         placeVolumeWindow(dlg, reinterpret_cast<HWND>(lParam));
         SetTimer(dlg, kInfoRefreshTimer, 1000, nullptr);
@@ -2685,7 +2689,8 @@ namespace fu = jl::fileup;
 
 // Notice: a one-line message about a Mac copy pasted here (F3 r2), shown
 // even when Explorer covers the viewer.
-enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled, Notice };
+// Receiving: a Finder "Send to JerisLink" push into Downloads\JerisLink (F5b).
+enum class ChipMode { Hidden, Running, Pasted, Ready, Failed, Cancelled, Notice, Receiving };
 static HWND gFileChip = nullptr;
 static ChipMode gChipMode = ChipMode::Hidden;
 static double gChipHideAtMs = 0.0;
@@ -2719,7 +2724,7 @@ static FileSession::UploadProgress currentUpload() {
 
 static bool fileTransferRunning() {
     return gFileUiSample || (gFileSession && gFileSession->uploadRunning()) ||
-           (gFilePullSession && gFilePullSession->pullRunning());
+           (gFilePullSession && (gFilePullSession->pullRunning() || gFilePullSession->pushRunning()));
 }
 
 static uint32_t readFileTransferMaxMbps() {
@@ -2779,7 +2784,7 @@ static ChipLayout chipLayout(UINT dpi) {
     ChipLayout l;
     l.width = s(gChipMode == ChipMode::Notice ? 500 : 360);
     l.height = s(36);
-    const bool cancel = gChipMode == ChipMode::Running;
+    const bool cancel = gChipMode == ChipMode::Running || gChipMode == ChipMode::Receiving;
     l.cancel = cancel ? RECT{l.width - s(84), s(5), l.width - s(6), l.height - s(5)} : RECT{0, 0, 0, 0};
     l.text = RECT{s(12), 0, cancel ? l.cancel.left - s(8) : l.width - s(12), l.height};
     return l;
@@ -2797,6 +2802,10 @@ static std::wstring chipLabel() {
     case ChipMode::Failed: return L"Paste to the Mac failed";
     case ChipMode::Cancelled: return L"Upload cancelled";
     case ChipMode::Notice: return gChipNotice;
+    case ChipMode::Receiving: {
+        const auto q = gFilePullSession ? gFilePullSession->pushProgress() : jl::filepush::Progress{};
+        return utf8ToWide(fu::chipTextReceive(q.files, q.received, q.total));
+    }
     default: return L"";
     }
 }
@@ -2868,7 +2877,7 @@ static void paintFileChip(HWND hwnd) {
     const COLORREF fg =
         gChipMode == ChipMode::Failed || (gChipMode == ChipMode::Notice && gChipNoticeError) ? c::kError : c::kText;
     overlayText(dc, chipLabel(), l.text, gOverlayTheme.label, fg, DT_LEFT | DT_VCENTER);
-    if (gChipMode == ChipMode::Running) {
+    if (gChipMode == ChipMode::Running || gChipMode == ChipMode::Receiving) {
         jl::ui::roundRect(dc, l.cancel, ov::scale(8, dpi), gChipCancelHot ? c::kSecondaryDown : c::kSecondary,
                           c::kBorder, 1);
         overlayText(dc, L"Cancel", l.cancel, gOverlayTheme.text, c::kText, DT_CENTER | DT_VCENTER);
@@ -2890,11 +2899,18 @@ static void fileChipHide() {
 static void fileConfirmHide();
 
 static void fileChipTick() {
-    if (gChipMode == ChipMode::Running && gFileChip) InvalidateRect(gFileChip, nullptr, FALSE);
+    if ((gChipMode == ChipMode::Running || gChipMode == ChipMode::Receiving) && gFileChip)
+        InvalidateRect(gFileChip, nullptr, FALSE);
     // A notice follows the viewer coming to the front or going behind.
     if (gChipMode == ChipMode::Notice && gFileChip) fileUiReposition();
     if (fileConfirmVisible()) InvalidateRect(gFileConfirm, nullptr, FALSE);
     if (gChipHideAtMs > 0.0 && steadyMsNow() >= gChipHideAtMs) fileChipHide();
+    // Belt and braces for the guard in FileChipWndProc: a Hidden chip that
+    // is on screen anyway goes away within one tick.
+    if (gChipMode == ChipMode::Hidden && gFileChip && IsWindowVisible(gFileChip)) {
+        ShowWindow(gFileChip, SW_HIDE);
+        logLine("file.chip_stray_hidden");
+    }
 }
 
 static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2902,6 +2918,19 @@ static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     switch (msg) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+    case WM_WINDOWPOSCHANGING: {
+        // F5b r3 (hand test: an empty chip stayed under the Mac menu bar).
+        // The chip is owned by the viewer, so Windows itself shows it again
+        // when the viewer is restored (SW_PARENTOPENING), even after
+        // fileChipHide(); with no transfer its label is "". Nothing may
+        // show it while it is Hidden: fileChipShow() sets the mode first.
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (gChipMode == ChipMode::Hidden && (wp->flags & SWP_SHOWWINDOW)) {
+            wp->flags &= ~UINT(SWP_SHOWWINDOW);
+            logLine("file.chip_show_blocked");
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
@@ -2912,7 +2941,7 @@ static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         return 0;
     case WM_MOUSEMOVE: {
         const ChipLayout l = chipLayout(fileUiDpi());
-        const bool hot = gChipMode == ChipMode::Running && PtInRect(&l.cancel, pt);
+        const bool hot = (gChipMode == ChipMode::Running || gChipMode == ChipMode::Receiving) && PtInRect(&l.cancel, pt);
         if (hot != gChipCancelHot) {
             gChipCancelHot = hot;
             if (hot) {
@@ -2932,7 +2961,10 @@ static LRESULT CALLBACK FileChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (gChipMode == ChipMode::Running && PtInRect(&l.cancel, pt) && gFileSession) {
             gFileSession->cancelUpload();
             logLine("file.upload_cancel source=chip");
-        } else if (gChipMode == ChipMode::Running && PtInRect(&l.text, pt)) {
+        } else if (gChipMode == ChipMode::Receiving && PtInRect(&l.cancel, pt) && gFilePullSession) {
+            gFilePullSession->cancelPush();
+            logLine("file.push_cancel source=chip");
+        } else if ((gChipMode == ChipMode::Running || gChipMode == ChipMode::Receiving) && PtInRect(&l.text, pt)) {
             filePanelToggle("chip");  // F4: the chip opens the Files panel
         }
         return 0;
@@ -2986,11 +3018,42 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     InvalidateRect(gFileChip, nullptr, FALSE);
 }
 
+// F5b: a Finder "Send to JerisLink" push started or ended. An upload's
+// chip keeps the chip; the Files panel still shows the push.
+static void onFilePushNotice(FileSession::PullNotice kind) {
+    using N = FileSession::PullNotice;
+    if (gChipMode == ChipMode::Running || !gFilePullSession) return;
+    const auto q = gFilePullSession->pushProgress();
+    switch (kind) {
+    case N::PushStarted:
+        fileChipShow(ChipMode::Receiving, 0);
+        return;
+    case N::PushDone:
+        gChipNotice = utf8ToWide(fu::receivedText(q.lastFiles));
+        gChipNoticeError = false;
+        break;
+    case N::PushCancelled:
+        gChipNotice = L"Receiving from the Mac cancelled";
+        gChipNoticeError = false;
+        break;
+    case N::PushFailed:
+        gChipNotice = L"Receiving from the Mac failed \x2014 send again from Finder";
+        gChipNoticeError = true;
+        break;
+    default: return;
+    }
+    fileChipShow(ChipMode::Notice, kind == N::PushFailed ? 8000 : 5000);
+}
+
 // The pull session saw something about a Mac copy the user must know (F3 r2).
 static void onFilePullNotice(WPARAM kind) {
     using N = FileSession::PullNotice;
     if (static_cast<N>(kind) == N::PasteBusy) {
         pasteRefusedFinder();  // shown over a running upload's chip, like a refused file paste
+        return;
+    }
+    if (static_cast<N>(kind) >= N::PushStarted) {
+        onFilePushNotice(static_cast<N>(kind));
         return;
     }
     // An upload's own chip wins; its result follows shortly anyway.
@@ -3065,8 +3128,10 @@ static void paintFileConfirm(HWND hwnd) {
     overlayText(dc, utf8ToWide(fu::confirmTitle()), l.title, t.label, c::kText, DT_LEFT | DT_VCENTER);
     const auto p = currentUpload();
     // Explorer pasting Mac files into this PC, with no upload running (F3).
-    const bool pulling = !(gFileSession && gFileSession->uploadRunning()) && gFilePullSession &&
-                         gFilePullSession->pullRunning();
+    const bool uploading = gFileSession && gFileSession->uploadRunning();
+    const bool pulling = !uploading && gFilePullSession && gFilePullSession->pullRunning();
+    // F5b: a Finder push is all that runs.
+    const bool pushing = !uploading && !pulling && gFilePullSession && gFilePullSession->pushRunning();
     {
         RECT body = l.body;
         HGDIOBJ old = SelectObject(dc, t.text);
@@ -3075,6 +3140,9 @@ static void paintFileConfirm(HWND hwnd) {
         if (pulling) {
             const auto q = gFilePullSession->pullProgress();
             bodyText = fu::confirmBodyPull(q.files > q.filesDone ? q.files - q.filesDone : 0, q.received, q.total);
+        } else if (pushing) {
+            const auto q = gFilePullSession->pushProgress();
+            bodyText = fu::confirmBodyPush(q.files > q.filesDone ? q.files - q.filesDone : 0, q.received, q.total);
         } else {
             const uint64_t left = p.files > p.filesDone ? p.files - p.filesDone : 0;
             bodyText = fu::confirmBody(left, p.committed, p.total);
@@ -3089,7 +3157,7 @@ static void paintFileConfirm(HWND hwnd) {
     overlayText(dc, L"Keep transferring", l.keep, t.text, c::kText, DT_CENTER | DT_VCENTER);
     jl::ui::roundRect(dc, l.disconnect, ov::scale(8, dpi), gConfirmHot == 1 ? c::kSecondaryDown : c::kSecondary,
                       c::kBorder, 1);
-    overlayText(dc, pulling ? L"Disconnect" : L"Disconnect and remove", l.disconnect, t.text, c::kError,
+    overlayText(dc, pulling || pushing ? L"Disconnect" : L"Disconnect and remove", l.disconnect, t.text, c::kError,
                 DT_CENTER | DT_VCENTER);
     // Keep shows as the default; the ring follows Tab.
     overlayFocusFrame(dc, focusKeep ? l.keep : l.disconnect, dpi);
@@ -3322,7 +3390,8 @@ static void paintFilePanel(HWND hwnd) {
         }
     };
     card(l.copyPaste, fp::guideHeading(), fp::copyPasteRows());
-    card(l.sendTo, fp::sendToHeading(), fp::sendToRows(gSendToSetup));
+    card(l.sendTo, fp::sendToHeading(),
+         fp::sendToRows(gSendToSetup, gFileUiSample || (gFilePullSession && gFilePullSession->hostPushes())));
     block(fp::tipLine(s.host), l.tip, t.smallText, s.host == fp::Host::Full ? c::kMuted : c::kError);
 
     // Progress: the running upload (with Cancel), else a running Mac paste.
@@ -3335,6 +3404,10 @@ static void paintFilePanel(HWND hwnd) {
     } else if (s.pullRunning) {
         const auto q = gFilePullSession->pullProgress();
         progress = "Pasting into this PC: " + fu::formatPair(q.received, q.total);
+        progressColor = c::kText;
+    } else if (gFilePullSession && gFilePullSession->pushRunning()) {
+        const auto q = gFilePullSession->pushProgress();
+        progress = fu::chipTextReceive(q.files, q.received, q.total) + " to Downloads\\JerisLink";
         progressColor = c::kText;
     }
     overlayText(dc, utf8ToWide(progress), toRECT(l.progress), t.label, progressColor, DT_LEFT | DT_VCENTER);
@@ -5333,6 +5406,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         if (ThemedDialog* td = themedDialog(dlg)) td->extraPaint = paintLaunchExtras;
         SetDlgItemTextW(dlg, IDC_LAUNCH_HERO, L"Your Mac,\r\nwithin reach.");
         SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  \u2192");
+        SetDlgItemTextW(dlg, IDC_LAUNCH_BUILD, JERISLINK_BUILD_ID_WSTR);
         HINSTANCE inst = GetModuleHandleW(nullptr);
         SendMessageW(dlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(LoadImageW(
             inst, MAKEINTRESOURCEW(IDI_JERISLINK), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
@@ -5417,7 +5491,8 @@ static INT_PTR runLaunchScreen(LaunchContext& ctx) {
 
 static int appMain(int argc, char** argv) {
     gLog.start(kLogPath, kHistoryLogPath);
-    logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
+    logLine(std::string("viewer.start version=" JERISLINK_VERSION_STR " build=" JERISLINK_GIT_SHA " pid=") +
+            std::to_string(GetCurrentProcessId()));
     loadUiAccent();
     gKeys.setPreset(loadKeyboardPreset());
     const std::vector<std::string> args = commandArgs(argc, argv);
@@ -6828,6 +6903,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         };
         cardFits(pl.copyPaste, fp::guideHeading(), fp::copyPasteRows(), "card1");
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::Installed), "card2_installed");
+        cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::Installed, true), "card2_mac_push");
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::NotInstalled), "card2_missing");
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::StorePackage), "card2_store");
         for (fp::Host h : {fp::Host::Full, fp::Host::PasteOnly, fp::Host::None, fp::Host::Unknown}) {

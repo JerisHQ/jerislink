@@ -243,6 +243,13 @@ void text() {
                "1 file(s) are still being pasted into this PC (70 KB of 4.0 GB). If you disconnect now, the paste "
                "stops and Explorer reports the unfinished files. Files that already finished are kept.",
            "confirm: Mac->Windows paste variant");
+    expect(chipTextReceive(20, 5000000, 70000000) == "\xE2\x86\x93 20 files from the Mac \xC2\xB7 5 / 70 MB",
+           "chip: F5b push from Finder");
+    expect(receivedText(1) == "Received 1 file in Downloads\\JerisLink", "chip: F5b push done");
+    expect(confirmBodyPush(2, 70000, 4000000000ull) ==
+               "2 file(s) from the Mac are still arriving in Downloads\\JerisLink (70 KB of 4.0 GB). If you "
+               "disconnect now, the unfinished file is removed. Files that already arrived are kept.",
+           "confirm: F5b push variant");
 }
 
 void confirmKeys() {

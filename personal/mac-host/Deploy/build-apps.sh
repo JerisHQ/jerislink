@@ -3,6 +3,7 @@
 #
 #   JerisLink.app/Contents/MacOS/JerisLinkHost                     video host, control service, launcher
 #   JerisLink.app/Contents/Helpers/JerisLink Input Helper.app      input injection helper (own bundle id)
+#   JerisLink.app/Contents/Library/Helpers/JerisLink Send.app      Finder Service "Send to JerisLink" (own bundle id)
 #   JerisLink.app/Contents/Library/LaunchAgents/*.plist            agents registered by the app (SMAppService)
 #
 # Signing, first match wins:
@@ -15,6 +16,7 @@ ROOT="${HERE:h}"
 OUT="${1:-$ROOT/.dist}"
 APP="$OUT/JerisLink.app"
 HELPER="$APP/Contents/Helpers/JerisLink Input Helper.app"
+SEND="$APP/Contents/Library/Helpers/JerisLink Send.app"
 ENTITLEMENTS="$HERE/JerisLink.entitlements"
 
 DEVELOPER_ID="${JERISLINK_DEVELOPER_ID:-}"
@@ -29,25 +31,34 @@ swift build -c release
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents" \
-         "$HELPER/Contents/MacOS" "$HELPER/Contents/Resources"
+         "$HELPER/Contents/MacOS" "$HELPER/Contents/Resources" \
+         "$SEND/Contents/MacOS" "$SEND/Contents/Resources"
 
 /usr/bin/swiftc -O -framework Foundation -framework CoreGraphics \
     InputHelper/JerisLinkInputHelper.swift -o "$HELPER/Contents/MacOS/JerisLinkInputHelper"
+# The Service helper shares the send socket wire with the host.
+/usr/bin/swiftc -O -framework AppKit \
+    SendHelper/main.swift Sources/JerisLinkHost/SendSocketWire.swift -o "$SEND/Contents/MacOS/JerisLinkSend"
 cp .build/release/JerisLinkHost "$APP/Contents/MacOS/JerisLinkHost"
 cp "$HERE/JerisLink-Info.plist" "$APP/Contents/Info.plist"
 cp "$HERE/JerisLinkInputHelper-Info.plist" "$HELPER/Contents/Info.plist"
+cp "$HERE/JerisLinkSend-Info.plist" "$SEND/Contents/Info.plist"
 cp Brand/JerisLink.icns "$APP/Contents/Resources/JerisLink.icns"
 cp Brand/JerisLink.icns "$HELPER/Contents/Resources/JerisLink.icns"
+cp Brand/JerisLink.icns "$SEND/Contents/Resources/JerisLink.icns"
 # libopus is BSD-3-Clause: its notice ships inside the app.
 cp ../third_party/opus/COPYING "$APP/Contents/Resources/COPYING-opus.txt"
 cp "$HERE"/LaunchAgents/*.plist "$APP/Contents/Library/LaunchAgents/"
 
 # Single source of the version: VERSION at the repository root.
 VERSION="$(head -n 1 "$ROOT/../../VERSION" | tr -d '[:space:]')"
-for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist"; do
+for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist" "$SEND/Contents/Info.plist"; do
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$plist"
 done
-for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist" "$APP"/Contents/Library/LaunchAgents/*.plist; do
+# Short git sha of this build, printed in the control log ("dev" without git).
+BUILD_SHA="$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
+/usr/libexec/PlistBuddy -c "Add :JLBuildSHA string $BUILD_SHA" "$APP/Contents/Info.plist"
+for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist" "$SEND/Contents/Info.plist" "$APP"/Contents/Library/LaunchAgents/*.plist; do
     /usr/bin/plutil -lint "$plist" >/dev/null
 done
 
@@ -77,12 +88,12 @@ else
     exit 1
 fi
 
-# Sign inside-out: nested helper app first, then the outer app. No --deep.
-for target in "$HELPER" "$APP"; do
+# Sign inside-out: nested helper apps first, then the outer app. No --deep.
+for target in "$HELPER" "$SEND" "$APP"; do
     /usr/bin/codesign --force --options runtime --entitlements "$ENTITLEMENTS" "${SIGN_ARGS[@]}" "$target"
 done
 /usr/bin/codesign --verify --strict --deep "$APP"
 
 echo "Built: $APP"
-echo "Version: $VERSION"
+echo "Version: $VERSION build $BUILD_SHA"
 echo "Signing: $SIGN_MODE"

@@ -142,6 +142,7 @@ enum ControlServiceSelfTest {
         failures += fileUploadEndToEnd(expect)
         failures += fileSendEndToEnd(expect)
         failures += fileAnnounceEndToEnd(expect)
+        failures += filePushEndToEnd(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
@@ -910,6 +911,183 @@ enum ControlServiceSelfTest {
         expect(server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)"),
                "announce e2e: stats (\(server.statsLine()))")
         return 0
+    }
+
+    /// F5b over real sockets: the send socket hands open files to the
+    /// newest file session, which pushes them (OFFER purpose=push) and
+    /// serves the viewer's REQUESTs. No session, an old viewer, a second
+    /// push, an untrusted peer, a bad name and a folder each get their answer.
+    private static func filePushEndToEnd(_ expect: (Bool, String) -> Void) -> Int {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("jl-push-e2e-\(getpid())", isDirectory: true)
+        let sockDir = "/tmp/jlps-\(getpid())"
+        defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(atPath: sockDir) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let body = FileAnnounceSelfTest.body(70_000, seed: 5)
+        let bigPath = root.appendingPathComponent("a.bin").path
+        let emptyPath = root.appendingPathComponent("empty.txt").path
+        FileManager.default.createFile(atPath: bigPath, contents: Data(body))
+        FileManager.default.createFile(atPath: emptyPath, contents: Data())
+
+        let broker = PushBroker()
+        let socket = SendSocketServer(path: sockDir + "/send.sock", broker: broker, peerCheck: { _ in true })
+        let refusing = SendSocketServer(path: sockDir + "/refuse.sock", broker: broker, peerCheck: { _ in false })
+        do { try socket.start(); try refusing.start() } catch {
+            expect(false, "push e2e: send sockets start (\(error.localizedDescription))")
+            return 0
+        }
+        defer { socket.stop(); refusing.stop() }
+        var st = stat()
+        expect(lstat(sockDir, &st) == 0 && (st.st_mode & 0o777) == 0o700, "push e2e: socket folder is 0700")
+        expect(lstat(socket.path, &st) == 0 && (st.st_mode & 0o777) == 0o600 && (st.st_mode & S_IFMT) == S_IFSOCK,
+               "push e2e: socket is 0600")
+
+        let sockPath = socket.path
+        func submit(_ paths: [String], names: [String]? = nil, path: String? = nil) -> String? {
+            pushSubmit(paths, names: names, path: path ?? sockPath)
+        }
+        final class Box: @unchecked Sendable { var reply: String?; let done = DispatchSemaphore(value: 0) }
+        func submitAsync(_ paths: [String]) -> Box {
+            let box = Box()
+            Thread.detachNewThread { box.reply = pushSubmit(paths, names: nil, path: sockPath); box.done.signal() }
+            return box
+        }
+
+        expect(submit([bigPath], path: refusing.path) == nil, "push e2e: an untrusted peer is closed with no reply")
+        expect(refusing.refusedPeers == 1, "push e2e: the refusal is counted")
+        expect(submit([bigPath]) == "not_connected", "push e2e: no viewer session answers not_connected")
+
+        let board = FakeClipboard(text: "before-push")
+        let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
+                                     notification: "io.jerislink.selftest.push.\(getpid())")
+        guard let port = freeLoopbackPort() else { expect(false, "push e2e: free port"); return 0 }
+        let server = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
+                                   port: port, inject: false,
+                                   settingsClientIP: { ListenConfig.loopbackIP }, acceptProxy: false,
+                                   inputHelper: nil, allowFileSessions: true,
+                                   fileStagingRoot: root.appendingPathComponent("staging"),
+                                   clipboard: board, inputSources: cache, pushBroker: broker,
+                                   frontmostApp: { nil })
+        do { try server.start() } catch { expect(false, "push e2e: server starts"); return 0 }
+        defer { server.stop() }
+        typealias M = FileProto.Message
+        func next(_ c: MRC1Client, _ timeout: Double = 3) -> M? {
+            c.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+        }
+
+        guard let old = MRC1Client(port: port) else { expect(false, "push e2e: old viewer connects"); return 0 }
+        _ = old.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.upload)])
+        expect(next(old) == .helloAck(proto: 1, caps: FileProto.Caps.host, maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes),
+               "push e2e: HELLO_ACK advertises the push service")
+        wait(until: { broker.sessionCount == 1 })
+        expect(submit([bigPath]) == "old_viewer", "push e2e: a viewer without the push cap answers old_viewer")
+        // r4: keep this caps-0 session open. The viewer opens a caps-0
+        // upload session and a push-capable pull session in either order;
+        // `old` connects before the pull session, `upload` after it.
+        defer { old.close() }
+
+        guard let pull = MRC1Client(port: port) else { expect(false, "push e2e: viewer connects"); return 0 }
+        defer { pull.close() }
+        _ = pull.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.pushService)])
+        _ = next(pull)
+        wait(until: { broker.sessionCount == 2 })
+        guard let upload = MRC1Client(port: port) else { expect(false, "push e2e: upload session connects"); return 0 }
+        defer { upload.close() }
+        _ = upload.send(type: 0x50, payload: [1, 0, 0])
+        _ = next(upload)
+        wait(until: { broker.sessionCount == 3 })
+        expect(submit([emptyPath], names: ["a/b"]) == "bad_name", "push e2e: a name with a slash is refused")
+        expect(submit([emptyPath], names: [".."]) == "bad_name", "push e2e: a dot name is refused")
+        expect(submit([root.path], names: ["folder"]) == "bad_name", "push e2e: a folder descriptor is refused")
+        expect(pull.receive(timeout: 0.3) == nil, "push e2e: refused batches send nothing to the viewer")
+
+        // A push: OFFER + ENTRYs, REPLY ok, then the files by REQUEST.
+        let first = submitAsync([bigPath, emptyPath])
+        guard case let .offer(t, purpose, entries, total)? = next(pull) else {
+            expect(false, "push e2e: OFFER arrives")
+            return 0
+        }
+        expect(purpose == FileProto.Purpose.push && entries == 2 && total == UInt64(body.count) && t & 0x8000_0001 == 0x8000_0000,
+               "push e2e: OFFER purpose=push, 2 entries, even id with the top bit")
+        _ = lstat(bigPath, &st)
+        expect(next(pull) == .entry(transfer: t, index: 0, kind: FileProto.EntryKind.file, size: UInt64(body.count),
+                                    mtime: Int64(st.st_mtimespec.tv_sec), path: Array("a.bin".utf8)),
+               "push e2e: ENTRY 0 with name, size and mtime")
+        guard case let .entry(_, 1, _, 0, _, name1)? = next(pull) else { expect(false, "push e2e: ENTRY 1"); return 0 }
+        expect(name1 == Array("empty.txt".utf8), "push e2e: ENTRY 1 is the empty file")
+        expect(submit([bigPath]) == "busy", "push e2e: a second push while one runs answers busy")
+        _ = pull.send(type: FileProto.MsgType.reply, payload: M.reply(transfer: t, status: FileProto.Status.ok).encode()!)
+        expect(first.done.wait(timeout: .now() + 5) == .success && first.reply == "ok", "push e2e: the helper hears ok after REPLY ok")
+
+        var got: [UInt8] = []
+        var end: M?
+        for off in stride(from: 0, to: body.count, by: 40_000) {
+            let len = min(40_000, body.count - off)
+            _ = pull.send(type: FileProto.MsgType.request,
+                          payload: M.request(transfer: t, index: 0, offset: UInt64(off), length: UInt32(len)).encode()!)
+        }
+        while let m = next(pull) {
+            if case let .data(_, 0, o, b) = m, o == UInt64(got.count) { got += b }
+            if case .fileEnd = m { end = m; break }
+            if case .reply = m { break }
+        }
+        expect(got == body && end == .fileEnd(transfer: t, index: 0, sha256: FileUploadSelfTest.sha(body)),
+               "push e2e: file 0 bytes and FILE_END match")
+        _ = pull.send(type: FileProto.MsgType.request, payload: M.request(transfer: t, index: 1, offset: 0, length: 0).encode()!)
+        expect(next(pull) == .fileEnd(transfer: t, index: 1, sha256: FileUploadSelfTest.sha([])),
+               "push e2e: the empty file gets FILE_END at once")
+        _ = pull.send(type: FileProto.MsgType.result, payload: M.result(transfer: t, status: FileProto.Status.ok, filesOK: 2).encode()!)
+        wait(until: { broker.isIdle })
+        expect(broker.isIdle, "push e2e: RESULT ends the push")
+
+        // A refusal from the viewer reaches the helper; an out-of-order
+        // REQUEST is refused.
+        let second = submitAsync([bigPath])
+        guard case let .offer(t2, _, _, _)? = next(pull) else { expect(false, "push e2e: second OFFER"); return 0 }
+        _ = next(pull)
+        _ = pull.send(type: FileProto.MsgType.reply, payload: M.reply(transfer: t2, status: FileProto.Status.noSpace).encode()!)
+        expect(second.done.wait(timeout: .now() + 5) == .success && second.reply == "no_space",
+               "push e2e: a viewer refusal reaches the helper (no_space)")
+        let third = submitAsync([bigPath])
+        guard case let .offer(t3, _, _, _)? = next(pull) else { expect(false, "push e2e: third OFFER"); return 0 }
+        _ = next(pull)
+        _ = pull.send(type: FileProto.MsgType.reply, payload: M.reply(transfer: t3, status: FileProto.Status.ok).encode()!)
+        _ = third.done.wait(timeout: .now() + 5)
+        _ = pull.send(type: FileProto.MsgType.request, payload: M.request(transfer: t3, index: 0, offset: 100, length: 10).encode()!)
+        expect(next(pull) == .reply(transfer: t3, status: FileProto.Status.failed), "push e2e: an out-of-order REQUEST is refused")
+        wait(until: { broker.isIdle })
+        expect(broker.isIdle, "push e2e: and the push ends")
+
+        // The session closing mid-push lets go of the files.
+        let fourth = submitAsync([bigPath])
+        guard case .offer? = next(pull) else { expect(false, "push e2e: fourth OFFER"); return 0 }
+        pull.close()
+        expect(fourth.done.wait(timeout: .now() + 5) == .success && fourth.reply == "not_connected",
+               "push e2e: a session closing before REPLY answers not_connected")
+        wait(until: { broker.isIdle })
+        expect(broker.isIdle, "push e2e: the broker is idle after the session closed")
+        wait(until: { broker.sessionCount == 2 })
+        expect(submit([bigPath]) == "old_viewer", "push e2e: with only caps-0 sessions left the push answers old_viewer")
+        wait(until: { server.statsLine().contains("file_pushes=4") })
+        expect(server.statsLine().contains("file_pushes=4"), "push e2e: stats (\(server.statsLine()))")
+
+        // The real peer check never trusts this test process.
+        var pair: [Int32] = [-1, -1]
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 {
+            expect(!SendSocketServer.isTrustedHelper(pair[0]), "push e2e: the signature check refuses a process that is not the helper")
+            Darwin.close(pair[0]); Darwin.close(pair[1])
+        }
+        expect(SendSocketServer.requirement.contains("identifier \"org.jeris.jerislink.send\"")
+               && SendSocketServer.requirement.contains("leaf[subject.OU] = \"DD6947X9AG\""),
+               "push e2e: the requirement names the helper and the team")
+        return 0
+    }
+
+    /// Opens the paths like the helper and submits them; closes its copies.
+    private static func pushSubmit(_ paths: [String], names: [String]?, path: String) -> String? {
+        let fds = paths.map { open($0, O_RDONLY | O_CLOEXEC) }
+        defer { fds.forEach { if $0 >= 0 { Darwin.close($0) } } }
+        let leafs = names ?? paths.map { ($0 as NSString).lastPathComponent }
+        return SendWire.submit(zip(leafs, fds).map { (name: Array($0.0.utf8), fd: $0.1) }, path: path, timeout: 15)
     }
 
     private static func freeLoopbackPort() -> UInt16? {

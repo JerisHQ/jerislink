@@ -32,6 +32,10 @@ FileSession::FileSession(std::string localIp, std::string remoteIp, uint16_t por
     if (role_ == Role::Pull) {
         hub_ = std::make_unique<jl::filepull::PullHub>(jl::filepull::sha256Digest());
         clip_ = std::make_unique<jl::filepull::FileClipboard>(*hub_, logFn_);
+        // F5b: Finder "Send to JerisLink" lands in Downloads\JerisLink.
+        push_ = std::make_unique<jl::filepush::PushReceiver>(
+            jl::filepush::makeFolderSink(jl::filepush::downloadsFolder(), jl::filepush::openInExplorer),
+            jl::filepull::sha256Digest());
     }
 }
 
@@ -198,7 +202,9 @@ void FileSession::run() {
         if (s != INVALID_SOCKET) {
             using namespace jl::file;
             // r3: the long-lived pull session also shows the Mac's NOTICEs.
-            const uint16_t ours = role_ == Role::Pull ? uint16_t(caps::kAnnounce | caps::kNotice) : caps::kViewer;
+            // F5b: it also takes Finder "Send to JerisLink" pushes.
+            const uint16_t ours =
+                role_ == Role::Pull ? uint16_t(caps::kAnnounce | caps::kNotice | caps::kPushService) : caps::kViewer;
             const auto hello = encode(Hello{kVersion, ours});
             if (hello && sendPacket(s, type::kHello, *hello)) {
                 outcome = Outcome::NoAck;
@@ -260,6 +266,10 @@ void FileSession::run() {
                         if (!pkt || !sendPacket(s, type::kReveal, *pkt)) { reason = "send_failed"; break; }
                         log("file.reveal transfer=" + std::to_string(rv));
                     }
+                    if (role_ == Role::Pull && pushCancel_.exchange(false)) {
+                        if (!sendPushOut(s, push_->cancel())) { reason = "send_failed"; break; }
+                        pushEnded();
+                    }
                     if (role_ == Role::Pull && !pumpRequests(s)) { reason = "send_failed"; break; }
                     if (std::chrono::steady_clock::now() - lastPing >= std::chrono::milliseconds(kPingIntervalMs)) {
                         if (outstanding) { reason = "ping_timeout"; break; }
@@ -271,7 +281,7 @@ void FileSession::run() {
                         lastPing = std::chrono::steady_clock::now();
                     }
                     // While Explorer is pulling, poll fast so REQUESTs follow reads.
-                    const int poll = hub_ && hub_->wantsService() ? kPullPollMs : kPollMs;
+                    const int poll = (hub_ && hub_->wantsService()) || (push_ && push_->wantsService()) ? kPullPollMs : kPollMs;
                     if (!waitReadable(s, poll)) continue;
                     uint8_t t = 0;
                     std::vector<uint8_t> p;
@@ -290,7 +300,13 @@ void FileSession::run() {
                     // Anything else well-formed is ignored.
                 }
                 log(std::string(role_ == Role::Pull ? "file.pull" : "file.session") + "=closed reason=" + reason);
-                if (role_ == Role::Pull) dropAnnounce();
+                if (role_ == Role::Pull) {
+                    dropAnnounce();
+                    if (push_ && push_->active()) {
+                        push_->disconnect();
+                        pushEnded();
+                    }
+                }
             }
             closeSocket(s);
         }
@@ -764,7 +780,9 @@ bool FileSession::pumpRequests(SOCKET s) {
     while (true) {
         const double now = nowMs();
         if (now < pullReadyMs_) return true;
-        const auto q = hub_->nextRequest();
+        // A Finder push goes first: the user asked for it just now.
+        auto q = push_ ? push_->nextRequest() : std::nullopt;
+        if (!q) q = hub_->nextRequest();
         if (!q) return true;
         const auto pkt = encode(*q);
         if (!pkt || !sendPacket(s, type::kRequest, *pkt)) return false;
@@ -782,6 +800,11 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         return pkt && sendPacket(s, type::kReply, *pkt) ? std::string() : std::string("send_failed");
     };
     if (const Offer* o = std::get_if<Offer>(&msg)) {
+        if (o->purpose == purpose::kPush) {
+            log("file.push=offered transfer=" + std::to_string(o->transfer) + " entries=" + std::to_string(o->entries) +
+                " bytes=" + std::to_string(o->total));
+            return pushOut(s, push_->onOffer(*o)) ? "" : "send_failed";
+        }
         if (o->purpose != purpose::kAnnounce) return "";
         // A new Finder copy replaces whatever this PC was offered before.
         collecting_.reset();
@@ -797,7 +820,9 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         return "";
     }
     if (const Entry* e = std::get_if<Entry>(&msg)) {
-        if (!collecting_ || e->transfer != collecting_->transfer) return "";
+        if (!collecting_ || e->transfer != collecting_->transfer) {
+            return pushOut(s, push_->onEntry(*e)) ? "" : "send_failed";
+        }
         entries_.push_back(*e);
         if (entries_.size() < collecting_->entries) return "";
         const Offer offer = *collecting_;
@@ -814,6 +839,11 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         return "";
     }
     if (const Cancel* c = std::get_if<Cancel>(&msg)) {
+        if (push_->current() == c->transfer) {
+            push_->onCancel(*c);
+            pushEnded();
+            return "";
+        }
         if (collecting_ && collecting_->transfer == c->transfer) {
             collecting_.reset();
             entries_.clear();
@@ -832,14 +862,17 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         return "";
     }
     if (const Data* d = std::get_if<Data>(&msg)) {
+        if (push_->current() == d->transfer) return pushOut(s, push_->onData(*d)) ? "" : "send_failed";
         hub_->onData(*d);
         return "";
     }
     if (const FileEnd* f = std::get_if<FileEnd>(&msg)) {
+        if (push_->current() == f->transfer) return pushOut(s, push_->onFileEnd(*f)) ? "" : "send_failed";
         hub_->onFileEnd(*f);
         return "";
     }
     if (const Reply* r = std::get_if<Reply>(&msg)) {
+        if (push_->current() == r->transfer) return pushOut(s, push_->onReply(*r)) ? "" : "send_failed";
         if (r->status != status::kOk && hub_->current() == r->transfer) {
             hub_->onFailed(r->transfer);
             const bool mac = r->status == status::kMacPermission;
@@ -854,4 +887,58 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
         return "";
     }
     return "";
+}
+
+// ---- F5b: Finder "Send to JerisLink" push --------------------------------
+
+bool FileSession::sendPushOut(SOCKET s, const std::vector<jl::file::Message>& out) {
+    for (const auto& m : out) {
+        const auto pkt = jl::file::encode(m);
+        if (!pkt || !sendPacket(s, jl::file::typeOf(m), *pkt)) return false;
+    }
+    return true;
+}
+
+// Sends what the push receiver answered and tells the UI when a push started
+// or ended. File names are never logged.
+bool FileSession::pushOut(SOCKET s, const std::vector<jl::file::Message>& out) {
+    using namespace jl::file;
+    for (const auto& m : out) {
+        if (const Reply* r = std::get_if<Reply>(&m)) {
+            if (r->status == status::kOk) {
+                const auto p = push_->progress();
+                log("file.push=accepted transfer=" + std::to_string(r->transfer) + " files=" + std::to_string(p.files) +
+                    " bytes=" + std::to_string(p.total));
+                if (pullNotice_) pullNotice_(PullNotice::PushStarted);
+            } else {
+                log("file.push=refused transfer=" + std::to_string(r->transfer) + " status=" + std::to_string(r->status) +
+                    " reason=" + push_->lastReason());
+            }
+        }
+    }
+    const bool sent = sendPushOut(s, out);
+    for (const auto& m : out) {
+        if (std::holds_alternative<Result>(m)) pushEnded();
+    }
+    return sent;
+}
+
+void FileSession::pushEnded() {
+    const auto p = push_->progress();
+    if (p.pushes == pushesSeen_) return;
+    pushesSeen_ = p.pushes;
+    const char* how = p.last == jl::filepush::Outcome::Done        ? "done"
+                      : p.last == jl::filepush::Outcome::Cancelled ? "cancelled"
+                                                                    : "failed";
+    // Mark of the Web totals for this session: zone_failed>0 means a file
+    // in Downloads\JerisLink has no ZoneId=3.
+    const auto z = push_->zoneCounts();
+    log(std::string("file.push=") + how + " files=" + std::to_string(p.lastFiles) +
+        (p.last == jl::filepush::Outcome::Done ? "" : " reason=" + push_->lastReason()) +
+        " zone_marked=" + std::to_string(z.marked) + " zone_failed=" + std::to_string(z.failed));
+    if (pullNotice_) {
+        pullNotice_(p.last == jl::filepush::Outcome::Done        ? PullNotice::PushDone
+                    : p.last == jl::filepush::Outcome::Cancelled ? PullNotice::PushCancelled
+                                                                  : PullNotice::PushFailed);
+    }
 }

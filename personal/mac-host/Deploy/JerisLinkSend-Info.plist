@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>JerisLink Send</string>
+	<key>CFBundleExecutable</key>
+	<string>JerisLinkSend</string>
+	<key>CFBundleIconFile</key>
+	<string>JerisLink.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.jeris.jerislink.send</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>JerisLink Send</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.9.4</string>
+	<key>CFBundleVersion</key>
+	<string>13</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from your Desktop to copy them to your PC.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from Documents to copy them to your PC.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>JerisLink Send reads the files you send from Downloads to copy them to your PC.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>JerisLink Send reads the files you send from a network volume to copy them to your PC.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>JerisLink Send reads the files you send from an external drive to copy them to your PC.</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Send to JerisLink</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>sendToJerisLink</string>
+			<key>NSPortName</key>
+			<string>JerisLink Send</string>
+			<key>NSRequiredContext</key>
+			<dict/>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

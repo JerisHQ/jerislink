@@ -26,6 +26,11 @@
 // upload with purpose=send, which the host puts in ~/Downloads/JerisLink and
 // shows in Finder. requestReveal() sends 0x5C REVEAL for the last send so
 // Finder shows that folder again. Both need a host with caps reveal.
+//
+// F5b: the Pull session also says HELLO caps=push_service. Files the user
+// sends from Finder's "Send to JerisLink" arrive as OFFER purpose=push; the
+// session accepts them with no prompt and pulls them into
+// Downloads\JerisLink (PushReceiver, file_push.hpp).
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -40,6 +45,7 @@
 
 #include "file_proto.hpp"
 #include "file_pull.hpp"
+#include "file_push.hpp"
 #include "file_upload.hpp"
 
 #include <memory>
@@ -53,7 +59,11 @@ public:
     using UploadDoneFn = std::function<void()>;
     // Pull role: something the user should see about a Mac copy (F3 r2).
     // Called on the session thread; post to the UI thread, do not block.
-    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3, PasteBusy = 4 };
+    // F5b adds a Finder push starting and ending (read pushProgress()).
+    enum class PullNotice : int {
+        MacPermission = 1, PullFailed = 2, NotOffered = 3, PasteBusy = 4,
+        PushStarted = 5, PushDone = 6, PushFailed = 7, PushCancelled = 8,
+    };
     using PullNoticeFn = std::function<void(PullNotice)>;
     enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
     // Paste: Cmd+V in Finder (F2). Send: a drop on the viewer (F4).
@@ -112,7 +122,15 @@ public:
     jl::filepull::PullHub::Progress pullProgress() const {
         return hub_ ? hub_->progress() : jl::filepull::PullHub::Progress{};
     }
-    uint64_t rxBytes() const { return hub_ ? hub_->rxBytes() : 0; }
+    uint64_t rxBytes() const { return (hub_ ? hub_->rxBytes() : 0) + (push_ ? push_->rxBytes() : 0); }
+    // F5b: a Finder "Send to JerisLink" push into Downloads\JerisLink.
+    bool pushRunning() const { return push_ && push_->progress().active; }
+    jl::filepush::Progress pushProgress() const { return push_ ? push_->progress() : jl::filepush::Progress{}; }
+    void cancelPush() { pushCancel_ = true; }
+    // The host takes Finder pushes (its HELLO_ACK has push_service).
+    bool hostPushes() const {
+        return role_ == Role::Pull && capability() == Capability::Yes && (hostCaps() & jl::file::caps::kPushService);
+    }
     void setMaxMbps(uint32_t mbps) { pullMbps_ = mbps; }
     void setPullNoticeCallback(PullNoticeFn fn) { pullNotice_ = std::move(fn); }  // before start()
 
@@ -147,6 +165,10 @@ private:
     // Pull role: sends the REQUESTs the hub wants and the pacer allows.
     bool pumpRequests(SOCKET s);
     void dropAnnounce();
+    // F5b: sends the push receiver's answers; pushOut also logs and tells the UI.
+    bool sendPushOut(SOCKET s, const std::vector<jl::file::Message>& out);
+    bool pushOut(SOCKET s, const std::vector<jl::file::Message>& out);
+    void pushEnded();
 
     std::string localIp_;
     std::string remoteIp_;
@@ -191,4 +213,7 @@ private:
     double pullReadyMs_ = 0.0;
     std::optional<jl::file::Offer> collecting_;   // session thread only
     std::vector<jl::file::Entry> entries_;
+    std::unique_ptr<jl::filepush::PushReceiver> push_;
+    std::atomic<bool> pushCancel_{false};
+    uint32_t pushesSeen_ = 0;  // session thread
 };

@@ -52,8 +52,9 @@ enum FileProto {
         static let notice: UInt16 = 1 << 4
         /// What this build implements. F2: paste uploads. F3: Cmd+C
         /// announces and REQUEST pulls, on sessions whose viewer asks for them.
-        /// F4: send uploads (drop on the viewer) and REVEAL.
-        static let host: UInt16 = upload | reveal | announce
+        /// F4: send uploads (drop on the viewer) and REVEAL. F5b: Finder
+        /// "Send to JerisLink" pushes (OFFER purpose=push).
+        static let host: UInt16 = upload | pushService | reveal | announce
     }
 
     /// NOTICE codes. A viewer ignores codes it does not know.
