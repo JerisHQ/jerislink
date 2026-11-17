@@ -596,6 +596,26 @@ void testForceQuit() {
     expect(atEscape == std::set<uint16_t>{kWin, kAlt},
            "force quit: Escape goes down with exactly Command+Option held");
     expect(mac.empty(), "force quit: nothing is left held on the Mac");
+
+    // r2: two halves with a hold between them. The press leaves exactly
+    // Command+Option+Escape held on the Mac (so loginwindow sees a held hot
+    // key), the release lifts exactly those, Escape first.
+    expectEvents(forceQuitPress(), {U(1), U(2), U(3), U(4), D(3), D(2), D(ESC)},
+                 "force quit press: release all, then Cmd down, Opt down, Esc down");
+    expectEvents(forceQuitRelease(), {U(ESC), U(2), U(3)},
+                 "force quit release: Esc up, Opt up, Cmd up");
+    std::set<uint16_t> held{kShift, kCtrl};
+    for (const auto& e : forceQuitPress()) {
+        if (e.down) held.insert(e.semantic); else held.erase(e.semantic);
+    }
+    expect(held == std::set<uint16_t>{kWin, kAlt, ESC},
+           "force quit: during the hold exactly Command+Option+Escape are held");
+    for (const auto& e : forceQuitRelease()) {
+        if (e.down) held.insert(e.semantic); else held.erase(e.semantic);
+    }
+    expect(held.empty(), "force quit: after the release nothing is held");
+    expect(kForceQuitHoldMs >= 100 && kForceQuitHoldMs <= 300,
+           "force quit: hold is a human-length press (100-300 ms)");
 }
 
 }  // namespace

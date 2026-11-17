@@ -150,15 +150,31 @@ inline std::vector<KeyEvent> releaseAllModifiers() {
 // modifier is released first, so a held Shift cannot turn it into
 // Cmd+Opt+Shift+Esc (force quit the front app at once), and the chord
 // releases its own modifiers last, in reverse order, so nothing stays held.
-inline std::vector<KeyEvent> forceQuitChord() {
+//
+// The chord goes in two halves with a hold in between, like a person
+// pressing it. Sent back to back (r1), the Mac's WindowServer matched the
+// hot key but handed loginwindow its key-down and key-up in the same
+// millisecond, and the Force Quit window never opened (hand test
+// 2026-11-17). The viewer sends forceQuitPress(), waits kForceQuitHoldMs on
+// a timer (never blocking the UI thread), then sends forceQuitRelease().
+inline constexpr unsigned kForceQuitHoldMs = 150;
+
+inline std::vector<KeyEvent> forceQuitPress() {
     std::vector<KeyEvent> out = releaseAllModifiers();
-    const auto esc = static_cast<uint16_t>(vk::Escape);
     out.push_back({true, kWin});
     out.push_back({true, kAlt});
-    out.push_back({true, esc});
-    out.push_back({false, esc});
-    out.push_back({false, kAlt});
-    out.push_back({false, kWin});
+    out.push_back({true, static_cast<uint16_t>(vk::Escape)});
+    return out;
+}
+
+inline std::vector<KeyEvent> forceQuitRelease() {
+    return {{false, static_cast<uint16_t>(vk::Escape)}, {false, kAlt}, {false, kWin}};
+}
+
+// The whole sequence in wire order: press, (hold), release.
+inline std::vector<KeyEvent> forceQuitChord() {
+    std::vector<KeyEvent> out = forceQuitPress();
+    for (const auto& e : forceQuitRelease()) out.push_back(e);
     return out;
 }
 
