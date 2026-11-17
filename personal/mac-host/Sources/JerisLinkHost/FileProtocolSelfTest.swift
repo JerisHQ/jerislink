@@ -77,7 +77,8 @@ enum FileProtocolSelfTest {
         expect(FileProto.Caps.notice == 0x10 && FileProto.Caps.host & FileProto.Caps.notice == 0,
                "file codec: notice is a viewer cap (0x10), not advertised by the host")
         expect(M.fileEnd(transfer: 1, index: 0, sha256: [1]).encode() == nil, "file codec: FILE_END needs 32-byte hash")
-        expect(FileProto.Caps.host == FileProto.Caps.upload | FileProto.Caps.reveal | FileProto.Caps.announce, "file codec: F4 host advertises upload, reveal and announce")
+        expect(FileProto.Caps.host == FileProto.Caps.upload | FileProto.Caps.pushService | FileProto.Caps.reveal | FileProto.Caps.announce,
+               "file codec: F5b host advertises upload, push service, reveal and announce")
     }
 
     /// FinderPasteGate: only a Cmd+V down that `refuse` approves is refused;

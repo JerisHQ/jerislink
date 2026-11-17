@@ -38,6 +38,7 @@ final class ControlServer: @unchecked Sendable {
     private var fileAnnounces: UInt64 = 0
     private var filePulls: UInt64 = 0
     private var fileTxBytes: UInt64 = 0
+    private var filePushes: UInt64 = 0
     /// Open file sessions that announce Finder copies (F3). While one is
     /// open the text clipboard session leaves file copies alone, so the
     /// filename text Finder also puts on the pasteboard does not replace the
@@ -89,6 +90,8 @@ final class ControlServer: @unchecked Sendable {
     /// Current keyboard input source, cached from the system notification so
     /// the per-key Caps check never asks TIS on the main thread.
     private let inputSources: InputSourceCache
+    /// Finder "Send to JerisLink" jobs for file sessions (F5b).
+    private let pushBroker: PushBroker
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
@@ -100,10 +103,12 @@ final class ControlServer: @unchecked Sendable {
          fileSendFolder: FileSendFolder = .shared,
          clipboard: ClipboardBackend = SystemClipboard.shared,
          inputSources: InputSourceCache = .shared,
+         pushBroker: PushBroker = .shared,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
         self.inputSources = inputSources
+        self.pushBroker = pushBroker
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -469,7 +474,7 @@ final class ControlServer: @unchecked Sendable {
 
     private func fileStatsText() -> String {
         fileStatsLock.lock(); defer { fileStatsLock.unlock() }
-        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes) finder_paste_refused=\(finderPastesRefused)"
+        return "file_uploads=\(fileUploads) file_upload_failed=\(fileUploadsFailed) file_rx_bytes=\(fileRxBytes) file_announces=\(fileAnnounces) file_pulls=\(filePulls) file_tx_bytes=\(fileTxBytes) file_pushes=\(filePushes) finder_paste_refused=\(finderPastesRefused)"
     }
 
     /// A file session: HELLO_ACK with this build's caps, PING echo, paste
@@ -513,7 +518,19 @@ final class ControlServer: @unchecked Sendable {
         var received = 0
         var refused = 0
         var reason = "peer_closed"
+        // F5b: Finder pushes go to the newest session; one at a time.
+        let pushSession = pushBroker.register(peerCaps: peerCaps)
+        var push: PushSender?
+        func endPush() {
+            guard let p = push else { return }
+            p.close()
+            fileStatsLock.lock(); filePushes += 1; fileTxBytes += p.bytesOut; fileStatsLock.unlock()
+            pushBroker.finished(p.job)
+            push = nil
+        }
         defer {
+            endPush()
+            pushBroker.unregister(pushSession)
             receiver.abort(reason: reason)
             noteUpload(&uploading, active: false)
             if showsNotice { fileStatsLock.lock(); noticeSessions -= 1; fileStatsLock.unlock() }
@@ -543,6 +560,16 @@ final class ControlServer: @unchecked Sendable {
                     lastNotice = seq
                     guard sendAll([.notice(code: FileProto.Notice.pasteBusy)]) else { reason = "send_failed"; return }
                 }
+            }
+            if let p = push, p.ended { endPush() }
+            if let p = push, !p.accepted, p.job.isAbandoned {
+                guard sendAll(p.abandon()) else { reason = "send_failed"; return }
+                endPush()
+            }
+            if push == nil, let job = pushBroker.take(session: pushSession) {
+                let p = PushSender(job: job)
+                push = p
+                guard sendAll(p.start()) else { reason = "send_failed"; return }
             }
             if let announcer {
                 let changeCount = clipboard.changeCount()
@@ -581,6 +608,18 @@ final class ControlServer: @unchecked Sendable {
             switch msg {
             case .ping:
                 guard sendPacket(fd, type: type, payload: payload) else { reason = "send_failed"; return }
+            case .request(let t, let index, let offset, let length) where push != nil && t == push?.transfer:
+                guard let p = push, p.serve(index: index, offset: offset, length: length,
+                                            send: { m in m.encode().map { sendPacket(fd, type: m.type, payload: $0) } ?? false }) else {
+                    reason = "send_failed"; return
+                }
+                lastMessage = Date()
+            case .reply(let t, let status) where push != nil && t == push?.transfer:
+                push?.reply(status)
+            case .result(let t, let status, let filesOK) where push != nil && t == push?.transfer:
+                push?.result(status: status, filesOK: filesOK)
+            case .cancel(let t, _) where push != nil && t == push?.transfer:
+                push?.cancelled()
             case .request(let t, let index, let offset, let length):
                 guard let announcer else {
                     refused += 1

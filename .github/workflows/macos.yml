@@ -25,3 +25,5 @@ jobs:
         run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/MacOS/JerisLinkHost" --self-test'
       - name: Input helper self-test (status throttle, display bounds cache)
         run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/Helpers/JerisLink Input Helper.app/Contents/MacOS/JerisLinkInputHelper" --self-test'
+      - name: Send helper self-test (Finder Service checks, alerts)
+        run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/Library/Helpers/JerisLink Send.app/Contents/MacOS/JerisLinkSend" --self-test'

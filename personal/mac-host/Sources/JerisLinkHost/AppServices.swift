@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CoreServices
 import Foundation
 import ServiceManagement
 
@@ -83,11 +84,29 @@ enum JerisLinkAgents {
 /// show one dialog with the result. The app then quits; the agents keep running.
 @MainActor
 enum JerisLinkLauncher {
+    /// F5b: makes sure Launch Services knows the Finder Service helper
+    /// inside this app, then refreshes the Services menu. Returns a status
+    /// line, or nil when there is no helper (a development build).
+    static func registerSendService() -> String? {
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
+        guard FileManager.default.fileExists(atPath: helper.path) else { return nil }
+        let known = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SendWire.helperBundleID)
+        var registered = known?.standardizedFileURL.path == helper.standardizedFileURL.path
+        if !registered {
+            registered = LSRegisterURL(helper as CFURL, true) == noErr
+        }
+        NSUpdateDynamicServices()
+        return registered
+            ? "Finder: right-click files > Quick Actions or Services > Send to JerisLink."
+            : "Finder \"Send to JerisLink\" could not be registered."
+    }
+
     static func run() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
         let errors = JerisLinkAgents.registerAll()
+        let sendService = registerSendService()
         let screenRecording = CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess()
         let needsApproval = JerisLinkAgents.needsUserApproval
 
@@ -99,6 +118,7 @@ enum JerisLinkLauncher {
         }
         lines.append("Screen Recording for JerisLink: \(screenRecording ? "allowed" : "not allowed yet")")
         lines.append("Accessibility for JerisLink Input Helper is asked for by the helper itself the first time it runs.")
+        if let sendService { lines.append(sendService) }
         if !errors.isEmpty {
             lines.append("")
             lines.append("Errors:")

@@ -61,6 +61,13 @@ enum ControlService {
         return servers
     }
 
+    static func raiseOpenFileLimit(to want: rlim_t) {
+        var rl = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &rl) == 0, rl.rlim_cur < want else { return }
+        rl.rlim_cur = min(want, rl.rlim_max)
+        _ = setrlimit(RLIMIT_NOFILE, &rl)
+    }
+
     static func run(_ o: Options) async -> Never {
         // stdout is a file under launchd: flush every line so ControlServer's
         // print() output (connects, warnings) reaches the log promptly.
@@ -79,6 +86,11 @@ enum ControlService {
             exit(1)
         }
         log("listening: \(running.count) listener(s), one input helper connection")
+        // F5b: Finder "Send to JerisLink". A push holds up to 1,000 open
+        // files; launchd's soft limit is 256.
+        raiseOpenFileLimit(to: 4096)
+        let sendSocket = SendSocketServer()
+        do { try sendSocket.start() } catch { log("send socket off: \(error.localizedDescription)") }
         ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
         while true {
             try? await Task.sleep(for: .seconds(3600))
