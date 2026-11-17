@@ -2135,6 +2135,7 @@ static void runSessionModalTick() {
 namespace ov = jl::overlay;
 
 static HWND gOverlay = nullptr;
+static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
 static bool gOverlayKeyboard = false;  // opened with Ctrl+Alt+O: focus ring, keys
 static ov::Item gOverlayFocus = ov::Item::Mute;
 static ov::Item gOverlayHot = ov::Item::None;
@@ -2156,6 +2157,7 @@ static const char* overlayItemName(ov::Item item) {
     case ov::Item::Info: return "info";
     case ov::Item::Settings: return "settings";
     case ov::Item::Files: return "files";
+    case ov::Item::ForceQuit: return "force_quit";
     case ov::Item::Disconnect: return "disconnect";
     default: return "none";
     }
@@ -2186,6 +2188,14 @@ static void overlayReposition() {
                                           l.size.height(), top);
     SetWindowPos(gOverlay, nullptr, p.x, p.y, l.size.width(), l.size.height(),
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    if (gOverlayTip) {  // the button moves with the dpi
+        TTTOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.hwnd = gOverlay;
+        ti.uId = 1;
+        ti.rect = RECT{l.forceQuit.left, l.forceQuit.top, l.forceQuit.right, l.forceQuit.bottom};
+        SendMessageW(gOverlayTip, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
 }
 
 static void overlayShow(bool keyboard, const char* source, double autoHideMs) {
@@ -2242,6 +2252,23 @@ static void requestDisconnect(const char* source) {
 
 static void filePanelToggle(const char* source);  // F4, below
 
+// Overlay Force Quit: asks the Mac host to open its Force Quit Applications
+// window (MRC1 0x60 FORCE_QUIT_OPEN). A synthetic Command+Option+Escape does
+// not work: the Mac log showed WindowServer handing loginwindow the hot key,
+// held or not, and loginwindow never opening the window (hand tests r1/r2,
+// 2026-11-17). The host presses Apple menu > Force Quit through
+// Accessibility instead. Every remote modifier is released first and the
+// local shortcut state is reset like on focus loss, so nothing stays held on
+// either side. A host without 0x60 logs it as unknown and does nothing.
+// overlay.action item=force_quit records that the button was used.
+static void forceQuitMac() {
+    gKeys.reset();
+    gPasteGate.modifiersReleased();
+    if (!gControl) return;
+    for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
+    gControl->sendForceQuitOpen();
+}
+
 static void overlayActivate(ov::Item item, const char* source) {
     logLine(std::string("overlay.action item=") + overlayItemName(item) + " source=" + source);
     switch (item) {
@@ -2264,6 +2291,10 @@ static void overlayActivate(ov::Item item, const char* source) {
     case ov::Item::Files:
         overlayHide("action");
         filePanelToggle(source);
+        break;
+    case ov::Item::ForceQuit:
+        overlayHide("action");  // so the Mac's Force Quit window is in view
+        forceQuitMac();
         break;
     case ov::Item::Disconnect:
         requestDisconnect("overlay");
@@ -2508,6 +2539,7 @@ static void paintOverlay(HWND hwnd) {
     overlayButton(dc, toRECT(l.info), L"Info", ov::Item::Info, c::kText, dpi);
     overlayButton(dc, toRECT(l.settings), L"Settings", ov::Item::Settings, c::kText, dpi);
     overlayButton(dc, toRECT(l.files), L"Files", ov::Item::Files, c::kText, dpi);
+    overlayButton(dc, toRECT(l.forceQuit), L"Force Quit", ov::Item::ForceQuit, c::kText, dpi);
     overlayButton(dc, toRECT(l.disconnect), L"Disconnect", ov::Item::Disconnect, c::kError, dpi);
 
     if (gOverlayKeyboard) {
@@ -2518,6 +2550,7 @@ static void paintOverlay(HWND hwnd) {
         case ov::Item::Info: f = toRECT(l.info); break;
         case ov::Item::Settings: f = toRECT(l.settings); break;
         case ov::Item::Files: f = toRECT(l.files); break;
+        case ov::Item::ForceQuit: f = toRECT(l.forceQuit); break;
         case ov::Item::Disconnect: f = toRECT(l.disconnect); break;
         default: break;
         }
@@ -2526,8 +2559,12 @@ static void paintOverlay(HWND hwnd) {
 
     jl::ui::fillRect(dc, RECT{l.hint.left, l.bar.bottom - 1, l.hint.right, l.bar.bottom},
                      c::kBorder);
+    // The hovered (or keyboard-focused) item's tooltip replaces the hint.
+    const wchar_t* tip = ov::tooltipFor(gOverlayHot);
+    if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus);
     overlayText(dc,
-                gOverlayKeyboard
+                tip ? tip
+                : gOverlayKeyboard
                     ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
                     : L"Ctrl+Alt+O, or hold the pointer bottom-left for 2 s",
                 toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
@@ -2620,7 +2657,10 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         overlayRefresh();
         return 0;
     case WM_DESTROY:
-        if (gOverlay == hwnd) gOverlay = nullptr;
+        if (gOverlay == hwnd) {
+            gOverlay = nullptr;
+            gOverlayTip = nullptr;
+        }
         return 0;
     default:
         break;
@@ -2657,6 +2697,23 @@ static void overlayCreate(HWND viewer) {
     DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
     DwmSetWindowAttribute(gOverlay, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
     ensureAudioVolumeLoaded();
+    // Hover tooltip on Force Quit. Not activating, owned by the overlay (gone
+    // with it); TTF_SUBCLASS relays the overlay's mouse moves to it.
+    gOverlayTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                  WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, gOverlay, nullptr,
+                                  hi, nullptr);
+    if (gOverlayTip) {
+        TTTOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_SUBCLASS;
+        ti.hwnd = gOverlay;
+        ti.uId = 1;
+        ti.lpszText = const_cast<wchar_t*>(ov::tooltipFor(ov::Item::ForceQuit));
+        SendMessageW(gOverlayTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+    } else {
+        logLine("overlay.tooltip_failed error=" + std::to_string(GetLastError()));
+    }
     gOverlayFocus = ov::Item::Mute;
     gOverlayDwell.reset();
     gOverlaySwallowUp.reset();
@@ -2667,6 +2724,7 @@ static void overlayCreate(HWND viewer) {
 static void overlayDestroy() {
     if (gOverlay && IsWindow(gOverlay)) DestroyWindow(gOverlay);
     gOverlay = nullptr;
+    gOverlayTip = nullptr;  // owned by the overlay, destroyed with it
     gOverlayKeyboard = false;
     gOverlayDragging = false;
     gOverlayTracking = false;
@@ -6827,6 +6885,11 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     snapshotWindow(viewer, dir, L"overlay-open-mouse");
     overlayShow(true, "snapshot", 0);
     snapshotWindow(viewer, dir, L"overlay-open");
+    gOverlayFocus = ov::Item::ForceQuit;  // hint row shows its tooltip
+    overlayRefresh();
+    snapshotWindow(viewer, dir, L"overlay-force-quit-focus");
+    gOverlayFocus = ov::Item::Mute;
+    overlayRefresh();
     const bool overlayShown = overlayVisible();
     // Placement and translucency: top centre, below the remote menu bar, a layered
     // window at ov::kSessionUiAlpha.
@@ -7031,6 +7094,9 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         SendMessageW(gVolumeDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     }
     pumpFor(60);
+    overlayShow(false, "snapshot", 0);
+    timed("overlay-force-quit", [] { overlayActivate(ov::Item::ForceQuit, "snapshot"); }, true);
+    timed("overlay-force-quit-check", [] {}, !overlayVisible() && gOverlayTip != nullptr);
     overlayShow(false, "snapshot", 0);
     timed("overlay-disconnect", [] { overlayActivate(ov::Item::Disconnect, "snapshot"); }, true);
     timed("overlay-disconnect-check", [] {},

@@ -40,7 +40,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/
          "$SEND/Contents/MacOS" "$SEND/Contents/Resources" \
          "$SERVICE/Contents/MacOS" "$SERVICE/Contents/Resources"
 
-/usr/bin/swiftc -O -framework Foundation -framework CoreGraphics \
+/usr/bin/swiftc -O -framework Foundation -framework CoreGraphics -framework ApplicationServices -framework AppKit \
     InputHelper/JerisLinkInputHelper.swift -o "$HELPER/Contents/MacOS/JerisLinkInputHelper"
 # The Service helper shares the send socket wire with the host.
 /usr/bin/swiftc -O -framework AppKit \

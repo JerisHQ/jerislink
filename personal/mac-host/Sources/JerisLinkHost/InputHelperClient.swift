@@ -271,4 +271,12 @@ final class InputHelperClient: @unchecked Sendable {
         let bytes = packet(type: 0x22, payload: int16Bytes(dx) + int16Bytes(dy))
         return deliver(bytes)
     }
+
+    /// FORCE_QUIT_OPEN, empty payload: the helper opens the Force Quit
+    /// Applications window. A helper without it ignores the type.
+    static let forceQuitOpenType: UInt8 = 0x60
+
+    func sendForceQuitOpen() -> Bool {
+        deliver(packet(type: Self.forceQuitOpenType, payload: []))
+    }
 }
