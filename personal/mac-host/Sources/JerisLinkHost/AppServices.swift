@@ -10,6 +10,72 @@ import ServiceManagement
 /// Each agent is its own process with KeepAlive, so a crash in one of them
 /// (video host, control service, input helper) does not take down the others,
 /// and launchd restarts it. This replaces the old zsh watchdog LaunchAgents.
+/// Where this process runs from. The video and control agents run from a
+/// nested copy of the host, JerisLink Service.app, with the same bundle id and
+/// signature (so Screen Recording and the defaults domain stay the same).
+///
+/// Why: ScreenCaptureKit and the HIServices calls check those agents in with
+/// Launch Services as UIElement apps that never answer Apple events. Launch
+/// Services matches a running app by bundle path, so while they ran from
+/// JerisLink.app itself, opening the app from Spotlight, Finder or the Dock
+/// was routed to them and failed with "The application is not open anymore".
+/// Running them from another path leaves JerisLink.app free to start the
+/// launcher.
+enum JerisLinkBundle {
+    static let serviceHelperPath = "Contents/Library/Helpers/JerisLink Service.app"
+
+    /// True when this process is JerisLink Service.app inside JerisLink.app.
+    static var isServiceHelper: Bool { isServiceHelper(Bundle.main.bundleURL) }
+
+    static func isServiceHelper(_ bundleURL: URL) -> Bool {
+        let parts = bundleURL.standardizedFileURL.pathComponents
+        guard parts.count >= 5 else { return false }
+        return parts.suffix(4).dropLast().elementsEqual(["Contents", "Library", "Helpers"])
+            && parts[parts.count - 5].hasSuffix(".app")
+            && parts.last == (serviceHelperPath as NSString).lastPathComponent
+    }
+
+    /// JerisLink.app: this bundle, or the app that contains the service helper.
+    static var appURL: URL { appURL(for: Bundle.main.bundleURL) }
+
+    static func appURL(for bundleURL: URL) -> URL {
+        guard isServiceHelper(bundleURL) else { return bundleURL }
+        return bundleURL.standardizedFileURL
+            .deletingLastPathComponent()  // Helpers
+            .deletingLastPathComponent()  // Library
+            .deletingLastPathComponent()  // Contents
+            .deletingLastPathComponent()  // JerisLink.app
+    }
+
+    /// The service helper was opened with no arguments (Finder, `open`):
+    /// open JerisLink.app instead so the launcher runs there.
+    static func openApp() {
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = [appURL.path]
+        try? open.run()
+        open.waitUntilExit()
+    }
+
+    static func selfTest() -> Int32 {
+        var failures: Int32 = 0
+        func check(_ ok: Bool, _ name: String) {
+            print("\(ok ? "ok" : "FAIL"): bundle \(name)")
+            if !ok { failures += 1 }
+        }
+        let app = URL(fileURLWithPath: "/Users/x/Applications/JerisLink.app")
+        let helper = app.appendingPathComponent(serviceHelperPath)
+        let send = app.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
+        check(!isServiceHelper(app), "app is not the service helper")
+        check(isServiceHelper(helper), "service helper detected")
+        check(appURL(for: helper).path == app.path, "service helper resolves the app")
+        check(appURL(for: app).path == app.path, "app resolves itself")
+        check(!isServiceHelper(send), "send helper is not the service helper")
+        check(!isServiceHelper(URL(fileURLWithPath: "/tmp/Helpers/X.app")), "loose Helpers dir ignored")
+        return failures
+    }
+}
+
 enum JerisLinkAgents {
     static let launcherBundleIdentifier = "org.jeris.jerislink.host"
 
@@ -82,13 +148,11 @@ enum JerisLinkAgents {
 /// F5b: the Finder Service helper (JerisLink Send.app) inside this app.
 ///
 /// The control agent calls this at every start, so the Finder item appears
-/// after an install without opening the app. Opening JerisLink.app is not
-/// reliable for this: while the video agent runs it is checked in with
-/// Launch Services under the app's bundle id, so Finder sends the open event
-/// to that agent instead of starting the launcher, and the launcher never runs.
+/// after an install without opening the app. The control agent runs from
+/// JerisLink Service.app, so the path is taken from JerisLink.app.
 enum JerisLinkSendService {
     static var helperURL: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
+        JerisLinkBundle.appURL.appendingPathComponent("Contents/Library/Helpers/JerisLink Send.app")
     }
 
     /// nil: this build has no helper. Otherwise whether Launch Services knows

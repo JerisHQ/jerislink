@@ -200,7 +200,8 @@ struct JerisLinkHostMain {
             let display = await DisplayFollowerSelfTest.run()
             let video = VideoDiagSelfTest.run()
             let files = FileProtocolSelfTest.run()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && video == 0 && files == 0 ? 0 : 1)
+            let bundle = JerisLinkBundle.selfTest()
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && video == 0 && files == 0 && bundle == 0 ? 0 : 1)
         }
         // H.264 encode -> decode check on the hardware encoder at the capped
         // sizes. No screen capture, no network, no settings change.
@@ -219,6 +220,11 @@ struct JerisLinkHostMain {
             print(PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL).summary)
             return
         }
+        if JerisLinkBundle.isServiceHelper && (o.registerAgents || o.unregisterAgents || o.showAgentStatus) {
+            // SMAppService looks for the agent plists in the main bundle.
+            fputs("Error: run this from JerisLink.app/Contents/MacOS/JerisLinkHost\n", stderr)
+            exit(2)
+        }
         if o.registerAgents || o.unregisterAgents {
             let errors = o.registerAgents ? JerisLinkAgents.registerAll() : JerisLinkAgents.unregisterAll()
             JerisLinkAgents.statusLines().forEach { print($0) }
@@ -235,7 +241,11 @@ struct JerisLinkHostMain {
         // Opened from Finder or at login as JerisLink.app with no arguments.
         if CommandLine.arguments.count == 1,
            Bundle.main.bundleIdentifier == JerisLinkAgents.launcherBundleIdentifier {
-            await MainActor.run { JerisLinkLauncher.run() }
+            if JerisLinkBundle.isServiceHelper {
+                JerisLinkBundle.openApp()
+            } else {
+                await MainActor.run { JerisLinkLauncher.run() }
+            }
             return
         }
         if let service = o.service {

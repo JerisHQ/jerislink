@@ -89,6 +89,7 @@ Rebuilds with the same certificate and bundle identifiers keep their approvals. 
 ```sh
 codesign -d -r- JerisLink.app
 codesign -d -r- "JerisLink.app/Contents/Helpers/JerisLink Input Helper.app"
+codesign -d -r- "JerisLink.app/Contents/Library/Helpers/JerisLink Service.app"   # must equal the app's
 ```
 
 Do not replace the signing certificate casually.
