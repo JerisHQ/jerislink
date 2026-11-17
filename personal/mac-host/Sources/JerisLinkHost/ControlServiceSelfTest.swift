@@ -143,6 +143,7 @@ enum ControlServiceSelfTest {
         failures += fileSendEndToEnd(expect)
         failures += fileAnnounceEndToEnd(expect)
         failures += filePushEndToEnd(expect)
+        pushBrokerRouting(expect)
         failures += capsUsesInputSourceCache(expect)
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
@@ -911,6 +912,54 @@ enum ControlServiceSelfTest {
         expect(server.statsLine().contains("file_announces=1 file_pulls=1 file_tx_bytes=\(body.count)"),
                "announce e2e: stats (\(server.statsLine()))")
         return 0
+    }
+
+    /// r5: pushes go to the newest push-capable session that is still
+    /// heard from. A second viewer window on the same PC can leave the
+    /// first one's pull session open but silent; the broker skips it.
+    private static func pushBrokerRouting(_ expect: (Bool, String) -> Void) {
+        final class Clock: @unchecked Sendable { var t: Double = 1000 }
+        let clock = Clock()
+        let broker = PushBroker(now: { clock.t })
+        let push = FileProto.Caps.pushService
+        func job() -> PushJob { PushJob(files: []) }
+        /// Offers a job; returns the session that took it, or the answer.
+        func route() -> (UInt64?, SendWire.Reply?) {
+            let j = job()
+            if let r = broker.offer(j) { return (nil, r) }
+            for id in UInt64(1)...20 {
+                if let got = broker.take(session: id) { broker.finished(got); return (id, nil) }
+            }
+            return (nil, nil)
+        }
+
+        expect(route().1 == .notConnected, "push route: no session is not_connected")
+        let a = broker.register(peerCaps: push)
+        let up = broker.register(peerCaps: 0)
+        expect(route().0 == a, "push route: a fresh push session takes the push")
+        clock.t += PushBroker.liveSeconds - 1
+        expect(route().0 == a, "push route: a session quiet for less than the live window still takes it")
+        clock.t += 2
+        expect(route().1 == .notConnected, "push route: a push session quiet past the live window is not_connected")
+        broker.heard(up)
+        expect(route().1 == .notConnected, "push route: a live caps-0 session does not make a quiet push session live")
+        broker.heard(a)
+        expect(route().0 == a, "push route: a PING makes the session live again")
+
+        // A second viewer's pull session opens later, then goes quiet; the
+        // older one keeps pinging and gets the push.
+        let b = broker.register(peerCaps: push)
+        expect(route().0 == b, "push route: the newest live push session wins")
+        clock.t += 20; broker.heard(a)
+        clock.t += 20; broker.heard(a)
+        expect(route().0 == a, "push route: a newer but quiet session is skipped for an older live one")
+        broker.heard(b)
+        expect(route().0 == b, "push route: once heard again the newer session wins again")
+        broker.unregister(b)
+        broker.unregister(a)
+        expect(route().1 == .oldViewer, "push route: only a caps-0 session left is old_viewer")
+        broker.unregister(up)
+        expect(broker.sessionCount == 0 && broker.isIdle, "push route: the broker is empty and idle")
     }
 
     /// F5b over real sockets: the send socket hands open files to the

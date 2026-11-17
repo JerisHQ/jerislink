@@ -71,19 +71,36 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
     static let shared = PushBroker()
 
     private let lock = NSLock()
-    private var sessions: [(id: UInt64, caps: UInt16)] = []
+    private var sessions: [(id: UInt64, caps: UInt16, heard: Double)] = []
     private var nextSession: UInt64 = 0
     private var pending: (session: UInt64, job: PushJob)?
     private var running: PushJob?
+    private let now: () -> Double
 
-    /// A file session opened. Pushes go to the newest session whose viewer
-    /// said HELLO caps=push_service: one viewer opens a caps-0 upload
+    /// A session heard from within this long is live. The viewer PINGs
+    /// every 15 s, so a live one is never quiet for more than about 15 s;
+    /// this allows one lost PING and some slack.
+    static let liveSeconds: Double = 35
+
+    init(now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+        self.now = now
+    }
+
+    /// A file session opened. Pushes go to the newest live session whose
+    /// viewer said HELLO caps=push_service: one viewer opens a caps-0 upload
     /// session next to its push-capable pull session, in either order.
     func register(peerCaps: UInt16) -> UInt64 {
         lock.lock(); defer { lock.unlock() }
         nextSession += 1
-        sessions.append((nextSession, peerCaps))
+        sessions.append((nextSession, peerCaps, now()))
         return nextSession
+    }
+
+    /// The session got a message from its viewer (PING or anything else).
+    func heard(_ id: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
+        sessions[i].heard = now()
     }
 
     func unregister(_ id: UInt64) {
@@ -96,13 +113,25 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         orphan?.release()
     }
 
-    /// Queues `job` for the newest push-capable session. Answers at once
-    /// when it cannot: no session at all is not_connected, sessions that
-    /// all lack push_service are old_viewer.
+    /// Queues `job` for the newest live push-capable session. Answers at
+    /// once when it cannot: no session at all is not_connected, sessions
+    /// that all lack push_service are old_viewer, and push-capable sessions
+    /// that have all gone quiet are not_connected too. A quiet session's
+    /// viewer is gone or stuck (a second viewer window on the same PC left
+    /// one behind): offering to it would only time out as failed.
     func offer(_ job: PushJob) -> SendWire.Reply? {
         lock.lock(); defer { lock.unlock() }
         guard !sessions.isEmpty else { return .notConnected }
-        guard let target = sessions.last(where: { ($0.caps & FileProto.Caps.pushService) != 0 }) else { return .oldViewer }
+        let capable = sessions.filter { ($0.caps & FileProto.Caps.pushService) != 0 }
+        guard !capable.isEmpty else { return .oldViewer }
+        let t = now()
+        guard let target = capable.last(where: { t - $0.heard <= PushBroker.liveSeconds }) else {
+            print("file.push_route=no_live_session push_sessions=\(capable.count)")
+            return .notConnected
+        }
+        if target.id != capable.last?.id {
+            print("file.push_route=skipped_quiet push_sessions=\(capable.count)")
+        }
         guard pending == nil, running == nil else { return .busy }
         pending = (target.id, job)
         return nil
