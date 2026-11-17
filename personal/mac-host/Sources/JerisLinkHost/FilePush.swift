@@ -255,10 +255,10 @@ final class PushSender {
         } else {
             guard i == index, offset == next else { return refuse("sequence") }
         }
-        let end = min(f.size, offset + UInt64(min(length, Self.maxRequest)))
+        let stop = min(f.size, offset + UInt64(min(length, Self.maxRequest)))
         var buf = [UInt8](repeating: 0, count: Int(FileProto.maxChunk))
-        while next < end {
-            let want = Int(min(UInt64(FileProto.maxChunk), end - next))
+        while next < stop {
+            let want = Int(min(UInt64(FileProto.maxChunk), stop - next))
             let n = buf.withUnsafeMutableBytes { Darwin.pread(f.fd, $0.baseAddress!, want, off_t(next)) }
             if n < 0, errno == EINTR { continue }
             if n <= 0 { return refuse(n == 0 ? "changed" : "read") }
