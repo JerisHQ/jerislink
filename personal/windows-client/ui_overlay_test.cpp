@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <string>
 
 namespace {
 
@@ -29,7 +30,7 @@ void layoutTests() {
     for (unsigned dpi : {96u, 120u, 144u, 192u}) {
         const Layout l = layoutFor(dpi);
         const Rect items[] = {l.status, l.mute, l.volumeLabel, l.slider, l.info, l.settings,
-                              l.files, l.disconnect};
+                              l.files, l.forceQuit, l.disconnect};
         bool allInBar = true, ordered = true;
         for (size_t i = 0; i < std::size(items); ++i) {
             allInBar = allInBar && inside(l.bar, items[i]) && items[i].width() > 0;
@@ -40,7 +41,7 @@ void layoutTests() {
         expect(l.sep1 > l.status.right && l.sep1 < l.mute.left, "first separator between status and mute");
         expect(l.sep2 > l.slider.right && l.sep2 < l.info.left, "second separator between slider and Info");
         expect(inside(l.size, l.hint) && l.hint.top >= l.bar.bottom, "hint row under the bar");
-        expect(l.size.width() == scale(712, dpi), "width scales with dpi");
+        expect(l.size.width() == scale(804, dpi), "width scales with dpi");
     }
 }
 
@@ -59,8 +60,11 @@ void hitTests() {
     expect(hitTest(l, c[0], c[1]) == Item::Settings, "hit Settings");
     c = mid(l.files);
     expect(hitTest(l, c[0], c[1]) == Item::Files, "hit Files");
+    c = mid(l.forceQuit);
+    expect(hitTest(l, c[0], c[1]) == Item::ForceQuit, "hit Force Quit");
     c = mid(l.disconnect);
     expect(hitTest(l, c[0], c[1]) == Item::Disconnect, "hit Disconnect");
+    expect(hitTest(l, l.forceQuit.right + 1, c[1]) == Item::None, "gap between Force Quit and Disconnect");
     c = mid(l.status);
     expect(hitTest(l, c[0], c[1]) == Item::None, "status is not a button");
     c = mid(l.hint);
@@ -73,7 +77,9 @@ void focusTests() {
     expect(nextFocus(Item::None, -1) == Item::Disconnect, "Shift+Tab from nothing starts at Disconnect");
     expect(nextFocus(Item::Mute, 1) == Item::Volume, "mute -> volume");
     expect(nextFocus(Item::Settings, 1) == Item::Files, "Settings -> Files");
-    expect(nextFocus(Item::Files, 1) == Item::Disconnect, "Files -> Disconnect");
+    expect(nextFocus(Item::Files, 1) == Item::ForceQuit, "Files -> Force Quit");
+    expect(nextFocus(Item::ForceQuit, 1) == Item::Disconnect, "Force Quit -> Disconnect");
+    expect(nextFocus(Item::Disconnect, -1) == Item::ForceQuit, "Disconnect <- Force Quit");
     expect(nextFocus(Item::Disconnect, 1) == Item::Mute, "wraps forward");
     expect(nextFocus(Item::Mute, -1) == Item::Disconnect, "wraps back");
     // A full lap visits every item once.
@@ -84,8 +90,14 @@ void focusTests() {
         seen |= 1 << static_cast<int>(it);
     }
     expect(seen == ((1 << int(Item::Mute)) | (1 << int(Item::Volume)) | (1 << int(Item::Info)) |
-                    (1 << int(Item::Settings)) | (1 << int(Item::Files)) | (1 << int(Item::Disconnect))),
-           "one lap visits all six items");
+                    (1 << int(Item::Settings)) | (1 << int(Item::Files)) | (1 << int(Item::ForceQuit)) |
+                    (1 << int(Item::Disconnect))),
+           "one lap visits all seven items");
+    expect(tooltipFor(Item::ForceQuit) != nullptr &&
+               std::wstring(tooltipFor(Item::ForceQuit)) == L"Force Quit Mac apps (Cmd+Option+Esc)",
+           "Force Quit tooltip names the chord");
+    expect(tooltipFor(Item::Disconnect) == nullptr && tooltipFor(Item::Files) == nullptr,
+           "other items have no tooltip");
 }
 
 void sliderTests() {

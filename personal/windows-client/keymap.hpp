@@ -144,6 +144,24 @@ inline std::vector<KeyEvent> releaseAllModifiers() {
     return {{false, kCtrl}, {false, kAlt}, {false, kWin}, {false, kShift}};
 }
 
+// Overlay Force Quit (D4): Command+Option+Escape opens the Mac's Force Quit
+// Applications window. Wire semantics are fixed (3 = Command, 2 = Option)
+// whatever the preset; the preset only moves physical keys. Every remote
+// modifier is released first, so a held Shift cannot turn it into
+// Cmd+Opt+Shift+Esc (force quit the front app at once), and the chord
+// releases its own modifiers last, in reverse order, so nothing stays held.
+inline std::vector<KeyEvent> forceQuitChord() {
+    std::vector<KeyEvent> out = releaseAllModifiers();
+    const auto esc = static_cast<uint16_t>(vk::Escape);
+    out.push_back({true, kWin});
+    out.push_back({true, kAlt});
+    out.push_back({true, esc});
+    out.push_back({false, esc});
+    out.push_back({false, kAlt});
+    out.push_back({false, kWin});
+    return out;
+}
+
 // Window-message side: WM_KEYDOWN/WM_SYSKEYDOWN, WM_KEYUP/WM_SYSKEYUP and the
 // messages the low-level hook posts. Keeps the "key owned by a remapped
 // shortcut until its physical key-up" state.
