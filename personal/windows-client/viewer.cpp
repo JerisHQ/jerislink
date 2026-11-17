@@ -404,6 +404,10 @@ struct ConnectionInfoState {
     std::string backend = "pending";
     std::string decoder = "pending";
     std::string adapter;
+    // Addresses in use (read-only here; no longer in Settings).
+    std::string hostIp;      // the Mac, from the launch screen or --host
+    std::string bindIp;      // this PC, chosen automatically (or --bind-ip)
+    std::string bindReason;  // cli | auto-tailnet | auto-tailcat | fallback | none
 };
 
 static ConnectionInfoState gConnectionInfo;
@@ -887,7 +891,8 @@ static LONG writeRegString(HKEY key, const wchar_t* name, const std::string& val
 }
 
 // Per-user settings in HKCU\Software\Jeris\Jerislink:
-//   HostIp (REG_SZ), BindIp (REG_SZ, empty = auto), VideoCodec, VideoBitrateMbps (REG_DWORD).
+//   HostIp (REG_SZ), VideoCodec, VideoBitrateMbps (REG_DWORD). An old BindIp
+//   value (manual "This PC's address", removed) is ignored and deleted on save.
 static SavedSettings loadSavedSettings() {
     SavedSettings settings;
     HKEY key = nullptr;
@@ -909,7 +914,6 @@ static SavedSettings loadSavedSettings() {
         bitrate = 25;
     }
     settings.hostIp = readRegString(key, L"HostIp");
-    settings.bindIp = readRegString(key, L"BindIp");
     RegCloseKey(key);
     settings.codec = savedCodecName(codec);
     settings.bitrateMbps = static_cast<uint16_t>(bitrate);
@@ -932,10 +936,10 @@ static bool saveSettings(const SavedSettings& settings) {
         key, L"VideoBitrateMbps", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&bitrate), sizeof(bitrate));
     const LONG hostResult = writeRegString(key, L"HostIp", settings.hostIp);
-    const LONG bindResult = writeRegString(key, L"BindIp", settings.bindIp);
+    RegDeleteValueW(key, L"BindIp");  // stale manual bind; not-found is fine
     RegCloseKey(key);
     return codecResult == ERROR_SUCCESS && bitrateResult == ERROR_SUCCESS &&
-           hostResult == ERROR_SUCCESS && bindResult == ERROR_SUCCESS;
+           hostResult == ERROR_SUCCESS;
 }
 
 // Viewer volume in HKCU\Software\Jeris\Jerislink\AudioVolumePercent
@@ -1053,10 +1057,10 @@ static void commitAudioVolume(const char* source) {
 // viewer window uses, so the dialogs match the viewer's title bar.
 
 static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
-static constexpr int kSettingsFooterTop = 306;  // dialog units, see jerislink.rc
+static constexpr int kSettingsFooterTop = 201;  // dialog units, see jerislink.rc
 static constexpr int kVolumeFooterTop = 70;
 static constexpr int kLaunchFooterTop = 238;
-static constexpr int kInfoFooterTop = 172;
+static constexpr int kInfoFooterTop = 205;
 
 struct ThemedDialog;
 using ThemedExtraPaint = void (*)(HWND dlg, HDC dc, const ThemedDialog& td);
@@ -1090,12 +1094,11 @@ static TextRole textRole(int id) {
     case IDC_INFO_SECTION_CONFIGURED:
     case IDC_INFO_SECTION_EFFECTIVE:
     case IDC_INFO_SECTION_DECODER:
-    case IDC_UI_SECTION_CONNECTION:
+    case IDC_INFO_SECTION_ADDRESS:
     case IDC_UI_SECTION_VIDEO:
     case IDC_UI_SECTION_AUDIO:
     case IDC_UI_SECTION_KEYBOARD: return TextRole::Section;
     case IDC_UI_LABEL_HOST:
-    case IDC_UI_LABEL_BIND:
     case IDC_UI_LABEL_CODEC:
     case IDC_UI_LABEL_BITRATE:
     case IDC_UI_LABEL_VOLUME:
@@ -1105,8 +1108,7 @@ static TextRole textRole(int id) {
     case IDC_UI_HINT_HOST:
     case IDC_UI_HINT_BITRATE:
     case IDC_UI_HINT_VOLUME:
-    case IDC_UI_HINT_KEYBOARD:
-    case IDC_BIND_HINT: return TextRole::Hint;
+    case IDC_UI_HINT_KEYBOARD: return TextRole::Hint;
     case IDC_APPLY_NOTE:
     case IDC_LAUNCH_BUILD:
     case IDC_INFO_BUILD: return TextRole::Note;
@@ -1147,7 +1149,7 @@ static void applyThemeFonts(HWND dlg) {
         }
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
     }
-    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP, IDC_KEYBOARD_PRESET}) {
+    for (int id : {IDC_VIDEO_CODEC, IDC_KEYBOARD_PRESET}) {
         HWND combo = GetDlgItem(dlg, id);
         if (!combo) continue;
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), comboFieldHeight(dlg));
@@ -1156,7 +1158,7 @@ static void applyThemeFonts(HWND dlg) {
     RedrawWindow(dlg, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
-// The drop-downs (codec, this PC's address) paint their own closed state:
+// The drop-downs (codec, keyboard) paint their own closed state:
 // rounded field, text and chevron, like the edit boxes. The list itself is
 // owner-drawn items. Disabled: muted text, no chevron (greyed info).
 // Classic GWLP_WNDPROC subclass: SetWindowSubclass is a comctl32 v6 API and
@@ -1296,7 +1298,7 @@ static void initThemedDialog(HWND dlg, int titlePt, int footerTopDlu) {
     td->theme.build(dlg, titlePt);
     SetWindowLongPtrW(dlg, DWLP_USER, reinterpret_cast<LONG_PTR>(td));
     jl::ui::applyWindowChrome(dlg);
-    for (int id : {IDC_VIDEO_CODEC, IDC_BIND_IP, IDC_KEYBOARD_PRESET}) {
+    for (int id : {IDC_VIDEO_CODEC, IDC_KEYBOARD_PRESET}) {
         if (HWND combo = GetDlgItem(dlg, id)) themeComboBox(combo);
     }
     applyThemeFonts(dlg);
@@ -1472,7 +1474,7 @@ static bool handleThemedDialogMessage(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         }
         const int fromId = LOWORD(wParam);
         if (code == CBN_DROPDOWN &&
-            (fromId == IDC_VIDEO_CODEC || fromId == IDC_BIND_IP || fromId == IDC_KEYBOARD_PRESET)) {
+            (fromId == IDC_VIDEO_CODEC || fromId == IDC_KEYBOARD_PRESET)) {
             fitComboDropHeight(reinterpret_cast<HWND>(lParam));
         }
         return false;  // the dialog's own handler still sees the command
@@ -1662,12 +1664,6 @@ static constexpr int kBitrateSliderMin = 4;
 static constexpr int kBitrateSliderMax = 100;
 static constexpr int kBitrateSliderDefault = 25;
 
-static std::wstring dialogText(HWND dlg, int id) {
-    wchar_t text[64]{};
-    GetDlgItemTextW(dlg, id, text, static_cast<int>(std::size(text)));
-    return text;
-}
-
 static void updateBitrateControls(HWND dlg) {
     const bool autoRate = jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO);
     HWND slider = GetDlgItem(dlg, IDC_VIDEO_BITRATE);
@@ -1678,79 +1674,15 @@ static void updateBitrateControls(HWND dlg) {
     SetDlgItemTextW(dlg, IDC_BITRATE_VALUE, text.c_str());
 }
 
-// "This PC's address" for the open settings dialog (one at a time).
-static jl::BindDetection gBindDetection;
-static std::vector<jl::BindChoice> gBindChoices;
-static std::string gBindSaved;
 // The modal copy runs before connecting (Connect); from the running viewer
 // the dialog is modeless, so video and audio keep running while it is open.
 static bool gSettingsModal = false;
-
-static std::wstring bindChoiceLabel(const jl::BindChoice& c) {
-    switch (c.kind) {
-    case jl::BindKind::Auto: return L"Auto (match Mac address)";
-    case jl::BindKind::Tailnet: return L"Tailscale  " + wideFromAscii(c.ip);
-    case jl::BindKind::Tailcat: return L"Tailcat  " + wideFromAscii(c.ip);
-    case jl::BindKind::Saved: return L"Saved  " + wideFromAscii(c.ip);
-    }
-    return {};
-}
-
-static void fillBindChoices(HWND dlg) {
-    HWND combo = GetDlgItem(dlg, IDC_BIND_IP);
-    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-    gBindDetection = detectBindAddresses();
-    gBindChoices = jl::bindChoices(gBindDetection, gBindSaved);
-    for (const auto& c : gBindChoices) {
-        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(bindChoiceLabel(c).c_str()));
-    }
-    SendMessageW(combo, CB_SETCURSEL, jl::initialBindChoice(gBindChoices, gBindSaved), 0);
-    // Nothing detected and nothing saved: Auto is the only entry, shown greyed.
-    EnableWindow(combo, gBindChoices.size() > 1 ? TRUE : FALSE);
-}
-
-// Greyed info under the drop-down: what Auto would use for the Mac address
-// typed above, or what the manual choice always uses.
-static void updateBindHint(HWND dlg) {
-    const LRESULT sel = SendDlgItemMessageW(dlg, IDC_BIND_IP, CB_GETCURSEL, 0, 0);
-    std::wstring hint;
-    if (sel > 0 && static_cast<size_t>(sel) < gBindChoices.size()) {
-        hint = L"Always uses " + wideFromAscii(gBindChoices[static_cast<size_t>(sel)].ip) +
-               L". Choose Auto to match the Mac address.";
-    } else {
-        const std::string host = asciiFromWide(dialogText(dlg, IDC_HOST_IP));
-        const jl::AutoBind a = jl::autoBindFor(host, gBindDetection);
-        const std::wstring ip = wideFromAscii(a.ip);
-        if (a.reason == "auto-tailnet") {
-            hint = L"Uses " + ip + L" (Tailscale), matching the Mac address.";
-        } else if (a.reason == "auto-tailcat") {
-            hint = L"Uses " + ip + L" (Tailcat bridge), matching the Mac address.";
-        } else if (a.reason == "fallback") {
-            if (jl::isTailcatIPv4(host)) {
-                hint = L"No Tailcat bridge on this PC (127.0.0.1:48400). Falls back to " + ip +
-                       L" (Tailscale).";
-            } else if (jl::isIPv4(host)) {
-                hint = L"The Mac address is not Tailscale or Tailcat. Falls back to " + ip +
-                       L" (Tailscale).";
-            } else {
-                hint = L"Uses " + ip + L" (Tailscale) until the Mac address is set.";
-            }
-        } else if (jl::isTailnetIPv4(host)) {
-            hint = L"No Tailscale address on this PC. Connect Tailscale first.";
-        } else if (jl::isTailcatIPv4(host)) {
-            hint = L"No Tailcat bridge on this PC (127.0.0.1:48400) and no Tailscale address.";
-        } else {
-            hint = L"No Tailscale or Tailcat address found on this PC.";
-        }
-    }
-    SetDlgItemTextW(dlg, IDC_BIND_HINT, hint.c_str());
-}
 
 // Says what applies now and what needs a reconnect (Disconnect in the
 // overlay, then Connect on the launch screen).
 static std::wstring settingsApplyNote(bool connect) {
     return connect ? L"Used for your next connection. Volume and keyboard apply now."
-                   : L"Volume and keyboard apply now. Connection and video apply when you reconnect.";
+                   : L"Volume and keyboard apply now. Video applies when you reconnect.";
 }
 
 // Validation errors show in the footer note (no message box: it would stop
@@ -1800,11 +1732,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         jl::ui::setOwnerChecked(dlg, IDC_BITRATE_AUTO, autoRate);
         updateBitrateControls(dlg);
 
-        SetDlgItemTextW(dlg, IDC_HOST_IP, wideFromAscii(settings.hostIp).c_str());
-        gBindSaved = settings.bindIp;
-        fillBindChoices(dlg);
-        updateBindHint(dlg);
-
         ensureAudioVolumeLoaded();
         initVolumeControls(dlg);
 
@@ -1820,10 +1747,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
         // Owner-drawn buttons cannot be BS_DEFPUSHBUTTON; Enter still means Save.
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
         SetForegroundWindow(dlg);
-        if (settings.hostIp.empty()) {
-            SetFocus(GetDlgItem(dlg, IDC_HOST_IP));
-            return FALSE;  // focus set manually
-        }
         return TRUE;
     }
     case WM_HSCROLL:
@@ -1854,25 +1777,12 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                                 "settings");
             return TRUE;
         }
-        if ((LOWORD(wParam) == IDC_HOST_IP && HIWORD(wParam) == EN_CHANGE) ||
-            (LOWORD(wParam) == IDC_BIND_IP && HIWORD(wParam) == CBN_SELCHANGE)) {
-            updateBindHint(dlg);
-            if (gSettingsNoteError) {
-                gSettingsNoteError = false;
-                SetDlgItemTextW(dlg, IDC_APPLY_NOTE, settingsApplyNote(gSettingsModal).c_str());
-            }
-            return TRUE;
-        }
         if (LOWORD(wParam) == IDCANCEL) {
             // Volume and mute already applied and stay; nothing else was saved.
             closeSettingsDialog(dlg, IDCANCEL);
             return TRUE;
         }
         if (LOWORD(wParam) == IDOK) {
-            const std::string host = asciiFromWide(dialogText(dlg, IDC_HOST_IP));
-            const int bindIndex = static_cast<int>(
-                SendDlgItemMessageW(dlg, IDC_BIND_IP, CB_GETCURSEL, 0, 0));
-            const std::string bind = jl::bindValueToSave(gBindChoices, bindIndex, gBindSaved);
             const LRESULT selected = SendDlgItemMessageW(
                 dlg, IDC_VIDEO_CODEC, CB_GETCURSEL, 0, 0);
             const bool autoRate = jl::ui::ownerChecked(dlg, IDC_BITRATE_AUTO);
@@ -1881,23 +1791,16 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
             const UINT bitrate = autoRate
                 ? 0u
                 : static_cast<UINT>(std::clamp(sliderValue, kBitrateSliderMin, kBitrateSliderMax));
-            logLine("settings.save_attempt host=" + host +
-                    " bind=" + (bind.empty() ? std::string("auto") : bind) +
-                    " selected=" + std::to_string(selected) +
+            logLine("settings.save_attempt selected=" + std::to_string(selected) +
                     " bitrate_auto=" + (autoRate ? "yes" : "no") +
                     " bitrate=" + std::to_string(bitrate));
-            if (!jl::isIPv4(host)) {
-                showSettingsError(dlg, L"Enter the Mac's IPv4 address, e.g. 100.64.0.10.",
-                                  IDC_HOST_IP);
-                return TRUE;
-            }
             if (selected == CB_ERR) {
                 showSettingsError(dlg, L"Choose a codec.", IDC_VIDEO_CODEC);
                 return TRUE;
             }
+            // The Mac address is entered on the launch screen; keep the saved one.
             SavedSettings settings;
-            settings.hostIp = host;
-            settings.bindIp = bind;
+            settings.hostIp = loadSavedSettings().hostIp;
             settings.codec = selected == 0 ? "auto" : (selected == 2 ? "hevc" : "h264");
             settings.bitrateMbps = static_cast<uint16_t>(bitrate);
             if (!saveSettings(settings)) {
@@ -1905,9 +1808,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARA
                 showSettingsError(dlg, L"Could not save the settings.", 0);
                 return TRUE;
             }
-            logLine("settings.saved host=" + settings.hostIp +
-                    " bind=" + (settings.bindIp.empty() ? std::string("auto") : settings.bindIp) +
-                    " codec=" + settings.codec +
+            logLine("settings.saved codec=" + settings.codec +
                     " bitrate_mbps=" + std::to_string(settings.bitrateMbps));
             closeSettingsDialog(dlg, IDOK);
             return TRUE;
@@ -1982,10 +1883,30 @@ static void updateViewerTitle(HWND hwnd) {
 
 static constexpr UINT_PTR kInfoRefreshTimer = 1;
 
+// How this PC's address was chosen, for the read-only Addresses section.
+static std::wstring bindReasonLabel(const std::string& reason) {
+    if (reason == "auto-tailnet") return L"automatic, Tailscale";
+    if (reason == "auto-tailcat") return L"automatic, Tailcat";
+    if (reason == "fallback") return L"automatic, Tailscale fallback";
+    if (reason == "cli") return L"set by --bind-ip";
+    return L"none found";
+}
+
+static std::wstring addressText(const std::string& hostIp, const std::string& bindIp,
+                                const std::string& reason) {
+    std::wostringstream s;
+    s << L"Mac: " << (hostIp.empty() ? std::wstring(L"not set") : wideFromAscii(hostIp))
+      << L"\r\nThis PC: " << (bindIp.empty() ? std::wstring(L"none") : wideFromAscii(bindIp))
+      << L" (" << bindReasonLabel(reason) << L")";
+    return s.str();
+}
+
 static std::wstring connectionInfoText(int id) {
     const auto& c = gConnectionInfo;
     std::wostringstream s;
-    if (id == IDC_INFO_CONFIGURED) {
+    if (id == IDC_INFO_ADDRESS) {
+        return addressText(c.hostIp, c.bindIp, c.bindReason);
+    } else if (id == IDC_INFO_CONFIGURED) {
         s << L"Codec: " << codecDisplayName(c.configuredCodec) << L"\r\nBandwidth: "
           << (c.configuredBitrateMbps == 0 ? std::wstring(L"Auto")
                                            : std::to_wstring(c.configuredBitrateMbps) + L" Mbps");
@@ -2016,7 +1937,7 @@ static std::wstring windowText(HWND hwnd) {
 
 // Only changed text is set, so the window does not flicker every second.
 static void fillConnectionInfo(HWND dlg) {
-    for (int id : {IDC_INFO_CONFIGURED, IDC_INFO_EFFECTIVE, IDC_INFO_DECODER}) {
+    for (int id : {IDC_INFO_ADDRESS, IDC_INFO_CONFIGURED, IDC_INFO_EFFECTIVE, IDC_INFO_DECODER}) {
         HWND item = GetDlgItem(dlg, id);
         const std::wstring next = connectionInfoText(id);
         if (item && windowText(item) != next) SetWindowTextW(item, next.c_str());
@@ -5247,8 +5168,8 @@ static jl::LaunchRequest resolveLaunchArgs(const std::vector<std::string>& args)
 // while video is playing, so the modal dialog cannot stall a session.
 
 static const wchar_t* const kNoTailnetNote =
-    L"No Tailscale or Tailcat address on this PC. Connect one, or set this PC's "
-    L"address in Advanced settings.";
+    L"No Tailscale or Tailcat address on this PC. Connect Tailscale, or start "
+    L"the Tailcat bridge, then try again.";
 
 struct LaunchContext {
     std::wstring note;              // why we are here (shown in the error line)
@@ -5372,7 +5293,7 @@ static bool drawLaunchButton(HWND dlg, const DRAWITEMSTRUCT& di) {
         launchText(dc, L"Advanced settings", title, t.label, jl::ui::color::kText,
                    DT_LEFT | DT_BOTTOM);
         RECT sub{r.left + s(12), mid + s(1), r.right - s(30), r.bottom};
-        launchText(dc, L"Bandwidth, codec, this PC's address", sub, t.smallText,
+        launchText(dc, L"Bandwidth, codec, audio, keyboard", sub, t.smallText,
                    jl::ui::color::kMuted, DT_LEFT | DT_TOP);
         RECT chevron{r.right - s(30), r.top, r.right - s(8), r.bottom};
         launchText(dc, L"\u203a", chevron, t.title, jl::ui::color::kMuted,
@@ -5508,8 +5429,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         case IDC_LAUNCH_ADVANCED:
             if (code == BN_CLICKED &&
                 runSettingsDialog(dlg, kSettingsDialogConnect) == IDOK) {
-                SetDlgItemTextW(dlg, IDC_HOST_IP,
-                                wideFromAscii(loadSavedSettings().hostIp).c_str());
+                // Settings no longer edit the Mac address: keep what is typed here.
                 launchSetError(dlg, L"");
             }
             return TRUE;
@@ -5621,6 +5541,9 @@ static int appMain(int argc, char** argv) {
     gConnectionInfo.remoteWidth = o.width;
     gConnectionInfo.remoteHeight = o.height;
     gConnectionInfo.fps = o.fps;
+    gConnectionInfo.hostIp = o.sourceIp;
+    gConnectionInfo.bindIp = o.bindIp;
+    gConnectionInfo.bindReason = request.bindReason;
     logLine("video.requested codec=" + o.codec +
             " bitrate_mbps=" + std::to_string(o.bitrateMbps));
     std::string effectiveCodec = "h264";
@@ -6741,7 +6664,6 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     SetFocus(GetDlgItem(settings, IDC_VIDEO_BITRATE));
     snapshotWindow(settings, dir, L"settings-manual");
     snapshotDropDown(settings, IDC_VIDEO_CODEC, dir, L"settings-codec-open");
-    snapshotDropDown(settings, IDC_BIND_IP, dir, L"settings-bind-open");
     snapshotDropDown(settings, IDC_KEYBOARD_PRESET, dir, L"settings-keyboard-open");
     // Keyboard preset applies at once (no Save) and is saved; then back.
     const jl::keymap::Preset presetBefore = gKeys.preset();
@@ -6758,29 +6680,10 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
                             loadKeyboardPreset() == jl::keymap::Preset::Mac;
     std::wcout << L"keymap_live=" << (keymapLive && keymapBack ? L"ok" : L"FAIL")
                << L" before=" << jl::keymap::presetName(presetBefore) << L"\n";
-    // Manual pick (Tailcat) and Auto with a Tailcat Mac address.
-    SendDlgItemMessageW(settings, IDC_BIND_IP, CB_SETCURSEL, 2, 0);
-    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BIND_IP, CBN_SELCHANGE),
-                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_BIND_IP)));
-    snapshotWindow(settings, dir, L"settings-bind-manual");
-    SendDlgItemMessageW(settings, IDC_BIND_IP, CB_SETCURSEL, 0, 0);
-    SetDlgItemTextW(settings, IDC_HOST_IP, L"127.0.0.1");  // EN_CHANGE updates the hint
-    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_BIND_IP, CBN_SELCHANGE),
-                 reinterpret_cast<LPARAM>(GetDlgItem(settings, IDC_BIND_IP)));
-    snapshotWindow(settings, dir, L"settings-bind-tailcat");
-    // Nothing detected: Auto only, greyed, with the reason below.
-    gBindDetectionOverride = jl::BindDetection{};
-    fillBindChoices(settings);
-    SetDlgItemTextW(settings, IDC_HOST_IP, L"100.64.0.10");
-    snapshotWindow(settings, dir, L"settings-bind-none");
-    const bool bindGreyed = !IsWindowEnabled(GetDlgItem(settings, IDC_BIND_IP));
-    gBindDetectionOverride = jl::BindDetection{std::string("100.64.0.25"), true};
-    // Validation error in the footer, no message box.
-    SetDlgItemTextW(settings, IDC_HOST_IP, L"");
-    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
-    snapshotWindow(settings, dir, L"settings-error");
-    const bool stillOpen = IsWindow(settings) && gSettingsDlg == settings;
-    SetDlgItemTextW(settings, IDC_HOST_IP, L"100.64.0.10");
+    // No address fields in Settings: the Mac address is on the launch screen and
+    // this PC's address is automatic (shown read-only in Connection info).
+    const bool noAddressFields = GetDlgItem(settings, IDC_HOST_IP) == nullptr &&
+                                 GetDlgItem(settings, IDC_UI_LABEL_HOST) == nullptr;
     // Settings Audio section and the volume window open together stay in step.
     SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDC_VOLUME_MUTE, BN_CLICKED), 0);
 
@@ -6801,7 +6704,27 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         jl::ui::ownerChecked(settings, IDC_VOLUME_MUTE) == gAudioMuted;
     std::wcout << L"volume_sync=" << (synced ? L"ok" : L"MISMATCH") << L"\n";
     DestroyWindow(volume);
-    DestroyWindow(settings);
+    // Save keeps the saved Mac address (CI sets HostIp first) and deletes an old
+    // manual BindIp value.
+    const std::string hostBefore = loadSavedSettings().hostIp;
+    HKEY bindKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, nullptr, 0, KEY_ALL_ACCESS,
+                        nullptr, &bindKey, nullptr) == ERROR_SUCCESS) {
+        writeRegString(bindKey, L"BindIp", "192.0.2.98");
+        RegCloseKey(bindKey);
+    }
+    SendMessageW(settings, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    pumpFor(100);
+    bool staleBindGone = false;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kJerislinkSettingsKey, 0, KEY_READ, &bindKey) ==
+        ERROR_SUCCESS) {
+        staleBindGone = RegQueryValueExW(bindKey, L"BindIp", nullptr, nullptr, nullptr,
+                                         nullptr) == ERROR_FILE_NOT_FOUND;
+        RegCloseKey(bindKey);
+    }
+    const bool saveKeepsHost = !IsWindow(settings) && !hostBefore.empty() &&
+                               loadSavedSettings().hostIp == hostBefore && staleBindGone;
+    if (IsWindow(settings)) DestroyWindow(settings);
     pumpFor(100);
 
     // One dialog at a time, through the same calls as the viewer's menus.
@@ -6817,8 +6740,9 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     pumpFor(100);
     const bool closed = gSettingsDlg == nullptr;
     const bool oneDialog = volumeFirst && settingsClosedVolume && volumeRefused && modeless && closed;
-    std::wcout << L"one_dialog=" << (oneDialog ? L"ok" : L"FAIL") << L" bind_greyed=" << bindGreyed
-               << L" error_inline=" << stillOpen << L"\n";
+    std::wcout << L"one_dialog=" << (oneDialog ? L"ok" : L"FAIL")
+               << L" settings_no_address=" << noAddressFields
+               << L" save_keeps_host=" << saveKeepsHost << L"\n";
 
     // Launch screen: host tab, code tab, inline error.
     LaunchContext launchCtx;
@@ -6880,6 +6804,9 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     gConnectionInfo.backend = "d3d11";
     gConnectionInfo.decoder = "hardware";
     gConnectionInfo.adapter = "Sample GPU";
+    gConnectionInfo.hostIp = "100.64.0.10";
+    gConnectionInfo.bindIp = "100.64.0.25";
+    gConnectionInfo.bindReason = "auto-tailnet";
     overlayCreate(viewer);
     overlayShow(false, "snapshot", 0);
     snapshotWindow(viewer, dir, L"overlay-open-mouse");
@@ -7072,9 +6999,13 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     timed("overlay-mute-again-check", [] {}, gAudioMuted == mutedBefore);
     timed("overlay-info", [] { overlayActivate(ov::Item::Info, "snapshot"); }, true);
     timed("overlay-info-check", [] {}, gInfoDlg != nullptr);
+    bool infoAddress = false;
     if (gInfoDlg) {
         sessionAlpha(gInfoDlg, L"info");
         snapshotWindow(gInfoDlg, dir, L"connection-info");
+        const std::wstring shown = windowText(GetDlgItem(gInfoDlg, IDC_INFO_ADDRESS));
+        infoAddress = shown == L"Mac: 100.64.0.10\r\nThis PC: 100.64.0.25 (automatic, Tailscale)";
+        std::wcout << L"info_address=" << (infoAddress ? L"ok" : L"FAIL") << L"\n";
         SendMessageW(gInfoDlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
     }
     pumpFor(60);
@@ -7144,7 +7075,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
 
     if (!synced) return 4;
     if (!oneDialog) return 5;
-    if (!bindGreyed || !stillOpen) return 6;
+    if (!noAddressFields || !saveKeepsHost || !infoAddress) return 6;
     if (!noMenu) return 7;
     if (!actionsOk || !noModal || !overlayShown || !overlayPlaced || !layered ||
         !sessionDialogsLayered)

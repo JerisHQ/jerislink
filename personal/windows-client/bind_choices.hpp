@@ -1,11 +1,9 @@
 #pragma once
 
-// "This PC's address": which local IPv4 the viewer binds to.
-// Pure C++ (no Win32), so the rules can be unit-tested anywhere.
-//
-// Saved in HKCU ...\Jerislink\BindIp (REG_SZ, same format as before):
-//   empty      Auto (match the Mac address), the default
-//   an IPv4    manual choice, used as is
+// "This PC's address": which local IPv4 the viewer binds to. It is always
+// set automatically from the Mac address; there is no manual choice
+// (--bind-ip on the command line still overrides it). Connection info shows
+// the result. Pure C++ (no Win32), so the rules can be unit-tested anywhere.
 //
 // Detection (viewer.cpp):
 //   tailnet : first active adapter IPv4 in 100.64.0.0/10 (Tailscale range)
@@ -26,7 +24,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace jl {
 
@@ -88,46 +85,6 @@ inline AutoBind autoBindFor(const std::string& macHost, const BindDetection& d) 
     if (isTailcatIPv4(macHost) && d.tailcat) return {kTailcatBindIp, "auto-tailcat"};
     if (haveTailnet) return {*d.tailnetIp, "fallback"};
     return {"", "none"};
-}
-
-enum class BindKind { Auto, Tailnet, Tailcat, Saved };
-
-struct BindChoice {
-    BindKind kind;
-    std::string ip;          // shown to the user (empty for Auto)
-    std::string savedValue;  // written to BindIp when chosen
-};
-
-// Auto first, then each detected local IP as a manual choice. A saved manual
-// IP that is not detected now stays in the list, so saving keeps it.
-inline std::vector<BindChoice> bindChoices(const BindDetection& d, const std::string& savedBind) {
-    std::vector<BindChoice> out;
-    out.push_back({BindKind::Auto, "", ""});
-    if (d.tailnetIp && !d.tailnetIp->empty()) {
-        out.push_back({BindKind::Tailnet, *d.tailnetIp, *d.tailnetIp});
-    }
-    if (d.tailcat) out.push_back({BindKind::Tailcat, kTailcatBindIp, kTailcatBindIp});
-    if (isIPv4(savedBind)) {
-        bool listed = false;
-        for (const auto& c : out) listed = listed || c.savedValue == savedBind;
-        if (!listed) out.push_back({BindKind::Saved, savedBind, savedBind});
-    }
-    return out;
-}
-
-// The entry that matches what is saved; Auto when nothing matches.
-inline int initialBindChoice(const std::vector<BindChoice>& choices, const std::string& savedBind) {
-    for (size_t i = 0; i < choices.size(); ++i) {
-        if (choices[i].savedValue == savedBind) return static_cast<int>(i);
-    }
-    return 0;
-}
-
-// Value to save. No valid pick: keep what was saved.
-inline std::string bindValueToSave(const std::vector<BindChoice>& choices, int index,
-                                   const std::string& savedBind) {
-    if (index < 0 || static_cast<size_t>(index) >= choices.size()) return savedBind;
-    return choices[static_cast<size_t>(index)].savedValue;
 }
 
 }  // namespace jl
