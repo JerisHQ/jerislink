@@ -17,6 +17,37 @@ JerisLink.app/
 
 The Input Helper stays a separate process with its own bundle identifier. If it crashes, the host and the video stream keep running, and the other way round. launchd restarts whichever process exits (`KeepAlive`).
 
+## Install from a release
+
+For people who use JerisLink, not build it. The Windows viewer is JerisLink from the Microsoft Store (or the installer on the GitHub release). JerisLink works only between devices in the same Tailscale network (tailnet). It does not connect over the open internet or a LAN.
+
+You need a Mac with Apple silicon and macOS 14 or later, and Tailscale signed in to the same tailnet on the Mac and the Windows PC. Note each machine's Tailscale IPv4 address (`100.x.y.z`).
+
+1. From <https://github.com/JerisHQ/jerislink/releases>, download `JerisLink-<version>-macos-arm64.zip`. Do not use a file ending in `-unsigned.zip`; that one is ad-hoc signed for developers. The normal zip is Developer ID signed and notarized by Apple.
+2. Unpack it and move `JerisLink.app` into `~/Applications` (the `Applications` folder in your home folder; create it if it is missing).
+3. Open `JerisLink.app` once. It registers its background services and shows their status.
+4. Allow the permissions macOS asks for (see "Privacy permissions" below):
+   - Screen Recording (shown as **JerisLink**): screen video and the Mac's sound.
+   - Accessibility (shown as **JerisLink Input Helper**): keyboard and mouse from the PC.
+   - Downloads folder (shown as **JerisLink**, asked the first time the PC sends a file): files go to `~/Downloads/JerisLink`. If you refuse, they go to `~/JerisLink Received`.
+   - Login Items, only if the status shows `requiresApproval`.
+
+   Then open `JerisLink.app` again. All three services should show `enabled`.
+5. Allow the Windows PC. The host accepts one viewer address, set in `listen.plist` (see "Listen endpoint" below). The app has no field for it yet, so use Terminal and replace `100.x.y.z` with the **Windows PC's** Tailscale IPv4:
+
+   ```sh
+   mkdir -p ~/Library/Application\ Support/JerisLink
+   /usr/libexec/PlistBuddy -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' \
+     ~/Library/Application\ Support/JerisLink/listen.plist
+   ```
+
+   To change it later: `/usr/libexec/PlistBuddy -c 'Set :clientIP 100.a.b.c' ~/Library/Application\ Support/JerisLink/listen.plist`. The services pick up the change within a few seconds.
+6. On the PC, open JerisLink, type the **Mac's** Tailscale IPv4 on the launch screen, and connect. This PC's address is chosen automatically; both addresses are shown read-only under Connection info.
+
+The Microsoft Store version of the viewer has no "Send to" entry in Explorer. Drag files onto the viewer window or its Files panel instead.
+
+To remove the host: run `~/Applications/JerisLink.app/Contents/MacOS/JerisLinkHost --unregister`, delete `~/Applications/JerisLink.app` and `~/Library/Application Support/JerisLink`, then remove JerisLink from Screen Recording and Accessibility in System Settings.
+
 ## Background agents
 
 The app registers its agents itself with `SMAppService` (macOS 13+; the app requires macOS 14). There are no hand-installed `~/Library/LaunchAgents` files and no zsh watchdogs.
