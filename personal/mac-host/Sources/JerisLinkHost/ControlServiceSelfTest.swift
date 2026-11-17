@@ -1120,6 +1120,8 @@ private final class FakeInputHelper: @unchecked Sendable {
     private var current: Int32 = -1
     private(set) var maxConcurrentConnections = 0
     private var stopping = false
+    /// Signalled when the accept loop has closed the listening socket.
+    private let loopDone = DispatchSemaphore(value: 0)
 
     private init(fd: Int32, port: UInt16) {
         listenFD = fd
@@ -1145,10 +1147,25 @@ private final class FakeInputHelper: @unchecked Sendable {
         return helper
     }
 
+    /// Only the accept loop closes the listening socket, after its last
+    /// accept(). Closing it here while the loop could still call accept()
+    /// let the next FakeInputHelper reuse the descriptor number, and the
+    /// stopped helper's loop then took that helper's connections (events
+    /// recorded on the wrong helper, depending on timing). stop() ends the
+    /// served connection, wakes a blocked accept() and waits for the loop,
+    /// so the port is free again when it returns.
     func stop() {
-        lock.lock(); stopping = true; lock.unlock()
-        Darwin.shutdown(listenFD, SHUT_RDWR)
-        Darwin.close(listenFD)
+        lock.lock(); stopping = true; let c = current; lock.unlock()
+        if c >= 0 { Darwin.shutdown(c, SHUT_RDWR) }
+        let wake = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        if wake >= 0 {
+            var addr = ControlServiceSelfTest.loopbackAddress(port: port)
+            _ = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(wake, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            Darwin.close(wake)
+        }
+        _ = loopDone.wait(timeout: .now() + 3)
     }
 
     func received(_ event: Event) -> Bool {
@@ -1198,14 +1215,21 @@ private final class FakeInputHelper: @unchecked Sendable {
     }
 
     private func acceptLoop() {
+        defer {
+            Darwin.close(listenFD)
+            loopDone.signal()
+        }
         while true {
+            lock.lock(); let stopped = stopping; lock.unlock()
+            if stopped { return }
             let c = Darwin.accept(listenFD, nil, nil)
-            if c < 0 {
-                lock.lock(); let done = stopping; lock.unlock()
-                if done { return }
-                continue
-            }
+            if c < 0 { continue }
             lock.lock()
+            if stopping {                    // stop()'s wake-up connection
+                lock.unlock()
+                Darwin.close(c)
+                return
+            }
             active += 1
             accepted += 1
             current = c
