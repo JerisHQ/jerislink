@@ -569,6 +569,9 @@ static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileC
 static HWND gFilePanel = nullptr;  // F4 Files panel
 static bool filePanelVisible() { return gFilePanel && IsWindowVisible(gFilePanel); }
 static bool pasteEligible();
+static bool pasteBusy();
+static void pasteRefusedBusy();
+static void pasteRefusedFinder();
 static void startPasteUpload();
 
 static bool viewerHasInteractiveFocus(HWND hwnd) {
@@ -621,9 +624,10 @@ static jl::keymap::Held heldModifiers() {
 // A Cmd+V with copied Windows files is held here while they upload (F2).
 static void sendKeyOutput(const jl::keymap::Output& out) {
     if (!gControl) return;
-    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible);
+    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible, pasteBusy);
     for (const auto& e : f.events) gControl->sendKey(e.down, e.semantic);
     if (f.startUpload) startPasteUpload();
+    if (f.refusedBusy) pasteRefusedBusy();
     if (!out.debugTag.empty() && debugMode()) logLine(out.debugTag);
 }
 
@@ -2730,9 +2734,11 @@ static uint32_t readFileTransferMaxMbps() {
 
 // Asked by the gate only when a Cmd+V is about to go out. Reads the copied
 // paths (CF_HDROP) now, so a clipboard that cannot be opened lets the key
-// pass through instead of eating it.
+// pass through instead of eating it. True even while a transfer runs: the
+// gate then asks pasteBusy() and refuses, instead of letting the Mac paste
+// whatever stale thing its pasteboard holds.
 static bool pasteEligible() {
-    if (!gFileSession || !gFileSession->canUpload()) return false;
+    if (!gFileSession || !gFileSession->canReceiveUploads()) return false;
     if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
     const DWORD seq = GetClipboardSequenceNumber();
     if (seq == gLastUploadClipSeq) return false;
@@ -2757,6 +2763,9 @@ static bool pasteEligible() {
     gPendingClipSeq = seq;
     return true;
 }
+
+// Any transfer at all: a paste or Send to upload, or a Mac->Windows pull.
+static bool pasteBusy() { return fileTransferRunning(); }
 
 static UINT fileUiDpi() { return jl::ui::windowDpi(gViewerHwnd); }
 
@@ -2823,6 +2832,12 @@ static void fileUiReposition() {
             const int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
             SetWindowPos(gFileChip, HWND_NOTOPMOST, c.right - l.width - ov::scale(16, dpi), c.top + top, l.width,
                          l.height, SWP_NOACTIVATE);
+        }
+        // Restored after a transfer began while minimised: bring the chip up.
+        if (!IsWindowVisible(gFileChip) &&
+            jl::filepanel::chipOnScreen(gChipMode != ChipMode::Hidden, IsIconic(gViewerHwnd) != FALSE,
+                                        fileChipFloats())) {
+            ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
         }
     }
     filePanelPlace();
@@ -2964,7 +2979,9 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
     gChipCancelHot = false;
     gChipHideAtMs = hideAfterMs > 0 ? steadyMsNow() + hideAfterMs : 0.0;
     fileUiReposition();
-    if (gViewerHwnd && (!IsIconic(gViewerHwnd) || fileChipFloats())) ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    if (gViewerHwnd && jl::filepanel::chipOnScreen(true, IsIconic(gViewerHwnd) != FALSE, fileChipFloats())) {
+        ShowWindow(gFileChip, SW_SHOWNOACTIVATE);
+    }
     filePanelPlace();  // now that the chip is up, keep the panel clear of it
     InvalidateRect(gFileChip, nullptr, FALSE);
 }
@@ -2972,6 +2989,10 @@ static void fileChipShow(ChipMode mode, double hideAfterMs) {
 // The pull session saw something about a Mac copy the user must know (F3 r2).
 static void onFilePullNotice(WPARAM kind) {
     using N = FileSession::PullNotice;
+    if (static_cast<N>(kind) == N::PasteBusy) {
+        pasteRefusedFinder();  // shown over a running upload's chip, like a refused file paste
+        return;
+    }
     // An upload's own chip wins; its result follows shortly anyway.
     if (gChipMode == ChipMode::Running) return;
     switch (static_cast<N>(kind)) {
@@ -3447,6 +3468,23 @@ static void fileChipNotice(const std::string& text, bool error, double ms) {
     gChipNotice = utf8ToWide(text);
     gChipNoticeError = error;
     fileChipShow(ChipMode::Notice, ms);
+}
+
+// Cmd+V with new copied files while a transfer runs: the V was eaten, so the
+// Mac pastes nothing. The clipboard stays unclaimed (the next Cmd+V after
+// the transfer pastes it).
+static void pasteRefusedBusy() {
+    gPendingRoots.clear();
+    logLine("file.paste=refused reason=busy");
+    fileChipNotice(fu::pasteBusy(), true, 6000);
+}
+
+// The Mac did not pass Cmd+V to Finder while a transfer runs (NOTICE 0x5D):
+// Finder would have saved the text clipboard as a .textClipping file. Same
+// notice as a refused file paste, so the V is never eaten silently.
+static void pasteRefusedFinder() {
+    logLine("file.paste=refused reason=busy_finder source=mac");
+    fileChipNotice(fu::pasteBusy(), true, 6000);
 }
 
 // Files dropped on the viewer (WM_DROPFILES): send them to the Mac.

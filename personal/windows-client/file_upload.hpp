@@ -9,6 +9,8 @@
 //   viewer to upload. When the upload ends within 3 s it gives back a Cmd+V
 //   to send; later than that, or after focus left, the chip says "Ready,
 //   press Cmd+V again" instead, so a late paste never lands elsewhere.
+//   While any transfer runs, a Cmd+V with new files is eaten and the chip
+//   says so (never a stale paste on the Mac, never a second transfer).
 // - Pacer: token bucket for FileTransferMaxMbps (0 = no cap).
 // - Text for the progress chip and the disconnect confirm.
 // - ConfirmKeys: keyboard rules of the disconnect confirm.
@@ -34,6 +36,7 @@ public:
     struct Filtered {
         std::vector<keymap::KeyEvent> events;  // what to send to the Mac
         bool startUpload = false;              // a new hold began: start the upload now
+        bool refusedBusy = false;              // Cmd+V eaten: files copied, but a transfer runs
     };
     enum class Outcome { None, Paste, Late, Dropped };
     struct Finished {
@@ -42,20 +45,31 @@ public:
     };
 
     // eligible() is asked only when a Cmd+V down is about to go out and no
-    // hold is running: clipboard has files newer than the last upload, the
-    // host can receive them, no upload is running.
+    // hold is running: clipboard has files newer than the last upload and
+    // the host can receive them. busy() is asked only after eligible() said
+    // yes: a transfer (upload, Send to, Mac->Windows pull) is running. Then
+    // the V is eaten, so the Mac never pastes its stale pasteboard, and
+    // refusedBusy asks the viewer to say why. Without files (text) or with
+    // an old host the Cmd+V passes through as before.
     Filtered filter(const std::vector<keymap::KeyEvent>& in, double nowMs,
-                    const std::function<bool()>& eligible) {
+                    const std::function<bool()>& eligible, const std::function<bool()>& busy = nullptr) {
         Filtered out;
         for (const auto& e : in) {
             if (e.semantic == keymap::kWin) cmd_ = e.down;
             else if (e.semantic == keymap::kCtrl) ctrl_ = e.down;
             if (e.semantic == kKeyV) {
-                if (e.down && holding_) {           // repeat or a second press while held
+                if (e.down && (holding_ || refusing_)) {  // repeat or a second press while held
                     swallowUp_ = true;
                     continue;
                 }
+                if (!e.down && refusing_) refusing_ = false;
                 if (e.down && cmd_ && eligible && eligible()) {
+                    if (busy && busy()) {
+                        refusing_ = true;
+                        swallowUp_ = true;
+                        out.refusedBusy = true;
+                        continue;
+                    }
                     holding_ = true;
                     late_ = false;
                     startMs_ = nowMs;
@@ -107,6 +121,7 @@ public:
         cmd_ = false;
         ctrl_ = false;
         swallowUp_ = false;
+        refusing_ = false;
     }
     bool holding() const { return holding_; }
 
@@ -114,6 +129,7 @@ private:
     bool cmd_ = false;
     bool ctrl_ = false;
     bool holding_ = false;
+    bool refusing_ = false;  // a busy refusal ate this V down; eat its repeats too
     bool late_ = false;
     bool swallowUp_ = false;
     double startMs_ = 0.0;
@@ -195,6 +211,11 @@ inline std::string chipText(uint64_t files, uint64_t done, uint64_t total, uint6
     std::string s = "\xE2\x86\x91 " + plural(files, "file", "files") + " \xC2\xB7 " + formatPair(done, total);
     if (bytesPerSec > 0) s += " \xC2\xB7 " + formatBytes(bytesPerSec) + "/s";
     return s;
+}
+
+// Cmd+V with copied files while a transfer runs: nothing is pasted on the Mac.
+inline std::string pasteBusy() {
+    return "A transfer is already running. Wait or cancel it in Files, then press Cmd+V again.";
 }
 
 inline std::string confirmTitle() { return "File transfer in progress"; }

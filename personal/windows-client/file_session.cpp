@@ -197,7 +197,8 @@ void FileSession::run() {
         Outcome outcome = Outcome::ConnectFailed;
         if (s != INVALID_SOCKET) {
             using namespace jl::file;
-            const uint16_t ours = role_ == Role::Pull ? caps::kAnnounce : caps::kViewer;
+            // r3: the long-lived pull session also shows the Mac's NOTICEs.
+            const uint16_t ours = role_ == Role::Pull ? uint16_t(caps::kAnnounce | caps::kNotice) : caps::kViewer;
             const auto hello = encode(Hello{kVersion, ours});
             if (hello && sendPacket(s, type::kHello, *hello)) {
                 outcome = Outcome::NoAck;
@@ -822,6 +823,12 @@ std::string FileSession::handlePull(SOCKET s, const jl::file::Message& msg) {
             clip_->withdraw(c->transfer);
             log("file.announce=cancelled transfer=" + std::to_string(c->transfer));
         }
+        return "";
+    }
+    if (const Notice* n = std::get_if<Notice>(&msg)) {
+        // r3: the Mac did not pass Cmd+V to Finder mid-transfer. Unknown
+        // codes are ignored (a newer Mac).
+        if (n->code == notice::kPasteBusy && pullNotice_) pullNotice_(PullNotice::PasteBusy);
         return "";
     }
     if (const Data* d = std::get_if<Data>(&msg)) {

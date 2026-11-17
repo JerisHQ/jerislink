@@ -1,6 +1,6 @@
 #pragma once
 
-// File transfer wire (MRC1 types 0x50-0x5C), design r2 section 4. The Mac
+// File transfer wire (MRC1 types 0x50-0x5D), design r2 section 4. The Mac
 // side is FileProtocol.swift; both must encode the same bytes.
 //
 // The viewer opens a dedicated TCP connection to the control port and sends
@@ -37,6 +37,7 @@ inline constexpr uint8_t kRequest = 0x59;
 inline constexpr uint8_t kProgress = 0x5A;
 inline constexpr uint8_t kPing = 0x5B;
 inline constexpr uint8_t kReveal = 0x5C;
+inline constexpr uint8_t kNotice = 0x5D;     // host -> viewer: show a notice (r3)
 }  // namespace type
 
 namespace purpose {
@@ -54,8 +55,14 @@ inline constexpr uint16_t kUpload = 1u << 0;       // F2: host receives paste/se
 inline constexpr uint16_t kPushService = 1u << 1;  // F5b: Finder Send to JerisLink
 inline constexpr uint16_t kReveal = 1u << 2;       // F4: 0x5C opens the received folder
 inline constexpr uint16_t kAnnounce = 1u << 3;     // F3: Cmd+C manifests, serves REQUEST
+inline constexpr uint16_t kNotice = 1u << 4;       // viewer only: shows NOTICE (0x5D)
 inline constexpr uint16_t kViewer = 0;             // what this viewer build implements (F1: none)
 }  // namespace caps
+
+// NOTICE codes. Codes this viewer does not know are ignored.
+namespace notice {
+inline constexpr uint8_t kPasteBusy = 1;  // the Mac did not pass Cmd+V to Finder mid-transfer
+}  // namespace notice
 
 namespace status {
 inline constexpr uint8_t kOk = 0;
@@ -95,8 +102,9 @@ struct Request { uint32_t transfer; uint32_t index; uint64_t offset; uint32_t le
 struct Progress { uint32_t transfer; uint64_t committed; bool operator==(const Progress&) const = default; };
 struct Ping { std::vector<uint8_t> token; bool operator==(const Ping&) const = default; };
 struct Reveal { uint32_t transfer; bool operator==(const Reveal&) const = default; };
+struct Notice { uint8_t code; bool operator==(const Notice&) const = default; };
 
-using Message = std::variant<Hello, HelloAck, Offer, Entry, Reply, Data, FileEnd, Result, Cancel, Request, Progress, Ping, Reveal>;
+using Message = std::variant<Hello, HelloAck, Offer, Entry, Reply, Data, FileEnd, Result, Cancel, Request, Progress, Ping, Reveal, Notice>;
 
 // Wire type of a message: 0x50 + variant index (the order above is the wire order).
 inline uint8_t typeOf(const Message& m) { return static_cast<uint8_t>(type::kHello + m.index()); }
@@ -153,6 +161,7 @@ inline std::optional<std::vector<uint8_t>> encode(const Message& m) {
             w.bytes(v.token);
         }
         else if constexpr (std::is_same_v<T, Reveal>) { w.u32(v.transfer); }
+        else if constexpr (std::is_same_v<T, Notice>) { w.u8(v.code); }
     }, m);
     if (!ok) return std::nullopt;
     return std::move(w.out);
@@ -220,6 +229,10 @@ inline std::optional<Message> decode(uint8_t t, const std::vector<uint8_t>& p) {
     case type::kReveal: {
         if (n != 4) return std::nullopt;
         Reveal v; v.transfer = r.u32(); return v;
+    }
+    case type::kNotice: {
+        if (n != 1) return std::nullopt;
+        Notice v; v.code = r.u8(); return v;
     }
     default:
         return std::nullopt;

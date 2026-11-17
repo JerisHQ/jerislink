@@ -105,6 +105,70 @@ void notEligible() {
     expect(g.finish(true, 0).outcome == PasteGate::Outcome::None, "finish without hold does nothing");
 }
 
+// A transfer is running (Send to / drop / paste upload, or a Mac->Windows
+// pull): a Cmd+V with new copied files is eaten, never passed to the Mac
+// (where it would paste a stale pasteboard) and never a second upload.
+void busy() {
+    auto yes = [] { return true; };
+    auto no = [] { return false; };
+    for (const char* kind : {"upload busy", "pull busy"}) {
+        const std::string k = kind;
+        PasteGate g;
+        int busyAsked = 0;
+        auto running = [&] { ++busyAsked; return true; };
+        auto r = g.filter({D(kWin), D(V)}, 0, yes, running);
+        expectEvents(r.events, {D(kWin)}, k + ": V down eaten");
+        expect(r.refusedBusy && !r.startUpload && !g.holding() && busyAsked == 1,
+               k + ": refused, no upload, no hold");
+        r = g.filter({D(V)}, 30, yes, running);
+        expectEvents(r.events, {}, k + ": auto-repeat V eaten");
+        expect(!r.refusedBusy && busyAsked == 1, k + ": repeat refuses once only");
+        r = g.filter({U(V), U(kWin)}, 40, yes, running);
+        expectEvents(r.events, {U(kWin)}, k + ": V up eaten, Command up passes");
+        expect(g.finish(true, 50).outcome == PasteGate::Outcome::None, k + ": nothing to finish");
+        // The transfer ended: the same clipboard pastes normally.
+        r = g.filter({D(kWin), D(V), U(V), U(kWin)}, 100, yes, no);
+        expectEvents(r.events, {D(kWin), U(kWin)}, k + ": after it ends, Cmd+V is held for upload");
+        expect(r.startUpload && !r.refusedBusy && g.holding(), k + ": after it ends, upload starts");
+    }
+    {
+        PasteGate g;
+        int busyAsked = 0;
+        auto r = g.filter({D(kWin), D(V), U(V), U(kWin)}, 0, no, [&] { ++busyAsked; return true; });
+        expectEvents(r.events, {D(kWin), D(V), U(V), U(kWin)},
+                     "busy, no files (text) or old host: Cmd+V passes through");
+        expect(!r.refusedBusy && !r.startUpload && busyAsked == 0, "busy, no files: busy never asked, no refusal");
+    }
+    {
+        // Hand test r2, case 1: during a Send to, Ctrl+C inside the viewer
+        // goes to the Mac as Cmd+C; the Mac's text then syncs to the Windows
+        // clipboard (no files). The Cmd+V that follows is a text paste and
+        // passes, busy or not: Finder makes a text clipping of it.
+        PasteGate g;
+        int busyAsked = 0;
+        const uint16_t C = 'C';
+        auto r = g.filter({D(kWin), D(C), U(C), D(V), U(V), U(kWin)}, 0, no, [&] { ++busyAsked; return true; });
+        expectEvents(r.events, {D(kWin), D(C), U(C), D(V), U(V), U(kWin)},
+                     "busy, Mac copy then Cmd+V: both go to the Mac unchanged");
+        expect(!r.refusedBusy && busyAsked == 0, "busy, Mac text on the clipboard: not refused");
+    }
+    {
+        PasteGate g;
+        auto r = g.filter({D(kWin), D(V), U(V), U(kWin)}, 0, yes, no);
+        expectEvents(r.events, {D(kWin), U(kWin)}, "not busy: Cmd+V held as before");
+        expect(r.startUpload && !r.refusedBusy, "not busy: upload starts as before");
+    }
+    {
+        PasteGate g;
+        g.filter({D(kWin), D(V)}, 0, yes, yes);
+        g.modifiersReleased();  // focus left before V up
+        auto r = g.filter({D(kWin), D(V), U(V), U(kWin)}, 500, yes, no);
+        expect(r.startUpload, "refusal does not stick after focus loss");
+    }
+    expect(pasteBusy() == "A transfer is already running. Wait or cancel it in Files, then press Cmd+V again.",
+           "text: busy notice");
+}
+
 void lateAndFailed() {
     auto yes = [] { return true; };
     {
@@ -203,6 +267,7 @@ int main() {
     macPresetChord();
     windowsPreset();
     notEligible();
+    busy();
     lateAndFailed();
     pacer();
     text();

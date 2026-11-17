@@ -1,6 +1,6 @@
 import Foundation
 
-/// File transfer wire (MRC1 types 0x50-0x5C), design r2 section 4.
+/// File transfer wire (MRC1 types 0x50-0x5D), design r2 section 4.
 ///
 /// A viewer opens a dedicated TCP connection to the control port and sends
 /// FILE_HELLO first; the connection is then a file session and carries only
@@ -29,6 +29,7 @@ enum FileProto {
         static let progress: UInt8 = 0x5A
         static let ping: UInt8 = 0x5B
         static let reveal: UInt8 = 0x5C
+        static let notice: UInt8 = 0x5D     // host -> viewer: show a notice (r3)
     }
 
     enum Purpose {
@@ -46,10 +47,19 @@ enum FileProto {
         static let pushService: UInt16 = 1 << 1  // F5b: Finder Send to JerisLink
         static let reveal: UInt16 = 1 << 2       // F4: 0x5C opens the received folder
         static let announce: UInt16 = 1 << 3     // F3: Cmd+C manifests, serves REQUEST
+        /// Viewer side only: it shows NOTICE (0x5D). The host sends NOTICE
+        /// only to a session whose HELLO carries this bit.
+        static let notice: UInt16 = 1 << 4
         /// What this build implements. F2: paste uploads. F3: Cmd+C
         /// announces and REQUEST pulls, on sessions whose viewer asks for them.
         /// F4: send uploads (drop on the viewer) and REVEAL.
         static let host: UInt16 = upload | reveal | announce
+    }
+
+    /// NOTICE codes. A viewer ignores codes it does not know.
+    enum Notice {
+        /// Cmd+V was not passed to Finder while a transfer runs.
+        static let pasteBusy: UInt8 = 1
     }
 
     enum Status {
@@ -94,6 +104,7 @@ enum FileProto {
         case progress(transfer: UInt32, committed: UInt64)
         case ping(token: [UInt8])
         case reveal(transfer: UInt32)
+        case notice(code: UInt8)
 
         var type: UInt8 {
             switch self {
@@ -110,6 +121,7 @@ enum FileProto {
             case .progress: return MsgType.progress
             case .ping: return MsgType.ping
             case .reveal: return MsgType.reveal
+            case .notice: return MsgType.notice
             }
         }
 
@@ -147,6 +159,8 @@ enum FileProto {
                 w.bytes(token)
             case let .reveal(t):
                 w.u32(t)
+            case let .notice(code):
+                w.u8(code)
             }
             return w.out
         }
@@ -202,6 +216,9 @@ enum FileProto {
         case MsgType.reveal:
             guard p.count == 4 else { return nil }
             msg = .reveal(transfer: r.u32())
+        case MsgType.notice:
+            guard p.count == 1 else { return nil }
+            msg = .notice(code: r.u8())
         default:
             return nil
         }

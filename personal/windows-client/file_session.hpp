@@ -53,7 +53,7 @@ public:
     using UploadDoneFn = std::function<void()>;
     // Pull role: something the user should see about a Mac copy (F3 r2).
     // Called on the session thread; post to the UI thread, do not block.
-    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3 };
+    enum class PullNotice : int { MacPermission = 1, PullFailed = 2, NotOffered = 3, PasteBusy = 4 };
     using PullNoticeFn = std::function<void(PullNotice)>;
     enum class UploadState : int { Idle = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
     // Paste: Cmd+V in Finder (F2). Send: a drop on the viewer (F4).
@@ -92,9 +92,11 @@ public:
     bool startUpload(std::vector<std::wstring> roots, uint32_t maxMbps, Purpose purpose = Purpose::Paste);
     void cancelUpload() { uploadCancel_ = true; }
     bool uploadRunning() const { return uploadRunning_.load(); }
-    bool canUpload() const {
-        return capability() == Capability::Yes && (hostCaps() & jl::file::caps::kUpload) && !uploadRunning();
+    // The host takes uploads (F2+), whether or not one is running now.
+    bool canReceiveUploads() const {
+        return capability() == Capability::Yes && (hostCaps() & jl::file::caps::kUpload);
     }
+    bool canUpload() const { return canReceiveUploads() && !uploadRunning(); }
     // A drop needs an F4 host: one that answers REVEAL takes purpose=send.
     bool canSend() const { return canUpload() && (hostCaps() & jl::file::caps::kReveal); }
     UploadProgress uploadProgress() const;

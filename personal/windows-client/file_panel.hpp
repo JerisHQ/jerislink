@@ -239,4 +239,12 @@ private:
     int focus_ = -1;
 };
 
+// Whether the transfer chip (progress bar or notice) belongs on screen. A chip
+// started while the viewer was minimised (Send to from Explorer) was never
+// shown; Windows restores only the owned popups it hid itself, so the viewer
+// shows it on restore. A floating notice stays up even while minimised.
+inline bool chipOnScreen(bool chipActive, bool viewerMinimised, bool floats) {
+    return chipActive && (!viewerMinimised || floats);
+}
+
 }  // namespace jl::filepanel
