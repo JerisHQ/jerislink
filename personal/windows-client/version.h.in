@@ -9,5 +9,9 @@
 #define JERISLINK_VERSION_STR "@JERISLINK_VERSION@"
 #define JERISLINK_VERSION_WSTR L"@JERISLINK_VERSION@"
 #define JERISLINK_PRODUCT_NAME "JerisLink"
+// Short git sha of the build ("dev" when built without git).
+#define JERISLINK_GIT_SHA "@JERISLINK_GIT_SHA@"
+// Launch screen and Connection info: "0.2.0 <U+00B7> 0385c0c".
+#define JERISLINK_BUILD_ID_WSTR L"@JERISLINK_VERSION@ \u00B7 @JERISLINK_GIT_SHA@"
 
 #endif

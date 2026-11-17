@@ -24,6 +24,7 @@
 #include "file_session.hpp"
 #include "hardware_video_pipeline.hpp"
 #include "resource.h"
+#include "version.h"
 #include "viewer_options.hpp"
 #include "video_receiver.hpp"
 #include "abr.hpp"
@@ -1105,7 +1106,9 @@ static TextRole textRole(int id) {
     case IDC_UI_HINT_VOLUME:
     case IDC_UI_HINT_KEYBOARD:
     case IDC_BIND_HINT: return TextRole::Hint;
-    case IDC_APPLY_NOTE: return TextRole::Note;
+    case IDC_APPLY_NOTE:
+    case IDC_LAUNCH_BUILD:
+    case IDC_INFO_BUILD: return TextRole::Note;
     default: return TextRole::Other;
     }
 }
@@ -2025,6 +2028,7 @@ static INT_PTR CALLBACK InfoDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
     case WM_INITDIALOG:
         initThemedDialog(dlg, 13, kInfoFooterTop);
+        SetDlgItemTextW(dlg, IDC_INFO_BUILD, L"Build " JERISLINK_BUILD_ID_WSTR);
         fillConnectionInfo(dlg);
         placeVolumeWindow(dlg, reinterpret_cast<HWND>(lParam));
         SetTimer(dlg, kInfoRefreshTimer, 1000, nullptr);
@@ -5402,6 +5406,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         if (ThemedDialog* td = themedDialog(dlg)) td->extraPaint = paintLaunchExtras;
         SetDlgItemTextW(dlg, IDC_LAUNCH_HERO, L"Your Mac,\r\nwithin reach.");
         SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  \u2192");
+        SetDlgItemTextW(dlg, IDC_LAUNCH_BUILD, JERISLINK_BUILD_ID_WSTR);
         HINSTANCE inst = GetModuleHandleW(nullptr);
         SendMessageW(dlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(LoadImageW(
             inst, MAKEINTRESOURCEW(IDI_JERISLINK), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
@@ -5486,7 +5491,8 @@ static INT_PTR runLaunchScreen(LaunchContext& ctx) {
 
 static int appMain(int argc, char** argv) {
     gLog.start(kLogPath, kHistoryLogPath);
-    logLine(std::string("viewer.start pid=") + std::to_string(GetCurrentProcessId()));
+    logLine(std::string("viewer.start version=" JERISLINK_VERSION_STR " build=" JERISLINK_GIT_SHA " pid=") +
+            std::to_string(GetCurrentProcessId()));
     loadUiAccent();
     gKeys.setPreset(loadKeyboardPreset());
     const std::vector<std::string> args = commandArgs(argc, argv);

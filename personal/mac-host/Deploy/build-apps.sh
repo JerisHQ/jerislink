@@ -55,6 +55,9 @@ VERSION="$(head -n 1 "$ROOT/../../VERSION" | tr -d '[:space:]')"
 for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist" "$SEND/Contents/Info.plist"; do
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$plist"
 done
+# Short git sha of this build, printed in the control log ("dev" without git).
+BUILD_SHA="$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
+/usr/libexec/PlistBuddy -c "Add :JLBuildSHA string $BUILD_SHA" "$APP/Contents/Info.plist"
 for plist in "$APP/Contents/Info.plist" "$HELPER/Contents/Info.plist" "$SEND/Contents/Info.plist" "$APP"/Contents/Library/LaunchAgents/*.plist; do
     /usr/bin/plutil -lint "$plist" >/dev/null
 done
@@ -92,5 +95,5 @@ done
 /usr/bin/codesign --verify --strict --deep "$APP"
 
 echo "Built: $APP"
-echo "Version: $VERSION"
+echo "Version: $VERSION build $BUILD_SHA"
 echo "Signing: $SIGN_MODE"

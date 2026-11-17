@@ -100,7 +100,8 @@ BEGIN
     CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 190, 250, 24
     LTEXT           "Joining a Mac with a pairing code is coming soon. For now, use the Mac's address on the Host address tab.", IDC_LAUNCH_CODE_NOTE, 196, 90, 250, 28, SS_NOPREFIX | NOT WS_VISIBLE
 
-    LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 246, 120, 9, SS_NOPREFIX
+    LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 246, 48, 9, SS_NOPREFIX
+    LTEXT           "", IDC_LAUNCH_BUILD, 70, 247, 110, 9, SS_NOPREFIX
     RTEXT           "Private connection over your tailnet", IDC_LAUNCH_PRIVACY, 196, 246, 250, 9, SS_NOPREFIX
 END
 
@@ -120,6 +121,7 @@ BEGIN
     LTEXT           "", IDC_INFO_EFFECTIVE, 10, 81, 240, 36, SS_NOPREFIX
     LTEXT           "DECODER", IDC_INFO_SECTION_DECODER, 10, 121, 240, 9, SS_NOPREFIX
     LTEXT           "", IDC_INFO_DECODER, 10, 132, 240, 36, SS_NOPREFIX
+    LTEXT           "", IDC_INFO_BUILD, 10, 180, 180, 9, SS_NOPREFIX
     CONTROL         "Close", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 202, 177, 48, 14
 END
 

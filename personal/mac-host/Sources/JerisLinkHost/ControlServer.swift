@@ -173,7 +173,10 @@ final class ControlServer: @unchecked Sendable {
             inputHelper = helper
             helperOK = helper.ping()
         }
-        print("Control MRC1: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), inject=\(injectRequested ? "requested" : "off"), inputHelper=\(helperOK ? "ready" : "unavailable")")
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "dev"
+        let build = info?["JLBuildSHA"] as? String ?? "dev"
+        print("Control MRC1: version=\(version) build=\(build) \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), inject=\(injectRequested ? "requested" : "off"), inputHelper=\(helperOK ? "ready" : "unavailable")")
         if injectRequested && !helperOK {
             print("Control warning: JerisLink Input Helper is not reachable yet; input will reconnect lazily when the next event arrives.")
         }

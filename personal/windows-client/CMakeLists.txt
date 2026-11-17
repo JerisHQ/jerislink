@@ -20,10 +20,23 @@ endif()
 set(JERISLINK_VERSION_MAJOR ${CMAKE_MATCH_1})
 set(JERISLINK_VERSION_MINOR ${CMAKE_MATCH_2})
 set(JERISLINK_VERSION_PATCH ${CMAKE_MATCH_3})
+# Build id shown in the viewer: "<version> · <short sha>", "dev" without git.
+set(JERISLINK_GIT_SHA "dev")
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short=7 HEAD
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    OUTPUT_VARIABLE JERISLINK_GIT_SHA_OUT
+                    RESULT_VARIABLE JERISLINK_GIT_SHA_RC
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(JERISLINK_GIT_SHA_RC EQUAL 0 AND JERISLINK_GIT_SHA_OUT MATCHES "^[0-9a-f]+$")
+        set(JERISLINK_GIT_SHA "${JERISLINK_GIT_SHA_OUT}")
+    endif()
+endif()
 configure_file(version.h.in ${CMAKE_CURRENT_BINARY_DIR}/version.h @ONLY)
 configure_file(jerislink.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/jerislink.manifest @ONLY)
 configure_file(setup.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/setup.manifest @ONLY)
-message(STATUS "JerisLink version ${JERISLINK_VERSION}")
+message(STATUS "JerisLink version ${JERISLINK_VERSION} build ${JERISLINK_GIT_SHA}")
 
 # libopus (BSD-3-Clause), vendored at a pinned release by
 # ../third_party/update-opus.sh: the portable float C sources only.
