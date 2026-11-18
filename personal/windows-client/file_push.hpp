@@ -363,7 +363,9 @@ private:
 // ZoneId=3 is written on the partial file and moves with the rename; after
 // the rename it is checked and, if missing, written again (zoneCounts()).
 // `open` shows the folder in Explorer when a push finished (tests pass a no-op).
-std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open);
+// `zone` is for tests only.
+std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
+                                     filepull::ZoneOps zone = {});
 
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
 // Windows does not know the Downloads folder.

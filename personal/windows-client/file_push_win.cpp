@@ -38,8 +38,8 @@ std::wstring longPath(const std::wstring& p) {
 
 class FolderSink : public Sink {
 public:
-    FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open)
-        : folder_(std::move(folder)), open_(std::move(open)) {}
+    FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
+        : folder_(std::move(folder)), open_(std::move(open)), ops_(zone) {}
     ~FolderSink() override { abort(); }
 
     bool prepare() override {
@@ -65,7 +65,7 @@ public:
                 // moves with the rename, so the file never has its final name
                 // without it (a scanner opening a new .exe right after the
                 // rename can no longer make the mark fail). commit() checks.
-                filepull::writeInternetZone(longPath(part));
+                ops_.write(longPath(part));
                 return true;
             }
             if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
@@ -127,11 +127,11 @@ private:
     // (Defender scanning a new .exe) holds the file.
     void ensureZone(const std::wstring& path) {
         for (int i = 0; i < 20; ++i) {
-            if (filepull::readZoneId(path) == 3) {
+            if (ops_.read(path) == 3) {
                 ++zone_.marked;
                 return;
             }
-            if (filepull::writeInternetZone(path) == filepull::ZoneWrite::Written) continue;
+            if (ops_.write(path) == filepull::ZoneWrite::Written) continue;
             Sleep(50);
         }
         ++zone_.failed;
@@ -145,6 +145,7 @@ private:
 
     std::wstring folder_;
     std::function<void(const std::wstring&)> open_;
+    filepull::ZoneOps ops_;
     std::wstring name_;
     std::wstring part_;
     HANDLE file_ = INVALID_HANDLE_VALUE;
@@ -153,8 +154,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open) {
-    return std::make_unique<FolderSink>(std::move(folder), std::move(open));
+std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
+                                     filepull::ZoneOps zone) {
+    return std::make_unique<FolderSink>(std::move(folder), std::move(open), zone);
 }
 
 std::wstring downloadsFolder() {

@@ -135,6 +135,27 @@ void helpers() {
            "unit: found files done, folder dropped, others still wanted");
     const auto again = markDelivered(m, {sub}, since, want, done);
     expect(again.written == 0 && want.size() == 2, "unit: a second pass finds nothing new");
+
+    // #53: a volume without streams (FAT, exFAT): ZoneId=3 cannot be
+    // written, so the pasted file is not left there unmarked.
+    const std::wstring fat = dir + L"\\fat";
+    CreateDirectoryW(fat.c_str(), nullptr);
+    Manifest fm;
+    fm.transfer = 3;
+    fm.items = {{false, 64, 0, L"nomark.exe"}};
+    fm.files = 1;
+    const FILETIME since2 = nowMinus(0);
+    Sleep(50);
+    expect(writeFile(fat + L"\\nomark.exe", body(64, 9)), "unit: pasted nomark.exe");
+    ZoneOps noStreams;
+    noStreams.write = [](const std::wstring&) { return ZoneWrite::Failed; };
+    noStreams.read = [](const std::wstring&) { return -1; };
+    std::set<uint32_t> fwant{0};
+    std::set<uint32_t> fdone;
+    const auto nst = markDelivered(fm, {fat}, since2, fwant, fdone, noStreams);
+    expect(nst.failed == 1 && nst.written == 0, "unit: a mark that cannot be written is counted failed (#53)");
+    expect(GetFileAttributesW((fat + L"\\nomark.exe").c_str()) == INVALID_FILE_ATTRIBUTES,
+           "unit: a pasted file that cannot carry ZoneId=3 is removed (#53)");
 }
 
 // The host side of a pull: answers the hub's REQUESTs from `files`, ends

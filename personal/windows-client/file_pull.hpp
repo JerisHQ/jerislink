@@ -501,6 +501,13 @@ ZoneWrite writeInternetZone(const std::wstring& path);
 // Reads `path`:Zone.Identifier's ZoneId, or -1 if there is none.
 int readZoneId(const std::wstring& path);
 
+// The two calls above, swappable so a test can stand in for a volume
+// without streams (FAT, exFAT), where writing the mark fails.
+struct ZoneOps {
+    ZoneWrite (*write)(const std::wstring&) = writeInternetZone;
+    int (*read)(const std::wstring&) = readZoneId;
+};
+
 struct ZoneMarkStats {
     uint32_t written = 0;  // Zone.Identifier added
     uint32_t existed = 0;  // already had one (kept)
@@ -511,7 +518,7 @@ struct ZoneMarkStats {
 // end) that are found under one of `folders`, created at or after `since`.
 // Found indexes move from `want` to `done`.
 ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
-                            std::set<uint32_t>& want, std::set<uint32_t>& done);
+                            std::set<uint32_t>& want, std::set<uint32_t>& done, const ZoneOps& zone = {});
 
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.

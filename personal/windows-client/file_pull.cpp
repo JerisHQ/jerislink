@@ -247,7 +247,7 @@ int readZoneId(const std::wstring& path) {
 }
 
 ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
-                            std::set<uint32_t>& want, std::set<uint32_t>& done) {
+                            std::set<uint32_t>& want, std::set<uint32_t>& done, const ZoneOps& zone) {
     ZoneMarkStats stats;
     for (auto it = want.begin(); it != want.end();) {
         const uint32_t i = *it;
@@ -268,7 +268,7 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
                 const uint64_t size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
                 if (size != item.size || !sameOrLater(a.ftCreationTime, since)) continue;
                 found = true;
-                switch (writeInternetZone(path)) {
+                switch (zone.write(path)) {
                 case ZoneWrite::Written: wrote = true; break;
                 case ZoneWrite::Exists: existed = true; break;
                 case ZoneWrite::Failed: failed = true; break;

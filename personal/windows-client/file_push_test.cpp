@@ -482,6 +482,28 @@ void realFolder() {
         const auto z = r.zoneCounts();
         expect(z.marked == 2 && z.failed == 0, "folder: zone counts marked=2 failed=0");
     }
+    // #53: on a volume without streams (FAT, exFAT) ZoneId=3 cannot be
+    // written. The file is not delivered: the push fails, nothing is left.
+    {
+        fpull::ZoneOps noStreams;
+        noStreams.write = [](const std::wstring&) { return fpull::ZoneWrite::Failed; };
+        noStreams.read = [](const std::wstring&) { return -1; };
+        PushReceiver r(makeFolderSink(dir, {}, noStreams), fpull::sha256Digest());
+        auto nm = makePush(54, {{"nomark.exe", 2048}});
+        offerAll(r, nm);
+        r.nextRequest();
+        r.onData({54, 0, 0, nm.contents[0]});
+        auto d = fpull::sha256Digest()();
+        d->update(nm.contents[0].data(), nm.contents[0].size());
+        const auto endOut = r.onFileEnd({54, 0, d->finish()});
+        const auto* nres = only<file::Result>(endOut);
+        expect(nres && nres->status != file::status::kOk && nres->filesOk == 0,
+               "folder: push fails when ZoneId=3 cannot be written (#53)");
+        expect(GetFileAttributesW((dir + L"\\nomark.exe").c_str()) == INVALID_FILE_ATTRIBUTES && countParts(dir) == 0,
+               "folder: a file without ZoneId=3 is not delivered, no .jlpart left (#53)");
+        expect(r.lastReason() == "motw", "folder: failure reason motw (#53)");
+        expect(r.zoneCounts().failed == 1 && r.zoneCounts().marked == 0, "folder: zone counts marked=0 failed=1 (#53)");
+    }
     // Disconnect mid-file removes the partial file.
     {
         PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());

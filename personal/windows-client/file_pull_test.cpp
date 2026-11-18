@@ -164,6 +164,13 @@ void manifests() {
     expect(build({}, 0, 2, 0) == "empty", "manifest: empty announce refused");
     expect(build({entry(2, 0, false, 1, "a")}, 1, 2, file::kMaxEntries + 1) == "too_many", "manifest: entry limit");
     expect(build({entry(2, 0, false, 1, "a")}, file::kMaxTotalBytes + 1) == "too_big", "manifest: size limit");
+    // #49/#53: 10 + (2^64 - 5) wraps to 5 when added first and checked after.
+    expect(build({entry(2, 0, false, 10, "a"), entry(2, 1, false, UINT64_MAX - 4, "b")}, 5) == "too_big",
+           "manifest: a size sum that wraps past 2^64 is refused");
+    expect(build({entry(2, 0, false, file::kMaxTotalBytes + 1, "a")}, 0) == "too_big",
+           "manifest: one entry over the limit is refused");
+    expect(build({entry(2, 0, false, file::kMaxTotalBytes - 1, "a"), entry(2, 1, false, 1, "b")}, file::kMaxTotalBytes).empty(),
+           "manifest: exactly the limit is accepted");
 }
 
 Manifest oneFile(uint32_t t, uint64_t size) {
