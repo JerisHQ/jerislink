@@ -210,7 +210,14 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var pongDrops: UInt64 = 0
     private(set) var audioRequestRx: UInt64 = 0
 
-    init(bindIP: String, allowedClientIP: String?, port: UInt16) {
+    /// Told about every valid datagram from the allowed client (video
+    /// service: capture runs only while a viewer is heard).
+    private let presence: ViewerPresence?
+    /// A new source port not yet passed to `presence` (receive loop only).
+    private var presenceNewSession = false
+
+    init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil) {
+        self.presence = presence
         self.bindIP = bindIP
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -452,6 +459,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             // for stale/reordered traffic from the previous process.
             let peerPort = UInt16(bigEndian: peer.sin_port)
             if lastPeerPort != peerPort {
+                presenceNewSession = true
                 lastPeerPort = peerPort
                 lastSequence = nil
                 lock.lock()
@@ -469,6 +477,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 badPackets &+= 1
                 continue
             }
+            presence?.heard(type: buffer[5], newSession: presenceNewSession)
+            presenceNewSession = false
 
             let seq = UInt32(buffer[6]) << 24 |
                       UInt32(buffer[7]) << 16 |
