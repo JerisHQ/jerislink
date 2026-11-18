@@ -86,11 +86,20 @@ public:
     }
 
     bool commit() override {
+        zoneRefused_ = false;
         if (file_ == INVALID_HANDLE_VALUE) return false;
         const BOOL flushed = FlushFileBuffers(file_);
         CloseHandle(file_);
         file_ = INVALID_HANDLE_VALUE;
         if (!flushed) return dropPart();
+        // #53: no file reaches the folder without ZoneId=3. Checked on the
+        // partial file first: on a volume without streams (FAT, exFAT) the
+        // mark cannot be written, and the file is dropped, not delivered.
+        if (!ensureZone(longPath(part_))) {
+            ++zone_.failed;
+            zoneRefused_ = true;
+            return dropPart();
+        }
         // No overwrite: an existing name moves on to "name (2).ext" ...
         const std::string utf8 = toUtf8(name_);
         for (int n = 1; n < 1000; ++n) {
@@ -98,8 +107,16 @@ public:
             const std::wstring target = folder_ + L"\\" + leaf;
             if (MoveFileExW(longPath(part_).c_str(), longPath(target).c_str(), MOVEFILE_WRITE_THROUGH)) {
                 part_.clear();
-                ensureZone(longPath(target));
-                return true;
+                // The stream moved with the rename; checked again on the
+                // final name. Without it the file is taken back out.
+                if (ensureZone(longPath(target))) {
+                    ++zone_.marked;
+                    return true;
+                }
+                ++zone_.failed;
+                zoneRefused_ = true;
+                for (int i = 0; i < 20 && !DeleteFileW(longPath(target).c_str()); ++i) Sleep(50);
+                return false;
             }
             const DWORD e = GetLastError();
             if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS && e != ERROR_ACCESS_DENIED) break;
@@ -120,21 +137,19 @@ public:
     }
 
     ZoneCounts zoneCounts() const override { return zone_; }
+    bool zoneRefused() const override { return zoneRefused_; }
 
 private:
-    // The file must carry ZoneId=3 (Q1). Normally it came with the rename;
-    // otherwise write it, retrying for about a second while something
-    // (Defender scanning a new .exe) holds the file.
-    void ensureZone(const std::wstring& path) {
+    // True when the file carries ZoneId=3 (Q1). Normally it is there
+    // already; otherwise write it, retrying for about a second while
+    // something (Defender scanning a new .exe) holds the file.
+    bool ensureZone(const std::wstring& path) {
         for (int i = 0; i < 20; ++i) {
-            if (ops_.read(path) == 3) {
-                ++zone_.marked;
-                return;
-            }
+            if (ops_.read(path) == 3) return true;
             if (ops_.write(path) == filepull::ZoneWrite::Written) continue;
             Sleep(50);
         }
-        ++zone_.failed;
+        return false;
     }
 
     bool dropPart() {
@@ -150,6 +165,7 @@ private:
     std::wstring part_;
     HANDLE file_ = INVALID_HANDLE_VALUE;
     ZoneCounts zone_;
+    bool zoneRefused_ = false;
 };
 
 }  // namespace

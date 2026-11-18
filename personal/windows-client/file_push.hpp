@@ -58,6 +58,9 @@ public:
         uint32_t failed = 0;
     };
     virtual ZoneCounts zoneCounts() const { return {}; }
+    // The last commit() failed because ZoneId=3 could not be put on the
+    // file (#53): the file was not delivered.
+    virtual bool zoneRefused() const { return false; }
 };
 
 enum class Outcome { None, Done, Failed, Cancelled };
@@ -229,7 +232,10 @@ public:
         const std::vector<uint8_t> sha = hash_ ? hash_->finish() : std::vector<uint8_t>{};
         hash_.reset();
         if (sha.empty() || sha != f.sha256) return failLocked("hash", file::status::kFailed);
-        if (!sink_->commit()) return failLocked("rename", file::status::kNoSpace);
+        if (!sink_->commit()) {
+            if (sink_->zoneRefused()) return failLocked("motw", file::status::kFailed);
+            return failLocked("rename", file::status::kNoSpace);
+        }
         ++cur_;
         if (cur_ < items_.size()) {
             if (!startFileLocked()) return failLocked("create", file::status::kNoSpace);
@@ -360,8 +366,9 @@ private:
 // downloadsFolder()). Partial files are "<name>.<n>.jlpart", created with
 // CREATE_NEW; a verified file is moved to "<name>" with no overwrite, and on
 // a clash to "name (2).ext", "name (3).ext" ... (up to 999). Zone.Identifier
-// ZoneId=3 is written on the partial file and moves with the rename; after
-// the rename it is checked and, if missing, written again (zoneCounts()).
+// ZoneId=3 is written on the partial file and moves with the rename. It is
+// checked before and after the rename; a file that cannot carry it (a volume
+// without streams) is deleted and the push fails with reason "motw" (#53).
 // `open` shows the folder in Explorer when a push finished (tests pass a no-op).
 // `zone` is for tests only.
 std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
