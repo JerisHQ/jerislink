@@ -520,6 +520,14 @@ int main() {
         std::printf("FAIL OleInitialize\n");
         return 1;
     }
+    // A refused paste can leave the shell's copy (and its error dialog)
+    // blocking this thread; fail with a line instead of the step timeout.
+    std::thread([] {
+        Sleep(120000);
+        std::printf("FAIL watchdog: the test did not finish in 120 s (shell paste blocked)\n");
+        std::fflush(stdout);
+        ExitProcess(2);
+    }).detach();
     helpers();
     endToEnd();
     gateCases();

@@ -260,10 +260,13 @@ bool sameOrLater(const FILETIME& a, const FILETIME& since) {
 
 // Whether the file at `path` starts with r.head and has r.tail right before
 // its last byte: the bytes this transfer handed out, not a neighbour's.
-bool sameBytes(const std::wstring& path, const GateRequest& r) {
+bool sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        openError = GetLastError();
+        return false;
+    }
     std::vector<uint8_t> buf;
     auto readAt = [&](uint64_t off, size_t n) {
         buf.assign(n, 0);
@@ -327,7 +330,9 @@ int readZoneId(const std::wstring& path) {
 }
 
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
-                     ZoneMarkStats& stats) {
+                     ZoneMarkStats& stats, GateProbe* probe) {
+    GateProbe local;
+    GateProbe& pr = probe ? *probe : local;
     const size_t cut = r.rel.find(L'\\');
     const std::wstring top = cut == std::wstring::npos ? r.rel : r.rel.substr(0, cut);
     const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
@@ -339,12 +344,25 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
     for (const auto& folder : folders) {
         for (const auto& name : topNames(top)) {
             const std::wstring path = folder + L"\\" + name + rest;
+            ++pr.paths;
             WIN32_FILE_ATTRIBUTE_DATA a{};
             if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) continue;
             if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             const uint64_t size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
-            if (size < minSize || size > r.size || !sameOrLater(a.ftCreationTime, r.since)) continue;
-            if (!sameBytes(path, r)) continue;
+            ++pr.present;
+            pr.lastSize = size;
+            const ULARGE_INTEGER c{a.ftCreationTime.dwLowDateTime, a.ftCreationTime.dwHighDateTime};
+            const ULARGE_INTEGER s{r.since.dwLowDateTime, r.since.dwHighDateTime};
+            pr.lastAgeMs = (int64_t(c.QuadPart) - int64_t(s.QuadPart)) / 10000;
+            if (size < minSize) { ++pr.small; continue; }
+            if (size > r.size) { ++pr.big; continue; }
+            if (!sameOrLater(a.ftCreationTime, r.since)) { ++pr.older; continue; }
+            DWORD openError = 0;
+            if (!sameBytes(path, r, openError)) {
+                ++pr.otherBytes;
+                if (openError) pr.openError = openError;
+                continue;
+            }
             found = true;
             switch (markOne(path, zone)) {
             case MarkResult::Written: wrote = true; break;
@@ -787,9 +805,14 @@ struct FileClipboard::Impl {
         const ULONGLONG until = GetTickCount64() + kGateWaitMs;
         GateOutcome got = GateOutcome::NotFound;
         ZoneMarkStats st;
+        GateProbe probe;
+        size_t folders = 0;
         for (;;) {
             st = ZoneMarkStats{};
-            got = gateFile(r, searchFolders(), zone, st);
+            probe = GateProbe{};
+            const auto where = searchFolders();
+            folders = where.size();
+            got = gateFile(r, where, zone, st, &probe);
             if (got != GateOutcome::NotFound || GetTickCount64() >= until) break;
             Sleep(100);
             if (onSta) pumpShell();
@@ -805,7 +828,14 @@ struct FileClipboard::Impl {
         case GateOutcome::Marked:
             log(head + (st.written ? " marked=written" : " marked=existed"));
             return true;
-        case GateOutcome::NotFound: log(head + " refused reason=not_found"); break;
+        case GateOutcome::NotFound:
+            log(head + " refused reason=not_found sta=" + (onSta ? "1" : "0") + " folders=" + std::to_string(folders) +
+                " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
+                " small=" + std::to_string(probe.small) + " big=" + std::to_string(probe.big) +
+                " older=" + std::to_string(probe.older) + " other_bytes=" + std::to_string(probe.otherBytes) +
+                " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
+                " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
+            break;
         case GateOutcome::WriteFailed: log(head + " refused reason=zone_write_failed"); break;
         case GateOutcome::Invalid: log(head + " refused reason=zone_invalid"); break;
         }

@@ -542,10 +542,24 @@ enum class GateOutcome {
     Invalid,       // a copy found, its Zone.Identifier never read back as ZoneId=3
 };
 
+// Why no copy was proven: counts and sizes only, never names, for the log.
+struct GateProbe {
+    uint32_t paths = 0;       // candidate paths tried
+    uint32_t present = 0;     // of those, a file is there
+    uint32_t small = 0;       // shorter than the bytes handed out
+    uint32_t big = 0;         // longer than the manifest size
+    uint32_t older = 0;       // created before the paste started
+    uint32_t otherBytes = 0;  // right size and time, other bytes (or not readable)
+    uint64_t lastSize = 0;    // size of the last file found
+    int64_t lastAgeMs = 0;    // its creation time minus `since`
+    uint32_t openError = 0;   // GetLastError of the last byte check that could not open
+};
+
 // Looks for `r`'s copy under `folders`, proves it by name, time, size and
-// bytes, and marks every proven copy. Counts the outcome once in `stats`.
+// bytes, and marks every proven copy. Counts the outcome once in `stats`;
+// `probe`, if given, says why nothing was proven.
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
-                     ZoneMarkStats& stats);
+                     ZoneMarkStats& stats, GateProbe* probe = nullptr);
 
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.
