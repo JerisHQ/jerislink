@@ -497,9 +497,9 @@ DigestFactory sha256Digest();
 //
 // A copy counts as ours only when it has the manifest's path (or Explorer's
 // "name (2).ext" for the top item), was created after the paste started, is
-// one byte short of the manifest's size (or already full size, if Explorer
-// sets the size first), and its first and last bytes (up to 64 KiB each) are
-// the bytes this stream handed out. Nothing else is marked or deleted.
+// at least as long as the bytes handed out (Explorer may set a larger size
+// before it writes), and its first and last bytes (up to 64 KiB each, at
+// their offsets) are the bytes this stream handed out. Nothing else is marked or deleted.
 // An empty file has no last byte to hold back and is pasted unmarked.
 
 enum class ZoneWrite { Written, Exists, Failed };
@@ -547,9 +547,11 @@ struct GateProbe {
     uint32_t paths = 0;       // candidate paths tried
     uint32_t present = 0;     // of those, a file is there
     uint32_t tooSmall = 0;    // shorter than the bytes handed out
-    uint32_t tooBig = 0;      // longer than the manifest size
+    uint32_t larger = 0;      // longer than the manifest size (Explorer sized it first; not a refusal)
     uint32_t older = 0;       // created before the paste started
-    uint32_t otherBytes = 0;  // right size and time, other bytes (or not readable)
+    uint32_t openFailed = 0;  // could not be opened to check its bytes
+    uint32_t headDiff = 0;    // the first bytes are not the ones handed out
+    uint32_t tailDiff = 0;    // the bytes before the held-back one are not the ones handed out
     uint64_t lastSize = 0;    // size of the last file found
     int64_t lastAgeMs = 0;    // its creation time minus `since`
     uint32_t openError = 0;   // GetLastError of the last byte check that could not open

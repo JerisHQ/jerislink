@@ -260,12 +260,14 @@ bool sameOrLater(const FILETIME& a, const FILETIME& since) {
 
 // Whether the file at `path` starts with r.head and has r.tail right before
 // its last byte: the bytes this transfer handed out, not a neighbour's.
-bool sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError) {
+enum class Bytes { Same, OpenFailed, HeadDiff, TailDiff };
+
+Bytes sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         openError = GetLastError();
-        return false;
+        return Bytes::OpenFailed;
     }
     std::vector<uint8_t> buf;
     auto readAt = [&](uint64_t off, size_t n) {
@@ -278,11 +280,11 @@ bool sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError)
         return ReadFile(h, buf.data(), DWORD(n), &got, &o) && got == n;
     };
     const uint64_t body = r.size > 0 ? r.size - 1 : 0;   // bytes handed out before the gate
-    bool ok = r.head.size() <= body && r.tail.size() <= body;
-    ok = ok && readAt(0, r.head.size()) && buf == r.head;
-    ok = ok && readAt(body - r.tail.size(), r.tail.size()) && buf == r.tail;
+    Bytes out = Bytes::Same;
+    if (r.head.size() > body || !readAt(0, r.head.size()) || buf != r.head) out = Bytes::HeadDiff;
+    else if (r.tail.size() > body || !readAt(body - r.tail.size(), r.tail.size()) || buf != r.tail) out = Bytes::TailDiff;
     CloseHandle(h);
-    return ok;
+    return out;
 }
 
 enum class MarkResult { Written, Existed, WriteFailed, Invalid };
@@ -355,14 +357,13 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
             const ULARGE_INTEGER s{r.since.dwLowDateTime, r.since.dwHighDateTime};
             pr.lastAgeMs = (int64_t(c.QuadPart) - int64_t(s.QuadPart)) / 10000;
             if (size < minSize) { ++pr.tooSmall; continue; }
-            if (size > r.size) { ++pr.tooBig; continue; }
+            if (size > r.size) ++pr.larger;
             if (!sameOrLater(a.ftCreationTime, r.since)) { ++pr.older; continue; }
             DWORD openError = 0;
-            if (!sameBytes(path, r, openError)) {
-                ++pr.otherBytes;
-                if (openError) pr.openError = openError;
-                continue;
-            }
+            const Bytes b = sameBytes(path, r, openError);
+            if (b == Bytes::OpenFailed) { ++pr.openFailed; pr.openError = openError; continue; }
+            if (b == Bytes::HeadDiff) { ++pr.headDiff; continue; }
+            if (b == Bytes::TailDiff) { ++pr.tailDiff; continue; }
             found = true;
             switch (markOne(path, zone)) {
             case MarkResult::Written: wrote = true; break;
@@ -831,8 +832,9 @@ struct FileClipboard::Impl {
         case GateOutcome::NotFound:
             log(head + " refused reason=not_found sta=" + (onSta ? "1" : "0") + " folders=" + std::to_string(folders) +
                 " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
-                " small=" + std::to_string(probe.tooSmall) + " big=" + std::to_string(probe.tooBig) +
-                " older=" + std::to_string(probe.older) + " other_bytes=" + std::to_string(probe.otherBytes) +
+                " small=" + std::to_string(probe.tooSmall) + " larger=" + std::to_string(probe.larger) +
+                " older=" + std::to_string(probe.older) + " open_failed=" + std::to_string(probe.openFailed) +
+                " head_diff=" + std::to_string(probe.headDiff) + " tail_diff=" + std::to_string(probe.tailDiff) +
                 " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
                 " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
             break;

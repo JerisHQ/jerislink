@@ -135,7 +135,13 @@ void helpers() {
     const auto part = body(4000, 13);
     // What Explorer has written when the gate runs: all but the last byte.
     expect(writeFile(sub + L"\\part.bin", {part.begin(), part.end() - 1}), "unit: a copy one byte short");
-    expect(writeFile(sub + L"\\wrong-size.bin", body(79, 7)), "unit: a same-name file of another size");
+    expect(writeFile(sub + L"\\wrong-size.bin", body(70, 7)), "unit: a same-name file shorter than the bytes handed out");
+    // Explorer may set the file's size before it writes: longer than the
+    // manifest, with the bytes handed out so far at their offsets.
+    const auto sized = body(3000, 17);
+    std::vector<uint8_t> sizedOnDisk(sized.begin(), sized.end() - 1);
+    sizedOnDisk.resize(sized.size() + 5000, 0);
+    expect(writeFile(sub + L"\\sized.bin", sizedOnDisk), "unit: a copy Explorer sized past the manifest size");
     expect(writeFile(sub + L"\\other.bin", body(600, 3)), "unit: a same-name, same-size file with other bytes");
     const std::vector<std::wstring> folders{dir + L"\\nowhere", sub};
     ZoneMarkStats st;
@@ -151,7 +157,10 @@ void helpers() {
            "unit: a copy one byte short (the last byte held back) is proven and marked");
     expect(gateFile(requestFor(L"wrong-size.bin", body(77, 7), since), folders, {}, st) == GateOutcome::NotFound &&
                readZoneId(sub + L"\\wrong-size.bin") == -1,
-           "unit: a file of another size is not ours and left alone");
+           "unit: a file shorter than the bytes handed out is not ours and left alone");
+    expect(gateFile(requestFor(L"sized.bin", sized, since), folders, {}, st) == GateOutcome::Marked &&
+               readZoneId(sub + L"\\sized.bin") == 3,
+           "unit: a copy Explorer sized past the manifest size is proven and marked");
     expect(gateFile(requestFor(L"other.bin", body(600, 5), since), folders, {}, st) == GateOutcome::NotFound &&
                readZoneId(sub + L"\\other.bin") == -1,
            "unit: a file with other bytes is not ours and left alone");
@@ -159,7 +168,7 @@ void helpers() {
            "unit: a missing file is not found");
     expect(gateFile(requestFor(L"x.bin", x, since), folders, {}, st) == GateOutcome::Marked,
            "unit: a second gate on a marked copy passes (ZoneId=3 kept)");
-    expect(st.written == 3 && st.existed == 1 && st.failed == 0, "unit: gate counts written=3 existed=1 failed=0");
+    expect(st.written == 4 && st.existed == 1 && st.failed == 0, "unit: gate counts written=4 existed=1 failed=0");
 
     // #53: a volume without streams (FAT, exFAT): ZoneId=3 cannot be
     // written, so the gate fails and the file is not completed. The gate
