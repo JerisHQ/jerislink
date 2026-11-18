@@ -17,6 +17,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -296,6 +299,203 @@ void endToEnd() {
     clip.stop();
 }
 
+// ---- #53 r2: the last byte waits for the mark ----------------------------
+//
+// A stand-in for Explorer's copy engine, for the failure cases a real shell
+// paste would answer with a dialog: it takes FileContents[0] from the
+// clipboard object and writes each chunk to `path` before asking for more.
+// `presetZone` puts a Zone.Identifier on the new file first; `holdMs` keeps
+// the file open without delete sharing after the stream is released, so it
+// cannot be deleted meanwhile.
+struct FakeCopy {
+    uint64_t got = 0;
+    bool readFailed = false;
+};
+
+FakeCopy fakeExplorerCopy(IDataObject* obj, const std::wstring& path, uint64_t size, const char* presetZone,
+                          int holdMs) {
+    FakeCopy r;
+    FORMATETC fe{CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILECONTENTS)), nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM};
+    STGMEDIUM med{};
+    if (FAILED(obj->GetData(&fe, &med)) || med.tymed != TYMED_ISTREAM || !med.pstm) {
+        r.readFailed = true;
+        return r;
+    }
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (presetZone) {
+        HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD w = 0;
+        if (z != INVALID_HANDLE_VALUE) {
+            WriteFile(z, presetZone, DWORD(std::strlen(presetZone)), &w, nullptr);
+            CloseHandle(z);
+        }
+    }
+    std::vector<uint8_t> buf(65536);
+    while (r.got < size) {
+        ULONG n = 0;
+        const HRESULT hr = med.pstm->Read(buf.data(), ULONG(buf.size()), &n);
+        if (n > 0 && h != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            WriteFile(h, buf.data(), n, &w, nullptr);
+        }
+        r.got += n;
+        if (FAILED(hr)) { r.readFailed = true; break; }
+        if (n == 0) break;
+    }
+    ReleaseStgMedium(&med);
+    if (holdMs > 0) pump(holdMs);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    return r;
+}
+
+struct GateCase {
+    uint32_t transfer = 0;
+    ZoneOps ops;
+    std::vector<std::wstring> folders;   // search folders
+    std::wstring dest;                   // where the stand-in writes the copy
+    std::vector<uint8_t> bytes;
+    const char* presetZone = nullptr;
+    int holdMs = 0;
+    std::function<void()> beforeCopy;
+};
+
+// One paste of `same.bin` through the stand-in, with its own clipboard, hub
+// and host. Waits 3.5 s after the stream is released (a mark pass runs
+// ~1.5 s after each delivered file).
+FakeCopy runGateCase(const GateCase& gc) {
+    FakeCopy c;
+    c.readFailed = true;
+    std::vector<file::Entry> es = {
+        {gc.transfer, 0, file::kind::kFile, gc.bytes.size(), 1700000000, bytesOf("same.bin")}};
+    Manifest m;
+    if (!buildManifest(file::Offer{gc.transfer, file::purpose::kAnnounce, 1, gc.bytes.size()}, es, m).empty()) return c;
+    PullHub hub(sha256Digest());
+    FileClipboard clip(hub, [](const std::string& s) { std::printf("  log: %s\n", s.c_str()); }, gc.ops);
+    clip.start();
+    for (const auto& f : gc.folders) clip.addSearchFolder(f);
+    hub.announce(m);
+    clip.offer(m);
+    std::atomic<bool> stop{false};
+    const std::vector<std::vector<uint8_t>> files{gc.bytes};
+    std::thread host([&] { fakeHost(hub, gc.transfer, files, stop); });
+    pump(300);
+    if (gc.beforeCopy) gc.beforeCopy();
+    IDataObject* obj = nullptr;
+    if (SUCCEEDED(OleGetClipboard(&obj)) && obj) {
+        c = fakeExplorerCopy(obj, gc.dest, gc.bytes.size(), gc.presetZone, gc.holdMs);
+        obj->Release();
+    }
+    pump(3500);
+    stop = true;
+    host.join();
+    clip.withdraw(0);
+    clip.stop();
+    return c;
+}
+
+uint64_t sizeOf(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return 0;
+    return (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+}
+
+bool exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+void gateCases() {
+    ZoneOps noStreams;
+    noStreams.write = [](const std::wstring&) { return ZoneWrite::Failed; };
+    noStreams.read = [](const std::wstring&) { return -1; };
+    ZoneOps stuckInvalid;   // a Zone.Identifier that says ZoneId=0 and cannot be replaced
+    stuckInvalid.write = [](const std::wstring&) { return ZoneWrite::Exists; };
+    stuckInvalid.read = [](const std::wstring&) { return 0; };
+    const size_t n = 200000;
+
+    {   // A working mark: the copy completes and carries ZoneId=3.
+        const std::wstring dir = tempDir(L"gate-ok");
+        GateCase gc;
+        gc.transfer = 21;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 13);
+        const FakeCopy c = runGateCase(gc);
+        expect(c.got == n && !c.readFailed && readFile(gc.dest) == gc.bytes && readZoneId(gc.dest) == 3,
+               "gate: with a working mark the copy completes and carries ZoneId=3");
+    }
+    {   // No streams (FAT, exFAT): the mark cannot be written.
+        const std::wstring dir = tempDir(L"gate-noads");
+        GateCase gc;
+        gc.transfer = 22;
+        gc.ops = noStreams;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 17);
+        const FakeCopy c = runGateCase(gc);
+        std::printf("  no-ADS copy: got=%llu of %zu failed=%d\n", static_cast<unsigned long long>(c.got), n, int(c.readFailed));
+        expect(c.got == n - 1 && c.readFailed,
+               "gate: no Zone.Identifier possible: the last byte is withheld and the copy fails (#53)");
+    }
+    {   // Cleanup cannot delete the copy (still open without delete sharing).
+        const std::wstring dir = tempDir(L"gate-held");
+        GateCase gc;
+        gc.transfer = 23;
+        gc.ops = noStreams;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 19);
+        gc.holdMs = 4000;
+        runGateCase(gc);
+        const bool completeUnmarked = sizeOf(gc.dest) == n && readFile(gc.dest) == gc.bytes && readZoneId(gc.dest) != 3;
+        expect(!completeUnmarked, "gate: when the mark fails and the copy cannot be deleted, no complete unmarked file is left (#53)");
+    }
+    {   // An existing Zone.Identifier with ZoneId=0 (Local machine).
+        const std::wstring dir = tempDir(L"gate-zone0");
+        GateCase gc;
+        gc.transfer = 24;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 23);
+        gc.presetZone = "[ZoneTransfer]\r\nZoneId=0\r\n";
+        const FakeCopy c = runGateCase(gc);
+        expect(c.got == n && readZoneId(gc.dest) == 3, "gate: an existing ZoneId=0 is replaced by ZoneId=3 (#53)");
+    }
+    {   // A mark that stays invalid.
+        const std::wstring dir = tempDir(L"gate-stuck");
+        GateCase gc;
+        gc.transfer = 25;
+        gc.ops = stuckInvalid;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 29);
+        const FakeCopy c = runGateCase(gc);
+        expect(c.got == n - 1 && c.readFailed, "gate: a Zone.Identifier that stays invalid withholds the last byte (#53)");
+    }
+    // A neighbour: another file named same.bin, same size, other content,
+    // created during the paste in another searched folder. Not ours.
+    for (int pass = 0; pass < 2; ++pass) {
+        const std::wstring x = tempDir(pass == 0 ? L"gate-nx0" : L"gate-nx1");
+        const std::wstring y = tempDir(pass == 0 ? L"gate-ny0" : L"gate-ny1");
+        const std::wstring neighbour = y + L"\\same.bin";
+        const auto other = body(n, 31);
+        GateCase gc;
+        gc.transfer = 26 + uint32_t(pass);
+        if (pass == 0) gc.ops = noStreams;
+        gc.folders = {x, y};
+        gc.dest = x + L"\\same.bin";
+        gc.bytes = body(n, 37);
+        gc.beforeCopy = [&] { writeFile(neighbour, other); };
+        runGateCase(gc);
+        if (pass == 0) {
+            expect(exists(neighbour) && readFile(neighbour) == other,
+                   "gate: a neighbour file with the same name and size is kept when marking fails");
+        } else {
+            expect(readFile(neighbour) == other && readZoneId(neighbour) == -1,
+                   "gate: a neighbour file with the same name and size is not marked");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -305,6 +505,7 @@ int main() {
     }
     helpers();
     endToEnd();
+    gateCases();
     OleUninitialize();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

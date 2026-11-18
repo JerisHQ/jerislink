@@ -374,6 +374,28 @@ std::vector<uint8_t> readAll(const std::wstring& path) {
     return out;
 }
 
+// A scanner stand-in: the first look at a path ending in `heldName` opens
+// it without delete sharing and keeps it open until releaseHeld().
+std::wstring heldName;
+HANDLE gHeld = INVALID_HANDLE_VALUE;
+
+bool holdIfNamed(const std::wstring& path) {
+    if (heldName.empty() || path.size() < heldName.size() ||
+        path.compare(path.size() - heldName.size(), heldName.size(), heldName) != 0) {
+        return false;
+    }
+    if (gHeld == INVALID_HANDLE_VALUE) {
+        gHeld = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    }
+    return true;
+}
+
+void releaseHeld() {
+    if (gHeld != INVALID_HANDLE_VALUE) CloseHandle(gHeld);
+    gHeld = INVALID_HANDLE_VALUE;
+    heldName.clear();
+}
+
 int countParts(const std::wstring& folder) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((folder + L"\\*.jlpart").c_str(), &fd);
@@ -503,6 +525,50 @@ void realFolder() {
                "folder: a file without ZoneId=3 is not delivered, no .jlpart left (#53)");
         expect(r.lastReason() == "motw", "folder: failure reason motw (#53)");
         expect(r.zoneCounts().failed == 1 && r.zoneCounts().marked == 0, "folder: zone counts marked=0 failed=1 (#53)");
+    }
+    // #53 r2: a scanner holds the file (no delete sharing) just when the
+    // sink checks or cleans it. The cleanup is kept and retried, so once the
+    // holder lets go nothing unverified is left in the folder.
+    {
+        heldName = L"held.exe";
+        fpull::ZoneOps afterRename;   // the part is marked; the final name reads unmarked
+        afterRename.write = [](const std::wstring&) { return fpull::ZoneWrite::Written; };
+        afterRename.read = [](const std::wstring& p) { return holdIfNamed(p) ? -1 : 3; };
+        {
+            PushReceiver r(makeFolderSink(dir, {}, afterRename), fpull::sha256Digest());
+            auto hp = makePush(55, {{"held.exe", 2048}});
+            offerAll(r, hp);
+            r.nextRequest();
+            r.onData({55, 0, 0, hp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(hp.contents[0].data(), hp.contents[0].size());
+            const auto* hres = only<file::Result>(r.onFileEnd({55, 0, d->finish()}));
+            expect(hres && hres->status != file::status::kOk && hres->filesOk == 0,
+                   "folder: a file that fails the check after the rename is not delivered (#53)");
+            releaseHeld();
+        }
+        expect(GetFileAttributesW((dir + L"\\held.exe").c_str()) == INVALID_FILE_ATTRIBUTES && countParts(dir) == 0,
+               "folder: a file that failed the check is not left in the folder once its holder lets go (#53)");
+    }
+    {
+        heldName = L"stuck.exe.jlpart";
+        fpull::ZoneOps partHeld;      // no mark possible, and the part is held
+        partHeld.write = [](const std::wstring&) { return fpull::ZoneWrite::Failed; };
+        partHeld.read = [](const std::wstring& p) { holdIfNamed(p); return -1; };
+        {
+            PushReceiver r(makeFolderSink(dir, {}, partHeld), fpull::sha256Digest());
+            auto sp = makePush(56, {{"stuck.exe", 2048}});
+            offerAll(r, sp);
+            r.nextRequest();
+            r.onData({56, 0, 0, sp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(sp.contents[0].data(), sp.contents[0].size());
+            const auto* sres = only<file::Result>(r.onFileEnd({56, 0, d->finish()}));
+            expect(sres && sres->status != file::status::kOk, "folder: an unmarkable held part fails the push (#53)");
+            releaseHeld();
+        }
+        expect(countParts(dir) == 0 && GetFileAttributesW((dir + L"\\stuck.exe").c_str()) == INVALID_FILE_ATTRIBUTES,
+               "folder: a .jlpart that could not be deleted at once is removed later, not forgotten (#53)");
     }
     // Disconnect mid-file removes the partial file.
     {

@@ -532,7 +532,9 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
 class FileClipboard {
 public:
     using LogFn = std::function<void(const std::string&)>;
-    FileClipboard(PullHub& hub, LogFn log);
+    // `zone`: the Zone.Identifier calls (a test stands in for a volume
+    // without streams, or a mark that cannot be fixed).
+    FileClipboard(PullHub& hub, LogFn log, ZoneOps zone = {});
     ~FileClipboard();
     FileClipboard(const FileClipboard&) = delete;
     FileClipboard& operator=(const FileClipboard&) = delete;

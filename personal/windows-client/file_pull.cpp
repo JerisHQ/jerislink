@@ -481,7 +481,9 @@ struct FileClipboard::Impl {
     static constexpr int kMarkDelayMs = 1500;
     static constexpr int kMarkRetries = 8;   // about 12 s after the last file
 
-    Impl(PullHub& h, LogFn l) : hub(h), log(std::move(l)) {}
+    ZoneOps zone;
+
+    Impl(PullHub& h, LogFn l, ZoneOps z) : hub(h), log(std::move(l)), zone(z) {}
 
     static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(w, GWLP_USERDATA));
@@ -709,7 +711,7 @@ struct FileClipboard::Impl {
 
     void markPass() {
         if (!job) { KillTimer(hwnd, kMarkTimer); return; }
-        const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done);
+        const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done, zone);
         {
             std::lock_guard<std::mutex> lock(mu);
             totals.written += stats.written;
@@ -746,7 +748,7 @@ struct FileClipboard::Impl {
         if (!job) return;
         KillTimer(hwnd, kMarkTimer);
         if (!job->want.empty()) {
-            const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done);
+            const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done, zone);
             std::lock_guard<std::mutex> lock(mu);
             totals.written += stats.written;
             totals.existed += stats.existed;
@@ -758,7 +760,8 @@ struct FileClipboard::Impl {
     }
 };
 
-FileClipboard::FileClipboard(PullHub& hub, LogFn log) : impl_(std::make_unique<Impl>(hub, std::move(log))) {}
+FileClipboard::FileClipboard(PullHub& hub, LogFn log, ZoneOps zone)
+    : impl_(std::make_unique<Impl>(hub, std::move(log), zone)) {}
 
 FileClipboard::~FileClipboard() { stop(); }
 

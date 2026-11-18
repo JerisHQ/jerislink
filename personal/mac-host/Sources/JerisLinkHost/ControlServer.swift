@@ -130,6 +130,16 @@ final class ControlServer: @unchecked Sendable {
         self.settingsClientIP = settingsClientIP
     }
 
+    /// The legacy listeners: `--control-only`, and control inside the video
+    /// host (--bind-ip/--client-ip). `globalClientIP` is the network.conf
+    /// viewer (a fixed value in the self-test).
+    static func legacyListener(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
+                               globalClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
+                               clipboard: ClipboardBackend = SystemClipboard.shared) -> ControlServer {
+        ControlServer(bindIP: bindIP, allowedClientIP: allowedClientIP, port: port, inject: inject,
+                      settingsClientIP: globalClientIP, clipboard: clipboard)
+    }
+
     func start() throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NSError(domain: "JerisLink.Control", code: 1, userInfo: [NSLocalizedDescriptionKey: "control socket failed errno=\(errno)"]) }
