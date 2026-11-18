@@ -216,7 +216,88 @@ enum ControlServiceSelfTest {
         failures += fileSessions(expect)
         failures += finderPasteRefused(expect)
         failures += legacyListenerUsesItsClientIP(expect)
+        failures += relayCallerDecisions(expect)
         return failures == 0 ? 0 : 1
+    }
+
+    /// #60 r3: who may use the relay, decided on a played process table.
+    /// The relay is TCP on 127.0.0.1, so the caller is found by the socket's
+    /// ports; every process holding that socket must be ours, and the pid
+    /// must be the same process before and after its path is read.
+    private static func relayCallerDecisions(_ expect: (Bool, String) -> Void) -> Int {
+        let me = "/Applications/JerisLink Host.app/Contents/MacOS/JerisLinkHost"
+        let ours: pid_t = 4100
+        let other: pid_t = 4200
+        func lookup(holders: @escaping () -> [pid_t], start: @escaping (pid_t) -> UInt64? = { _ in 77 })
+            -> RelayCaller.Lookup {
+            RelayCaller.Lookup(holders: { _, _ in holders() }, startTime: start,
+                               path: { $0 == ours ? me : "/usr/bin/nc" }, selfPath: { me })
+        }
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [ours] }))
+                   == .allow(pid: ours),
+               "relay caller: our own executable alone on the socket is allowed")
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [other] }))
+                   == .reject("other-executable"),
+               "relay caller: another executable is refused")
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [] }))
+                   == .reject("no-owner"),
+               "relay caller: a socket nobody visible holds is refused")
+        // A socket shared with another process (passed on, or inherited):
+        // that process can write to the relay too. Refused (#60 r3).
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411,
+                                            lookup: lookup(holders: { [ours, other] })) {
+            expect(false, "relay caller: a socket also held by another executable is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a socket also held by another executable is refused (#60 r3)")
+        }
+        // The pid is reused between finding it and reading its path: its
+        // start time changes. Refused (#60 r3).
+        var starts: [UInt64] = [77, 78, 78, 78]
+        let reused = lookup(holders: { [ours] }, start: { _ in starts.isEmpty ? 78 : starts.removeFirst() })
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: reused) {
+            expect(false, "relay caller: a pid whose process changed while it was checked is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a pid whose process changed while it was checked is refused (#60 r3)")
+        }
+        // The process lets go of the socket after its path was read (it
+        // exited, and its pid may be someone else's next). Refused (#60 r3).
+        var lists: [[pid_t]] = [[ours], []]
+        let gone = lookup(holders: { lists.isEmpty ? [] : lists.removeFirst() })
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: gone) {
+            expect(false, "relay caller: a pid that no longer holds the socket after the check is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a pid that no longer holds the socket after the check is refused (#60 r3)")
+        }
+        // The live lookup on a real loopback connection made by this process.
+        var live = false
+        if let port = freeLoopbackPort() {
+            let ls = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            var addr = loopbackAddress(port: port)
+            var one: Int32 = 1
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+            let bound = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(ls, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            if bound == 0, Darwin.listen(ls, 1) == 0 {
+                let cs = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+                let connected = withUnsafePointer(to: &addr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(cs, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+                var local = sockaddr_in()
+                var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let named = withUnsafeMutablePointer(to: &local) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(cs, $0, &len) }
+                }
+                if connected == 0, named == 0 {
+                    let clientPort = UInt16(bigEndian: local.sin_port)
+                    live = RelayCaller.check(clientPort: clientPort, serverPort: port) == .allow(pid: getpid())
+                }
+                Darwin.close(cs)
+            }
+            Darwin.close(ls)
+        }
+        expect(live, "relay caller: the live lookup allows this process on a real loopback connection")
+        return 0
     }
 
     /// #58 r2: a legacy listener started with an explicit

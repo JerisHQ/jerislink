@@ -16,11 +16,41 @@ enum RelayCaller {
         case reject(String)
     }
 
+    /// What the decision looks up about processes, swappable so the
+    /// self-test can play a shared socket or a reused pid (#60 r3).
+    struct Lookup {
+        /// Every pid holding a TCP socket with local port `clientPort` and
+        /// remote port `serverPort`.
+        var holders: (_ clientPort: UInt16, _ serverPort: UInt16) -> [pid_t]
+        /// A process's start time, which changes when its pid is reused.
+        var startTime: (_ pid: pid_t) -> UInt64?
+        var path: (_ pid: pid_t) -> String?
+        var selfPath: () -> String?
+
+        static var live: Lookup { Lookup(
+            holders: { RelayCaller.holderPIDs(clientPort: $0, serverPort: $1) },
+            startTime: { RelayCaller.startTime($0) },
+            path: { RelayCaller.executablePath($0) },
+            selfPath: { RelayCaller.executablePath(getpid()) }) }
+    }
+
     static func check(clientPort: UInt16, serverPort: UInt16) -> Decision {
-        guard let me = executablePath(getpid()) else { return .reject("no-self-path") }
-        guard let pid = ownerPID(clientPort: clientPort, serverPort: serverPort) else { return .reject("no-owner") }
-        guard let path = executablePath(pid) else { return .reject("no-owner-path") }
+        decide(clientPort: clientPort, serverPort: serverPort, lookup: .live)
+    }
+
+    static func decide(clientPort: UInt16, serverPort: UInt16, lookup: Lookup) -> Decision {
+        guard let me = lookup.selfPath() else { return .reject("no-self-path") }
+        guard let pid = lookup.holders(clientPort, serverPort).first else { return .reject("no-owner") }
+        guard let path = lookup.path(pid) else { return .reject("no-owner-path") }
         return path == me ? .allow(pid: pid) : .reject("other-executable")
+    }
+
+    /// When `pid` started (seconds and microseconds since 1970), or nil.
+    static func startTime(_ pid: pid_t) -> UInt64? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return UInt64(info.pbi_start_tvsec) &* 1_000_000 &+ UInt64(info.pbi_start_tvusec)
     }
 
     static func executablePath(_ pid: pid_t) -> String? {
@@ -29,21 +59,25 @@ enum RelayCaller {
         return URL(fileURLWithPath: String(cString: buf)).resolvingSymlinksInPath().path
     }
 
-    /// The pid holding a TCP socket whose local port is `clientPort` and whose
-    /// remote port is `serverPort` (the client end of the relay connection).
-    static func ownerPID(clientPort: UInt16, serverPort: UInt16) -> pid_t? {
+    /// Every pid we can see holding a TCP socket whose local port is
+    /// `clientPort` and whose remote port is `serverPort` (the client end of
+    /// the relay connection). More than one when the socket is shared.
+    static func holderPIDs(clientPort: UInt16, serverPort: UInt16) -> [pid_t] {
         let count = proc_listallpids(nil, 0)
-        guard count > 0 else { return nil }
+        guard count > 0 else { return [] }
         var pids = [pid_t](repeating: 0, count: Int(count) + 64)
         let got = pids.withUnsafeMutableBytes { proc_listallpids($0.baseAddress, Int32($0.count)) }
-        guard got > 0 else { return nil }
-        for pid in pids.prefix(Int(got)) where pid > 0 {
-            if holdsClientSocket(pid: pid, clientPort: clientPort, serverPort: serverPort) { return pid }
+        guard got > 0 else { return [] }
+        return pids.prefix(Int(got)).filter {
+            $0 > 0 && holdsClientSocket(pid: $0, clientPort: clientPort, serverPort: serverPort)
         }
-        return nil
     }
 
-    private static func holdsClientSocket(pid: pid_t, clientPort: UInt16, serverPort: UInt16) -> Bool {
+    static func holdsClientSocket(pid: pid_t, clientPort: UInt16, serverPort: UInt16) -> Bool {
+        holdsSocket(pid: pid, clientPort: clientPort, serverPort: serverPort)
+    }
+
+    private static func holdsSocket(pid: pid_t, clientPort: UInt16, serverPort: UInt16) -> Bool {
         let fdSize = MemoryLayout<proc_fdinfo>.stride
         let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
         guard bytes > 0 else { return false }

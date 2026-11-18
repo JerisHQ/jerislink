@@ -515,17 +515,82 @@ ZoneWrite writeInternetZone(const std::wstring& path);
 // Reads `path`:Zone.Identifier's ZoneId, or -1 if there is none.
 int readZoneId(const std::wstring& path);
 
-// The two calls above, swappable so a test can stand in for a volume
-// without streams (FAT, exFAT), where writing the mark fails.
+// A file's identity: its volume and 128-bit file id (#60 r3). A handle to a
+// file keeps pointing at that file when it is renamed or another file takes
+// its name; checks and cleanups go through the identity, never the name.
+bool fileIdOf(HANDLE h, FILE_ID_INFO& out);
+bool sameFile(const FILE_ID_INFO& a, const FILE_ID_INFO& b);
+// Opens the file with identity `id` on the volume of `hint` (any handle on
+// that volume). INVALID_HANDLE_VALUE if it is gone or cannot be opened so;
+// GetLastError() says why.
+HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share);
+
+// The zone calls on an open file (#60 r3): the Zone.Identifier stream is
+// opened on the file's current path and used only when it belongs to the
+// same file (volume and file id), so a file swapped in under the name is
+// never marked or read instead. writeInternetZoneOn replaces whatever the
+// stream held; Failed on volumes without streams (FAT, exFAT).
+ZoneWrite writeInternetZoneOn(HANDLE file);
+int readZoneIdOn(HANDLE file);
+
+// The zone calls, swappable so a test can stand in for a volume without
+// streams (FAT, exFAT), a mark that cannot be fixed, or a file swapped
+// under its name while it is checked.
 struct ZoneOps {
     ZoneWrite (*write)(const std::wstring&) = writeInternetZone;
     int (*read)(const std::wstring&) = readZoneId;
+    ZoneWrite (*writeOn)(HANDLE) = writeInternetZoneOn;
+    int (*readOn)(HANDLE) = readZoneIdOn;
 };
 
 struct ZoneMarkStats {
     uint32_t written = 0;  // Zone.Identifier ZoneId=3 added (or a weaker zone replaced)
     uint32_t existed = 0;  // already ZoneId=3 or 4 (kept)
     uint32_t failed = 0;   // found, but could not be marked: the last byte was withheld
+    uint32_t kept = 0;     // settled: complete, the right bytes, ZoneId=3 or 4
+    uint32_t removed = 0;  // settled: anything else, deleted by identity
+    uint32_t left = 0;     // settled: could not be checked or deleted in time
+};
+
+// The copy the gate settled on, held open (attributes only, every sharing
+// mode, so nobody is blocked) for as long as the paste runs: the mark, the
+// final check and any cleanup go to this file, never to whatever has its
+// name by then. Move-only.
+class LockedCopy {
+public:
+    LockedCopy() = default;
+    ~LockedCopy() { reset(); }
+    LockedCopy(LockedCopy&& o) noexcept { *this = std::move(o); }
+    LockedCopy& operator=(LockedCopy&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h_ = o.h_;
+            id_ = o.id_;
+            o.h_ = INVALID_HANDLE_VALUE;
+            o.id_ = FILE_ID_INFO{};
+        }
+        return *this;
+    }
+    LockedCopy(const LockedCopy&) = delete;
+    LockedCopy& operator=(const LockedCopy&) = delete;
+
+    explicit operator bool() const { return h_ != INVALID_HANDLE_VALUE; }
+    HANDLE handle() const { return h_; }
+    const FILE_ID_INFO& id() const { return id_; }
+    void adopt(HANDLE h, const FILE_ID_INFO& id) {
+        reset();
+        h_ = h;
+        id_ = id;
+    }
+    void reset() {
+        if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_);
+        h_ = INVALID_HANDLE_VALUE;
+        id_ = FILE_ID_INFO{};
+    }
+
+private:
+    HANDLE h_ = INVALID_HANDLE_VALUE;
+    FILE_ID_INFO id_{};
 };
 
 // One file's gate: asked before Explorer gets the file's last byte.
@@ -544,6 +609,7 @@ enum class GateOutcome {
     NotFound,      // no copy proven to be ours
     WriteFailed,   // a copy found, the mark could not be written (a volume without streams)
     Invalid,       // a copy found, its Zone.Identifier never read back as ZoneId=3
+    Ambiguous,     // more than one copy could be ours: none is marked or taken
 };
 
 // Why no copy was proven: counts and sizes only, never names, for the log.
@@ -564,8 +630,29 @@ struct GateProbe {
 // Looks for `r`'s copy under `folders`, proves it by name, time, size and
 // bytes, and marks every proven copy. Counts the outcome once in `stats`;
 // `probe`, if given, says why nothing was proven.
+// `locked`, if given, receives the copy (also when its mark failed) for
+// settleCopy().
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
-                     ZoneMarkStats& stats, GateProbe* probe = nullptr);
+                     ZoneMarkStats& stats, GateProbe* probe = nullptr, LockedCopy* locked = nullptr);
+
+// What a stream knew when Explorer let go of it.
+struct SettleRequest {
+    uint32_t transfer = 0;
+    uint32_t index = 0;
+    uint64_t size = 0;             // manifest size
+    std::vector<uint8_t> sha256;   // SHA-256 of every byte handed out
+    bool complete = false;         // the gate passed and every byte was handed out
+};
+
+enum class SettleOutcome { None, Kept, Removed, Left };
+
+// After the paste (#60 r3): waits up to `waitMs` until nobody writes the
+// locked copy any more, then keeps it only when it is complete, exactly the
+// manifest size, has the SHA-256 of the bytes handed out and carries
+// ZoneId=3 or 4. Anything else is deleted through its identity. Counts the
+// outcome in `stats` and releases `copy`.
+SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps& zone, ZoneMarkStats& stats,
+                         int waitMs);
 
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.

@@ -396,6 +396,50 @@ void releaseHeld() {
     heldName.clear();
 }
 
+// The path an open handle points at now (#60 r3: the sink checks by handle).
+std::wstring pathOf(HANDLE h) {
+    wchar_t buf[2048] = {};
+    const DWORD n = GetFinalPathNameByHandleW(h, buf, 2048, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    return n > 0 && n < 2048 ? std::wstring(buf, n) : std::wstring();
+}
+
+bool endsWith(const std::wstring& s, const std::wstring& tail) {
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+// #60 r3 item 3: someone swaps the delivered file for another file of the
+// same name just when the sink checks it. The first check of a path ending
+// in \swap.exe moves the file aside to swap.exe.moved and writes a
+// replacement under the name; the check reads "unmarked", so the sink takes
+// its file back out. It must take out its own file, never the replacement.
+const std::vector<uint8_t> kReplacement = {'n', 'o', 't', ' ', 'o', 'u', 'r', 's'};
+bool gSwapTried = false;
+bool gSwapped = false;
+
+void swapOnce(const std::wstring& path) {
+    if (gSwapTried) return;
+    gSwapTried = true;
+    std::wstring p = path;
+    if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+    if (!MoveFileExW(p.c_str(), (p + L".moved").c_str(), 0)) return;
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, kReplacement.data(), DWORD(kReplacement.size()), &w, nullptr);
+    CloseHandle(h);
+    gSwapped = true;
+}
+
+int countIn(const std::wstring& folder, const wchar_t* pattern) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((folder + L"\\" + pattern).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do { ++n; } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
 int countParts(const std::wstring& folder) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((folder + L"\\*.jlpart").c_str(), &fd);
@@ -510,6 +554,8 @@ void realFolder() {
         fpull::ZoneOps noStreams;
         noStreams.write = [](const std::wstring&) { return fpull::ZoneWrite::Failed; };
         noStreams.read = [](const std::wstring&) { return -1; };
+        noStreams.writeOn = [](HANDLE) { return fpull::ZoneWrite::Failed; };
+        noStreams.readOn = [](HANDLE) { return -1; };
         PushReceiver r(makeFolderSink(dir, {}, noStreams), fpull::sha256Digest());
         auto nm = makePush(54, {{"nomark.exe", 2048}});
         offerAll(r, nm);
@@ -521,7 +567,8 @@ void realFolder() {
         const auto* nres = only<file::Result>(endOut);
         expect(nres && nres->status != file::status::kOk && nres->filesOk == 0,
                "folder: push fails when ZoneId=3 cannot be written (#53)");
-        expect(GetFileAttributesW((dir + L"\\nomark.exe").c_str()) == INVALID_FILE_ATTRIBUTES && countParts(dir) == 0,
+        expect(GetFileAttributesW((dir + L"\\nomark.exe").c_str()) == INVALID_FILE_ATTRIBUTES && countParts(dir) == 0 &&
+                   countParts(dir + L"\\.jlstaging") == 0,
                "folder: a file without ZoneId=3 is not delivered, no .jlpart left (#53)");
         expect(r.lastReason() == "motw", "folder: failure reason motw (#53)");
         expect(r.zoneCounts().failed == 1 && r.zoneCounts().marked == 0, "folder: zone counts marked=0 failed=1 (#53)");
@@ -534,6 +581,8 @@ void realFolder() {
         fpull::ZoneOps afterRename;   // the part is marked; the final name reads unmarked
         afterRename.write = [](const std::wstring&) { return fpull::ZoneWrite::Written; };
         afterRename.read = [](const std::wstring& p) { return holdIfNamed(p) ? -1 : 3; };
+        afterRename.writeOn = [](HANDLE) { return fpull::ZoneWrite::Written; };
+        afterRename.readOn = [](HANDLE h) { return holdIfNamed(pathOf(h)) ? -1 : 3; };
         {
             PushReceiver r(makeFolderSink(dir, {}, afterRename), fpull::sha256Digest());
             auto hp = makePush(55, {{"held.exe", 2048}});
@@ -555,6 +604,8 @@ void realFolder() {
         fpull::ZoneOps partHeld;      // no mark possible, and the part is held
         partHeld.write = [](const std::wstring&) { return fpull::ZoneWrite::Failed; };
         partHeld.read = [](const std::wstring& p) { holdIfNamed(p); return -1; };
+        partHeld.writeOn = [](HANDLE) { return fpull::ZoneWrite::Failed; };
+        partHeld.readOn = [](HANDLE h) { holdIfNamed(pathOf(h)); return -1; };
         {
             PushReceiver r(makeFolderSink(dir, {}, partHeld), fpull::sha256Digest());
             auto sp = makePush(56, {{"stuck.exe", 2048}});
@@ -567,8 +618,48 @@ void realFolder() {
             expect(sres && sres->status != file::status::kOk, "folder: an unmarkable held part fails the push (#53)");
             releaseHeld();
         }
-        expect(countParts(dir) == 0 && GetFileAttributesW((dir + L"\\stuck.exe").c_str()) == INVALID_FILE_ATTRIBUTES,
+        expect(countParts(dir) == 0 && countParts(dir + L"\\.jlstaging") == 0 &&
+                   GetFileAttributesW((dir + L"\\stuck.exe").c_str()) == INVALID_FILE_ATTRIBUTES,
                "folder: a .jlpart that could not be deleted at once is removed later, not forgotten (#53)");
+    }
+    // #60 r3 item 3: the file is swapped for another of the same name while
+    // the sink checks it under its final name. The replacement stays.
+    {
+        fpull::ZoneOps swapping;
+        swapping.read = [](const std::wstring& p) {
+            if (!endsWith(p, L"\\swap.exe")) return fpull::readZoneId(p);
+            swapOnce(p);
+            return -1;
+        };
+        swapping.write = [](const std::wstring& p) {
+            return endsWith(p, L"\\swap.exe") ? fpull::ZoneWrite::Failed : fpull::writeInternetZone(p);
+        };
+        swapping.readOn = [](HANDLE h) {
+            const std::wstring p = pathOf(h);
+            if (!endsWith(p, L"\\swap.exe")) return fpull::readZoneIdOn(h);
+            swapOnce(p);
+            return -1;
+        };
+        swapping.writeOn = [](HANDLE h) {
+            return endsWith(pathOf(h), L"\\swap.exe") ? fpull::ZoneWrite::Failed : fpull::writeInternetZoneOn(h);
+        };
+        PushReceiver r(makeFolderSink(dir, {}, swapping), fpull::sha256Digest());
+        auto sw = makePush(57, {{"swap.exe", 3000}});
+        offerAll(r, sw);
+        r.nextRequest();
+        r.onData({57, 0, 0, sw.contents[0]});
+        auto d = fpull::sha256Digest()();
+        d->update(sw.contents[0].data(), sw.contents[0].size());
+        const auto* wres = only<file::Result>(r.onFileEnd({57, 0, d->finish()}));
+        const std::wstring target = dir + L"\\swap.exe";
+        std::printf("  swap: tried=%d swapped=%d exists=%d\n", int(gSwapTried), int(gSwapped),
+                    int(GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES));
+        expect(wres && wres->status != file::status::kOk, "folder: a file that fails the check under its name is not delivered");
+        expect(gSwapTried, "folder: the swap test reached the check under the final name");
+        expect(gSwapped ? readAll(target) == kReplacement : GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES,
+               "folder: taking a failed file back out never moves or deletes a same-name replacement (#60 r3)");
+        DeleteFileW(target.c_str());
+        DeleteFileW((target + L".moved").c_str());
     }
     // Disconnect mid-file removes the partial file.
     {
@@ -577,18 +668,40 @@ void realFolder() {
         offerAll(r, half);
         r.nextRequest();
         r.onData({48, 0, 0, std::vector<uint8_t>(half.contents[0].begin(), half.contents[0].begin() + 1000)});
-        expect(countParts(dir) == 1, "folder: .jlpart while receiving");
+        // #60 r3 item 3: the partial file is in a hidden staging folder, not
+        // in Downloads\JerisLink itself.
+        const std::wstring staging = dir + L"\\.jlstaging";
+        const DWORD sa = GetFileAttributesW(staging.c_str());
+        expect(countParts(dir) == 0 && countParts(staging) == 1, "folder: .jlpart while receiving is in .jlstaging (#60 r3)");
+        expect(sa != INVALID_FILE_ATTRIBUTES && (sa & FILE_ATTRIBUTE_DIRECTORY) && (sa & FILE_ATTRIBUTE_HIDDEN) &&
+                   !(sa & FILE_ATTRIBUTE_REPARSE_POINT),
+               "folder: .jlstaging is a hidden plain folder (#60 r3)");
         // F5b r3: the mark is on the partial file already, while the
         // receiver still holds it open, so it moves with the rename.
-        expect(fpull::readZoneId(dir + L"\\half.bin.jlpart") == 3, "folder: .jlpart carries ZoneId=3 while receiving");
+        expect(fpull::readZoneId(staging + L"\\half.bin.jlpart") == 3, "folder: .jlpart carries ZoneId=3 while receiving");
         r.disconnect();
-        expect(countParts(dir) == 0 && GetFileAttributesW((dir + L"\\half.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
+        expect(countParts(dir) == 0 && countParts(staging) == 0 &&
+                   GetFileAttributesW((dir + L"\\half.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
                "folder: disconnect removes the .jlpart");
     }
     expect(!downloadsFolder().empty() && downloadsFolder().size() > 10 &&
                downloadsFolder().substr(downloadsFolder().size() - 10) == L"\\JerisLink",
            "folder: Downloads\\JerisLink from FOLDERID_Downloads");
+    // Nothing else is ever left in the folder: only delivered files.
+    expect(countIn(dir, L"*.jlpart") == 0 && countParts(dir + L"\\.jlstaging") == 0, "folder: no partial files left anywhere");
     // Clean up the temp folder.
+    {
+        const std::wstring st = dir + L"\\.jlstaging";
+        WIN32_FIND_DATAW sf{};
+        HANDLE sh = FindFirstFileW((st + L"\\*").c_str(), &sf);
+        if (sh != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(sf.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((st + L"\\" + sf.cFileName).c_str());
+            } while (FindNextFileW(sh, &sf));
+            FindClose(sh);
+        }
+        RemoveDirectoryW(st.c_str());
+    }
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {

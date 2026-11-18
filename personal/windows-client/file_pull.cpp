@@ -339,8 +339,93 @@ int readZoneId(const std::wstring& path) {
     return z ? std::atoi(z + 7) : -1;
 }
 
+bool fileIdOf(HANDLE h, FILE_ID_INFO& out) {
+    out = FILE_ID_INFO{};
+    return h != INVALID_HANDLE_VALUE && GetFileInformationByHandleEx(h, FileIdInfo, &out, sizeof(out));
+}
+
+bool sameFile(const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
+    return a.VolumeSerialNumber == b.VolumeSerialNumber &&
+           std::memcmp(a.FileId.Identifier, b.FileId.Identifier, sizeof(a.FileId.Identifier)) == 0;
+}
+
+HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share) {
+    FILE_ID_DESCRIPTOR d{};
+    d.dwSize = sizeof(d);
+    d.Type = ExtendedFileIdType;
+    d.ExtendedFileId = id.FileId;
+    HANDLE h = OpenFileById(hint, &d, access, share, nullptr, FILE_FLAG_OPEN_REPARSE_POINT);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    FILE_ID_INFO got{};
+    if (!fileIdOf(h, got) || !sameFile(got, id)) {
+        CloseHandle(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+namespace {
+
+// The file's current full path ("\\?\C:\..."), or "" when it has none.
+std::wstring finalPathOf(HANDLE h) {
+    std::wstring out(512, L'\0');
+    for (int i = 0; i < 2; ++i) {
+        const DWORD n = GetFinalPathNameByHandleW(h, out.data(), DWORD(out.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (n == 0) return {};
+        if (n < out.size()) {
+            out.resize(n);
+            return out;
+        }
+        out.assign(size_t(n) + 1, L'\0');
+    }
+    return {};
+}
+
+// The Zone.Identifier stream of the file behind `file`, opened on its
+// current path and only if it is that same file.
+HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition) {
+    FILE_ID_INFO want{};
+    if (!fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
+    const std::wstring path = finalPathOf(file);
+    if (path.empty()) return INVALID_HANDLE_VALUE;
+    HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share, nullptr, disposition,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (z == INVALID_HANDLE_VALUE) return z;
+    FILE_ID_INFO got{};
+    if (!fileIdOf(z, got) || !sameFile(got, want)) {
+        CloseHandle(z);
+        return INVALID_HANDLE_VALUE;
+    }
+    return z;
+}
+
+}  // namespace
+
+ZoneWrite writeInternetZoneOn(HANDLE file) {
+    HANDLE z = openZoneStream(file, GENERIC_WRITE, 0, OPEN_ALWAYS);
+    if (z == INVALID_HANDLE_VALUE) return ZoneWrite::Failed;
+    static const char kBody[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(z, kBody, DWORD(sizeof(kBody) - 1), &wrote, nullptr) && wrote == sizeof(kBody) - 1 &&
+                    SetEndOfFile(z);
+    CloseHandle(z);
+    return ok ? ZoneWrite::Written : ZoneWrite::Failed;
+}
+
+int readZoneIdOn(HANDLE file) {
+    HANDLE z = openZoneStream(file, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+    if (z == INVALID_HANDLE_VALUE) return -1;
+    char buf[1024] = {};
+    DWORD got = 0;
+    ReadFile(z, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(z);
+    const char* id = std::strstr(buf, "ZoneId=");
+    return id ? std::atoi(id + 7) : -1;
+}
+
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
-                     ZoneMarkStats& stats, GateProbe* probe) {
+                     ZoneMarkStats& stats, GateProbe* probe, LockedCopy*) {
     GateProbe local;
     GateProbe& pr = probe ? *probe : local;
     const size_t cut = r.rel.find(L'\\');
@@ -389,6 +474,11 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
     if (wrote) ++stats.written;
     else ++stats.existed;
     return GateOutcome::Marked;
+}
+
+SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest&, const ZoneOps&, ZoneMarkStats&, int) {
+    copy.reset();
+    return SettleOutcome::None;
 }
 
 namespace {
@@ -848,6 +938,7 @@ struct FileClipboard::Impl {
             break;
         case GateOutcome::WriteFailed: log(head + " refused reason=zone_write_failed"); break;
         case GateOutcome::Invalid: log(head + " refused reason=zone_invalid"); break;
+        case GateOutcome::Ambiguous: log(head + " refused reason=ambiguous"); break;
         }
         return false;
     }
