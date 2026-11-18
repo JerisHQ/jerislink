@@ -238,6 +238,32 @@ enum ViewerPresenceSelfTest {
                    "presence.watcher_survives_resume wakes=\(wakes.value) waited=\(String(format: "%.2f", waited))s")
         }
         do {
+            // Regression (r2 review of #63): a display event wakes the capture
+            // loop, and the idle watcher's signal lands right after the stop()
+            // check (viewer still active then) but before the loop reads the
+            // monitor generation. The loop must not swallow that signal: it
+            // wakes again, sees the viewer idle and returns long before the
+            // deadline (r2 only returned at the deadline).
+            let monitor = DisplayChangeMonitor()
+            let stopCalls = Count()
+            let before = monitor.currentGeneration
+            monitor.note(flags: [.setModeFlag])
+            let start = Date()
+            let result: Int? = await DisplayFollower.waitForChange(
+                monitor: monitor, since: before, deadline: Date().addingTimeInterval(3),
+                sleep: { _ in }, query: { 1 }, isChange: { _ in false },
+                stop: {
+                    if stopCalls.bump() == 1 {
+                        monitor.signal()  // the watcher's idle signal, just after the check
+                        return false
+                    }
+                    return true
+                })
+            let waited = Date().timeIntervalSince(start)
+            expect(result == nil && stopCalls.value == 2 && waited < 1.5,
+                   "presence.idle_signal_after_stop_check stops=\(stopCalls.value) waited=\(String(format: "%.2f", waited))s")
+        }
+        do {
             // Disconnect -> reconnect -> disconnect, three rounds through the
             // capture loop's wait: every silence ends the wait well before
             // the deadline, every return of the viewer makes it active.
