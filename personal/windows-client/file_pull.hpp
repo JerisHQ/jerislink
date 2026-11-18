@@ -499,10 +499,11 @@ DigestFactory sha256Digest();
 // "name (2).ext" for the top item), was created after the paste started, is
 // at least as long as the bytes handed out (Explorer may set a larger size
 // before it writes), and its first and last bytes (up to 64 KiB each, at
-// their offsets) are the bytes this stream handed out, or still zero:
-// Explorer keeps its last buffer until it has the last byte, so the end of
-// the copy is often not written yet when the gate runs. Any other bytes
-// there mean the file is not ours. Nothing else is marked or deleted.
+// their offsets) are the bytes this stream handed out, up to where Explorer
+// has written, and zero after that: Explorer writes in order and keeps its
+// last buffer until it has the last byte, so the end of the copy is often
+// not written yet when the gate runs. Any other bytes there mean the file
+// is not ours. Nothing else is marked or deleted.
 // An empty file has no last byte to hold back and is pasted unmarked.
 
 enum class ZoneWrite { Written, Exists, Failed };

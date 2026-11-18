@@ -280,10 +280,12 @@ Bytes sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError
         return ReadFile(h, buf.data(), DWORD(n), &got, &o) && got == n;
     };
     const uint64_t body = r.size > 0 ? r.size - 1 : 0;   // bytes handed out before the gate
-    // Ours, or not written yet: Explorer writes its last buffer only after
-    // it has the last byte, and a file it sized first reads as zeros there.
+    // Ours up to where Explorer has written, zeros after: it writes in order
+    // and its last buffer only after it has the last byte, and a file it
+    // sized first reads as zeros past the written part.
     auto oursOrUnwritten = [&](const std::vector<uint8_t>& want) {
-        return buf == want || std::all_of(buf.begin(), buf.end(), [](uint8_t b) { return b == 0; });
+        const auto diff = std::mismatch(buf.begin(), buf.end(), want.begin()).first;
+        return std::all_of(diff, buf.end(), [](uint8_t b) { return b == 0; });
     };
     Bytes out = Bytes::Same;
     if (r.head.size() > body || !readAt(0, r.head.size()) || !oursOrUnwritten(r.head)) out = Bytes::HeadDiff;

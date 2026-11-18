@@ -139,12 +139,13 @@ void helpers() {
     // What CI showed the shell doing: the file sized past the manifest size
     // first, the start written, the last buffer not written yet (zeros).
     const auto sized = body(200000, 17);
-    std::vector<uint8_t> sizedOnDisk(sized.begin(), sized.begin() + 70000);
+    // Written up to 170000: the last 64 KiB handed out are part ours, part zeros.
+    std::vector<uint8_t> sizedOnDisk(sized.begin(), sized.begin() + 170000);
     sizedOnDisk.resize(sized.size() + 5000, 0);
     expect(writeFile(sub + L"\\sized.bin", sizedOnDisk), "unit: a copy Explorer sized past the manifest size");
     // The same, but the end holds someone else's bytes, not zeros.
     std::vector<uint8_t> foreignTail = sizedOnDisk;
-    for (size_t i = 150000; i < 190000; ++i) foreignTail[i] = 0x5a;
+    for (size_t i = 180000; i < 190000; ++i) foreignTail[i] = 0x5a;
     expect(writeFile(sub + L"\\foreign.bin", foreignTail), "unit: a same-name file with our start and other bytes at the end");
     expect(writeFile(sub + L"\\other.bin", body(600, 3)), "unit: a same-name, same-size file with other bytes");
     const std::vector<std::wstring> folders{dir + L"\\nowhere", sub};
