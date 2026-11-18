@@ -546,8 +546,8 @@ enum class GateOutcome {
 struct GateProbe {
     uint32_t paths = 0;       // candidate paths tried
     uint32_t present = 0;     // of those, a file is there
-    uint32_t small = 0;       // shorter than the bytes handed out
-    uint32_t big = 0;         // longer than the manifest size
+    uint32_t tooSmall = 0;    // shorter than the bytes handed out
+    uint32_t tooBig = 0;      // longer than the manifest size
     uint32_t older = 0;       // created before the paste started
     uint32_t otherBytes = 0;  // right size and time, other bytes (or not readable)
     uint64_t lastSize = 0;    // size of the last file found

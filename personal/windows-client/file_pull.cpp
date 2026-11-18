@@ -354,8 +354,8 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
             const ULARGE_INTEGER c{a.ftCreationTime.dwLowDateTime, a.ftCreationTime.dwHighDateTime};
             const ULARGE_INTEGER s{r.since.dwLowDateTime, r.since.dwHighDateTime};
             pr.lastAgeMs = (int64_t(c.QuadPart) - int64_t(s.QuadPart)) / 10000;
-            if (size < minSize) { ++pr.small; continue; }
-            if (size > r.size) { ++pr.big; continue; }
+            if (size < minSize) { ++pr.tooSmall; continue; }
+            if (size > r.size) { ++pr.tooBig; continue; }
             if (!sameOrLater(a.ftCreationTime, r.since)) { ++pr.older; continue; }
             DWORD openError = 0;
             if (!sameBytes(path, r, openError)) {
@@ -831,7 +831,7 @@ struct FileClipboard::Impl {
         case GateOutcome::NotFound:
             log(head + " refused reason=not_found sta=" + (onSta ? "1" : "0") + " folders=" + std::to_string(folders) +
                 " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
-                " small=" + std::to_string(probe.small) + " big=" + std::to_string(probe.big) +
+                " small=" + std::to_string(probe.tooSmall) + " big=" + std::to_string(probe.tooBig) +
                 " older=" + std::to_string(probe.older) + " other_bytes=" + std::to_string(probe.otherBytes) +
                 " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
                 " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
