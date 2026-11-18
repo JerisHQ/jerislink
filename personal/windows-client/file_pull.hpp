@@ -481,18 +481,26 @@ private:
 // SHA-256 through BCrypt, for PullHub.
 DigestFactory sha256Digest();
 
-// ---- Mark of the Web for pasted Mac files (F3 r2) ----------------------
+// ---- Mark of the Web for pasted Mac files (F3 r2, #53 r2) --------------
 //
 // Explorer writes a virtual-file paste (FileGroupDescriptorW + FileContents)
 // itself and, as the F3 hand test showed, adds no Zone.Identifier to it,
 // whatever the source says in "UntrustedDragDrop". The viewer never learns
-// the destination folder either. So once Explorer has read a file to its
-// end, FileClipboard looks for it: in folders where the shell reported new
-// items during the paste, in folders open in Explorer windows, and on the
-// Desktop. A file counts only when it has the manifest's path (or Explorer's
-// "name (2).ext" for the top item), the manifest's size, and was created
-// after the paste started. Each one found gets ZoneId=3 (Internet), the mark
-// a browser download gets. An existing Zone.Identifier is never replaced.
+// the destination folder either. So the last byte of each file waits for the
+// mark: when Explorer asks for it, FileClipboard looks for the copy on disk
+// (in folders where the shell reported new items during the paste, in
+// folders open in Explorer windows when the paste started, and on the
+// Desktop), proves it is this transfer's copy, and makes sure it carries
+// ZoneId=3 (Internet), the mark a browser download gets. Only then does
+// Explorer get the last byte. If no copy is found, or the mark cannot be
+// written or read back, the read fails and Explorer never completes the file.
+//
+// A copy counts as ours only when it has the manifest's path (or Explorer's
+// "name (2).ext" for the top item), was created after the paste started, is
+// one byte short of the manifest's size (or already full size, if Explorer
+// sets the size first), and its first and last bytes (up to 64 KiB each) are
+// the bytes this stream handed out. Nothing else is marked or deleted.
+// An empty file has no last byte to hold back and is pasted unmarked.
 
 enum class ZoneWrite { Written, Exists, Failed };
 
@@ -511,19 +519,33 @@ struct ZoneOps {
 };
 
 struct ZoneMarkStats {
-    uint32_t written = 0;  // Zone.Identifier added
-    uint32_t existed = 0;  // already had one (kept)
-    uint32_t failed = 0;   // found but could not be marked
-    uint32_t removed = 0;  // of those, deleted (#53: never left unmarked)
+    uint32_t written = 0;  // Zone.Identifier ZoneId=3 added (or a weaker zone replaced)
+    uint32_t existed = 0;  // already ZoneId=3 or 4 (kept)
+    uint32_t failed = 0;   // found, but could not be marked: the last byte was withheld
 };
 
-// Marks the manifest files listed in `want` (indexes Explorer read to the
-// end) that are found under one of `folders`, created at or after `since`.
-// Found indexes move from `want` to `done`. A file whose mark cannot be
-// written (a volume without streams) is deleted, so a paste never leaves a
-// file without ZoneId=3 (#53).
-ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
-                            std::set<uint32_t>& want, std::set<uint32_t>& done, const ZoneOps& zone = {});
+// One file's gate: asked before Explorer gets the file's last byte.
+struct GateRequest {
+    uint32_t transfer = 0;
+    uint32_t index = 0;
+    std::wstring rel;            // manifest path, Windows-mapped
+    uint64_t size = 0;           // manifest size
+    FILETIME since{};            // a copy must be created at or after this
+    std::vector<uint8_t> head;   // the first bytes handed out (up to 64 KiB)
+    std::vector<uint8_t> tail;   // the last bytes handed out before the gate (up to 64 KiB)
+};
+
+enum class GateOutcome {
+    Marked,        // every copy found carries ZoneId=3 (or 4)
+    NotFound,      // no copy proven to be ours
+    WriteFailed,   // a copy found, the mark could not be written (a volume without streams)
+    Invalid,       // a copy found, its Zone.Identifier never read back as ZoneId=3
+};
+
+// Looks for `r`'s copy under `folders`, proves it by name, time, size and
+// bytes, and marks every proven copy. Counts the outcome once in `stats`.
+GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
+                     ZoneMarkStats& stats);
 
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.

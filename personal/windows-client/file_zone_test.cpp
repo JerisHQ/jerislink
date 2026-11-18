@@ -1,8 +1,9 @@
 // Mark of the Web for Mac->Windows paste (F3 r2, hand test H): Explorer does
 // not write Zone.Identifier for virtual files pasted from the clipboard, so
-// the viewer writes ZoneId=3 itself once each file is delivered.
+// the viewer makes sure the copy carries ZoneId=3 before Explorer gets the
+// file's last byte (#53 r2).
 //
-// 1. writeInternetZone / readZoneId / markDelivered on real NTFS files.
+// 1. writeInternetZone / readZoneId / gateFile on real NTFS files.
 // 2. End to end: FileClipboard offers a manifest (names mapped for Windows),
 //    the folder's shell drop target pastes it (the same path Explorer's
 //    Ctrl+V takes), a fake host thread serves the bytes with real SHA-256,
@@ -74,6 +75,20 @@ std::vector<uint8_t> body(size_t n, unsigned seed) {
 
 std::vector<uint8_t> bytesOf(const std::string& s) { return {s.begin(), s.end()}; }
 
+// The gate request a PullStream builds for `full`: the first and the last
+// 64 KiB of every byte but the last.
+GateRequest requestFor(const std::wstring& rel, const std::vector<uint8_t>& full, const FILETIME& since) {
+    GateRequest r;
+    r.rel = rel;
+    r.size = full.size();
+    r.since = since;
+    const size_t body = full.empty() ? 0 : full.size() - 1;
+    const size_t k = std::min<size_t>(body, 64 * 1024);
+    r.head.assign(full.begin(), full.begin() + std::ptrdiff_t(k));
+    r.tail.assign(full.begin() + std::ptrdiff_t(body - k), full.begin() + std::ptrdiff_t(body));
+    return r;
+}
+
 FILETIME nowMinus(int seconds) {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -103,62 +118,65 @@ void helpers() {
     expect(readZoneId(a) == 3, "unit: ZoneId=3 read back");
     expect(writeInternetZone(a) == ZoneWrite::Exists, "unit: an existing Zone.Identifier is kept, not overwritten");
 
-    // markDelivered: the manifest's file, Explorer's "Keep both" name, size
-    // and time checks.
+    // gateFile: the manifest's file, Explorer's "Keep both" name, size,
+    // time and byte checks.
     const std::wstring sub = dir + L"\\m";
     CreateDirectoryW(sub.c_str(), nullptr);
-    Manifest m;
-    m.transfer = 2;
-    m.items = {
-        {false, 500, 0, L"x.bin"},            // 0: pasted as "x (2).bin" (x.bin exists, older)
-        {true, 0, 0, L"d"},                   // 1: folder, never marked
-        {false, 300, 0, L"d\\inner.bin"},     // 2: under the folder
-        {false, 77, 0, L"wrong-size.bin"},    // 3: same name, other size: not ours
-        {false, 10, 0, L"absent.bin"},        // 4: not there (yet)
-    };
-    m.files = 4;
+    const auto x = body(500, 5);
     // The old x.bin was there before the paste: older than `since`.
-    expect(writeFile(sub + L"\\x.bin", body(500, 5)), "unit: an older x.bin exists");
+    expect(writeFile(sub + L"\\x.bin", x), "unit: an older x.bin exists");
     Sleep(1100);
     const FILETIME since = nowMinus(0);
     Sleep(50);
-    expect(writeFile(sub + L"\\x (2).bin", body(500, 5)), "unit: pasted x (2).bin");
+    expect(writeFile(sub + L"\\x (2).bin", x), "unit: pasted x (2).bin");
     CreateDirectoryW((sub + L"\\d").c_str(), nullptr);
-    expect(writeFile(sub + L"\\d\\inner.bin", body(300, 7)), "unit: pasted d\\inner.bin");
-    expect(writeFile(sub + L"\\wrong-size.bin", body(78, 7)), "unit: a same-name file of another size");
-    std::set<uint32_t> want{0, 1, 2, 3, 4};
-    std::set<uint32_t> done;
-    const auto st = markDelivered(m, {dir + L"\\nowhere", sub}, since, want, done);
-    expect(st.written == 2 && st.existed == 0 && st.failed == 0, "unit: two delivered files marked");
+    const auto inner = body(300, 7);
+    expect(writeFile(sub + L"\\d\\inner.bin", inner), "unit: pasted d\\inner.bin");
+    const auto part = body(4000, 13);
+    // What Explorer has written when the gate runs: all but the last byte.
+    expect(writeFile(sub + L"\\part.bin", {part.begin(), part.end() - 1}), "unit: a copy one byte short");
+    expect(writeFile(sub + L"\\wrong-size.bin", body(79, 7)), "unit: a same-name file of another size");
+    expect(writeFile(sub + L"\\other.bin", body(600, 3)), "unit: a same-name, same-size file with other bytes");
+    const std::vector<std::wstring> folders{dir + L"\\nowhere", sub};
+    ZoneMarkStats st;
+    expect(gateFile(requestFor(L"x.bin", x, since), folders, {}, st) == GateOutcome::Marked,
+           "unit: the Keep-both copy passes the gate");
     expect(readZoneId(sub + L"\\x (2).bin") == 3, "unit: the Keep-both copy carries ZoneId=3");
     expect(readZoneId(sub + L"\\x.bin") == -1, "unit: the older file of the same name is left alone");
-    expect(readZoneId(sub + L"\\d\\inner.bin") == 3, "unit: a file inside a pasted folder carries ZoneId=3");
-    expect(readZoneId(sub + L"\\wrong-size.bin") == -1, "unit: a file of another size is left alone");
-    expect(done == std::set<uint32_t>{0, 2} && want == std::set<uint32_t>{3, 4},
-           "unit: found files done, folder dropped, others still wanted");
-    const auto again = markDelivered(m, {sub}, since, want, done);
-    expect(again.written == 0 && want.size() == 2, "unit: a second pass finds nothing new");
+    expect(gateFile(requestFor(L"d\\inner.bin", inner, since), folders, {}, st) == GateOutcome::Marked &&
+               readZoneId(sub + L"\\d\\inner.bin") == 3,
+           "unit: a file inside a pasted folder carries ZoneId=3");
+    expect(gateFile(requestFor(L"part.bin", part, since), folders, {}, st) == GateOutcome::Marked &&
+               readZoneId(sub + L"\\part.bin") == 3,
+           "unit: a copy one byte short (the last byte held back) is proven and marked");
+    expect(gateFile(requestFor(L"wrong-size.bin", body(77, 7), since), folders, {}, st) == GateOutcome::NotFound &&
+               readZoneId(sub + L"\\wrong-size.bin") == -1,
+           "unit: a file of another size is not ours and left alone");
+    expect(gateFile(requestFor(L"other.bin", body(600, 5), since), folders, {}, st) == GateOutcome::NotFound &&
+               readZoneId(sub + L"\\other.bin") == -1,
+           "unit: a file with other bytes is not ours and left alone");
+    expect(gateFile(requestFor(L"absent.bin", body(10, 1), since), folders, {}, st) == GateOutcome::NotFound,
+           "unit: a missing file is not found");
+    expect(gateFile(requestFor(L"x.bin", x, since), folders, {}, st) == GateOutcome::Marked,
+           "unit: a second gate on a marked copy passes (ZoneId=3 kept)");
+    expect(st.written == 3 && st.existed == 1 && st.failed == 0, "unit: gate counts written=3 existed=1 failed=0");
 
     // #53: a volume without streams (FAT, exFAT): ZoneId=3 cannot be
-    // written, so the pasted file is not left there unmarked.
+    // written, so the gate fails and the file is not completed. The gate
+    // deletes nothing.
     const std::wstring fat = dir + L"\\fat";
     CreateDirectoryW(fat.c_str(), nullptr);
-    Manifest fm;
-    fm.transfer = 3;
-    fm.items = {{false, 64, 0, L"nomark.exe"}};
-    fm.files = 1;
     const FILETIME since2 = nowMinus(0);
     Sleep(50);
-    expect(writeFile(fat + L"\\nomark.exe", body(64, 9)), "unit: pasted nomark.exe");
+    const auto nomark = body(64, 9);
+    expect(writeFile(fat + L"\\nomark.exe", {nomark.begin(), nomark.end() - 1}), "unit: pasted nomark.exe, one byte short");
     ZoneOps noStreams;
     noStreams.write = [](const std::wstring&) { return ZoneWrite::Failed; };
     noStreams.read = [](const std::wstring&) { return -1; };
-    std::set<uint32_t> fwant{0};
-    std::set<uint32_t> fdone;
-    const auto nst = markDelivered(fm, {fat}, since2, fwant, fdone, noStreams);
-    expect(nst.failed == 1 && nst.written == 0, "unit: a mark that cannot be written is counted failed (#53)");
-    expect(GetFileAttributesW((fat + L"\\nomark.exe").c_str()) == INVALID_FILE_ATTRIBUTES,
-           "unit: a pasted file that cannot carry ZoneId=3 is removed (#53)");
+    ZoneMarkStats fst;
+    expect(gateFile(requestFor(L"nomark.exe", nomark, since2), {fat}, noStreams, fst) == GateOutcome::WriteFailed &&
+               fst.failed == 1 && fst.written == 0,
+           "unit: a mark that cannot be written fails the gate (#53)");
 }
 
 // The host side of a pull: answers the hub's REQUESTs from `files`, ends
@@ -249,8 +267,8 @@ void endToEnd() {
 
     const std::wstring p0 = dir + L"\\report_.txt";
     const std::wstring p2 = dir + L"\\box_\\inner.bin";
-    // The shell copies on its own thread; the viewer marks ~1.5 s after each
-    // file. Wait up to 40 s.
+    // The shell copies on its own thread; the viewer marks each file before
+    // the shell gets its last byte. Wait up to 40 s.
     for (int i = 0; i < 400; ++i) {
         if (readZoneId(p0) == 3 && readZoneId(p2) == 3) break;
         pump(100);
@@ -362,8 +380,7 @@ struct GateCase {
 };
 
 // One paste of `same.bin` through the stand-in, with its own clipboard, hub
-// and host. Waits 3.5 s after the stream is released (a mark pass runs
-// ~1.5 s after each delivered file).
+// and host. Waits 3.5 s after the stream is released.
 FakeCopy runGateCase(const GateCase& gc) {
     FakeCopy c;
     c.readFailed = true;
