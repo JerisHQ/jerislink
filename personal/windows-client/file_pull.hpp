@@ -532,6 +532,12 @@ bool sameFile(const FILE_ID_INFO& a, const FILE_ID_INFO& b);
 // that volume). INVALID_HANDLE_VALUE if it is gone or cannot be opened so;
 // GetLastError() says why.
 HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share);
+// Deletes the file with identity `id` on the volume of `hint`, never
+// whatever has its name. NTFS does not delete through a handle opened by
+// id, so the file is reopened under its current name with delete access
+// and used only if it is still the same file. True once it is gone (or
+// already going); false while it cannot be deleted yet.
+bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id);
 
 // The zone calls on an open file (#60 r3): the Zone.Identifier stream is
 // opened on the file's current path and used only when it belongs to the

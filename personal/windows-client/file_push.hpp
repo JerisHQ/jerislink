@@ -7,8 +7,7 @@
 // session. The viewer accepts at once (Q1: no confirm click), then pulls the
 // files one after another with REQUEST, like a paste but with a plain file
 // writer and no clipboard. Files land in %USERPROFILE%\Downloads\JerisLink:
-// each is written to a ".jlpart" file in the hidden ".jlstaging" folder
-// there, and only when FILE_END's SHA-256
+// each is written to a ".jlpart" file, and only when FILE_END's SHA-256
 // matched it is renamed to its name, or "name (2).ext" ... when that name is
 // taken, and gets Zone.Identifier ZoneId=3. Nothing is ever opened; Explorer
 // shows the folder when every file arrived. The viewer ends every push with
@@ -364,17 +363,12 @@ private:
 
 #ifdef _WIN32
 // Writes into `folder` (normally %USERPROFILE%\Downloads\JerisLink, see
-// downloadsFolder()). Partial files are "<name>.<n>.jlpart" in the hidden
-// "<folder>\.jlstaging", created with CREATE_NEW and held open (#60 r3). A
-// verified file (its size and ZoneId=3 checked in staging) is moved through
-// that handle to "<name>" with no overwrite, and on a clash to "name (2).ext",
-// "name (3).ext" ... (up to 999). Zone.Identifier ZoneId=3 is written on the
-// partial file and moves with the rename; it is checked again through the
-// handle after the move. A file that cannot carry it (a volume without
-// streams) is moved back and deleted through the handle, and the push fails
-// with reason "motw" (#53). A delete that cannot be done at once is kept by
-// file id and retried until it succeeds; a same-name file someone else put
-// there is never moved or deleted.
+// downloadsFolder()). Partial files are "<name>.<n>.jlpart", created with
+// CREATE_NEW; a verified file is moved to "<name>" with no overwrite, and on
+// a clash to "name (2).ext", "name (3).ext" ... (up to 999). Zone.Identifier
+// ZoneId=3 is written on the partial file and moves with the rename. It is
+// checked before and after the rename; a file that cannot carry it (a volume
+// without streams) is deleted and the push fails with reason "motw" (#53).
 // `open` shows the folder in Explorer when a push finished (tests pass a no-op).
 // `zone` is for tests only.
 std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,

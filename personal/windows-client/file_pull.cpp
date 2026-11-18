@@ -399,21 +399,44 @@ std::vector<uint8_t> hashOf(HANDLE h, uint64_t size) {
     return d.finish();
 }
 
-// Deletes the file with identity `id` (never whatever has its name). True
-// once it is gone or going.
+// Deletes the locked copy `hint` (identity `id`). True once it is gone or going.
 bool deleteById(HANDLE hint, const FILE_ID_INFO& id) {
     FILE_STANDARD_INFO st{};
     if (GetFileInformationByHandleEx(hint, FileStandardInfo, &st, sizeof(st)) && st.DeletePending) return true;
-    HANDLE h = openById(hint, id, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    FILE_DISPOSITION_INFO del{};
-    del.DeleteFile = TRUE;
-    const bool ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
-    CloseHandle(h);
-    return ok;
+    return deleteFileById(hint, id);
 }
 
 }  // namespace
+
+bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id) {
+    const DWORD all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE byId = openById(hint, id, FILE_READ_ATTRIBUTES | SYNCHRONIZE, all);
+    if (byId == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_PARAMETER;
+    }
+    FILE_STANDARD_INFO st{};
+    if (GetFileInformationByHandleEx(byId, FileStandardInfo, &st, sizeof(st)) && st.DeletePending) {
+        CloseHandle(byId);
+        return true;
+    }
+    const std::wstring path = finalPathOf(byId);
+    CloseHandle(byId);
+    if (path.empty()) return false;
+    HANDLE h = CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, all, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    // Another file may have taken the name since: then nothing is deleted.
+    FILE_ID_INFO got{};
+    bool ok = false;
+    if (fileIdOf(h, got) && sameFile(got, id)) {
+        FILE_DISPOSITION_INFO del{};
+        del.DeleteFile = TRUE;
+        ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
+    }
+    CloseHandle(h);
+    return ok;
+}
 
 ZoneWrite writeInternetZoneOn(HANDLE file) {
     HANDLE z = openZoneStream(file, GENERIC_WRITE, 0, OPEN_ALWAYS);
