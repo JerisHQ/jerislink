@@ -481,30 +481,38 @@ private:
 // SHA-256 through BCrypt, for PullHub.
 DigestFactory sha256Digest();
 
-// ---- Mark of the Web for pasted Mac files (F3 r2, #53 r2) --------------
+// ---- Mark of the Web for pasted Mac files (F3 r2, #53 r2, #60 r3) -------
 //
 // Explorer writes a virtual-file paste (FileGroupDescriptorW + FileContents)
 // itself and, as the F3 hand test showed, adds no Zone.Identifier to it,
 // whatever the source says in "UntrustedDragDrop". The viewer never learns
-// the destination folder either. So the last byte of each file waits for the
-// mark: when Explorer asks for it, FileClipboard looks for the copy on disk
-// (in folders where the shell reported new items during the paste, in
-// folders open in Explorer windows when the paste started, and on the
-// Desktop), proves it is this transfer's copy, and makes sure it carries
-// ZoneId=3 (Internet), the mark a browser download gets. Only then does
-// Explorer get the last byte. If no copy is found, or the mark cannot be
-// written or read back, the read fails and Explorer never completes the file.
+// the destination folder either. So the last byte of each file (for an
+// empty file, the end of its stream) waits for the mark: when Explorer asks
+// for it, FileClipboard looks for the copy on disk (in folders where the
+// shell reported new items during the paste, in folders open in Explorer
+// windows when the paste started, and on the Desktop), settles on this
+// paste's copy, and makes sure it carries ZoneId=3 (Internet), the mark a
+// browser download gets. Only then does Explorer get the last byte. If no
+// copy is found, more than one could be ours, or the mark cannot be written
+// and read back, the read fails and Explorer never completes the file.
 //
-// A copy counts as ours only when it has the manifest's path (or Explorer's
-// "name (2).ext" for the top item), was created after the paste started, is
-// at least as long as the bytes handed out (Explorer may set a larger size
-// before it writes), and its first and last bytes (up to 64 KiB each, at
-// their offsets) are the bytes this stream handed out, up to where Explorer
-// has written, and zero after that: Explorer writes in order and keeps its
-// last buffer until it has the last byte, so the end of the copy is often
-// not written yet when the gate runs. Any other bytes there mean the file
-// is not ours. Nothing else is marked or deleted.
-// An empty file has no last byte to hold back and is pasted unmarked.
+// A file is this paste's copy only when it has the manifest's path (or
+// Explorer's "name (2).ext" for the top item), is a plain file (no folder,
+// no link at the name), was created after the paste started, is at least as
+// long as the bytes handed out, and is open for writing right now: Explorer
+// holds it so until it has the last byte. No bytes are sampled; a file
+// nobody writes is never taken, whatever it holds. Explorer may size the
+// copy past the manifest before it writes, so a longer file is taken here
+// and judged after the paste. Exactly one such file must exist. It is held
+// open by identity (volume and file id) from then on: the mark, its read
+// back and any later delete go to that file, never to whatever has its name.
+//
+// After Explorer lets go of the stream, settleCopy() waits until nobody
+// writes the copy, then keeps it only when every byte was handed out, it is
+// exactly the manifest size, its SHA-256 is that of the bytes handed out and
+// it carries ZoneId=3 (or 4). Anything else (a refused paste the shell had
+// already sized to full length, a copy that ended longer, a mark that went
+// away) is deleted through its identity. Nothing else is marked or deleted.
 
 enum class ZoneWrite { Written, Exists, Failed };
 
@@ -600,13 +608,11 @@ struct GateRequest {
     std::wstring rel;            // manifest path, Windows-mapped
     uint64_t size = 0;           // manifest size
     FILETIME since{};            // a copy must be created at or after this
-    std::vector<uint8_t> head;   // the first bytes handed out (up to 64 KiB)
-    std::vector<uint8_t> tail;   // the last bytes handed out before the gate (up to 64 KiB)
 };
 
 enum class GateOutcome {
-    Marked,        // every copy found carries ZoneId=3 (or 4)
-    NotFound,      // no copy proven to be ours
+    Marked,        // the one copy carries ZoneId=3 (or 4)
+    NotFound,      // no file could be this paste's copy
     WriteFailed,   // a copy found, the mark could not be written (a volume without streams)
     Invalid,       // a copy found, its Zone.Identifier never read back as ZoneId=3
     Ambiguous,     // more than one copy could be ours: none is marked or taken
@@ -619,17 +625,17 @@ struct GateProbe {
     uint32_t tooSmall = 0;    // shorter than the bytes handed out
     uint32_t larger = 0;      // longer than the manifest size (Explorer sized it first; not a refusal)
     uint32_t older = 0;       // created before the paste started
-    uint32_t openFailed = 0;  // could not be opened to check its bytes
-    uint32_t headDiff = 0;    // the first bytes are neither the ones handed out nor unwritten zeros
-    uint32_t tailDiff = 0;    // the bytes before the held-back one: neither ours nor unwritten zeros
+    uint32_t openFailed = 0;  // there, but could not be opened to check it
+    uint32_t idle = 0;        // nobody is writing it: not a copy in progress
+    uint32_t candidates = 0;  // copies taken (more than one: ambiguous)
     uint64_t lastSize = 0;    // size of the last file found
     int64_t lastAgeMs = 0;    // its creation time minus `since`
-    uint32_t openError = 0;   // GetLastError of the last byte check that could not open
+    uint32_t openError = 0;   // GetLastError of the last open that failed
 };
 
-// Looks for `r`'s copy under `folders`, proves it by name, time, size and
-// bytes, and marks every proven copy. Counts the outcome once in `stats`;
-// `probe`, if given, says why nothing was proven.
+// Looks for `r`'s copy under `folders` (name, time, size, being written,
+// exactly one) and marks it through its handle. Counts the outcome once in
+// `stats`; `probe`, if given, says why nothing was taken.
 // `locked`, if given, receives the copy (also when its mark failed) for
 // settleCopy().
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,

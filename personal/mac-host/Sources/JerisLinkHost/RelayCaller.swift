@@ -38,11 +38,40 @@ enum RelayCaller {
         decide(clientPort: clientPort, serverPort: serverPort, lookup: .live)
     }
 
+    /// Accepted only when every process holding the client end of the
+    /// connection runs our own executable, each is the same process (same
+    /// start time) before and after its path is read, and the same set
+    /// still holds the socket after the check (#60 r3).
+    ///
+    /// Residual risk, accepted for v0.3.0: this is a lookup by TCP ports, not
+    /// a property of the accepted socket. On TCP loopback macOS has no
+    /// LOCAL_PEERPID or audit token (those need AF_UNIX), so the peer cannot
+    /// be bound to the accepted socket itself; a process of the same user
+    /// that could make our executable connect for it, or that wins a race
+    /// between this check and its first message, is not excluded. To be
+    /// tightened together with the relay's connection password.
     static func decide(clientPort: UInt16, serverPort: UInt16, lookup: Lookup) -> Decision {
         guard let me = lookup.selfPath() else { return .reject("no-self-path") }
-        guard let pid = lookup.holders(clientPort, serverPort).first else { return .reject("no-owner") }
-        guard let path = lookup.path(pid) else { return .reject("no-owner-path") }
-        return path == me ? .allow(pid: pid) : .reject("other-executable")
+        let holders = Array(Set(lookup.holders(clientPort, serverPort))).sorted()
+        guard !holders.isEmpty else { return .reject("no-owner") }
+        var starts: [pid_t: UInt64] = [:]
+        for pid in holders {
+            guard let start = lookup.startTime(pid) else { return .reject("owner-gone") }
+            starts[pid] = start
+        }
+        for pid in holders {
+            guard let path = lookup.path(pid) else { return .reject("no-owner-path") }
+            // A socket shared with (passed to, or inherited by) another
+            // executable lets that process write to the relay too.
+            guard path == me else { return .reject(holders.count > 1 ? "shared-socket" : "other-executable") }
+        }
+        for pid in holders where lookup.startTime(pid) != starts[pid] {
+            return .reject("pid-reused")
+        }
+        guard Array(Set(lookup.holders(clientPort, serverPort))).sorted() == holders else {
+            return .reject("owner-gone")
+        }
+        return .allow(pid: holders[0])
     }
 
     /// When `pid` started (seconds and microseconds since 1970), or nil.

@@ -38,8 +38,6 @@ constexpr UINT kMsgQuit = WM_APP + 3;
 // F3 r2, Mark of the Web: posted by the clipboard object to the STA window.
 constexpr UINT kMsgPasteStart = WM_APP + 4;  // wParam transfer
 constexpr UINT kMsgShellChange = WM_APP + 6; // SHChangeNotifyRegister
-// #53 r2: how much of a file's start and end the gate compares.
-constexpr size_t kGateBytes = 64 * 1024;
 // What the paste source says about its data (design (j)): the shell's
 // "high risk" URL action, so Explorer treats the files as from the Internet
 // zone. Its effect on Mark of the Web is checked in the hand test.
@@ -90,18 +88,24 @@ HGLOBAL globalCopy(const void* data, size_t size) {
     return h;
 }
 
-// Asked once per file, before Explorer gets its last byte (#53 r2): true
-// only when the copy on disk was found and carries ZoneId=3.
-using GateFn = std::function<bool(const GateRequest&)>;
+// Asked once per file, before Explorer gets its last byte (#53 r2; for an
+// empty file, before its end): true only when the copy on disk was found and
+// carries ZoneId=3. The copy it settled on, if any, goes into `locked` (#60 r3).
+using GateFn = std::function<bool(const GateRequest&, LockedCopy&)>;
+// Called once per stream when Explorer lets go of it, with the copy the gate
+// locked (possibly none) and what the stream handed out (#60 r3).
+using SettleFn = std::function<void(LockedCopy&&, SettleRequest)>;
 
 // One file's bytes for Explorer. Sequential only: Seek may only report or
-// keep the current position. The last byte is held back until the gate
-// passes; if it fails, this read and every later one fail, so Explorer never
-// completes the file.
+// keep the current position. The last byte (for an empty file, the end) is
+// held back until the gate passes; if it fails, this read and every later
+// one fail, so Explorer never completes the file.
 class PullStream : public IStream {
 public:
-    PullStream(PullHub& hub, uint64_t token, uint64_t size, std::wstring leaf, GateRequest req, GateFn gate)
-        : hub_(hub), token_(token), size_(size), leaf_(std::move(leaf)), req_(std::move(req)), gate_(std::move(gate)) {}
+    PullStream(PullHub& hub, uint64_t token, uint64_t size, std::wstring leaf, GateRequest req, GateFn gate,
+               SettleFn settle)
+        : hub_(hub), token_(token), size_(size), leaf_(std::move(leaf)), req_(std::move(req)), gate_(std::move(gate)),
+          settle_(std::move(settle)) {}
 
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** out) override {
@@ -126,6 +130,15 @@ public:
         if (read) *read = 0;
         if (!out) return STG_E_INVALIDPOINTER;
         if (gateFailed_) return STG_E_READFAULT;
+        // An empty file has no last byte to hold back: the gate runs before
+        // Explorer learns the stream has ended (#60 r3).
+        if (size_ == 0 && !gatePassed_) {
+            if (!runGate()) {
+                gateFailed_ = true;
+                return STG_E_READFAULT;
+            }
+            gatePassed_ = true;
+        }
         auto* p = static_cast<uint8_t*>(out);
         ULONG done = 0;
         bool atGate = false;
@@ -149,7 +162,7 @@ public:
             size_t got = 0;
             const auto r = hub_.read(token_, p + done, size_t(want), got, kReadTimeoutMs);
             if (r == PullHub::ReadResult::Ok) {
-                if (!gatePassed_) keep(p + done, got);
+                sha_.update(p + done, got);
                 done += ULONG(got);
                 continue;
             }
@@ -198,25 +211,21 @@ public:
     STDMETHODIMP Clone(IStream**) override { return E_NOTIMPL; }
 
 private:
-    ~PullStream() { hub_.close(token_); }
-
-    // The first and the last kGateBytes handed out, for the gate's proof.
-    void keep(const uint8_t* b, size_t n) {
-        if (req_.head.size() < kGateBytes) {
-            req_.head.insert(req_.head.end(), b, b + std::min(n, kGateBytes - req_.head.size()));
-        }
-        if (n >= kGateBytes) {
-            req_.tail.assign(b + n - kGateBytes, b + n);
-            return;
-        }
-        req_.tail.insert(req_.tail.end(), b, b + n);
-        if (req_.tail.size() > kGateBytes) {
-            req_.tail.erase(req_.tail.begin(), req_.tail.begin() + std::ptrdiff_t(req_.tail.size() - kGateBytes));
-        }
+    // Explorer let go: the locked copy is checked once nobody writes it.
+    ~PullStream() {
+        hub_.close(token_);
+        if (!settle_) return;
+        SettleRequest s;
+        s.transfer = req_.transfer;
+        s.index = req_.index;
+        s.size = size_;
+        s.sha256 = sha_.finish();
+        s.complete = gatePassed_ && pos_ == size_;
+        settle_(std::move(locked_), std::move(s));
     }
 
     // No gate (no clipboard thread behind us) means no mark: fail closed.
-    bool runGate() { return gate_ && gate_(req_); }
+    bool runGate() { return gate_ && gate_(req_, locked_); }
 
     PullHub& hub_;
     uint64_t token_;
@@ -225,6 +234,9 @@ private:
     uint64_t pos_ = 0;
     GateRequest req_;
     GateFn gate_;
+    SettleFn settle_;
+    LockedCopy locked_;
+    BCryptDigest sha_;   // every byte handed out
     bool gatePassed_ = false;
     bool gateFailed_ = false;
     std::atomic<long> refs_{1};
@@ -252,64 +264,6 @@ std::vector<std::wstring> topNames(const std::wstring& top) {
     const std::string u = utf8Of(top);
     for (int n = 2; n <= 20; ++n) out.push_back(wideOf(file::path::clashName(u, n)));
     return out;
-}
-
-bool sameOrLater(const FILETIME& a, const FILETIME& since) {
-    return CompareFileTime(&a, &since) >= 0;
-}
-
-// Whether the file at `path` starts with r.head and has r.tail right before
-// its last byte: the bytes this transfer handed out, not a neighbour's.
-enum class Bytes { Same, OpenFailed, HeadDiff, TailDiff };
-
-Bytes sameBytes(const std::wstring& path, const GateRequest& r, DWORD& openError) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        openError = GetLastError();
-        return Bytes::OpenFailed;
-    }
-    std::vector<uint8_t> buf;
-    auto readAt = [&](uint64_t off, size_t n) {
-        buf.assign(n, 0);
-        if (n == 0) return true;
-        OVERLAPPED o{};
-        o.Offset = DWORD(off & 0xffffffffu);
-        o.OffsetHigh = DWORD(off >> 32);
-        DWORD got = 0;
-        return ReadFile(h, buf.data(), DWORD(n), &got, &o) && got == n;
-    };
-    const uint64_t body = r.size > 0 ? r.size - 1 : 0;   // bytes handed out before the gate
-    // Ours up to where Explorer has written, zeros after: it writes in order
-    // and its last buffer only after it has the last byte, and a file it
-    // sized first reads as zeros past the written part.
-    auto oursOrUnwritten = [&](const std::vector<uint8_t>& want) {
-        const auto diff = std::mismatch(buf.begin(), buf.end(), want.begin()).first;
-        return std::all_of(diff, buf.end(), [](uint8_t b) { return b == 0; });
-    };
-    Bytes out = Bytes::Same;
-    if (r.head.size() > body || !readAt(0, r.head.size()) || !oursOrUnwritten(r.head)) out = Bytes::HeadDiff;
-    else if (r.tail.size() > body || !readAt(body - r.tail.size(), r.tail.size()) || !oursOrUnwritten(r.tail))
-        out = Bytes::TailDiff;
-    CloseHandle(h);
-    return out;
-}
-
-enum class MarkResult { Written, Existed, WriteFailed, Invalid };
-
-// Makes sure `path` carries ZoneId=3 (or the stricter 4). A weaker or broken
-// Zone.Identifier is removed and written again; the result is read back.
-MarkResult markOne(const std::wstring& path, const ZoneOps& zone) {
-    const int before = zone.read(path);
-    if (before == 3 || before == 4) return MarkResult::Existed;
-    DeleteFileW((path + L":Zone.Identifier").c_str());
-    ZoneWrite w = ZoneWrite::Failed;
-    for (int n = 0; n < 10; ++n) {
-        if (n) Sleep(100);
-        w = zone.write(path);
-        if (zone.read(path) == 3) return MarkResult::Written;
-    }
-    return w == ZoneWrite::Failed ? MarkResult::WriteFailed : MarkResult::Invalid;
 }
 
 }  // namespace
@@ -400,6 +354,65 @@ HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition)
     return z;
 }
 
+
+// A file's attributes, opened without following a link at the name and
+// without blocking anyone (every sharing mode, no read or write access).
+HANDLE openAttributes(const std::wstring& path) {
+    return CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+// Whether someone has the file open for writing (or keeps readers out):
+// a read open that refuses to share writing then fails with a sharing
+// violation.
+bool beingWritten(HANDLE hint, const FILE_ID_INFO& id) {
+    HANDLE h = openById(hint, id, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        return false;
+    }
+    return GetLastError() == ERROR_SHARING_VIOLATION;
+}
+
+// SHA-256 of the whole file behind `h`, or empty if it does not read as
+// exactly `size` bytes.
+std::vector<uint8_t> hashOf(HANDLE h, uint64_t size) {
+    BCryptDigest d;
+    std::vector<uint8_t> buf(256 * 1024);
+    uint64_t total = 0;
+    for (;;) {
+        OVERLAPPED o{};
+        o.Offset = DWORD(total & 0xffffffffu);
+        o.OffsetHigh = DWORD(total >> 32);
+        DWORD got = 0;
+        if (!ReadFile(h, buf.data(), DWORD(buf.size()), &got, &o)) {
+            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            return {};
+        }
+        if (got == 0) break;
+        d.update(buf.data(), got);
+        total += got;
+        if (total > size) return {};
+    }
+    if (total != size) return {};
+    return d.finish();
+}
+
+// Deletes the file with identity `id` (never whatever has its name). True
+// once it is gone or going.
+bool deleteById(HANDLE hint, const FILE_ID_INFO& id) {
+    FILE_STANDARD_INFO st{};
+    if (GetFileInformationByHandleEx(hint, FileStandardInfo, &st, sizeof(st)) && st.DeletePending) return true;
+    HANDLE h = openById(hint, id, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FILE_DISPOSITION_INFO del{};
+    del.DeleteFile = TRUE;
+    const bool ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
+    CloseHandle(h);
+    return ok;
+}
+
 }  // namespace
 
 ZoneWrite writeInternetZoneOn(HANDLE file) {
@@ -425,60 +438,143 @@ int readZoneIdOn(HANDLE file) {
 }
 
 GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
-                     ZoneMarkStats& stats, GateProbe* probe, LockedCopy*) {
+                     ZoneMarkStats& stats, GateProbe* probe, LockedCopy* locked) {
     GateProbe local;
     GateProbe& pr = probe ? *probe : local;
     const size_t cut = r.rel.find(L'\\');
     const std::wstring top = cut == std::wstring::npos ? r.rel : r.rel.substr(0, cut);
     const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
     const uint64_t minSize = r.size > 0 ? r.size - 1 : 0;
-    // Counted once per file: the same copy can be reached through two folder
-    // spellings (a short 8.3 path and its long name).
-    bool found = false, wrote = false;
-    GateOutcome bad = GateOutcome::Marked;
+    const ULARGE_INTEGER since{r.since.dwLowDateTime, r.since.dwHighDateTime};
+    // Every file that could be this paste's copy, held open by identity. The
+    // same file reached through two folder spellings (8.3 and long) counts once.
+    struct Candidate {
+        HANDLE h;
+        FILE_ID_INFO id;
+    };
+    std::vector<Candidate> found;
     for (const auto& folder : folders) {
         for (const auto& name : topNames(top)) {
             const std::wstring path = folder + L"\\" + name + rest;
             ++pr.paths;
-            WIN32_FILE_ATTRIBUTE_DATA a{};
-            if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) continue;
-            if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            const uint64_t size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+            HANDLE h = openAttributes(path);
+            if (h == INVALID_HANDLE_VALUE) {
+                const DWORD e = GetLastError();
+                if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                    ++pr.openFailed;
+                    pr.openError = e;
+                }
+                continue;
+            }
+            FILE_BASIC_INFO basic{};
+            FILE_STANDARD_INFO standard{};
+            FILE_ID_INFO id{};
+            if (!GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic)) ||
+                !GetFileInformationByHandleEx(h, FileStandardInfo, &standard, sizeof(standard)) || !fileIdOf(h, id)) {
+                ++pr.openFailed;
+                pr.openError = GetLastError();
+                CloseHandle(h);
+                continue;
+            }
+            // Folders and links (a junction or symlink under the name) are never ours.
+            if (standard.Directory ||
+                (basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+                CloseHandle(h);
+                continue;
+            }
+            const uint64_t size = uint64_t(standard.EndOfFile.QuadPart);
             ++pr.present;
             pr.lastSize = size;
-            const ULARGE_INTEGER c{a.ftCreationTime.dwLowDateTime, a.ftCreationTime.dwHighDateTime};
-            const ULARGE_INTEGER s{r.since.dwLowDateTime, r.since.dwHighDateTime};
-            pr.lastAgeMs = (int64_t(c.QuadPart) - int64_t(s.QuadPart)) / 10000;
-            if (size < minSize) { ++pr.tooSmall; continue; }
-            if (size > r.size) ++pr.larger;
-            if (!sameOrLater(a.ftCreationTime, r.since)) { ++pr.older; continue; }
-            DWORD openError = 0;
-            const Bytes b = sameBytes(path, r, openError);
-            if (b == Bytes::OpenFailed) { ++pr.openFailed; pr.openError = openError; continue; }
-            if (b == Bytes::HeadDiff) { ++pr.headDiff; continue; }
-            if (b == Bytes::TailDiff) { ++pr.tailDiff; continue; }
-            found = true;
-            switch (markOne(path, zone)) {
-            case MarkResult::Written: wrote = true; break;
-            case MarkResult::Existed: break;
-            case MarkResult::WriteFailed: if (bad == GateOutcome::Marked) bad = GateOutcome::WriteFailed; break;
-            case MarkResult::Invalid: bad = GateOutcome::Invalid; break;
+            pr.lastAgeMs = (basic.CreationTime.QuadPart - int64_t(since.QuadPart)) / 10000;
+            bool skip = false;
+            if (size < minSize) { ++pr.tooSmall; skip = true; }
+            else if (basic.CreationTime.QuadPart < int64_t(since.QuadPart)) { ++pr.older; skip = true; }
+            else if (std::any_of(found.begin(), found.end(), [&](const Candidate& c) { return sameFile(c.id, id); })) skip = true;
+            // Explorer holds the copy open for writing until it has the last
+            // byte; a file nobody writes is not this paste's copy, whatever
+            // its name, size or bytes.
+            else if (!beingWritten(h, id)) { ++pr.idle; skip = true; }
+            if (skip) {
+                CloseHandle(h);
+                continue;
             }
+            // Explorer may size the copy past the manifest before it writes:
+            // taken, and settleCopy() keeps it only at the exact size.
+            if (size > r.size) ++pr.larger;
+            found.push_back({h, id});
         }
     }
-    if (!found) return GateOutcome::NotFound;
-    if (bad != GateOutcome::Marked) {
+    if (found.empty()) return GateOutcome::NotFound;
+    if (found.size() > 1) {
+        // Which one is ours cannot be told: none is marked or taken.
+        pr.candidates = uint32_t(found.size());
+        for (auto& c : found) CloseHandle(c.h);
         ++stats.failed;
-        return bad;
+        return GateOutcome::Ambiguous;
     }
-    if (wrote) ++stats.written;
+    pr.candidates = 1;
+    HANDLE h = found[0].h;
+    // Mark and read back through the handle: a file swapped in under the
+    // name meanwhile is never marked instead.
+    GateOutcome out = GateOutcome::Marked;
+    bool wrote = false;
+    const int before = zone.readOn(h);
+    if (before != 3 && before != 4) {
+        ZoneWrite w = ZoneWrite::Failed;
+        for (int n = 0; n < 10 && !wrote; ++n) {
+            if (n) Sleep(100);
+            w = zone.writeOn(h);
+            wrote = zone.readOn(h) == 3;
+        }
+        if (!wrote) out = w == ZoneWrite::Failed ? GateOutcome::WriteFailed : GateOutcome::Invalid;
+    }
+    // Held also when the mark failed: settleCopy() removes it then.
+    if (locked) locked->adopt(h, found[0].id);
+    else CloseHandle(h);
+    if (out != GateOutcome::Marked) ++stats.failed;
+    else if (wrote) ++stats.written;
     else ++stats.existed;
-    return GateOutcome::Marked;
+    return out;
 }
 
-SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest&, const ZoneOps&, ZoneMarkStats&, int) {
+SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps& zone, ZoneMarkStats& stats,
+                         int waitMs) {
+    if (!copy) return SettleOutcome::None;
+    const HANDLE h = copy.handle();
+    const FILE_ID_INFO id = copy.id();
+    const ULONGLONG until = GetTickCount64() + ULONGLONG(waitMs > 0 ? waitMs : 0);
+    while (beingWritten(h, id) && GetTickCount64() < until) Sleep(50);
+    // Kept only when complete, exactly the manifest size, the bytes handed
+    // out and marked. Checked under a handle that keeps writers out.
+    bool keep = false;
+    if (s.complete && !s.sha256.empty()) {
+        HANDLE rd = openById(h, id, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+        if (rd != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(rd, &size) && uint64_t(size.QuadPart) == s.size && hashOf(rd, s.size) == s.sha256) {
+                const int z = zone.readOn(rd);
+                keep = z == 3 || z == 4;
+            }
+            CloseHandle(rd);
+        }
+    }
+    SettleOutcome out = SettleOutcome::Kept;
+    if (!keep) {
+        out = SettleOutcome::Left;
+        for (;;) {
+            if (deleteById(h, id)) {
+                out = SettleOutcome::Removed;
+                break;
+            }
+            if (GetTickCount64() >= until) break;
+            Sleep(100);
+        }
+    }
     copy.reset();
-    return SettleOutcome::None;
+    if (out == SettleOutcome::Kept) ++stats.kept;
+    else if (out == SettleOutcome::Removed) ++stats.removed;
+    else ++stats.left;
+    return out;
 }
 
 namespace {
@@ -486,8 +582,10 @@ namespace {
 // The clipboard object for one announce.
 class PullDataObject : public IDataObject {
 public:
-    PullDataObject(PullHub& hub, Manifest m, std::function<void(const std::string&)> log, HWND notify, GateFn gate)
-        : hub_(hub), m_(std::move(m)), log_(std::move(log)), notify_(notify), gate_(std::move(gate)) {
+    PullDataObject(PullHub& hub, Manifest m, std::function<void(const std::string&)> log, HWND notify, GateFn gate,
+                   SettleFn settle)
+        : hub_(hub), m_(std::move(m)), log_(std::move(log)), notify_(notify), gate_(std::move(gate)),
+          settle_(std::move(settle)) {
         cfDescriptor_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
         cfContents_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILECONTENTS));
         cfDropEffect_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT));
@@ -571,7 +669,7 @@ public:
             u.QuadPart -= 5ull * 10000000ull;
             req.since = FILETIME{u.LowPart, u.HighPart};
             med->tymed = TYMED_ISTREAM;
-            med->pstm = new PullStream(hub_, token, it.size, std::move(leaf), std::move(req), gate_);
+            med->pstm = new PullStream(hub_, token, it.size, std::move(leaf), std::move(req), gate_, settle_);
             return S_OK;
         }
         DWORD value = fe->cfFormat == cfDropEffect_ ? DROPEFFECT_COPY : kUrlActionShellExecuteHighRisk;
@@ -625,6 +723,7 @@ private:
     std::function<void(const std::string&)> log_;
     HWND notify_ = nullptr;
     GateFn gate_;
+    SettleFn settle_;
     CLIPFORMAT cfDescriptor_ = 0;
     CLIPFORMAT cfContents_ = 0;
     CLIPFORMAT cfDropEffect_ = 0;
@@ -660,6 +759,11 @@ struct FileClipboard::Impl {
 
     // How long the gate looks for a copy before it gives up.
     static constexpr int kGateWaitMs = 5000;
+    // How long a settle waits for the shell to let go of a copy (#60 r3).
+    static constexpr int kSettleWaitMs = 10000;
+    // Settle checks still running (guarded by mu); stop() waits for them.
+    int settling = 0;
+    std::condition_variable settled;
 
     ZoneOps zone;
 
@@ -746,7 +850,8 @@ struct FileClipboard::Impl {
         withdraw(0);
         const uint32_t t = m.transfer;
         const size_t entries = m.items.size();
-        auto* obj = new PullDataObject(hub, m, log, hwnd, [this](const GateRequest& r) { return gate(r); });
+        auto* obj = new PullDataObject(hub, m, log, hwnd, [this](const GateRequest& r, LockedCopy& c) { return gate(r, c); },
+                                       [this](LockedCopy&& c, SettleRequest s) { settle(std::move(c), std::move(s)); });
         const HRESULT hr = setClipboard(obj);
         if (FAILED(hr)) {
             obj->Release();
@@ -895,7 +1000,7 @@ struct FileClipboard::Impl {
 
     // #53 r2: runs before Explorer gets a file's last byte. True only when
     // the copy on disk is proven ours and carries ZoneId=3. Logs no names.
-    bool gate(const GateRequest& r) {
+    bool gate(const GateRequest& r, LockedCopy& locked) {
         const bool onSta = GetCurrentThreadId() == threadId;
         if (onSta) {
             pumpShell();
@@ -911,7 +1016,7 @@ struct FileClipboard::Impl {
             probe = GateProbe{};
             const auto where = searchFolders();
             folders = where.size();
-            got = gateFile(r, where, zone, st, &probe);
+            got = gateFile(r, where, zone, st, &probe, &locked);
             if (got != GateOutcome::NotFound || GetTickCount64() >= until) break;
             Sleep(100);
             if (onSta) pumpShell();
@@ -932,15 +1037,41 @@ struct FileClipboard::Impl {
                 " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
                 " small=" + std::to_string(probe.tooSmall) + " larger=" + std::to_string(probe.larger) +
                 " older=" + std::to_string(probe.older) + " open_failed=" + std::to_string(probe.openFailed) +
-                " head_diff=" + std::to_string(probe.headDiff) + " tail_diff=" + std::to_string(probe.tailDiff) +
+                " idle=" + std::to_string(probe.idle) +
                 " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
                 " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
             break;
         case GateOutcome::WriteFailed: log(head + " refused reason=zone_write_failed"); break;
         case GateOutcome::Invalid: log(head + " refused reason=zone_invalid"); break;
-        case GateOutcome::Ambiguous: log(head + " refused reason=ambiguous"); break;
+        case GateOutcome::Ambiguous: log(head + " refused reason=ambiguous candidates=" + std::to_string(probe.candidates)); break;
         }
         return false;
+    }
+
+    // #60 r3: once Explorer lets go of a stream, its locked copy is checked
+    // on a thread of its own (the shell may still hold the file a while) and
+    // kept or removed through its identity. Logs no names.
+    void settle(LockedCopy&& copy, SettleRequest s) {
+        if (!copy) return;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            ++settling;
+        }
+        std::thread([this, c = std::move(copy), s = std::move(s)]() mutable {
+            ZoneMarkStats st;
+            const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
+            const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
+            log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
+                " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                totals.kept += st.kept;
+                totals.removed += st.removed;
+                totals.left += st.left;
+                --settling;
+            }
+            settled.notify_all();
+        }).detach();
     }
 };
 
@@ -962,6 +1093,10 @@ void FileClipboard::stop() {
     if (impl_->hwnd) PostMessageW(impl_->hwnd, kMsgQuit, 0, 0);
     impl_->thread.join();
     impl_->hwnd = nullptr;
+    // Every settle check finishes (each is bounded by kSettleWaitMs and one
+    // read of the copy) before the totals are final.
+    std::unique_lock<std::mutex> lock(impl_->mu);
+    impl_->settled.wait(lock, [&] { return impl_->settling == 0; });
 }
 
 void FileClipboard::offer(const Manifest& m) {

@@ -75,17 +75,12 @@ std::vector<uint8_t> body(size_t n, unsigned seed) {
 
 std::vector<uint8_t> bytesOf(const std::string& s) { return {s.begin(), s.end()}; }
 
-// The gate request a PullStream builds for `full`: the first and the last
-// 64 KiB of every byte but the last.
+// The gate request a PullStream builds for `full`.
 GateRequest requestFor(const std::wstring& rel, const std::vector<uint8_t>& full, const FILETIME& since) {
     GateRequest r;
     r.rel = rel;
     r.size = full.size();
     r.since = since;
-    const size_t body = full.empty() ? 0 : full.size() - 1;
-    const size_t k = std::min<size_t>(body, 64 * 1024);
-    r.head.assign(full.begin(), full.begin() + std::ptrdiff_t(k));
-    r.tail.assign(full.begin() + std::ptrdiff_t(body - k), full.begin() + std::ptrdiff_t(body));
     return r;
 }
 
@@ -169,7 +164,7 @@ void helpers() {
     expect(writeInternetZone(a) == ZoneWrite::Exists, "unit: an existing Zone.Identifier is kept, not overwritten");
 
     // gateFile: the manifest's file, Explorer's "Keep both" name, size,
-    // time and byte checks.
+    // time and being-written checks.
     const std::wstring sub = dir + L"\\m";
     CreateDirectoryW(sub.c_str(), nullptr);
     const auto x = body(500, 5);
