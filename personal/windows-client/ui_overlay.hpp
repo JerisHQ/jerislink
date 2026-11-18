@@ -180,6 +180,18 @@ inline Point placeInClient(const Rect& client, int w, int h, int margin) {
     return p;
 }
 
+// Top for a window that opens while the overlay can be in view (Files panel,
+// Info, Volume, Settings): when it would cover the overlay's columns at or
+// below the overlay's top, it moves down to `gap` under the overlay, so the
+// overlay stays visible and clickable. Kept above `maxBottom` (work area)
+// when there is room; a window that cannot fit below keeps `maxBottom - h`.
+inline int topBelowOverlay(const Rect& win, const Rect& overlay, int gap, int maxBottom) {
+    const bool columns = win.left < overlay.right && win.right > overlay.left;
+    if (!columns || win.bottom <= overlay.top || win.top >= overlay.bottom + gap) return win.top;
+    const int want = overlay.bottom + gap;
+    return std::max(win.top, std::min(want, maxBottom - win.height()));
+}
+
 // ---- Hover zone on any monitor ---------------------------------------------
 // Part of `a` that is also in `b`; empty (width or height <= 0) when apart.
 inline Rect intersect(const Rect& a, const Rect& b) {

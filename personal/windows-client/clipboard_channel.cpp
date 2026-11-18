@@ -284,7 +284,8 @@ void ClipboardChannel::run() {
         }
 
         const UINT sequence = GetClipboardSequenceNumber();
-        if (sequence != lastSequence) {
+        const bool resend = resendRequested_.exchange(false);
+        if (sequence != lastSequence || resend) {
             lastSequence = sequence;
             std::wstring wide;
             std::string utf8;
@@ -294,12 +295,12 @@ void ClipboardChannel::run() {
                 log("clipboard.skip_oversize bytes=" + std::to_string(utf8.size()));
                 continue;
             }
-            if (utf8 == lastRemoteApplied) {
+            if (!resend && utf8 == lastRemoteApplied) {
                 lastRemoteApplied.clear();
                 lastSent = utf8;
                 continue;
             }
-            if (utf8 == lastSent) continue;
+            if (!resend && utf8 == lastSent) continue;
             if (!sendPacket(s, kClipboardText, utf8)) {
                 log("clipboard.disconnected send_error");
                 closeSocket(s);
@@ -307,7 +308,7 @@ void ClipboardChannel::run() {
             }
             lastSent = utf8;
             ++sent_;
-            log("clipboard.tx bytes=" + std::to_string(utf8.size()));
+            log(std::string(resend ? "clipboard.tx_resend" : "clipboard.tx") + " bytes=" + std::to_string(utf8.size()));
         }
     }
 

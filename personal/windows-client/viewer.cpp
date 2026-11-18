@@ -570,12 +570,14 @@ static bool physicalKeyDown(int vk) {
 static FileSession* gFileSession = nullptr;  // set while a session runs
 static FileSession* gFilePullSession = nullptr;  // F3 Mac->Windows paste, same lifetime
 static jl::fileup::PasteGate gPasteGate;
+static ClipboardChannel* gClipboard = nullptr;  // text sync, same lifetime as gFileSession
 static HWND gFileConfirm = nullptr;
 static bool fileConfirmVisible() { return gFileConfirm && IsWindowVisible(gFileConfirm); }
 static HWND gFilePanel = nullptr;  // F4 Files panel
 static bool filePanelVisible() { return gFilePanel && IsWindowVisible(gFilePanel); }
 static bool pasteEligible();
 static bool pasteBusy();
+static bool pasteTextWhileHeld();
 static void pasteRefusedBusy();
 static void pasteRefusedFinder();
 static void startPasteUpload();
@@ -630,7 +632,7 @@ static jl::keymap::Held heldModifiers() {
 // A Cmd+V with copied Windows files is held here while they upload (F2).
 static void sendKeyOutput(const jl::keymap::Output& out) {
     if (!gControl) return;
-    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible, pasteBusy);
+    const auto f = gPasteGate.filter(out.events, steadyMsNow(), pasteEligible, pasteBusy, pasteTextWhileHeld);
     for (const auto& e : f.events) gControl->sendKey(e.down, e.semantic);
     if (f.startUpload) startPasteUpload();
     if (f.refusedBusy) pasteRefusedBusy();
@@ -1552,6 +1554,8 @@ static void ensureCommonControls() {
     ready = InitCommonControlsEx(&icc) != FALSE;
 }
 
+static void keepBelowOverlay(HWND w, const char* what);  // below, with the overlay
+
 // Opens at the top-right corner of the viewer window, inside its monitor's
 // work area, so it covers the corner of the picture and not the middle.
 static void placeVolumeWindow(HWND dlg, HWND owner) {
@@ -1570,6 +1574,7 @@ static void placeVolumeWindow(HWND dlg, HWND owner) {
         y = std::clamp(y, top, std::max(top, static_cast<int>(mi.rcWork.bottom) - h));
     }
     SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    keepBelowOverlay(dlg, "dialog");
 }
 
 static INT_PTR CALLBACK VolumeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1847,6 +1852,7 @@ static void showVideoSettings(HWND owner) {
         return;
     }
     applySessionTranslucency(dlg, owner, "settings");
+    keepBelowOverlay(dlg, "settings");
     ShowWindow(dlg, SW_SHOW);
     logLine("settings.window open=modeless");
 }
@@ -2094,8 +2100,9 @@ static UINT overlayDpi() {
     return jl::ui::windowDpi(gOverlay ? gOverlay : gViewerHwnd);
 }
 
-static void overlayReposition() {
-    if (!gOverlay || !gViewerHwnd) return;
+// Where the overlay is, or would be when shown, in screen coordinates.
+static ov::Rect overlayScreenRect() {
+    if (!gViewerHwnd) return {};
     const UINT dpi = overlayDpi();
     const ov::Layout l = ov::layoutFor(dpi);
     RECT c{};
@@ -2107,8 +2114,33 @@ static void overlayReposition() {
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
     const ov::Point p = ov::placeInClient({c.left, c.top, c.right, c.bottom}, l.size.width(),
                                           l.size.height(), top);
-    SetWindowPos(gOverlay, nullptr, p.x, p.y, l.size.width(), l.size.height(),
-                 SWP_NOZORDER | SWP_NOACTIVATE);
+    return {p.x, p.y, p.x + l.size.width(), p.y + l.size.height()};
+}
+
+// Info, Volume and Settings open where the overlay can be: never on top of it,
+// so its buttons stay in reach while they are open.
+static void keepBelowOverlay(HWND w, const char* what) {
+    if (!w || !gOverlay || !gViewerHwnd) return;
+    RECT r{};
+    if (!GetWindowRect(w, &r)) return;
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    LONG maxBottom = r.bottom + 100000;
+    if (GetMonitorInfoW(MonitorFromWindow(gViewerHwnd, MONITOR_DEFAULTTONEAREST), &mi)) maxBottom = mi.rcWork.bottom;
+    const ov::Rect o = overlayScreenRect();
+    const int top = ov::topBelowOverlay({r.left, r.top, r.right, r.bottom}, o,
+                                        ov::scale(8, overlayDpi()), static_cast<int>(maxBottom));
+    if (top == r.top) return;
+    SetWindowPos(w, nullptr, r.left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    logLine(std::string("overlay.below what=") + what + " dy=" + std::to_string(top - r.top));
+}
+
+static void overlayReposition() {
+    if (!gOverlay || !gViewerHwnd) return;
+    const UINT dpi = overlayDpi();
+    const ov::Rect r = overlayScreenRect();
+    SetWindowPos(gOverlay, nullptr, r.left, r.top, r.width(), r.height(), SWP_NOZORDER | SWP_NOACTIVATE);
+    const ov::Layout l = ov::layoutFor(dpi);
     if (gOverlayTip) {  // the button moves with the dpi
         TTTOOLINFOW ti{};
         ti.cbSize = sizeof(ti);
@@ -2127,6 +2159,8 @@ static void overlayShow(bool keyboard, const char* source, double autoHideMs) {
     gOverlayHideAtMs = autoHideMs > 0 ? steadyMsNow() + autoHideMs : 0.0;
     overlayReposition();
     if (!wasVisible) ShowWindow(gOverlay, SW_SHOWNOACTIVATE);
+    // Above the Files panel and the chip (both HWND_TOP popups of the viewer).
+    SetWindowPos(gOverlay, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     overlayRefresh();
     logLine(std::string("overlay.show source=") + source + " keyboard=" + (keyboard ? "1" : "0"));
 }
@@ -2210,7 +2244,12 @@ static void overlayActivate(ov::Item item, const char* source) {
         showVideoSettings(gViewerHwnd);
         break;
     case ov::Item::Files:
-        overlayHide("action");
+        // The panel opens under the overlay, which stays up (mouse mode, so
+        // keys go to the panel): Volume, Settings and the rest stay in reach.
+        if (gOverlayKeyboard) {
+            gOverlayKeyboard = false;
+            overlayRefresh();
+        }
         filePanelToggle(source);
         break;
     case ov::Item::ForceQuit:
@@ -2751,6 +2790,17 @@ static bool pasteEligible() {
 
 // Any transfer at all: a paste or Send to upload, or a Mac->Windows pull.
 static bool pasteBusy() { return fileTransferRunning(); }
+
+// Asked by the gate for a new Cmd+V while a file paste upload is held:
+// something other than files (text) was copied since that Cmd+V. The key then
+// goes to the Mac, whose pasteboard already holds that text (clipboard sync
+// runs during the upload), instead of being eaten until the upload ends.
+static bool pasteTextWhileHeld() {
+    if (GetClipboardSequenceNumber() == gPendingClipSeq) return false;
+    if (IsClipboardFormatAvailable(CF_HDROP)) return false;
+    logLine("file.paste=text_passed_while_held");
+    return true;
+}
 
 static UINT fileUiDpi() { return jl::ui::windowDpi(gViewerHwnd); }
 
@@ -3310,13 +3360,20 @@ static void filePanelPlace() {
     const fp::Layout l = fp::layoutFor(dpi);
     RECT c{};
     GetClientRect(gViewerHwnd, &c);
-    const int cw = c.right - c.left, ch = c.bottom - c.top;
+    const int cw = c.right - c.left;
     MapWindowPoints(gViewerHwnd, nullptr, reinterpret_cast<POINT*>(&c), 2);
-    int top = ov::overlayTopOffset(cw, ch, gRemoteWidth, gRemoteHeight, ov::scale(ov::kMenuBarGap, dpi));
-    // The chip docks top right at the same height: on a narrow viewer it
+    // Under the overlay (shown or not), never over it: its buttons stay
+    // clickable while the panel is open.
+    const ov::Rect o = overlayScreenRect();
+    int y = o.bottom + ov::scale(8, dpi);
+    // The chip docks top right at the overlay's height: on a narrow viewer it
     // would cover the panel, so the panel goes below it.
-    if (gFileChip && IsWindowVisible(gFileChip) && !fileChipFloats()) top += chipLayout(dpi).height + ov::scale(8, dpi);
-    SetWindowPos(gFilePanel, HWND_TOP, c.left + (cw - l.width) / 2, c.top + top, l.width, l.height, SWP_NOACTIVATE);
+    if (gFileChip && IsWindowVisible(gFileChip) && !fileChipFloats()) {
+        RECT chip{};
+        if (GetWindowRect(gFileChip, &chip)) y = std::max(y, static_cast<int>(chip.bottom) + ov::scale(8, dpi));
+    }
+    SetWindowPos(gFilePanel, HWND_TOP, c.left + (cw - l.width) / 2, y, l.width, l.height, SWP_NOACTIVATE);
+    if (overlayVisible()) SetWindowPos(gOverlay, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static void panelButton(HDC dc, const RECT& r, const wchar_t* text, bool hot, bool focus, UINT dpi) {
@@ -3702,6 +3759,12 @@ static void onFileUploadDone() {
         gChipPastedFiles = p.files;
         fileChipShow(ChipMode::Pasted, 2500);
         logLine("file.paste=pasted");
+    } else if (ok && f.superseded) {
+        // The host put the files on the Mac pasteboard when the upload ended,
+        // over the newer text: send that text again so the next Cmd+V pastes it.
+        if (gClipboard) gClipboard->resendCurrent();
+        fileChipNotice(fu::pasteSuperseded(), false, 6000);
+        logLine("file.paste=superseded resend_text=1");
     } else if (ok) {
         fileChipShow(ChipMode::Ready, 10000);
         logLine("file.paste=ready");
@@ -3793,7 +3856,7 @@ static void overlayHoverTick() {
     }
     if (gOverlayDwell.update(inZone, now) && !overlayVisible()) overlayShow(false, "hover", 0);
     if (!overlayVisible() || gOverlayKeyboard || gOverlayDragging) return;
-    if (overOverlay || inZone) {
+    if (overOverlay || inZone || filePanelVisible()) {  // stays up above the open Files panel
         gOverlayHideAtMs = 0.0;
         return;
     }
@@ -3877,6 +3940,15 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (filePanelVisible()) {
+            // Ctrl+Alt+O still brings the overlay (mouse mode) above the panel.
+            if (wParam == 'O' && physicalKeyDown(VK_CONTROL) && physicalKeyDown(VK_MENU) && !physicalKeyDown(VK_SHIFT)) {
+                if (wParam < 256) gOverlaySwallowUp.set(static_cast<size_t>(wParam));
+                if ((lParam & (1LL << 30)) == 0) {
+                    if (overlayVisible()) overlayHide("hotkey_panel");
+                    else overlayShow(false, "hotkey_panel", 0);
+                }
+                return 0;
+            }
             filePanelKey(wParam, lParam);
             return 0;
         }
@@ -5723,6 +5795,7 @@ static int appMain(int argc, char** argv) {
                 o.bindIp, o.sourceIp, o.controlPort,
                 [](const std::string& message) { logLine(message); });
             clipboard->start();
+            gClipboard = clipboard.get();
             logLine("clipboard.enabled mode=unicode-text max_bytes=61440");
             // File transfer: its own TCP connection (F1 probe, F2 paste upload).
             fileSession = std::make_unique<FileSession>(
@@ -6447,6 +6520,7 @@ static int appMain(int argc, char** argv) {
         // Stop the clipboard worker before Winsock shutdown and before the
         // control channel is released. Video/keyboard/mouse paths remain
         // independent from this second TCP session.
+        gClipboard = nullptr;
         if (clipboard) clipboard->stop();
         gFileSession = nullptr;
         gFilePullSession = nullptr;

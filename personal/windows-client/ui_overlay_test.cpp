@@ -305,6 +305,23 @@ void menuBarOffsetTests() {
 
 }  // namespace
 
+void belowOverlayTests() {
+    const Rect bar{558, 40, 1362, 118};  // 804x78 at 96 dpi, centred on 1920
+    // Files panel centred under the menu bar, same top as the bar: moves under it.
+    expect(topBelowOverlay({660, 40, 1260, 520}, bar, 8, 1040) == 126, "panel at bar top moves 8 px under the bar");
+    // Already below: unchanged.
+    expect(topBelowOverlay({660, 200, 1260, 680}, bar, 8, 1040) == 200, "panel already below stays");
+    // Other columns (Volume top right on a wide window): unchanged.
+    expect(topBelowOverlay({1500, 60, 1880, 260}, bar, 8, 1040) == 60, "window beside the bar stays");
+    // Overlapping columns on a narrow window: moves under.
+    expect(topBelowOverlay({1200, 60, 1580, 260}, bar, 8, 1040) == 126, "volume over the bar's right end moves under");
+    // Window above the bar entirely: unchanged.
+    expect(topBelowOverlay({660, 0, 1260, 30}, bar, 8, 1040) == 0, "window above the bar stays");
+    // Not enough room: as low as the work area allows, never above its own top.
+    expect(topBelowOverlay({660, 40, 1260, 1000}, bar, 8, 1040) == 80, "tall window stops at the work area bottom");
+    expect(topBelowOverlay({660, 100, 1260, 1100}, bar, 8, 1040) == 100, "never moved up");
+}
+
 int main() {
     layoutTests();
     hitTests();
@@ -316,6 +333,7 @@ int main() {
     hoverZoneTests();
     videoHoverZoneTests();
     menuBarOffsetTests();
+    belowOverlayTests();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }
