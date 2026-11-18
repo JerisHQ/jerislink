@@ -198,10 +198,11 @@ struct JerisLinkHostMain {
             let logs = LogHygieneSelfTest.run()
             let audio = AudioSelfTest.run()
             let display = await DisplayFollowerSelfTest.run()
+            let presence = await ViewerPresenceSelfTest.run()
             let video = VideoDiagSelfTest.run()
             let files = FileProtocolSelfTest.run()
             let bundle = JerisLinkBundle.selfTest()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && video == 0 && files == 0 && bundle == 0 ? 0 : 1)
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && bundle == 0 ? 0 : 1)
         }
         // H.264 encode -> decode check on the hardware encoder at the capped
         // sizes. No screen capture, no network, no settings change.
@@ -333,6 +334,8 @@ struct JerisLinkHostMain {
             var sender: UDPFrameSender?
             var control: ControlServer?
             var mouseUDP: MouseMoveUDPServer?
+            // Capture runs only while the viewer is heard on the MRM1 port.
+            var presence: ViewerPresence?
             if let bindIP = o.bindIP, let clientIP = o.clientIP {
                 sender = try UDPFrameSender(bindIP: bindIP, clientIP: clientIP,
                                             clientPort: o.clientPort, packetBytes: o.packetBytes,
@@ -342,9 +345,11 @@ struct JerisLinkHostMain {
                                             videoBitrateMbps: o.bitrateMbps,
                                             nominalFps: Int(o.fps))
                 if let mouseUDPPort = o.mouseUDPPort {
+                    let viewer = ViewerPresence()
+                    presence = viewer
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
-                                                    port: mouseUDPPort)
+                                                    port: mouseUDPPort, presence: viewer)
                     try server.start()
                     mouseUDP = server
                 }
@@ -378,8 +383,19 @@ struct JerisLinkHostMain {
             let displayEvents = DisplayChangeMonitor.shared.register()
             print("Display changes: \(displayEvents ? "CoreGraphics reconfiguration callback" : "callback not registered; capture will not follow display changes")")
             let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
+            if let presence {
+                print("Viewer presence: capture runs while the viewer is heard; stops after \(Int(ViewerPresence.idleSeconds)) s without a datagram (\(Int(ViewerPresence.fallbackSeconds)) s before the session's first keep-alive)")
+            }
             var sessionIndex = 0
             while deadline.map({ Date() < $0 }) ?? true {
+                if let presence, !presence.isActive() {
+                    // No viewer: no capture, no encode, nothing sent.
+                    print("video.viewer_wait capture=off")
+                    fflush(stdout)
+                    guard await presence.wait(active: true, deadline: deadline) else { break }
+                    print("video.viewer_active capture=on datagrams=\(presence.datagramsHeard)")
+                    fflush(stdout)
+                }
                 sessionIndex += 1
                 let displayGeneration = DisplayChangeMonitor.shared.currentGeneration
                 let target = try await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID)
@@ -478,19 +494,29 @@ struct JerisLinkHostMain {
                 // display changing, a resolution or HiDPI change). Sleeps until
                 // CoreGraphics reports a reconfiguration, with no timer, then
                 // looks up ScreenCaptureKit a few times while it settles.
-                let changedTarget: CaptureTarget? = await DisplayFollower.waitForChange(
-                    monitor: .shared, since: displayGeneration, deadline: deadline,
+                // The viewer going quiet wakes it too (a watcher signals on every idle
+                // transition, not only the first).
+                let changedTarget: CaptureTarget? = await DisplayFollower.waitForChangeOrViewerIdle(
+                    monitor: .shared, since: displayGeneration, deadline: deadline, presence: presence,
                     query: { try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) },
                     isChange: { current in
                         current.displayID != target.displayID ||
                             (autoResolution && !current.sameCapture(as: target))
                     })
+                // Before the deadline, nil means the viewer went quiet.
+                let viewerIdle = changedTarget == nil && presence != nil && (deadline.map { Date() < $0 } ?? true)
+                let silence = presence?.silenceSeconds() ?? -1
 
                 await capture.stop()
                 print("Capture session \(sessionIndex) complete: \(encoder.statsLine()) seconds=\(String(format: "%.1f", Date().timeIntervalSince(sessionStart))) \(keyframeGate.statsLine()) display_reconfigurations=\(DisplayChangeMonitor.shared.reconfigurationCount)")
 
                 if let changedTarget {
                     print("Display changed: \(target.summary) -> \(changedTarget.summary); restarting capture at native framebuffer size")
+                    continue
+                }
+                if viewerIdle {
+                    print("video.viewer_idle silence_s=\(String(format: "%.1f", silence)) capture=stopped encode=stopped udp=stopped")
+                    fflush(stdout)
                     continue
                 }
                 break
