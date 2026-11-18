@@ -139,8 +139,10 @@ inline std::string buildManifest(const file::Offer& offer, const std::vector<fil
             if (e.size != 0) return "size";
             dirs[v.original] = name;
         } else {
+            // #49/#53: checked before adding. Added first, a sum past 2^64
+            // wraps, slips under the limit and can match offer.total.
+            if (e.size > file::kMaxTotalBytes || e.size > file::kMaxTotalBytes - total) return "too_big";
             total += e.size;
-            if (total > file::kMaxTotalBytes) return "too_big";
             ++out.files;
         }
         if (renamed) ++out.renamed;

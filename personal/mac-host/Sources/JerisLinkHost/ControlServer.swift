@@ -80,6 +80,12 @@ final class ControlServer: @unchecked Sendable {
     /// Answer FILE_HELLO (0x50). Only the viewer-facing direct listener;
     /// the loopback relay and the legacy listeners refuse it (design D13).
     private let allowFileSessions: Bool
+    /// FORCE_QUIT_OPEN (0x60) and CLIPBOARD_HELLO (0x30) act for the viewer
+    /// beyond keys and mouse. False on the loopback relay: its one real
+    /// client (the video service) sends only mouse moves, and a loopback
+    /// peer (or an old `tailscale serve` forward to 38411) cannot prove it
+    /// is the configured viewer. Elsewhere SettingsAuthority decides.
+    private let allowSensitiveControl: Bool
     /// Where paste uploads are staged (a temp folder in the self-test).
     private let fileStagingRoot: URL
     /// Where drops land and what REVEAL opens (a temp folder in the self-test).
@@ -99,6 +105,7 @@ final class ControlServer: @unchecked Sendable {
          inputHelper: InputHelperClient? = nil,
          announceInputSessions: Bool = true,
          allowFileSessions: Bool = false,
+         allowSensitiveControl: Bool = true,
          fileStagingRoot: URL = FileUploadReceiver.defaultRoot,
          fileSendFolder: FileSendFolder = .shared,
          clipboard: ClipboardBackend = SystemClipboard.shared,
@@ -112,6 +119,7 @@ final class ControlServer: @unchecked Sendable {
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
+        self.allowSensitiveControl = allowSensitiveControl
         self.fileStagingRoot = fileStagingRoot
         self.fileSendFolder = fileSendFolder
         self.inputHelper = inputHelper
@@ -332,6 +340,7 @@ final class ControlServer: @unchecked Sendable {
                 return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
+                guard sensitiveAllowed(type: type, peer: peer) else { return }
                 print("Clipboard session connected")
                 handleClipboardSession(fd)
                 print("Clipboard session ended")
@@ -392,11 +401,29 @@ final class ControlServer: @unchecked Sendable {
                     handleMouseMoveNormalized(nx: nx, ny: ny)
                 }
             case 0x60: // FORCE_QUIT_OPEN, empty payload
-                if payload.isEmpty { handleForceQuitOpen() }
+                if payload.isEmpty, sensitiveAllowed(type: type, peer: peer) { handleForceQuitOpen() }
             default:
                 print("Control unknown type=\(type) len=\(length)")
             }
         }
+    }
+
+    /// FORCE_QUIT_OPEN and CLIPBOARD_HELLO: refused on the loopback relay,
+    /// and elsewhere allowed only for the configured viewer (the same check
+    /// as VIDEO_CONFIG_SET), so a peer that cannot be verified gets neither.
+    private func sensitiveAllowed(type: UInt8, peer: ControlPeer) -> Bool {
+        let reason: String
+        if !allowSensitiveControl {
+            reason = "relay"
+        } else {
+            let clientIP = settingsClientIP()
+            switch SettingsAuthority.check(peer: peer, clientIP: clientIP) {
+            case .allow: return true
+            case .reject(let why): reason = why
+            }
+        }
+        print("Control sensitive reject type=0x\(String(type, radix: 16)) peer=\(peer.ip) verified=\(peer.verified) on \(bindIP):\(port) reason=\(reason)")
+        return false
     }
 
     private static func isInputMessage(_ type: UInt8) -> Bool {
