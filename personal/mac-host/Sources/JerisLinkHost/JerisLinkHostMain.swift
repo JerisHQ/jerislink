@@ -384,7 +384,7 @@ struct JerisLinkHostMain {
             print("Display changes: \(displayEvents ? "CoreGraphics reconfiguration callback" : "callback not registered; capture will not follow display changes")")
             let keyframeGate = KeyframeRequestGate(minimumInterval: 0.15)
             if let presence {
-                print("Viewer presence: capture runs while the viewer is heard; stops after \(Int(ViewerPresence.idleSeconds)) s without a datagram from a viewer that sends keep-alives")
+                print("Viewer presence: capture runs while the viewer is heard; stops after \(Int(ViewerPresence.idleSeconds)) s without a datagram (\(Int(ViewerPresence.fallbackSeconds)) s before the session's first keep-alive)")
             }
             var sessionIndex = 0
             while deadline.map({ Date() < $0 }) ?? true {
@@ -494,23 +494,15 @@ struct JerisLinkHostMain {
                 // display changing, a resolution or HiDPI change). Sleeps until
                 // CoreGraphics reports a reconfiguration, with no timer, then
                 // looks up ScreenCaptureKit a few times while it settles.
-                // The viewer going quiet wakes it too (the watcher signals).
-                let idleWatch: Task<Void, Never>? = presence.map { p in
-                    Task {
-                        if await p.wait(active: false, poll: .milliseconds(500)) {
-                            DisplayChangeMonitor.shared.signal()
-                        }
-                    }
-                }
-                let changedTarget: CaptureTarget? = await DisplayFollower.waitForChange(
-                    monitor: .shared, since: displayGeneration, deadline: deadline,
+                // The viewer going quiet wakes it too (a watcher signals on every idle
+                // transition, not only the first).
+                let changedTarget: CaptureTarget? = await DisplayFollower.waitForChangeOrViewerIdle(
+                    monitor: .shared, since: displayGeneration, deadline: deadline, presence: presence,
                     query: { try? await DisplayModeResolver.captureTarget(pinnedDisplayID: o.displayID) },
                     isChange: { current in
                         current.displayID != target.displayID ||
                             (autoResolution && !current.sameCapture(as: target))
-                    },
-                    stop: { presence.map { !$0.isActive() } ?? false })
-                idleWatch?.cancel()
+                    })
                 // Before the deadline, nil means the viewer went quiet.
                 let viewerIdle = changedTarget == nil && presence != nil && (deadline.map { Date() < $0 } ?? true)
                 let silence = presence?.silenceSeconds() ?? -1

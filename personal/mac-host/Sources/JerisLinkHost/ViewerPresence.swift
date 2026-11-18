@@ -14,20 +14,27 @@ import Foundation
 /// A running viewer repeats a 0x43 ping every second (when the host NACK is
 /// on), a 0x45 audio request every second (audio on) and a 0x42 receiver
 /// report every 250 ms (ABR on), also while it is minimized, has no input or
-/// sits in a Windows modal loop. Only a session that sent one of these can
-/// time out: a viewer that never repeats anything (host NACK, ABR and audio
-/// all off) keeps the stream running once it has been heard, as before.
+/// sits in a Windows modal loop. Once a session (source port) has sent one of
+/// these, `idleSeconds` of silence ends it. Until then (the first keep-alive
+/// was lost, the viewer vanished after a keyframe request, or a viewer with
+/// NACK, ABR and audio all off) the longer `fallbackSeconds` applies: no
+/// session is exempt from the timeout.
 final class ViewerPresence: @unchecked Sendable {
     static let idleSeconds: Double = 15
+    /// Silence limit for a session that has not sent a keep-alive yet.
+    static let fallbackSeconds: Double = 60
 
     private let lock = NSLock()
     private let idleNs: UInt64
+    private let fallbackNs: UInt64
     private var lastHeardNs: UInt64 = 0  // 0: nothing heard yet
     private var keepAliveSeen = false
     private var heardCount: UInt64 = 0
 
-    init(idleSeconds: Double = ViewerPresence.idleSeconds) {
+    init(idleSeconds: Double = ViewerPresence.idleSeconds,
+         fallbackSeconds: Double = ViewerPresence.fallbackSeconds) {
         idleNs = UInt64(idleSeconds * 1_000_000_000)
+        fallbackNs = UInt64(max(fallbackSeconds, idleSeconds) * 1_000_000_000)
     }
 
     static func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -38,8 +45,8 @@ final class ViewerPresence: @unchecked Sendable {
     }
 
     /// One valid MRM1 datagram from the allowed client. `newSession`: a new
-    /// source port (a viewer started or restarted), which has to show again
-    /// that it repeats keep-alives before it can time out.
+    /// source port (a viewer started or restarted); it is held to the
+    /// fallback limit until it sends a keep-alive of its own.
     func heard(type: UInt8, newSession: Bool, nowNs: UInt64 = ViewerPresence.nowNs()) {
         lock.lock(); defer { lock.unlock() }
         if newSession { keepAliveSeen = false }
@@ -48,12 +55,12 @@ final class ViewerPresence: @unchecked Sendable {
         heardCount &+= 1
     }
 
-    /// A viewer was heard and, if it repeats keep-alives, recently.
+    /// A viewer was heard within the silence limit of its session.
     func isActive(nowNs: UInt64 = ViewerPresence.nowNs()) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard lastHeardNs != 0 else { return false }
-        if !keepAliveSeen { return true }
-        return nowNs < lastHeardNs || nowNs - lastHeardNs < idleNs
+        let limit = keepAliveSeen ? idleNs : fallbackNs
+        return nowNs < lastHeardNs || nowNs - lastHeardNs < limit
     }
 
     /// Seconds since the last datagram (-1: none yet), for the log.
@@ -80,11 +87,62 @@ final class ViewerPresence: @unchecked Sendable {
         }
         return true
     }
+
+    /// Calls `onIdle` every time the viewer goes quiet, until the task is
+    /// cancelled. The capture loop re-checks `isActive()` after each wake, so
+    /// a viewer that comes back before that check keeps capture running; the
+    /// watcher then waits for it to go quiet again instead of exiting.
+    func watchIdle(poll: Duration = .milliseconds(500), onIdle: @Sendable () -> Void) async {
+        while !Task.isCancelled {
+            guard await wait(active: false, poll: poll) else { return }
+            onIdle()
+            guard await wait(active: true, poll: poll) else { return }
+        }
+    }
+}
+
+extension DisplayFollower {
+    /// `waitForChange` for the capture loop: also returns nil when the viewer
+    /// goes quiet. A watcher task wakes the monitor on every idle transition
+    /// for as long as this waits. `beforeIdleSignal` is for the self-test (a
+    /// datagram landing between the wake and the capture loop's check).
+    static func waitForChangeOrViewerIdle<T>(isolation: isolated (any Actor)? = #isolation,
+                                             monitor: DisplayChangeMonitor,
+                                             since generation: UInt64,
+                                             deadline: Date?,
+                                             presence: ViewerPresence?,
+                                             idlePoll: Duration = .milliseconds(500),
+                                             beforeIdleSignal: (@Sendable () -> Void)? = nil,
+                                             settleDelays: [Duration] = DisplayFollower.settleDelays,
+                                             sleep: (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+                                             query: () async -> T?,
+                                             isChange: (T) -> Bool) async -> T? {
+        let idleWatch: Task<Void, Never>? = presence.map { p in
+            Task {
+                await p.watchIdle(poll: idlePoll) {
+                    beforeIdleSignal?()
+                    monitor.signal()
+                }
+            }
+        }
+        defer { idleWatch?.cancel() }
+        return await waitForChange(isolation: isolation, monitor: monitor, since: generation,
+                                   deadline: deadline, settleDelays: settleDelays, sleep: sleep,
+                                   query: query, isChange: isChange,
+                                   stop: { presence.map { !$0.isActive() } ?? false })
+    }
 }
 
 /// `JerisLinkHost --self-test` part for the viewer presence gate. Fixed
-/// clock values; no sockets.
+/// clock values for the timeout rules; short real timers for the watcher.
 enum ViewerPresenceSelfTest {
+    private final class Count: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func bump() -> Int { lock.lock(); defer { lock.unlock() }; n += 1; return n }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+    }
+
     static func run() async -> Int32 {
         var failures = 0
         func expect(_ ok: Bool, _ name: String) {
@@ -99,12 +157,25 @@ enum ViewerPresenceSelfTest {
             expect(p.silenceSeconds(nowNs: 100 * s) == -1, "presence.none_heard_silence")
         }
         do {
-            // A viewer that only sends keyframe requests or mouse never
-            // times out (old behaviour for viewers without keep-alives).
-            let p = ViewerPresence(idleSeconds: 15)
+            // A viewer that sends one keyframe request and is gone before its
+            // first keep-alive: active for the fallback limit, then idle.
+            let p = ViewerPresence(idleSeconds: 15, fallbackSeconds: 60)
             p.heard(type: 0x40, newSession: true, nowNs: 100 * s)
             expect(p.isActive(nowNs: 101 * s), "presence.first_datagram_active")
-            expect(p.isActive(nowNs: 10_000 * s), "presence.no_keepalive_never_idle")
+            expect(p.isActive(nowNs: 159 * s), "presence.gone_before_keepalive active at 59s")
+            expect(!p.isActive(nowNs: 160 * s), "presence.gone_before_keepalive idle at 60s")
+            expect(!p.isActive(nowNs: 10_000 * s), "presence.no_keepalive_not_exempt")
+        }
+        do {
+            // The first keep-alive is lost; later ones arm the 15 s timeout.
+            let p = ViewerPresence(idleSeconds: 15, fallbackSeconds: 60)
+            p.heard(type: 0x40, newSession: true, nowNs: 100 * s)
+            // 0x43 at 101 and 102 lost; mouse at 102 does not arm it.
+            p.heard(type: 0x00, newSession: false, nowNs: 102 * s)
+            expect(p.isActive(nowNs: 130 * s), "presence.first_keepalive_lost fallback holds")
+            for t in 103...120 { p.heard(type: 0x43, newSession: false, nowNs: UInt64(t) * s) }
+            expect(p.isActive(nowNs: 134 * s), "presence.first_keepalive_lost active at 14s")
+            expect(!p.isActive(nowNs: 135 * s), "presence.first_keepalive_lost idle at 15s")
         }
         do {
             // Pings every second keep it alive; 15 s of silence ends it.
@@ -127,12 +198,15 @@ enum ViewerPresenceSelfTest {
             }
         }
         do {
-            // A new viewer (new source port) after a pinging one has to ping
-            // again before it can time out.
-            let p = ViewerPresence(idleSeconds: 15)
+            // A new source port after a pinging session: bounded by the
+            // fallback until it pings, never exempt.
+            let p = ViewerPresence(idleSeconds: 15, fallbackSeconds: 60)
             p.heard(type: 0x43, newSession: true, nowNs: 100 * s)
             p.heard(type: 0x40, newSession: true, nowNs: 101 * s)
-            expect(p.isActive(nowNs: 500 * s), "presence.new_session_rearms")
+            expect(p.isActive(nowNs: 160 * s), "presence.new_session_fallback active at 59s")
+            expect(!p.isActive(nowNs: 161 * s), "presence.new_session_fallback idle at 60s")
+            p.heard(type: 0x43, newSession: false, nowNs: 200 * s)
+            expect(!p.isActive(nowNs: 215 * s), "presence.new_session_keepalive_rearms 15s")
         }
         do {
             // wait(active:) returns at once when already there, and gives up
@@ -144,6 +218,53 @@ enum ViewerPresenceSelfTest {
             p.heard(type: 0x43, newSession: true)
             let up = await p.wait(active: true, poll: .milliseconds(50))
             expect(up, "presence.wait_active")
+        }
+        do {
+            // Regression (review of #63): the viewer comes back between the
+            // watcher's wake and the capture loop's check, twice. The watcher
+            // must keep watching, so the third silence still stops capture.
+            let p = ViewerPresence(idleSeconds: 0.3, fallbackSeconds: 0.3)
+            let monitor = DisplayChangeMonitor()
+            let wakes = Count()
+            p.heard(type: 0x43, newSession: true)
+            let start = Date()
+            let result: Int? = await DisplayFollower.waitForChangeOrViewerIdle(
+                monitor: monitor, since: monitor.currentGeneration,
+                deadline: Date().addingTimeInterval(6), presence: p, idlePoll: .milliseconds(50),
+                beforeIdleSignal: { if wakes.bump() <= 2 { p.heard(type: 0x43, newSession: false) } },
+                sleep: { _ in }, query: { 1 }, isChange: { _ in false })
+            let waited = Date().timeIntervalSince(start)
+            expect(result == nil && wakes.value == 3 && waited < 4,
+                   "presence.watcher_survives_resume wakes=\(wakes.value) waited=\(String(format: "%.2f", waited))s")
+        }
+        do {
+            // Disconnect -> reconnect -> disconnect, three rounds through the
+            // capture loop's wait: every silence ends the wait well before
+            // the deadline, every return of the viewer makes it active.
+            let p = ViewerPresence(idleSeconds: 0.3, fallbackSeconds: 0.3)
+            let monitor = DisplayChangeMonitor()
+            var rounds = 0
+            for round in 1...3 {
+                let feeder = Task {
+                    let end = Date().addingTimeInterval(0.6)
+                    while Date() < end, !Task.isCancelled {
+                        p.heard(type: 0x43, newSession: round == 1)
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+                let up = await p.wait(active: true, deadline: Date().addingTimeInterval(2), poll: .milliseconds(20))
+                let start = Date()
+                let result: Int? = await DisplayFollower.waitForChangeOrViewerIdle(
+                    monitor: monitor, since: monitor.currentGeneration,
+                    deadline: Date().addingTimeInterval(5), presence: p, idlePoll: .milliseconds(50),
+                    sleep: { _ in }, query: { 1 }, isChange: { _ in false })
+                let waited = Date().timeIntervalSince(start)
+                feeder.cancel()
+                let ok = up && result == nil && !p.isActive() && waited >= 0.5 && waited < 2.5
+                expect(ok, "presence.disconnect_reconnect round=\(round) waited=\(String(format: "%.2f", waited))s")
+                if ok { rounds += 1 }
+            }
+            expect(rounds == 3, "presence.disconnect_reconnect_rounds=\(rounds)")
         }
         print("viewer presence self-test: \(failures == 0 ? "ok" : "\(failures) failed")")
         return failures == 0 ? 0 : 1
