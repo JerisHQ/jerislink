@@ -8,6 +8,7 @@
 #include <shlobj.h>
 
 #include <thread>
+#include <vector>
 
 namespace jl::filepush {
 namespace {
@@ -40,7 +41,12 @@ class FolderSink : public Sink {
 public:
     FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
         : folder_(std::move(folder)), open_(std::move(open)), ops_(zone) {}
-    ~FolderSink() override { abort(); }
+    ~FolderSink() override {
+        abort();
+        // #53 r2: a file that failed its check, or a .jlpart, that something
+        // still held: retried for about a second more before the sink goes.
+        for (int i = 0; i < 20 && !retryCleanup(); ++i) Sleep(50);
+    }
 
     bool prepare() override {
         if (folder_.empty()) return false;
@@ -53,6 +59,7 @@ public:
 
     bool begin(const std::wstring& name) override {
         abort();
+        retryCleanup();
         name_ = name;
         for (int n = 1; n < 1000; ++n) {
             const std::wstring part = folder_ + L"\\" + name + (n == 1 ? L"" : L"." + std::to_wstring(n)) + L".jlpart";
@@ -87,6 +94,7 @@ public:
 
     bool commit() override {
         zoneRefused_ = false;
+        retryCleanup();
         if (file_ == INVALID_HANDLE_VALUE) return false;
         const BOOL flushed = FlushFileBuffers(file_);
         CloseHandle(file_);
@@ -106,16 +114,28 @@ public:
             const std::wstring leaf = n == 1 ? name_ : toWide(file::path::clashName(utf8, n));
             const std::wstring target = folder_ + L"\\" + leaf;
             if (MoveFileExW(longPath(part_).c_str(), longPath(target).c_str(), MOVEFILE_WRITE_THROUGH)) {
+                const std::wstring staged = part_;
                 part_.clear();
                 // The stream moved with the rename; checked again on the
-                // final name. Without it the file is taken back out.
+                // final name. Without it the file is taken back out: first
+                // back to its .jlpart name, so it never stays under the name
+                // it was meant to have, then deleted. Whatever cannot be done
+                // now (a scanner holds the file) is kept and retried.
                 if (ensureZone(longPath(target))) {
                     ++zone_.marked;
                     return true;
                 }
                 ++zone_.failed;
                 zoneRefused_ = true;
-                for (int i = 0; i < 20 && !DeleteFileW(longPath(target).c_str()); ++i) Sleep(50);
+                if (MoveFileExW(longPath(target).c_str(), longPath(staged).c_str(), 0)) {
+                    forget(staged);
+                    return false;
+                }
+                for (int i = 0; i < 20; ++i) {
+                    if (DeleteFileW(longPath(target).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return false;
+                    Sleep(50);
+                }
+                cleanup_.push_back(target);
                 return false;
             }
             const DWORD e = GetLastError();
@@ -130,9 +150,11 @@ public:
             file_ = INVALID_HANDLE_VALUE;
         }
         dropPart();
+        retryCleanup();
     }
 
     void finished(uint32_t) override {
+        retryCleanup();
         if (open_) open_(folder_);
     }
 
@@ -153,9 +175,25 @@ private:
     }
 
     bool dropPart() {
-        if (!part_.empty()) DeleteFileW(longPath(part_).c_str());
+        if (!part_.empty()) forget(part_);
         part_.clear();
         return false;
+    }
+
+    // Deletes `path` now, or keeps it for retryCleanup() (#53 r2: a held
+    // .jlpart, or a file that failed its check, is never just forgotten).
+    void forget(const std::wstring& path) {
+        if (DeleteFileW(longPath(path).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return;
+        cleanup_.push_back(path);
+    }
+
+    // True once nothing is left to clean up.
+    bool retryCleanup() {
+        for (auto it = cleanup_.begin(); it != cleanup_.end();) {
+            if (DeleteFileW(longPath(*it).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) it = cleanup_.erase(it);
+            else ++it;
+        }
+        return cleanup_.empty();
     }
 
     std::wstring folder_;
@@ -163,6 +201,7 @@ private:
     filepull::ZoneOps ops_;
     std::wstring name_;
     std::wstring part_;
+    std::vector<std::wstring> cleanup_;   // still to delete (held when first tried)
     HANDLE file_ = INVALID_HANDLE_VALUE;
     ZoneCounts zone_;
     bool zoneRefused_ = false;
