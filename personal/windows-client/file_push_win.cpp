@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -37,15 +38,36 @@ std::wstring longPath(const std::wstring& p) {
     return L"\\\\?\\" + p;
 }
 
+// Renames the open file `h` to `target` (a full long path), never over an
+// existing file. The handle keeps pointing at the same file afterwards.
+bool renameTo(HANDLE h, const std::wstring& target) {
+    const size_t nameBytes = target.size() * sizeof(wchar_t);
+    std::vector<uint8_t> buf(sizeof(FILE_RENAME_INFO) + nameBytes, 0);
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+    info->ReplaceIfExists = FALSE;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = DWORD(nameBytes);
+    std::memcpy(info->FileName, target.data(), nameBytes);
+    return SetFileInformationByHandle(h, FileRenameInfo, info, DWORD(buf.size())) != 0;
+}
+
+// Marks the open file `h` for deletion (it goes when the last handle closes).
+bool deleteOn(HANDLE h) {
+    FILE_DISPOSITION_INFO del{};
+    del.DeleteFile = TRUE;
+    return SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
+}
+
 class FolderSink : public Sink {
 public:
     FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
-        : folder_(std::move(folder)), open_(std::move(open)), ops_(zone) {}
+        : folder_(std::move(folder)), staging_(folder_ + L"\\.jlstaging"), open_(std::move(open)), ops_(zone) {}
     ~FolderSink() override {
         abort();
-        // #53 r2: a file that failed its check, or a .jlpart, that something
-        // still held: retried for about a second more before the sink goes.
+        // #53 r2: a file that failed its check, or a .jlpart, that could not
+        // be deleted at once: retried for about a second more before the sink goes.
         for (int i = 0; i < 20 && !retryCleanup(); ++i) Sleep(50);
+        if (dir_ != INVALID_HANDLE_VALUE) CloseHandle(dir_);
     }
 
     bool prepare() override {
@@ -53,8 +75,20 @@ public:
         // The folder and its parents (Downloads normally exists already).
         const int rc = SHCreateDirectoryExW(nullptr, folder_.c_str(), nullptr);
         if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) return false;
-        const DWORD a = GetFileAttributesW(longPath(folder_).c_str());
-        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+        if (!plainFolder(folder_)) return false;
+        // #60 r3: partial files live in a hidden folder inside it, so nothing
+        // unverified ever sits in Downloads\JerisLink itself.
+        if (!CreateDirectoryW(longPath(staging_).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        if (!plainFolder(staging_)) return false;
+        const DWORD a = GetFileAttributesW(longPath(staging_).c_str());
+        if (!(a & FILE_ATTRIBUTE_HIDDEN)) SetFileAttributesW(longPath(staging_).c_str(), a | FILE_ATTRIBUTE_HIDDEN);
+        // Any handle on the volume, for cleanups by file id.
+        if (dir_ == INVALID_HANDLE_VALUE) {
+            dir_ = CreateFileW(longPath(folder_).c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        }
+        return dir_ != INVALID_HANDLE_VALUE;
     }
 
     bool begin(const std::wstring& name) override {
@@ -62,17 +96,19 @@ public:
         retryCleanup();
         name_ = name;
         for (int n = 1; n < 1000; ++n) {
-            const std::wstring part = folder_ + L"\\" + name + (n == 1 ? L"" : L"." + std::to_wstring(n)) + L".jlpart";
-            HANDLE h = CreateFileW(longPath(part).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            const std::wstring part = staging_ + L"\\" + name + (n == 1 ? L"" : L"." + std::to_wstring(n)) + L".jlpart";
+            // Delete access: a rename or delete later goes through this
+            // handle, to this file, never to whatever has its name then.
+            HANDLE h = CreateFileW(longPath(part).c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ,
+                                   nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
                 file_ = h;
                 part_ = part;
+                written_ = 0;
                 // Mark of the Web goes on the partial file first: the stream
                 // moves with the rename, so the file never has its final name
-                // without it (a scanner opening a new .exe right after the
-                // rename can no longer make the mark fail). commit() checks.
-                ops_.write(longPath(part));
+                // without it. commit() checks.
+                ops_.writeOn(file_);
                 return true;
             }
             if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
@@ -88,6 +124,7 @@ public:
             if (!WriteFile(file_, data, chunk, &wrote, nullptr) || wrote == 0) return false;
             data += wrote;
             size -= wrote;
+            written_ += wrote;
         }
         return true;
     }
@@ -96,47 +133,42 @@ public:
         zoneRefused_ = false;
         retryCleanup();
         if (file_ == INVALID_HANDLE_VALUE) return false;
-        const BOOL flushed = FlushFileBuffers(file_);
-        CloseHandle(file_);
-        file_ = INVALID_HANDLE_VALUE;
-        if (!flushed) return dropPart();
-        // #53: no file reaches the folder without ZoneId=3. Checked on the
-        // partial file first: on a volume without streams (FAT, exFAT) the
-        // mark cannot be written, and the file is dropped, not delivered.
-        if (!ensureZone(longPath(part_))) {
+        // In staging: every byte on disk, exactly as many as were written.
+        LARGE_INTEGER size{};
+        if (!FlushFileBuffers(file_) || !GetFileSizeEx(file_, &size) || uint64_t(size.QuadPart) != written_) {
+            return dropPart();
+        }
+        // #53: no file reaches the folder without ZoneId=3. On a volume
+        // without streams (FAT, exFAT) the mark cannot be written, and the
+        // file is dropped, not delivered.
+        if (!ensureZone(file_)) {
             ++zone_.failed;
             zoneRefused_ = true;
             return dropPart();
         }
-        // No overwrite: an existing name moves on to "name (2).ext" ...
+        // Moved by handle, no overwrite: an existing name moves on to
+        // "name (2).ext" ...
         const std::string utf8 = toUtf8(name_);
         for (int n = 1; n < 1000; ++n) {
             const std::wstring leaf = n == 1 ? name_ : toWide(file::path::clashName(utf8, n));
-            const std::wstring target = folder_ + L"\\" + leaf;
-            if (MoveFileExW(longPath(part_).c_str(), longPath(target).c_str(), MOVEFILE_WRITE_THROUGH)) {
-                const std::wstring staged = part_;
-                part_.clear();
-                // The stream moved with the rename; checked again on the
-                // final name. Without it the file is taken back out: first
-                // back to its .jlpart name, so it never stays under the name
-                // it was meant to have, then deleted. Whatever cannot be done
-                // now (a scanner holds the file) is kept and retried.
-                if (ensureZone(longPath(target))) {
+            if (renameTo(file_, longPath(folder_ + L"\\" + leaf))) {
+                // The stream moved with the file; checked again on it, now
+                // under its final name. Without it the file is taken back
+                // out through the handle: back to staging first, so it never
+                // stays under the name it was meant to have, then deleted.
+                // A same-name file someone put there meanwhile is not ours
+                // and is never touched.
+                if (ensureZone(file_)) {
                     ++zone_.marked;
+                    CloseHandle(file_);
+                    file_ = INVALID_HANDLE_VALUE;
+                    part_.clear();
                     return true;
                 }
                 ++zone_.failed;
                 zoneRefused_ = true;
-                if (MoveFileExW(longPath(target).c_str(), longPath(staged).c_str(), 0)) {
-                    forget(staged);
-                    return false;
-                }
-                for (int i = 0; i < 20; ++i) {
-                    if (DeleteFileW(longPath(target).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return false;
-                    Sleep(50);
-                }
-                cleanup_.push_back(target);
-                return false;
+                renameTo(file_, longPath(part_));
+                return dropPart();
             }
             const DWORD e = GetLastError();
             if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS && e != ERROR_ACCESS_DENIED) break;
@@ -145,10 +177,6 @@ public:
     }
 
     void abort() override {
-        if (file_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(file_);
-            file_ = INVALID_HANDLE_VALUE;
-        }
         dropPart();
         retryCleanup();
     }
@@ -162,47 +190,70 @@ public:
     bool zoneRefused() const override { return zoneRefused_; }
 
 private:
-    // True when the file carries ZoneId=3 (Q1). Normally it is there
+    static bool plainFolder(const std::wstring& path) {
+        const DWORD a = GetFileAttributesW(longPath(path).c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+    }
+
+    // True when the open file carries ZoneId=3 (Q1). Normally it is there
     // already; otherwise write it, retrying for about a second while
-    // something (Defender scanning a new .exe) holds the file.
-    bool ensureZone(const std::wstring& path) {
+    // something (Defender scanning a new .exe) holds the stream.
+    bool ensureZone(HANDLE h) {
         for (int i = 0; i < 20; ++i) {
-            if (ops_.read(path) == 3) return true;
-            if (ops_.write(path) == filepull::ZoneWrite::Written) continue;
+            if (ops_.readOn(h) == 3) return true;
+            if (ops_.writeOn(h) == filepull::ZoneWrite::Written) continue;
             Sleep(50);
         }
         return false;
     }
 
+    // Deletes the partial file through its handle. If that cannot be done
+    // now, its identity is kept for retryCleanup() (#53 r2, #60 r3: never
+    // just forgotten, never retried by name).
     bool dropPart() {
-        if (!part_.empty()) forget(part_);
+        if (file_ != INVALID_HANDLE_VALUE) {
+            FILE_ID_INFO id{};
+            const bool known = filepull::fileIdOf(file_, id);
+            const bool gone = deleteOn(file_);
+            CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            if (!gone && known) cleanup_.push_back(id);
+        }
         part_.clear();
+        written_ = 0;
         return false;
     }
 
-    // Deletes `path` now, or keeps it for retryCleanup() (#53 r2: a held
-    // .jlpart, or a file that failed its check, is never just forgotten).
-    void forget(const std::wstring& path) {
-        if (DeleteFileW(longPath(path).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return;
-        cleanup_.push_back(path);
-    }
-
-    // True once nothing is left to clean up.
+    // True once nothing is left to clean up. Each record goes only when its
+    // file is deleted or no longer exists.
     bool retryCleanup() {
+        if (dir_ == INVALID_HANDLE_VALUE) return cleanup_.empty();
         for (auto it = cleanup_.begin(); it != cleanup_.end();) {
-            if (DeleteFileW(longPath(*it).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) it = cleanup_.erase(it);
+            HANDLE h = filepull::openById(dir_, *it, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            if (h == INVALID_HANDLE_VALUE) {
+                const DWORD e = GetLastError();
+                if (e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_PARAMETER) it = cleanup_.erase(it);
+                else ++it;
+                continue;
+            }
+            const bool gone = deleteOn(h);
+            CloseHandle(h);
+            if (gone) it = cleanup_.erase(it);
             else ++it;
         }
         return cleanup_.empty();
     }
 
     std::wstring folder_;
+    std::wstring staging_;   // folder_\.jlstaging (hidden)
     std::function<void(const std::wstring&)> open_;
     filepull::ZoneOps ops_;
     std::wstring name_;
     std::wstring part_;
-    std::vector<std::wstring> cleanup_;   // still to delete (held when first tried)
+    uint64_t written_ = 0;
+    std::vector<FILE_ID_INFO> cleanup_;   // files still to delete, by identity
     HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE dir_ = INVALID_HANDLE_VALUE;   // folder_, a volume hint for cleanups
     ZoneCounts zone_;
     bool zoneRefused_ = false;
 };
