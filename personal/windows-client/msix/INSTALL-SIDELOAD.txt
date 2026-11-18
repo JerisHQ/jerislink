@@ -14,7 +14,7 @@ Test certificate
 Files
   Jerislink-<version>.0-x64-sideload.msix   the package
   JerisLink-sideload-test.cer               public certificate (no private key)
-  SHA256SUMS.txt                            checksums
+  SHA256SUMS                                checksums
 
 Install (Windows 10 1809 or later, PowerShell as Administrator)
   0. If an older JerisLink MSIX test package is installed, remove it first
@@ -22,7 +22,7 @@ Install (Windows 10 1809 or later, PowerShell as Administrator)
        Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage
   1. Check the files:
        Get-FileHash .\*.msix, .\*.cer -Algorithm SHA256
-     and compare with SHA256SUMS.txt.
+     and compare with SHA256SUMS.
   2. Once per PC: trust the test certificate for package installs only.
      Check the thumbprint is the SHA1 above, then import it:
        (Get-PfxCertificate .\JerisLink-sideload-test.cer).Thumbprint
@@ -42,6 +42,10 @@ Notes
     install, so it asks for the Mac host address on first start.
   - The package adds a Windows Firewall rule for inbound UDP 38402 (video).
   - The normal installer version can stay installed side by side.
+  - "Send to JerisLink" in the Explorer right-click menu is not in this
+    package (or the Store version); it is in the normal installer version
+    only. To send files, drop them on the viewer or its Files panel, or copy
+    and paste them.
 
 Remove
   Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage

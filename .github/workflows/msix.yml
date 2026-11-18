@@ -103,7 +103,7 @@ jobs:
         run: |
           Get-ChildItem "$env:RUNNER_TEMP\msix" -Recurse -File -Include *.msix, *.msixupload, *.cer |
             Get-FileHash -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
-            Tee-Object "$env:RUNNER_TEMP\msix\SHA256SUMS.txt"
+            Tee-Object "$env:RUNNER_TEMP\msix\SHA256SUMS"
       - uses: actions/upload-artifact@v4
         with:
           name: jerislink-msix-store
@@ -116,7 +116,7 @@ jobs:
           name: jerislink-msix-sideload-test
           path: |
             ${{ runner.temp }}/msix/sideload/*
-            ${{ runner.temp }}/msix/SHA256SUMS.txt
+            ${{ runner.temp }}/msix/SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
