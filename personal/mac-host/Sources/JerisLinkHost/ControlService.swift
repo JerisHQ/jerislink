@@ -51,7 +51,7 @@ enum ControlService {
                                           port: relayPort, inject: inject,
                                           settingsClientIP: { clientIP }, acceptProxy: false,
                                           inputHelper: helper, announceInputSessions: false,
-                                          allowSensitiveControl: false)
+                                          allowSensitiveControl: false, relayMouseOnly: true)
                 try relay.start()
                 servers.append(relay)
             }
