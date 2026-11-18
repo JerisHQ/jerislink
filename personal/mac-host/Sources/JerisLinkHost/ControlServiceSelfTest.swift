@@ -107,20 +107,18 @@ enum ControlServiceSelfTest {
         expect(helper.count(type: InputHelperClient.forceQuitOpenType) == 1,
                "control e2e: direct FORCE_QUIT_OPEN reaches the helper once")
         relayQuit?.close()
-        func clipboardPong(_ port: UInt16) -> Bool {
+        // A refused CLIPBOARD_HELLO closes the connection at once; an
+        // accepted one keeps a clipboard session open with nothing to send.
+        func clipboardClosedAtOnce(_ port: UInt16) -> Bool {
             guard let c = MRC1Client(port: port) else { return false }
             defer { c.close() }
             _ = c.send(type: 0x30, payload: [])
-            _ = c.send(type: 0x01, payload: [5, 6, 7, 8])
-            let until = Date().addingTimeInterval(2)
-            while Date() < until {
-                guard let m = c.receive(timeout: max(0.05, until.timeIntervalSinceNow)) else { return false }
-                if m.type == 0x02 && m.payload == [5, 6, 7, 8] { return true }
-            }
-            return false
+            let t0 = Date()
+            let got = c.receive(timeout: 1.5)
+            return got == nil && Date().timeIntervalSince(t0) < 1.0
         }
-        expect(!clipboardPong(relayPort), "control e2e: relay CLIPBOARD_HELLO is refused (connection closed)")
-        expect(clipboardPong(directPort), "control e2e: direct CLIPBOARD_HELLO still opens a clipboard session")
+        expect(clipboardClosedAtOnce(relayPort), "control e2e: relay CLIPBOARD_HELLO is refused (connection closed at once)")
+        expect(!clipboardClosedAtOnce(directPort), "control e2e: direct CLIPBOARD_HELLO keeps a clipboard session open")
 
         // F3 session lifecycle: one SESSION_START before a viewer connection's
         // first key or mouse message, one SESSION_END when it closes. Nothing
