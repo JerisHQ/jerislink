@@ -136,12 +136,16 @@ void helpers() {
     // What Explorer has written when the gate runs: all but the last byte.
     expect(writeFile(sub + L"\\part.bin", {part.begin(), part.end() - 1}), "unit: a copy one byte short");
     expect(writeFile(sub + L"\\wrong-size.bin", body(70, 7)), "unit: a same-name file shorter than the bytes handed out");
-    // Explorer may set the file's size before it writes: longer than the
-    // manifest, with the bytes handed out so far at their offsets.
-    const auto sized = body(3000, 17);
-    std::vector<uint8_t> sizedOnDisk(sized.begin(), sized.end() - 1);
+    // What CI showed the shell doing: the file sized past the manifest size
+    // first, the start written, the last buffer not written yet (zeros).
+    const auto sized = body(200000, 17);
+    std::vector<uint8_t> sizedOnDisk(sized.begin(), sized.begin() + 70000);
     sizedOnDisk.resize(sized.size() + 5000, 0);
     expect(writeFile(sub + L"\\sized.bin", sizedOnDisk), "unit: a copy Explorer sized past the manifest size");
+    // The same, but the end holds someone else's bytes, not zeros.
+    std::vector<uint8_t> foreignTail = sizedOnDisk;
+    for (size_t i = 150000; i < 190000; ++i) foreignTail[i] = 0x5a;
+    expect(writeFile(sub + L"\\foreign.bin", foreignTail), "unit: a same-name file with our start and other bytes at the end");
     expect(writeFile(sub + L"\\other.bin", body(600, 3)), "unit: a same-name, same-size file with other bytes");
     const std::vector<std::wstring> folders{dir + L"\\nowhere", sub};
     ZoneMarkStats st;
@@ -160,7 +164,10 @@ void helpers() {
            "unit: a file shorter than the bytes handed out is not ours and left alone");
     expect(gateFile(requestFor(L"sized.bin", sized, since), folders, {}, st) == GateOutcome::Marked &&
                readZoneId(sub + L"\\sized.bin") == 3,
-           "unit: a copy Explorer sized past the manifest size is proven and marked");
+           "unit: a copy Explorer sized past the manifest size, its end not written yet, is proven and marked");
+    expect(gateFile(requestFor(L"foreign.bin", sized, since), folders, {}, st) == GateOutcome::NotFound &&
+               readZoneId(sub + L"\\foreign.bin") == -1,
+           "unit: a file with our start but other bytes at the end is not ours and left alone");
     expect(gateFile(requestFor(L"other.bin", body(600, 5), since), folders, {}, st) == GateOutcome::NotFound &&
                readZoneId(sub + L"\\other.bin") == -1,
            "unit: a file with other bytes is not ours and left alone");
