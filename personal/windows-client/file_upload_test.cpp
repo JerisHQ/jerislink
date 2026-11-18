@@ -169,6 +169,64 @@ void busy() {
            "text: busy notice");
 }
 
+// Large file pasted, then text copied on Windows and pasted while the upload
+// still runs: the text Cmd+V goes to the Mac, the held file paste is given up.
+void textWhileHeld() {
+    auto yes = [] { return true; };
+    auto no = [] { return false; };
+    {
+        PasteGate g;
+        bool clipText = false;
+        int askedPass = 0;
+        auto pass = [&] { ++askedPass; return clipText; };
+        auto r = g.filter({U(kCtrl), D(kWin), D(V)}, 0, yes, no, pass);
+        expect(r.startUpload && g.holding(), "text-held: file Ctrl+V starts the upload");
+        r = g.filter({D(V), D(V)}, 30, yes, no, pass);  // auto-repeat of the held press
+        expectEvents(r.events, {}, "text-held: repeats of the held press stay swallowed");
+        expect(askedPass == 0, "text-held: pass not asked for repeats of the held press");
+        r = g.filter({U(V), U(kWin), D(kCtrl)}, 60, yes, no, pass);
+        expectEvents(r.events, {U(kWin), D(kCtrl)}, "text-held: held V up swallowed");
+        // Same clipboard (files): a second Ctrl+V is still swallowed.
+        r = g.filter({U(kCtrl), D(kWin), D(V), U(V), U(kWin), D(kCtrl)}, 500, yes, no, pass);
+        expectEvents(r.events, {U(kCtrl), D(kWin), U(kWin), D(kCtrl)}, "text-held: same files, second press swallowed");
+        // Text copied on Windows: the next Ctrl+V goes out whole.
+        clipText = true;
+        r = g.filter({U(kCtrl), D(kWin), D(V), D(V), U(V), U(kWin), D(kCtrl)}, 9000, yes, no, pass);
+        expectEvents(r.events, {U(kCtrl), D(kWin), D(V), D(V), U(V), U(kWin), D(kCtrl)},
+                     "text-held: text Ctrl+V passes (down, repeat, up)");
+        expect(!r.startUpload && g.holding(), "text-held: upload keeps running, no new upload");
+        // A further text paste passes too.
+        r = g.filter({U(kCtrl), D(kWin), D(V), U(V), U(kWin), D(kCtrl)}, 9500, yes, no, pass);
+        expectEvents(r.events, {U(kCtrl), D(kWin), D(V), U(V), U(kWin), D(kCtrl)}, "text-held: next text Ctrl+V passes");
+        const auto f = g.finish(true, 9600);
+        expect(f.outcome == PasteGate::Outcome::Late && f.events.empty(), "text-held: files never pasted over the text");
+        expect(f.superseded, "text-held: viewer told to send the text again");
+        // Next hold starts clean.
+        r = g.filter({U(kCtrl), D(kWin), D(V), U(V), U(kWin)}, 20000, yes, no, pass);
+        expect(r.startUpload, "text-held: next file paste holds again");
+        const auto f2 = g.finish(true, 20500);
+        expect(f2.outcome == PasteGate::Outcome::Paste && !f2.superseded, "text-held: clean hold pastes, not superseded");
+    }
+    {
+        // Within 3 s too: a text paste during the hold still wins.
+        PasteGate g;
+        g.filter({D(kWin), D(V), U(V)}, 0, yes, no, yes);
+        auto r = g.filter({D(V), U(V)}, 100, yes, no, yes);
+        expectEvents(r.events, {D(V), U(V)}, "text-held: fast text Cmd+V passes");
+        const auto f = g.finish(true, 200);
+        expect(f.outcome == PasteGate::Outcome::Late && f.superseded, "text-held: fast upload not pasted after text");
+    }
+    {
+        // Without Cmd held a V is just a letter: never asked, never passed by the gate rule.
+        PasteGate g;
+        int askedPass = 0;
+        auto pass = [&] { ++askedPass; return true; };
+        g.filter({D(kWin), D(V), U(V), U(kWin)}, 0, yes, no, pass);
+        g.filter({D(V), U(V)}, 100, yes, no, pass);
+        expect(askedPass == 0, "text-held: plain V not asked");
+    }
+}
+
 void lateAndFailed() {
     auto yes = [] { return true; };
     {
@@ -276,6 +334,7 @@ int main() {
     notEligible();
     busy();
     lateAndFailed();
+    textWhileHeld();
     pacer();
     text();
     confirmKeys();

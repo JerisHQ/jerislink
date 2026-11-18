@@ -21,6 +21,9 @@ public:
 
     void start();
     void stop();
+    // Send the current Windows clipboard text again, even if it was sent
+    // before (the Mac pasteboard was overwritten since). Any thread.
+    void resendCurrent() { resendRequested_ = true; }
 
     uint64_t sent() const { return sent_.load(); }
     uint64_t received() const { return received_.load(); }
@@ -52,6 +55,7 @@ private:
     uint16_t port_ = 0;
     LogFn logFn_;
     std::atomic<bool> stopRequested_{false};
+    std::atomic<bool> resendRequested_{false};
     std::thread worker_;
     std::atomic<uint64_t> sent_{0};
     std::atomic<uint64_t> received_{0};

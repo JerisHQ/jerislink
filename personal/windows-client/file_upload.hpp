@@ -11,6 +11,10 @@
 //   press Cmd+V again" instead, so a late paste never lands elsewhere.
 //   While any transfer runs, a Cmd+V with new files is eaten and the chip
 //   says so (never a stale paste on the Mac, never a second transfer).
+//   A new Cmd+V while a paste upload is held, after something other than
+//   files was copied (text), goes out at once: the text paste is not eaten,
+//   and the held file paste is given up (the chip says the files are on the
+//   Mac; Finished::superseded asks the viewer to send the text again).
 // - Pacer: token bucket for FileTransferMaxMbps (0 = no cap).
 // - Text for the progress chip and the disconnect confirm.
 // - ConfirmKeys: keyboard rules of the disconnect confirm.
@@ -41,6 +45,7 @@ public:
     enum class Outcome { None, Paste, Late, Dropped };
     struct Finished {
         Outcome outcome = Outcome::None;
+        bool superseded = false;               // a newer non-file copy was pasted during the hold
         std::vector<keymap::KeyEvent> events;  // Cmd+V to send when outcome == Paste
     };
 
@@ -51,13 +56,27 @@ public:
     // the V is eaten, so the Mac never pastes its stale pasteboard, and
     // refusedBusy asks the viewer to say why. Without files (text) or with
     // an old host the Cmd+V passes through as before.
+    // passWhileHeld() is asked only for a fresh Cmd+V press while a hold
+    // runs: true when the clipboard changed to something other than files
+    // since the upload began. That press goes to the Mac (its text paste
+    // works) and the held file paste never fires afterwards.
     Filtered filter(const std::vector<keymap::KeyEvent>& in, double nowMs,
-                    const std::function<bool()>& eligible, const std::function<bool()>& busy = nullptr) {
+                    const std::function<bool()>& eligible, const std::function<bool()>& busy = nullptr,
+                    const std::function<bool()>& passWhileHeld = nullptr) {
         Filtered out;
         for (const auto& e : in) {
             if (e.semantic == keymap::kWin) cmd_ = e.down;
             else if (e.semantic == keymap::kCtrl) ctrl_ = e.down;
             if (e.semantic == kKeyV) {
+                if (e.down && holding_ && !refusing_ && cmd_ && (!swallowUp_ || passing_) && passWhileHeld &&
+                    passWhileHeld()) {
+                    late_ = true;  // never paste the files over this newer copy
+                    superseded_ = true;
+                    passing_ = true;
+                    out.events.push_back(e);
+                    continue;
+                }
+                if (!e.down && passing_) passing_ = false;
                 if (e.down && (holding_ || refusing_)) {  // repeat or a second press while held
                     swallowUp_ = true;
                     continue;
@@ -72,6 +91,7 @@ public:
                     }
                     holding_ = true;
                     late_ = false;
+                    superseded_ = false;
                     startMs_ = nowMs;
                     swallowUp_ = true;
                     out.startUpload = true;
@@ -92,6 +112,9 @@ public:
         Finished f;
         if (!holding_) return f;
         holding_ = false;
+        f.superseded = superseded_;
+        superseded_ = false;
+        passing_ = false;
         if (!ok) {
             f.outcome = Outcome::Dropped;
             return f;
@@ -122,6 +145,7 @@ public:
         ctrl_ = false;
         swallowUp_ = false;
         refusing_ = false;
+        passing_ = false;
     }
     bool holding() const { return holding_; }
 
@@ -131,6 +155,8 @@ private:
     bool holding_ = false;
     bool refusing_ = false;  // a busy refusal ate this V down; eat its repeats too
     bool late_ = false;
+    bool superseded_ = false;  // a text Cmd+V went out during this hold
+    bool passing_ = false;     // the V now down was passed through; let its repeats and up pass too
     bool swallowUp_ = false;
     double startMs_ = 0.0;
 };
@@ -225,6 +251,12 @@ inline std::string receivedText(uint64_t files) {
 // Cmd+V with copied files while a transfer runs: nothing is pasted on the Mac.
 inline std::string pasteBusy() {
     return "A transfer is already running. Wait or cancel it in Files, then press Cmd+V again.";
+}
+
+// A text Cmd+V went out while a file paste upload ran: the files are not
+// pasted over that newer copy.
+inline std::string pasteSuperseded() {
+    return "Files not pasted: you copied something newer. Copy the files again to paste them.";
 }
 
 inline std::string confirmTitle() { return "File transfer in progress"; }
