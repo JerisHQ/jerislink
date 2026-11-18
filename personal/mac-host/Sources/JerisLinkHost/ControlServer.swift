@@ -240,6 +240,7 @@ final class ControlServer: @unchecked Sendable {
 
             var noSigPipe: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            let keepAlive = Self.enableKeepAlive(c)
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             if let allowedClientIP, peerIP != allowedClientIP {
@@ -251,7 +252,7 @@ final class ControlServer: @unchecked Sendable {
 
             lock.lock(); clientFDs.insert(c); lock.unlock()
             let peerPort = UInt16(bigEndian: peer.sin_port)
-            print("Control client connected: \(peerIP):\(peerPort)")
+            print("Control client connected: \(peerIP):\(peerPort) keepalive=\(keepAlive ? Self.keepAliveSummary : "off")")
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else {
                     Darwin.close(c)
@@ -265,6 +266,32 @@ final class ControlServer: @unchecked Sendable {
                 print("Control client disconnected: \(peerIP):\(peerPort)")
             }
         }
+    }
+
+    /// TCP keepalive on each viewer connection: after `keepAliveIdle` s with
+    /// nothing received, probe every `keepAliveInterval` s, and give up after
+    /// `keepAliveCount` unanswered probes (about 25 s). A viewer that vanished
+    /// (killed, asleep, off the network) sends no FIN, and an input or
+    /// clipboard session blocks in recv until the socket errors, which on an
+    /// idle connection never happens: it held its input session open with no
+    /// end. A live
+    /// viewer's TCP stack answers the probes, idle or not.
+    static let keepAliveIdle: Int32 = 10
+    static let keepAliveInterval: Int32 = 5
+    static let keepAliveCount: Int32 = 3
+    static var keepAliveSummary: String { "\(keepAliveIdle)/\(keepAliveInterval)/\(keepAliveCount)" }
+
+    /// Returns false when any option was refused (the connection still runs).
+    static func enableKeepAlive(_ fd: Int32) -> Bool {
+        func set(_ level: Int32, _ name: Int32, _ value: Int32) -> Bool {
+            var v = value
+            return setsockopt(fd, level, name, &v, socklen_t(MemoryLayout<Int32>.size)) == 0
+        }
+        let on = set(SOL_SOCKET, SO_KEEPALIVE, 1)
+        let idle = set(IPPROTO_TCP, TCP_KEEPALIVE, keepAliveIdle)
+        let interval = set(IPPROTO_TCP, TCP_KEEPINTVL, keepAliveInterval)
+        let count = set(IPPROTO_TCP, TCP_KEEPCNT, keepAliveCount)
+        return on && idle && interval && count
     }
 
     private func handleClient(_ fd: Int32, tcpPeerIP: String) {

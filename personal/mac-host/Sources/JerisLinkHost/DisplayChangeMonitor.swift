@@ -96,7 +96,10 @@ enum DisplayFollower {
     /// the current target was looked up, so an event that lands while capture
     /// is starting is not lost. `query` is the ScreenCaptureKit look-up and
     /// runs only after an event. A new event during the settle look-ups
-    /// restarts them.
+    /// restarts them. `stop` is checked after each wake (the caller signals
+    /// the monitor to wake it, as the deadline does): true returns nil. The
+    /// generation is read before `stop`, so a wake signal sent just after
+    /// the check is not lost.
     /// Runs in the caller's isolation, so the closures are not sent anywhere.
     static func waitForChange<T>(isolation: isolated (any Actor)? = #isolation,
                                  monitor: DisplayChangeMonitor,
@@ -105,7 +108,8 @@ enum DisplayFollower {
                                  settleDelays: [Duration] = DisplayFollower.settleDelays,
                                  sleep: (Duration) async -> Void = { try? await Task.sleep(for: $0) },
                                  query: () async -> T?,
-                                 isChange: (T) -> Bool) async -> T? {
+                                 isChange: (T) -> Bool,
+                                 stop: () -> Bool = { false }) async -> T? {
         var seen = generation
         let deadlineTask: Task<Void, Never>? = deadline.map { deadline in
             Task {
@@ -119,7 +123,11 @@ enum DisplayFollower {
             if let deadline, Date() >= deadline { return nil }
             await monitor.wait(after: seen)
             if let deadline, Date() >= deadline { return nil }
+            // Generation first, then stop(): a signal that lands after the
+            // stop() check (the viewer went idle just then) is past `seen`,
+            // so the next wait returns at once and stop() is asked again.
             seen = monitor.currentGeneration
+            if stop() { return nil }
             var restart = false
             for delay in settleDelays {
                 await sleep(delay)
