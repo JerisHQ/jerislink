@@ -136,8 +136,9 @@ final class ControlServer: @unchecked Sendable {
     static func legacyListener(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
                                globalClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
                                clipboard: ClipboardBackend = SystemClipboard.shared) -> ControlServer {
+        // The listener's own --control-client-ip wins; network.conf only decides when it is not set.
         ControlServer(bindIP: bindIP, allowedClientIP: allowedClientIP, port: port, inject: inject,
-                      settingsClientIP: globalClientIP, clipboard: clipboard)
+                      settingsClientIP: { allowedClientIP ?? globalClientIP() }, clipboard: clipboard)
     }
 
     func start() throws {
