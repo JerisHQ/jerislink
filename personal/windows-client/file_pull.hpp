@@ -514,11 +514,14 @@ struct ZoneMarkStats {
     uint32_t written = 0;  // Zone.Identifier added
     uint32_t existed = 0;  // already had one (kept)
     uint32_t failed = 0;   // found but could not be marked
+    uint32_t removed = 0;  // of those, deleted (#53: never left unmarked)
 };
 
 // Marks the manifest files listed in `want` (indexes Explorer read to the
 // end) that are found under one of `folders`, created at or after `since`.
-// Found indexes move from `want` to `done`.
+// Found indexes move from `want` to `done`. A file whose mark cannot be
+// written (a volume without streams) is deleted, so a paste never leaves a
+// file without ZoneId=3 (#53).
 ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
                             std::set<uint32_t>& want, std::set<uint32_t>& done, const ZoneOps& zone = {});
 

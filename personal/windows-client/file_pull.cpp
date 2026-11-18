@@ -258,7 +258,7 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
         const std::wstring rest = cut == std::wstring::npos ? L"" : item.rel.substr(cut);
         // Counted once per item: the same file can be reached through two
         // folder spellings (a short 8.3 path and its long name).
-        bool found = false, wrote = false, existed = false, failed = false;
+        bool found = false, wrote = false, existed = false, failed = false, removed = false;
         for (const auto& folder : folders) {
             for (const auto& name : topNames(top)) {
                 const std::wstring path = folder + L"\\" + name + rest;
@@ -271,12 +271,23 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
                 switch (zone.write(path)) {
                 case ZoneWrite::Written: wrote = true; break;
                 case ZoneWrite::Exists: existed = true; break;
-                case ZoneWrite::Failed: failed = true; break;
+                case ZoneWrite::Failed:
+                    // #53: no mark, no delivery. Explorer may still be closing
+                    // the file, so the delete is retried for about a second.
+                    failed = true;
+                    for (int n = 0; n < 20; ++n) {
+                        if (DeleteFileW(path.c_str())) { removed = true; break; }
+                        Sleep(50);
+                    }
+                    break;
                 }
             }
         }
         if (wrote) ++stats.written;
-        else if (failed) ++stats.failed;
+        else if (failed) {
+            ++stats.failed;
+            if (removed) ++stats.removed;
+        }
         else if (existed) ++stats.existed;
         if (found) {
             done.insert(i);
@@ -704,10 +715,19 @@ struct FileClipboard::Impl {
             totals.written += stats.written;
             totals.existed += stats.existed;
             totals.failed += stats.failed;
+            totals.removed += stats.removed;
         }
         if (stats.written || stats.existed || stats.failed) {
             log("file.motw transfer=" + std::to_string(job->m.transfer) + " written=" + std::to_string(stats.written) +
-                " existed=" + std::to_string(stats.existed) + " failed=" + std::to_string(stats.failed));
+                " existed=" + std::to_string(stats.existed) + " failed=" + std::to_string(stats.failed) +
+                " removed=" + std::to_string(stats.removed));
+        }
+        if (stats.failed) {
+            // #53: these files could not carry ZoneId=3 (a volume without
+            // streams?) and were taken back out of the paste folder.
+            log("file.motw transfer=" + std::to_string(job->m.transfer) + " refused=" + std::to_string(stats.failed) +
+                " reason=zone_write_failed removed=" + std::to_string(stats.removed) +
+                " left=" + std::to_string(stats.failed - stats.removed));
         }
         if (job->want.empty()) {
             KillTimer(hwnd, kMarkTimer);   // the next delivered file restarts it
@@ -731,6 +751,7 @@ struct FileClipboard::Impl {
             totals.written += stats.written;
             totals.existed += stats.existed;
             totals.failed += stats.failed;
+            totals.removed += stats.removed;
         }
         if (job->notifyId) SHChangeNotifyDeregister(job->notifyId);
         job.reset();
