@@ -567,8 +567,8 @@ struct ZoneMarkStats {
     uint32_t existed = 0;  // already ZoneId=3 or 4 (kept)
     uint32_t failed = 0;   // found, but could not be marked: the last byte was withheld
     uint32_t kept = 0;     // settled: complete, the right bytes, ZoneId=3 or 4
-    uint32_t removed = 0;  // settled: anything else, deleted by identity
-    uint32_t left = 0;     // settled: could not be checked or deleted in time
+    uint32_t removed = 0;  // settled: deleted (#60 r5: never, kept for the log format)
+    uint32_t left = 0;     // settled: anything else, left untouched, the paste failed (#60 r5)
 };
 
 // The copy the gate settled on, held open (attributes only, every sharing
@@ -674,7 +674,9 @@ enum class SettleOutcome { None, Kept, Removed, Left };
 // After the paste (#60 r3): waits up to `waitMs` until nobody writes the
 // locked copy any more, then keeps it only when it is complete, exactly the
 // manifest size, has the SHA-256 of the bytes handed out and carries
-// ZoneId=3 or 4. Anything else is deleted through its identity. Counts the
+// ZoneId=3 or 4. #60 r5: anything else is left untouched (never deleted:
+// the copy is linked only by the reading process) and counts as a failed
+// paste. Counts the
 // outcome in `stats` and releases `copy`.
 SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps& zone, ZoneMarkStats& stats,
                          int waitMs);

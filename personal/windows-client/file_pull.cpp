@@ -497,13 +497,6 @@ std::vector<uint8_t> hashOf(HANDLE h, uint64_t size) {
     return d.finish();
 }
 
-// Deletes the locked copy `hint` (identity `id`). True once it is gone or going.
-bool deleteById(HANDLE hint, const FILE_ID_INFO& id) {
-    FILE_STANDARD_INFO st{};
-    if (GetFileInformationByHandleEx(hint, FileStandardInfo, &st, sizeof(st)) && st.DeletePending) return true;
-    return deleteFileById(hint, id);
-}
-
 }  // namespace
 
 bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id) {
@@ -686,18 +679,10 @@ SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps
             CloseHandle(rd);
         }
     }
-    SettleOutcome out = SettleOutcome::Kept;
-    if (!keep) {
-        out = SettleOutcome::Left;
-        for (;;) {
-            if (deleteById(h, id)) {
-                out = SettleOutcome::Removed;
-                break;
-            }
-            if (GetTickCount64() >= until) break;
-            Sleep(100);
-        }
-    }
+    // #60 r5: anything else is left exactly as it is and the paste counts
+    // as failed. The copy is linked to this paste only by the process that
+    // read the stream, so it may not be ours: our code never deletes it.
+    const SettleOutcome out = keep ? SettleOutcome::Kept : SettleOutcome::Left;
     copy.reset();
     if (out == SettleOutcome::Kept) ++stats.kept;
     else if (out == SettleOutcome::Removed) ++stats.removed;
@@ -1215,8 +1200,11 @@ struct FileClipboard::Impl {
         ZoneMarkStats st;
         const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
         const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
-        log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
-            " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
+        // #60 r5: a copy that is not kept is an error, reported here; the
+        // file is left untouched.
+        log(std::string(o == SettleOutcome::Kept ? "file.motw" : "file.motw error=paste_failed") +
+            " transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) + " settled=" + what +
+            " complete=" + (s.complete ? "1" : "0"));
         std::lock_guard<std::mutex> lock(mu);
         totals.kept += st.kept;
         totals.removed += st.removed;
