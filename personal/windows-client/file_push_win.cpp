@@ -74,6 +74,30 @@ bool emptyOn(HANDLE h) {
     return SetFileInformationByHandle(h, FileEndOfFileInfo, &end, sizeof(end)) != 0;
 }
 
+// #60 r5: overwrites every byte of the open file `h` with zeros, for a file
+// that can be neither deleted nor cut (another program has it mapped).
+bool zeroOn(HANDLE h) {
+    LARGE_INTEGER size{};
+    LARGE_INTEGER zero{};
+    if (!GetFileSizeEx(h, &size) || !SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) return false;
+    static const std::vector<uint8_t> zeros(1u << 16, 0);
+    uint64_t left = uint64_t(size.QuadPart);
+    while (left > 0) {
+        const DWORD n = DWORD(std::min<uint64_t>(left, zeros.size()));
+        DWORD wrote = 0;
+        if (!WriteFile(h, zeros.data(), n, &wrote, nullptr) || wrote != n) return false;
+        left -= n;
+    }
+    return FlushFileBuffers(h) != 0;
+}
+
+// #60 r5: true once the open file `h` is gone, or holds no bytes of what was
+// received. Each step's result is checked; none is assumed.
+bool removeOrBlank(HANDLE h, bool& gone) {
+    gone = deleteNowOn(h) || deleteOn(h);
+    return gone || emptyOn(h) || zeroOn(h);
+}
+
 class FolderSink : public Sink {
 public:
     FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
@@ -83,6 +107,7 @@ public:
         // #53 r2: a file that failed its check, or a .jlpart, that could not
         // be deleted at once: retried for about a second more before the sink goes.
         for (int i = 0; i < 20 && !retryCleanup(); ++i) Sleep(50);
+        for (HANDLE h : held_) CloseHandle(h);
         if (dir_ != INVALID_HANDLE_VALUE) CloseHandle(dir_);
     }
 
@@ -173,7 +198,9 @@ public:
                 // out through the handle: back to staging first, so it never
                 // stays under the name it was meant to have, then deleted.
                 // If it cannot be moved back, dropPart() still deletes it
-                // there or, failing that, empties it (#60 r4). A same-name
+                // there or, failing that, empties it (#60 r4). #60 r5: a
+                // taken staging name moves it to another staging name, and
+                // every result is checked (takeOut(), dropPart()). A same-name
                 // file someone put there meanwhile is not ours and is never
                 // touched.
                 if (ensureZone(file_)) {
@@ -185,8 +212,9 @@ public:
                 }
                 ++zone_.failed;
                 zoneRefused_ = true;
-                // Stuck under its final name: its bytes go first.
-                if (!renameTo(file_, longPath(part_))) emptyOn(file_);
+                // Stuck under its final name: it leaves that name, or its
+                // bytes go, before anything else.
+                takeOut();
                 return dropPart();
             }
             const DWORD e = GetLastError();
@@ -226,6 +254,18 @@ private:
         return false;
     }
 
+    // #60 r5: moves the open file out of the folder, back to its staging
+    // name or, if that name was taken meanwhile, another one in staging.
+    // Failing that it is cut or zeroed in place. False if none of it worked;
+    // dropPart() then keeps the handle.
+    bool takeOut() {
+        if (renameTo(file_, longPath(part_))) return true;
+        for (int n = 2; n < 100; ++n) {
+            if (renameTo(file_, longPath(part_ + L"." + std::to_wstring(n)))) return true;
+        }
+        return emptyOn(file_) || zeroOn(file_);
+    }
+
     // Deletes the partial file through its handle, its name gone at once
     // where the volume allows (#60 r4). If that cannot be done now, its
     // bytes are cut to zero through the handle (#60 r4) and its identity is
@@ -235,11 +275,17 @@ private:
         if (file_ != INVALID_HANDLE_VALUE) {
             FILE_ID_INFO id{};
             const bool known = filepull::fileIdOf(file_, id);
-            const bool gone = deleteNowOn(file_) || deleteOn(file_);
-            if (!gone) emptyOn(file_);
-            CloseHandle(file_);
+            bool gone = false;
+            if (removeOrBlank(file_, gone)) {
+                CloseHandle(file_);
+                if (!gone && known) cleanup_.push_back(id);
+            } else {
+                // #60 r5: neither deleted, cut nor zeroed: the handle is
+                // kept (anyone else opening the file must share writing and
+                // deleting with it) and retryCleanup() tries again through it.
+                held_.push_back(file_);
+            }
             file_ = INVALID_HANDLE_VALUE;
-            if (!gone && known) cleanup_.push_back(id);
         }
         part_.clear();
         written_ = 0;
@@ -249,12 +295,24 @@ private:
     // True once nothing is left to clean up. Each record goes only when its
     // file is deleted or no longer exists.
     bool retryCleanup() {
-        if (dir_ == INVALID_HANDLE_VALUE) return cleanup_.empty();
+        for (auto it = held_.begin(); it != held_.end();) {
+            FILE_ID_INFO id{};
+            const bool known = filepull::fileIdOf(*it, id);
+            bool gone = false;
+            if (!removeOrBlank(*it, gone)) {
+                ++it;
+                continue;
+            }
+            CloseHandle(*it);
+            if (!gone && known) cleanup_.push_back(id);
+            it = held_.erase(it);
+        }
+        if (dir_ == INVALID_HANDLE_VALUE) return cleanup_.empty() && held_.empty();
         for (auto it = cleanup_.begin(); it != cleanup_.end();) {
             if (filepull::deleteFileById(dir_, *it)) it = cleanup_.erase(it);
             else ++it;
         }
-        return cleanup_.empty();
+        return cleanup_.empty() && held_.empty();
     }
 
     std::wstring folder_;
@@ -265,6 +323,7 @@ private:
     std::wstring part_;
     uint64_t written_ = 0;
     std::vector<FILE_ID_INFO> cleanup_;   // files still to delete, by identity
+    std::vector<HANDLE> held_;            // #60 r5: files whose bytes could not be removed yet
     HANDLE file_ = INVALID_HANDLE_VALUE;
     HANDLE dir_ = INVALID_HANDLE_VALUE;   // folder_, a volume hint for cleanups
     ZoneCounts zone_;
