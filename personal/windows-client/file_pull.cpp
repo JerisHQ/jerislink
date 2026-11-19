@@ -231,12 +231,14 @@ private:
     }
 
     // The process making this Read call (#60 r4): the owner of the calling
-    // thread inside a COM call (S_OK: this process, S_FALSE: another one),
-    // or this process for a direct call that is not a COM call at all.
+    // thread inside a COM call (S_OK: this process, S_FALSE: another one).
+    // #60 r5: a call whose caller cannot be told (not a COM call, or the
+    // call fails) is an unknown reader, never this process: no copy is
+    // linked to it and the paste fails closed.
     static uint32_t callerProcess() {
         DWORD tid = 0;
         const HRESULT hr = CoGetCallerTID(&tid);
-        if (FAILED(hr)) return uint32_t(GetCurrentProcessId());
+        if (FAILED(hr)) return kUnknownReader;
         if (tid == 0) return kUnknownReader;
         HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
         if (!t) return kUnknownReader;
@@ -565,7 +567,8 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
     const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
     const uint64_t minSize = r.size > 0 ? r.size - 1 : 0;
     const ULARGE_INTEGER since{r.since.dwLowDateTime, r.since.dwHighDateTime};
-    const uint32_t reader = r.reader ? r.reader : uint32_t(GetCurrentProcessId());
+    // #60 r5: 0 is an unidentified reader too (openedBy() links nothing to it).
+    const uint32_t reader = r.reader ? r.reader : kUnknownReader;
     // Every file that could be this paste's copy, held open by identity. The
     // same file reached through two folder spellings (8.3 and long) counts once.
     struct Candidate {

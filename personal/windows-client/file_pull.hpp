@@ -620,8 +620,9 @@ struct GateRequest {
     uint64_t size = 0;           // manifest size
     FILETIME since{};            // a copy must be created at or after this
     // #60 r4: the process reading this file's stream (Explorer, which writes
-    // the copy itself); 0 means this process. A copy is taken only if this
-    // process has it open.
+    // the copy itself). A copy is taken only if this process has it open.
+    // #60 r5: 0 or kUnknownReader means it could not be identified, and no
+    // copy is taken.
     uint32_t reader = 0;
 };
 // A reader that could not be identified: no file is ever linked to it.
