@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -528,6 +529,77 @@ bool goneOrZeroed(const std::wstring& path, uint64_t size) {
     return zero && seen == size;
 }
 
+// #60 r6: someone tries to open the file's Zone.Identifier stream for
+// writing just before the rename to its final name (stage 0) or just after
+// it, before the last check (stage 1), and to write ZoneId=0 into it.
+int gUnmarkStage = -1;
+int gUnmarkResult[2] = {0, 0};   // 1 = the open was refused, 2 = opened and ZoneId=0 written
+DWORD gUnmarkError[2] = {0, 0};
+
+void tryUnmark(HANDLE file, int stage) {
+    if (stage != gUnmarkStage) return;
+    const std::wstring p = pathOf(file) + L":Zone.Identifier";
+    HANDLE z = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (z == INVALID_HANDLE_VALUE) {
+        gUnmarkResult[stage] = 1;
+        gUnmarkError[stage] = GetLastError();
+        return;
+    }
+    static const char kZero[] = "[ZoneTransfer]\r\nZoneId=0\r\n";
+    DWORD w = 0;
+    const bool ok = WriteFile(z, kZero, DWORD(sizeof(kZero) - 1), &w, nullptr) && SetEndOfFile(z);
+    CloseHandle(z);
+    gUnmarkResult[stage] = ok ? 2 : 1;
+}
+
+// #60 r6: every take-back and cleanup step the sink reports, in order.
+std::vector<std::pair<std::string, bool>> gTrace;
+void collectTrace(const char* step, bool ok) { gTrace.push_back({step, ok}); }
+// 1 = the step ran and worked, 0 = it ran and failed, -1 = it did not run.
+int traced(const char* step) {
+    for (const auto& t : gTrace) {
+        if (t.first == step) return t.second ? 1 : 0;
+    }
+    return -1;
+}
+
+// #60 r6: the check under gBranchName's final name reads unmarked; the
+// first time, the staging name (gBranchNames 1) or every staging name the
+// sink may move the file to (gBranchNames 2) is taken first.
+std::wstring gBranchName;
+std::wstring gBranchPart;
+int gBranchNames = 0;
+bool gBranchTaken = false;
+
+int branchRead(HANDLE h) {
+    if (!endsWith(pathOf(h), L"\\" + gBranchName)) return fpull::readZoneIdOn(h);
+    if (!gBranchTaken) {
+        gBranchTaken = true;
+        if (gBranchNames >= 1) takeName(gBranchPart);
+        if (gBranchNames >= 2) {
+            for (int n = 2; n < 100; ++n) takeName(gBranchPart + L"." + std::to_wstring(n));
+        }
+    }
+    return -1;
+}
+
+fpull::ZoneWrite branchWrite(HANDLE h) {
+    return endsWith(pathOf(h), L"\\" + gBranchName) ? fpull::ZoneWrite::Failed : fpull::writeInternetZoneOn(h);
+}
+
+void clearStaging(const std::wstring& dir, const std::wstring& name) {
+    const std::wstring staging = dir + L"\\.jlstaging\\";
+    WIN32_FIND_DATAW fd{};
+    HANDLE f = FindFirstFileW((staging + name + L".jlpart*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        SetFileAttributesW((staging + fd.cFileName).c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW((staging + fd.cFileName).c_str());
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+
 int countIn(const std::wstring& folder, const wchar_t* pattern) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((folder + L"\\" + pattern).c_str(), &fd);
@@ -679,7 +751,7 @@ void realFolder() {
         fpull::ZoneOps afterRename;   // the part is marked; the final name reads unmarked
         afterRename.write = [](const std::wstring&) { return fpull::ZoneWrite::Written; };
         afterRename.read = [](const std::wstring& p) { return holdIfNamed(p) ? -1 : 3; };
-        afterRename.writeOn = [](HANDLE) { return fpull::ZoneWrite::Written; };
+        afterRename.writeOn = fpull::writeInternetZoneOn;   // #60 r6: a real mark, held through the rename
         afterRename.readOn = [](HANDLE h) { return holdIfNamed(pathOf(h)) ? -1 : 3; };
         {
             PushReceiver r(makeFolderSink(dir, {}, afterRename), fpull::sha256Digest());
@@ -827,6 +899,8 @@ void realFolder() {
         gStuckAllNames = true;
         gStuckImage = true;
         gStuckMapError = 0;
+        gTrace.clear();
+        gTakeOutTrace = collectTrace;
         fpull::ZoneOps stuck;
         stuck.readOn = [](HANDLE h) {
             if (!endsWith(pathOf(h), L"\\pinned2.exe")) return fpull::readZoneIdOn(h);
@@ -875,7 +949,15 @@ void realFolder() {
         std::printf("  stuck in place: blocked=%d maperr=%lu known=%d exists=%d size=%llu blank=%d\n",
                     int(gStuckBlocked), (unsigned long)gStuckMapError, int(known), int(exists),
                     (unsigned long long)onDisk, int(blank));
+        gTakeOutTrace = nullptr;
         expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file as an image");
+        // #60 r6: the zero-fill branch is proven taken: the sink's own
+        // results show the move back, every other staging name and the cut
+        // all failed before it zeroed the file.
+        expect(traced("back") == 0, "folder: take-back branch 4 (zero): the move back to its staging name failed (#60 r6)");
+        expect(traced("aside") == 0, "folder: take-back branch 4 (zero): every other staging name failed (#60 r6)");
+        expect(traced("cut") == 0, "folder: take-back branch 4 (zero): the cut failed (image section) (#60 r6)");
+        expect(traced("zero") == 1, "folder: take-back branch 4 (zero): the bytes were overwritten with zeros (#60 r6)");
         expect(blank,
                "folder: a file that can neither leave its final name, be deleted nor be cut has its bytes zeroed (#60 r5)");
         if (gStuckView) UnmapViewOfFile(gStuckView);
@@ -896,6 +978,92 @@ void realFolder() {
             } while (FindNextFileW(f, &fd));
             FindClose(f);
         }
+    }
+    // #60 r6 item 1: the mark is held from the staging check through the
+    // rename and the last check: nobody can open the Zone.Identifier stream
+    // for writing in between, and the file is delivered with ZoneId=3.
+    for (int stage = 0; stage < 2; ++stage) {
+        const std::string leaf = stage == 0 ? "guard0.exe" : "guard1.exe";
+        const std::wstring target = dir + L"\\" + std::wstring(leaf.begin(), leaf.end());
+        gUnmarkStage = stage;
+        gPublishHook = tryUnmark;
+        PushReceiver::Out out;
+        {
+            PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
+            auto gp = makePush(70 + uint32_t(stage), {{leaf, 2048}});
+            offerAll(r, gp);
+            r.nextRequest();
+            r.onData({70 + uint32_t(stage), 0, 0, gp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(gp.contents[0].data(), gp.contents[0].size());
+            out = r.onFileEnd({70 + uint32_t(stage), 0, d->finish()});
+        }
+        gPublishHook = nullptr;
+        gUnmarkStage = -1;
+        const auto* res = only<file::Result>(out);
+        const int zone = fpull::readZoneId(target);
+        std::printf("  publish window stage %d: unmark=%d err=%lu ok=%d zone=%d\n", stage, gUnmarkResult[stage],
+                    (unsigned long)gUnmarkError[stage], int(res && res->status == file::status::kOk), zone);
+        expect(gUnmarkResult[stage] == 1,
+               stage == 0 ? "folder: between the staging check and the rename nobody can open the file's Zone.Identifier for writing (#60 r6)"
+                          : "folder: between the rename and the last check nobody can open the file's Zone.Identifier for writing (#60 r6)");
+        expect(res && res->status == file::status::kOk && zone == 3,
+               stage == 0 ? "folder: a file whose mark someone tries to change before the rename is delivered with ZoneId=3 (#60 r6)"
+                          : "folder: a file whose mark someone tries to change after the rename is delivered with ZoneId=3 (#60 r6)");
+        DeleteFileW(target.c_str());
+    }
+    // #60 r6 item 2: each take-back branch on its own. The check under the
+    // final name reads unmarked; the sink's own result for every step is
+    // asserted, so each branch is shown taken, and the steps before it shown
+    // to have failed. (Branch 4, the zero-fill, is the stuck-in-place test.)
+    for (int names = 0; names < 3; ++names) {
+        const std::string leaf = "branch" + std::to_string(names + 1) + ".exe";
+        gBranchName = std::wstring(leaf.begin(), leaf.end());
+        gBranchPart = dir + L"\\.jlstaging\\" + gBranchName + L".jlpart";
+        gBranchNames = names;
+        gBranchTaken = false;
+        gTrace.clear();
+        gTakeOutTrace = collectTrace;
+        fpull::ZoneOps branch;
+        branch.readOn = branchRead;
+        branch.writeOn = branchWrite;
+        PushReceiver::Out out;
+        {
+            PushReceiver r(makeFolderSink(dir, {}, branch), fpull::sha256Digest());
+            auto bp = makePush(72 + uint32_t(names), {{leaf, 3000}});
+            offerAll(r, bp);
+            r.nextRequest();
+            r.onData({72 + uint32_t(names), 0, 0, bp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(bp.contents[0].data(), bp.contents[0].size());
+            out = r.onFileEnd({72 + uint32_t(names), 0, d->finish()});
+        }
+        gTakeOutTrace = nullptr;
+        const auto* res = only<file::Result>(out);
+        const std::wstring target = dir + L"\\" + gBranchName;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        const bool known = diskSize(target, exists, onDisk);
+        std::printf("  branch %d: taken=%d back=%d aside=%d cut=%d zero=%d exists=%d size=%llu\n", names + 1,
+                    int(gBranchTaken), traced("back"), traced("aside"), traced("cut"), traced("zero"), int(exists),
+                    (unsigned long long)onDisk);
+        expect(gBranchTaken && res && res->status != file::status::kOk,
+               "folder: take-back branch " + std::to_string(names + 1) + ": the check under the final name failed and the file is not delivered (#60 r6)");
+        if (names == 0) {
+            expect(traced("back") == 1, "folder: take-back branch 1 (back): the file moved back to its staging name (#60 r6)");
+        } else if (names == 1) {
+            expect(traced("back") == 0, "folder: take-back branch 2 (aside): the move back to its staging name failed (#60 r6)");
+            expect(traced("aside") == 1, "folder: take-back branch 2 (aside): the file moved to another staging name (#60 r6)");
+        } else {
+            expect(traced("back") == 0, "folder: take-back branch 3 (cut): the move back to its staging name failed (#60 r6)");
+            expect(traced("aside") == 0, "folder: take-back branch 3 (cut): every other staging name failed (#60 r6)");
+            expect(traced("cut") == 1, "folder: take-back branch 3 (cut): the file was cut to zero bytes (#60 r6)");
+        }
+        expect(known && (!exists || onDisk == 0),
+               "folder: take-back branch " + std::to_string(names + 1) + ": the file's bytes do not stay under its final name (#60 r6)");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        clearStaging(dir, gBranchName);
     }
     // Disconnect mid-file removes the partial file.
     {

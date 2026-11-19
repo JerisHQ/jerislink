@@ -380,6 +380,15 @@ private:
 std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
                                      filepull::ZoneOps zone = {});
 
+// Test seams (#60 r6), never set outside tests. gPublishHook is called by
+// commit() with the open file and stage 0 just before the rename to the
+// final name, and stage 1 just after it, before the last check.
+// gTakeOutTrace is called with each take-back and cleanup step's name
+// ("back", "aside", "cut", "zero", "drop.delete", "drop.cut", "drop.zero")
+// and whether it worked.
+extern void (*gPublishHook)(HANDLE file, int stage);
+extern void (*gTakeOutTrace)(const char* step, bool ok);
+
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
 // Windows does not know the Downloads folder.
 std::wstring downloadsFolder();

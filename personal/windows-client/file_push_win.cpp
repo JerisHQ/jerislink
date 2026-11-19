@@ -12,7 +12,17 @@
 #include <vector>
 
 namespace jl::filepush {
+
+void (*gPublishHook)(HANDLE file, int stage) = nullptr;
+void (*gTakeOutTrace)(const char* step, bool ok) = nullptr;
+
 namespace {
+
+// #60 r6: reports a take-back or cleanup step's result to a test.
+bool traced(const char* step, bool ok) {
+    if (gTakeOutTrace) gTakeOutTrace(step, ok);
+    return ok;
+}
 
 std::string toUtf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -94,8 +104,8 @@ bool zeroOn(HANDLE h) {
 // #60 r5: true once the open file `h` is gone, or holds no bytes of what was
 // received. Each step's result is checked; none is assumed.
 bool removeOrBlank(HANDLE h, bool& gone) {
-    gone = deleteNowOn(h) || deleteOn(h);
-    return gone || emptyOn(h) || zeroOn(h);
+    gone = traced("drop.delete", deleteNowOn(h) || deleteOn(h));
+    return gone || traced("drop.cut", emptyOn(h)) || traced("drop.zero", zeroOn(h));
 }
 
 class FolderSink : public Sink {
@@ -190,9 +200,11 @@ public:
         // Moved by handle, no overwrite: an existing name moves on to
         // "name (2).ext" ...
         const std::string utf8 = toUtf8(name_);
+        if (gPublishHook) gPublishHook(file_, 0);
         for (int n = 1; n < 1000; ++n) {
             const std::wstring leaf = n == 1 ? name_ : toWide(file::path::clashName(utf8, n));
             if (renameTo(file_, longPath(folder_ + L"\\" + leaf))) {
+                if (gPublishHook) gPublishHook(file_, 1);
                 // The stream moved with the file; checked again on it, now
                 // under its final name. Without it the file is taken back
                 // out through the handle: back to staging first, so it never
@@ -259,11 +271,12 @@ private:
     // Failing that it is cut or zeroed in place. False if none of it worked;
     // dropPart() then keeps the handle.
     bool takeOut() {
-        if (renameTo(file_, longPath(part_))) return true;
+        if (traced("back", renameTo(file_, longPath(part_)))) return true;
         for (int n = 2; n < 100; ++n) {
-            if (renameTo(file_, longPath(part_ + L"." + std::to_wstring(n)))) return true;
+            if (renameTo(file_, longPath(part_ + L"." + std::to_wstring(n)))) return traced("aside", true);
         }
-        return emptyOn(file_) || zeroOn(file_);
+        traced("aside", false);
+        return traced("cut", emptyOn(file_)) || traced("zero", zeroOn(file_));
     }
 
     // Deletes the partial file through its handle, its name gone at once
