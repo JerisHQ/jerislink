@@ -132,7 +132,8 @@ int zoneIdFrom(HANDLE z) {
 // file someone else put under the name is never touched. True when the name
 // is gone or no longer ours; false when it is ours and could not be removed
 // now (someone holds the file without delete sharing, or it is mapped as an
-// image).
+// image), and (#60 r9) when its file id could not be read: then nobody knows
+// whose the name is, so it is kept and tried again.
 bool unlinkName(const std::wstring& path, const FILE_ID_INFO& id) {
     HANDLE h = CreateFileW(longPath(path).c_str(), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -142,7 +143,11 @@ bool unlinkName(const std::wstring& path, const FILE_ID_INFO& id) {
         return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
     }
     FILE_ID_INFO got{};
-    if ((gIdLookupHook && gIdLookupHook(path)) || !filepull::fileIdOf(h, got) || !filepull::sameFile(got, id)) {
+    if ((gIdLookupHook && gIdLookupHook(path)) || !filepull::fileIdOf(h, got)) {
+        CloseHandle(h);
+        return false;
+    }
+    if (!filepull::sameFile(got, id)) {
         CloseHandle(h);
         return true;
     }
@@ -300,16 +305,16 @@ public:
                 ++zone_.marked;
                 if (gFinalHook) gFinalHook(final, 2);
                 // Success is decided with the mark, the bytes and the final
-                // name all still held; only then are the handles closed. The
-                // staging name is removed afterwards by name and file id
-                // (retryCleanup(), from finished(), the next file or the
-                // sink's end): removing it here would need the held
-                // handles closed first.
+                // name all still held. #60 r9: they stay held past the
+                // return; the caller lets go with settle() (so does the next
+                // begin(), abort(), finished() or the sink's end). The
+                // staging name is removed after that by name and file id
+                // (retryCleanup()): removing it needs the handles closed.
                 names_.push_back({part_, id});
                 part_.clear();
-                CloseHandle(pin);
-                CloseHandle(zone);
-                CloseHandle(file_);
+                done_[0] = pin;
+                done_[1] = zone;
+                done_[2] = file_;
                 file_ = INVALID_HANDLE_VALUE;
                 return true;
             }
@@ -320,11 +325,18 @@ public:
     }
 
     void abort() override {
+        letGo();
         dropPart();
         retryCleanup();
     }
 
+    void settle() override {
+        letGo();
+        retryCleanup();
+    }
+
     void finished(uint32_t) override {
+        letGo();
         retryCleanup();
         if (open_) open_(folder_);
     }
@@ -460,6 +472,15 @@ private:
         return false;
     }
 
+    // #60 r9: closes the delivered file's final name, mark and file handles
+    // that commit() kept open for its caller.
+    void letGo() {
+        for (HANDLE& h : done_) {
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            h = INVALID_HANDLE_VALUE;
+        }
+    }
+
     // True once nothing is left to clean up.
     bool retryCleanup() {
         for (auto it = held_.begin(); it != held_.end();) {
@@ -483,6 +504,9 @@ private:
     std::vector<std::pair<std::wstring, FILE_ID_INFO>> names_;   // #60 r7: names still to remove, with their file id
     std::vector<Held> held_;                                     // #60 r5/r7: files whose bytes could not be removed yet
     HANDLE file_ = INVALID_HANDLE_VALUE;
+    // #60 r9: the last delivered file's pinned final name, held mark and
+    // file handle, kept from commit() until settle().
+    HANDLE done_[3] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
     ZoneCounts zone_;
     bool zoneRefused_ = false;
 };
