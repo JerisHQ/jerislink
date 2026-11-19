@@ -553,8 +553,8 @@ int readZoneIdOn(HANDLE file);
 extern void (*gZoneStreamOpenHook)(HANDLE file);
 // The existing Zone.Identifier stream of the file `file` is open on, opened
 // the same way (relative to the handle, file id checked) with `access` and
-// `share` (delete sharing is always added, see file_pull.cpp). For a caller
-// that must hold the stream itself (#60 r6, the push sink).
+// exactly `share` (#60 r7: no delete sharing is added; the caller, the push
+// sink, holds the stream and must open its file without DELETE access).
 HANDLE openZoneStreamOn(HANDLE file, DWORD access, DWORD share);
 
 // The zone calls, swappable so a test can stand in for a volume without

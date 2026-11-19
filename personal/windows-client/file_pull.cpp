@@ -394,8 +394,10 @@ using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(LONG);
 // for the whole file, not per stream: while `file` (the push sink's .jlpart)
 // is open with DELETE, a stream open that does not share delete fails, so
 // the stream always shares delete. Readers and writers are still kept out
-// by `share`, and the file id is still checked.
-HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition) {
+// by `share`, and the file id is still checked. #60 r7: the push sink, whose
+// .jlpart has no DELETE access, asks for `share` exactly (addShareDelete
+// false), so it can hold the stream with delete sharing denied.
+HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition, bool addShareDelete = true) {
     static const auto ntCreate = reinterpret_cast<NtCreateFileFn>(
         reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
     static const auto toDos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
@@ -411,7 +413,8 @@ HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition)
     const ULONG options = 0x40 /* FILE_NON_DIRECTORY_FILE */ | 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ |
                           0x200000 /* FILE_OPEN_REPARSE_POINT */;
     HANDLE z = nullptr;
-    const LONG st = ntCreate(&z, access | SYNCHRONIZE, &oa, &io, nullptr, FILE_ATTRIBUTE_NORMAL, share | FILE_SHARE_DELETE,
+    const LONG st = ntCreate(&z, access | SYNCHRONIZE, &oa, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
+                             share | (addShareDelete ? FILE_SHARE_DELETE : 0),
                              how, options, nullptr, 0);
     if (st < 0 || !z) {
         SetLastError(toDos ? toDos(st) : ERROR_ACCESS_DENIED);
@@ -541,7 +544,7 @@ ZoneWrite writeInternetZoneOn(HANDLE file) {
 }
 
 HANDLE openZoneStreamOn(HANDLE file, DWORD access, DWORD share) {
-    return openZoneStream(file, access, share, OPEN_EXISTING);
+    return openZoneStream(file, access, share, OPEN_EXISTING, false);
 }
 
 int readZoneIdOn(HANDLE file) {

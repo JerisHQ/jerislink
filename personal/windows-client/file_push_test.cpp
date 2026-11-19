@@ -451,9 +451,11 @@ bool gStuckAllNames = false;
 bool gStuckImage = false;
 DWORD gStuckMapError = 0;
 
+// True once the name is taken (#60 r7: a name that exists already, such as
+// the staging name the sink keeps until the file is delivered, counts).
 bool takeName(const std::wstring& path) {
     HANDLE p = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
-    if (p == INVALID_HANDLE_VALUE) return false;
+    if (p == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_EXISTS;
     CloseHandle(p);
     return true;
 }
@@ -466,10 +468,9 @@ void blockTakeBack(HANDLE h) {
             if (!takeName(gStuckPart + L"." + std::to_wstring(n))) return;
         }
     }
-    FILE_BASIC_INFO b{};
-    if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof(b))) return;
-    b.FileAttributes |= FILE_ATTRIBUTE_READONLY;
-    if (SetFileInformationByHandle(h, FileBasicInfo, &b, sizeof(b)) == 0) return;
+    // #60 r7: by name, as the sink's check handle is read-only.
+    const DWORD attrs = GetFileAttributesW(pathOf(h).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !SetFileAttributesW(pathOf(h).c_str(), attrs | FILE_ATTRIBUTE_READONLY)) return;
     if (gStuckImage) {
         const std::wstring p = pathOf(h);
         const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -1115,13 +1116,10 @@ void realFolder() {
                     (unsigned long long)onDisk, int(blank));
         gTakeOutTrace = nullptr;
         expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file as an image");
-        // #60 r6: the zero-fill branch is proven taken: the sink's own
-        // results show the move back, every other staging name and the cut
-        // all failed before it zeroed the file.
-        expect(traced("back") == 0, "folder: take-back branch 4 (zero): the move back to its staging name failed (#60 r6)");
-        expect(traced("aside") == 0, "folder: take-back branch 4 (zero): every other staging name failed (#60 r6)");
-        expect(traced("cut") == 0, "folder: take-back branch 4 (zero): the cut failed (image section) (#60 r6)");
-        expect(traced("zero") == 1, "folder: take-back branch 4 (zero): the bytes were overwritten with zeros (#60 r6)");
+        // #60 r6/r7: the zero-fill branch is proven taken: the sink's own
+        // results show the cut failed before it zeroed the file.
+        expect(traced("cut") == 0, "folder: take-back branch 2 (zero): the cut failed (image section) (#60 r7)");
+        expect(traced("zero") == 1, "folder: take-back branch 2 (zero): the bytes were overwritten with zeros (#60 r7)");
         expect(blank,
                "folder: a file that can neither leave its final name, be deleted nor be cut has its bytes zeroed (#60 r5)");
         if (gStuckView) UnmapViewOfFile(gStuckView);
@@ -1176,11 +1174,11 @@ void realFolder() {
                           : "folder: a file whose mark someone tries to change after the rename is delivered with ZoneId=3 (#60 r6)");
         DeleteFileW(target.c_str());
     }
-    // #60 r6 item 2: each take-back branch on its own. The check under the
-    // final name reads unmarked; the sink's own result for every step is
-    // asserted, so each branch is shown taken, and the steps before it shown
-    // to have failed. (Branch 4, the zero-fill, is the stuck-in-place test.)
-    for (int names = 0; names < 3; ++names) {
+    // #60 r6/r7 item 2: the take-back's cut branch on its own. The check
+    // under the final name reads unmarked; the sink's own result for every
+    // step is asserted. (Branch 2, the zero-fill, is the stuck-in-place
+    // test; branch 3, isolation, is the isolation test below.)
+    for (int names = 0; names < 1; ++names) {
         const std::string leaf = "branch" + std::to_string(names + 1) + ".exe";
         gBranchName = std::wstring(leaf.begin(), leaf.end());
         gBranchPart = dir + L"\\.jlstaging\\" + gBranchName + L".jlpart";
@@ -1208,21 +1206,14 @@ void realFolder() {
         bool exists = false;
         uint64_t onDisk = 0;
         const bool known = diskSize(target, exists, onDisk);
-        std::printf("  branch %d: taken=%d back=%d aside=%d cut=%d zero=%d exists=%d size=%llu\n", names + 1,
-                    int(gBranchTaken), traced("back"), traced("aside"), traced("cut"), traced("zero"), int(exists),
+        std::printf("  branch %d: taken=%d cut=%d zero=%d unlink=%d exists=%d size=%llu\n", names + 1,
+                    int(gBranchTaken), traced("cut"), traced("zero"), traced("unlink"), int(exists),
                     (unsigned long long)onDisk);
         expect(gBranchTaken && res && res->status != file::status::kOk,
                "folder: take-back branch " + std::to_string(names + 1) + ": the check under the final name failed and the file is not delivered (#60 r6)");
-        if (names == 0) {
-            expect(traced("back") == 1, "folder: take-back branch 1 (back): the file moved back to its staging name (#60 r6)");
-        } else if (names == 1) {
-            expect(traced("back") == 0, "folder: take-back branch 2 (aside): the move back to its staging name failed (#60 r6)");
-            expect(traced("aside") == 1, "folder: take-back branch 2 (aside): the file moved to another staging name (#60 r6)");
-        } else {
-            expect(traced("back") == 0, "folder: take-back branch 3 (cut): the move back to its staging name failed (#60 r6)");
-            expect(traced("aside") == 0, "folder: take-back branch 3 (cut): every other staging name failed (#60 r6)");
-            expect(traced("cut") == 1, "folder: take-back branch 3 (cut): the file was cut to zero bytes (#60 r6)");
-        }
+        expect(traced("cut") == 1, "folder: take-back branch 1 (cut): the file was cut to zero bytes while its mark was held (#60 r7)");
+        expect(traced("unlink") == 1, "folder: take-back branch 1 (cut): then its final name was removed (#60 r7)");
+        expect(known && !exists, "folder: take-back branch 1 (cut): the file is gone from its final name (#60 r7)");
         expect(known && (!exists || onDisk == 0),
                "folder: take-back branch " + std::to_string(names + 1) + ": the file's bytes do not stay under its final name (#60 r6)");
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
