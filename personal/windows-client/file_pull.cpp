@@ -341,21 +341,62 @@ std::wstring finalPathOf(HANDLE h) {
     return {};
 }
 
-// The Zone.Identifier stream of the file behind `file`, opened on its
-// current path and only if it is that same file. NTFS counts delete access
+// NtCreateFile, for a stream opened relative to an open file (#60 r4).
+// Declared here rather than through winternl.h.
+struct JlUnicodeString {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+struct JlObjectAttributes {
+    ULONG Length;
+    HANDLE RootDirectory;
+    JlUnicodeString* ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+};
+struct JlIoStatus {
+    union {
+        LONG Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+};
+using NtCreateFileFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, JlObjectAttributes*, JlIoStatus*, PLARGE_INTEGER, ULONG, ULONG,
+                                    ULONG, ULONG, PVOID, ULONG);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(LONG);
+
+// The Zone.Identifier stream of the very file `file` is open on (#60 r4):
+// opened relative to the handle, not by path, so nothing created or swapped
+// in under the name meanwhile is ever reached, and with OPEN_ALWAYS no
+// empty stream is ever created on another file. NTFS counts delete access
 // for the whole file, not per stream: while `file` (the push sink's .jlpart)
 // is open with DELETE, a stream open that does not share delete fails, so
 // the stream always shares delete. Readers and writers are still kept out
-// by `share`, and the file id check below still holds.
+// by `share`, and the file id is still checked.
 HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition) {
+    static const auto ntCreate = reinterpret_cast<NtCreateFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
+    static const auto toDos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError")));
     FILE_ID_INFO want{};
-    if (!fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
-    const std::wstring path = finalPathOf(file);
-    if (path.empty()) return INVALID_HANDLE_VALUE;
+    if (!ntCreate || !fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
     if (gZoneStreamOpenHook) gZoneStreamOpenHook(file);
-    HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share | FILE_SHARE_DELETE, nullptr, disposition,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (z == INVALID_HANDLE_VALUE) return z;
+    wchar_t name[] = L":Zone.Identifier";
+    JlUnicodeString us{USHORT(sizeof(name) - sizeof(wchar_t)), USHORT(sizeof(name)), name};
+    JlObjectAttributes oa{sizeof(JlObjectAttributes), file, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, nullptr, nullptr};
+    JlIoStatus io{};
+    const ULONG how = disposition == OPEN_ALWAYS ? 3 /* FILE_OPEN_IF */ : 1 /* FILE_OPEN */;
+    const ULONG options = 0x40 /* FILE_NON_DIRECTORY_FILE */ | 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ |
+                          0x200000 /* FILE_OPEN_REPARSE_POINT */;
+    HANDLE z = nullptr;
+    const LONG st = ntCreate(&z, access | SYNCHRONIZE, &oa, &io, nullptr, FILE_ATTRIBUTE_NORMAL, share | FILE_SHARE_DELETE,
+                             how, options, nullptr, 0);
+    if (st < 0 || !z) {
+        SetLastError(toDos ? toDos(st) : ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     FILE_ID_INFO got{};
     if (!fileIdOf(z, got) || !sameFile(got, want)) {
         CloseHandle(z);

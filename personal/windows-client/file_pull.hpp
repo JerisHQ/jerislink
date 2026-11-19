@@ -539,10 +539,10 @@ HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share);
 // already going); false while it cannot be deleted yet.
 bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id);
 
-// The zone calls on an open file (#60 r3): the Zone.Identifier stream is
-// opened on the file's current path and used only when it belongs to the
-// same file (volume and file id), so a file swapped in under the name is
-// never marked or read instead. writeInternetZoneOn replaces whatever the
+// The zone calls on an open file (#60 r3, r4): the Zone.Identifier stream
+// is opened relative to the file's handle, never by path, and used only
+// when it belongs to the same file (volume and file id), so a file swapped
+// in under the name is never marked, read, or given an empty stream. writeInternetZoneOn replaces whatever the
 // stream held; Failed on volumes without streams (FAT, exFAT).
 ZoneWrite writeInternetZoneOn(HANDLE file);
 int readZoneIdOn(HANDLE file);
