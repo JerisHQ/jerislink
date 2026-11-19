@@ -430,6 +430,23 @@ void swapOnce(const std::wstring& path) {
     gSwapped = true;
 }
 
+// #60 r4 item 3: the first check under the name pinned.exe takes the
+// file's staging name (another file now holds it, so the move back fails)
+// and makes the file read-only (so a plain delete fails).
+std::wstring gStuckPart;
+bool gStuckBlocked = false;
+
+void blockTakeBack(HANDLE h) {
+    if (gStuckBlocked) return;
+    HANDLE p = CreateFileW(gStuckPart.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (p == INVALID_HANDLE_VALUE) return;
+    CloseHandle(p);
+    FILE_BASIC_INFO b{};
+    if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof(b))) return;
+    b.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+    gStuckBlocked = SetFileInformationByHandle(h, FileBasicInfo, &b, sizeof(b)) != 0;
+}
+
 int countIn(const std::wstring& folder, const wchar_t* pattern) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((folder + L"\\" + pattern).c_str(), &fd);
@@ -591,7 +608,8 @@ void realFolder() {
             r.onData({55, 0, 0, hp.contents[0]});
             auto d = fpull::sha256Digest()();
             d->update(hp.contents[0].data(), hp.contents[0].size());
-            const auto* hres = only<file::Result>(r.onFileEnd({55, 0, d->finish()}));
+            const auto hresOut = r.onFileEnd({55, 0, d->finish()});   // kept alive for the pointer (#60 r4)
+            const auto* hres = only<file::Result>(hresOut);
             expect(hres && hres->status != file::status::kOk && hres->filesOk == 0,
                    "folder: a file that fails the check after the rename is not delivered (#53)");
             releaseHeld();
@@ -614,7 +632,8 @@ void realFolder() {
             r.onData({56, 0, 0, sp.contents[0]});
             auto d = fpull::sha256Digest()();
             d->update(sp.contents[0].data(), sp.contents[0].size());
-            const auto* sres = only<file::Result>(r.onFileEnd({56, 0, d->finish()}));
+            const auto sresOut = r.onFileEnd({56, 0, d->finish()});   // kept alive for the pointer (#60 r4)
+            const auto* sres = only<file::Result>(sresOut);
             expect(sres && sres->status != file::status::kOk, "folder: an unmarkable held part fails the push (#53)");
             releaseHeld();
         }
@@ -650,7 +669,8 @@ void realFolder() {
         r.onData({57, 0, 0, sw.contents[0]});
         auto d = fpull::sha256Digest()();
         d->update(sw.contents[0].data(), sw.contents[0].size());
-        const auto* wres = only<file::Result>(r.onFileEnd({57, 0, d->finish()}));
+        const auto wresOut = r.onFileEnd({57, 0, d->finish()});   // kept alive for the pointer (#60 r4)
+        const auto* wres = only<file::Result>(wresOut);
         const std::wstring target = dir + L"\\swap.exe";
         std::printf("  swap: tried=%d swapped=%d exists=%d\n", int(gSwapTried), int(gSwapped),
                     int(GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES));
@@ -660,6 +680,45 @@ void realFolder() {
                "folder: taking a failed file back out never moves or deletes a same-name replacement (#60 r3)");
         DeleteFileW(target.c_str());
         DeleteFileW((target + L".moved").c_str());
+    }
+    // #60 r4 item 3: the check under the final name fails, and taking the
+    // file back out fails both ways: its staging name is taken meanwhile and
+    // it was made read-only. It must not stay in the folder under its final
+    // name with its bytes, unmarked.
+    {
+        gStuckPart = dir + L"\\.jlstaging\\pinned.exe.jlpart";
+        fpull::ZoneOps stuck;
+        stuck.readOn = [](HANDLE h) {
+            if (!endsWith(pathOf(h), L"\\pinned.exe")) return fpull::readZoneIdOn(h);
+            blockTakeBack(h);
+            return -1;
+        };
+        stuck.writeOn = [](HANDLE h) {
+            return endsWith(pathOf(h), L"\\pinned.exe") ? fpull::ZoneWrite::Failed : fpull::writeInternetZoneOn(h);
+        };
+        const std::wstring target = dir + L"\\pinned.exe";
+        {
+            PushReceiver r(makeFolderSink(dir, {}, stuck), fpull::sha256Digest());
+            auto pp = makePush(58, {{"pinned.exe", 3000}});
+            offerAll(r, pp);
+            r.nextRequest();
+            r.onData({58, 0, 0, pp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(pp.contents[0].data(), pp.contents[0].size());
+            const auto presOut = r.onFileEnd({58, 0, d->finish()});
+            const auto* pres = only<file::Result>(presOut);
+            expect(pres && pres->status != file::status::kOk, "folder: a file whose take-back fails is not delivered (#60 r4)");
+        }
+        const DWORD ta = GetFileAttributesW(target.c_str());
+        const std::vector<uint8_t> left = readAll(target);
+        std::printf("  take-back: blocked=%d exists=%d bytes=%zu zone=%d\n", int(gStuckBlocked), int(ta != INVALID_FILE_ATTRIBUTES),
+                    left.size(), fpull::readZoneId(target));
+        expect(gStuckBlocked, "folder: the take-back test blocked the move back and the delete");
+        expect(ta == INVALID_FILE_ATTRIBUTES || left.empty(),
+               "folder: when the move back and the delete both fail, the file's bytes do not stay under its final name (#60 r4)");
+        if (ta != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        DeleteFileW(gStuckPart.c_str());
     }
     // Disconnect mid-file removes the partial file.
     {
