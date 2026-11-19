@@ -540,6 +540,10 @@ ZoneWrite writeInternetZoneOn(HANDLE file) {
     return ok ? ZoneWrite::Written : ZoneWrite::Failed;
 }
 
+HANDLE openZoneStreamOn(HANDLE file, DWORD access, DWORD share) {
+    return openZoneStream(file, access, share, OPEN_EXISTING);
+}
+
 int readZoneIdOn(HANDLE file) {
     HANDLE z = openZoneStream(file, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     if (z == INVALID_HANDLE_VALUE) return -1;

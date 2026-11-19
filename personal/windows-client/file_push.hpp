@@ -370,7 +370,10 @@ private:
 // that handle to "<name>" with no overwrite, and on a clash to "name (2).ext",
 // "name (3).ext" ... (up to 999). Zone.Identifier ZoneId=3 is written on the
 // partial file and moves with the rename; it is checked again through the
-// handle after the move. A file that cannot carry it (a volume without
+// handle after the move. #60 r6: from the staging check until that last
+// check the Zone.Identifier stream is held open with no write sharing, so
+// the mark checked is the mark the file has under its final name; if it
+// cannot be held with ZoneId=3 the file is not published. A file that cannot carry it (a volume without
 // streams) is moved back and deleted through the handle, and the push fails
 // with reason "motw" (#53). A delete that cannot be done at once is kept by
 // file id and retried until it succeeds; a same-name file someone else put

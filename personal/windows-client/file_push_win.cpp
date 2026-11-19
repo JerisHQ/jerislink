@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -99,6 +100,17 @@ bool zeroOn(HANDLE h) {
         left -= n;
     }
     return FlushFileBuffers(h) != 0;
+}
+
+// #60 r6: the ZoneId in the Zone.Identifier stream open as `z`, read
+// through that handle from its start; -1 when it cannot be read.
+int zoneIdFrom(HANDLE z) {
+    char buf[1024] = {};
+    DWORD got = 0;
+    OVERLAPPED at{};
+    if (!ReadFile(z, buf, sizeof(buf) - 1, &got, &at)) return -1;
+    const char* id = std::strstr(buf, "ZoneId=");
+    return id ? std::atoi(id + 7) : -1;
 }
 
 // #60 r5: true once the open file `h` is gone, or holds no bytes of what was
@@ -197,6 +209,20 @@ public:
             zoneRefused_ = true;
             return dropPart();
         }
+        // #60 r6: the mark is held, not just seen. The Zone.Identifier
+        // stream is opened with no write sharing and ZoneId=3 is read
+        // through that handle; it stays open through the rename and the
+        // check under the final name, so nobody can change the mark between
+        // the check and the moment the file has its name. NTFS keeps sharing
+        // per stream: the .jlpart handle keeps writers out of the data only,
+        // this handle keeps them out of the mark. If the stream cannot be
+        // held with ZoneId=3, the file is not published.
+        HANDLE zone = lockZone();
+        if (zone == INVALID_HANDLE_VALUE) {
+            ++zone_.failed;
+            zoneRefused_ = true;
+            return dropPart();
+        }
         // Moved by handle, no overwrite: an existing name moves on to
         // "name (2).ext" ...
         const std::string utf8 = toUtf8(name_);
@@ -205,17 +231,17 @@ public:
             const std::wstring leaf = n == 1 ? name_ : toWide(file::path::clashName(utf8, n));
             if (renameTo(file_, longPath(folder_ + L"\\" + leaf))) {
                 if (gPublishHook) gPublishHook(file_, 1);
-                // The stream moved with the file; checked again on it, now
-                // under its final name. Without it the file is taken back
-                // out through the handle: back to staging first, so it never
-                // stays under the name it was meant to have, then deleted.
-                // If it cannot be moved back, dropPart() still deletes it
-                // there or, failing that, empties it (#60 r4). #60 r5: a
-                // taken staging name moves it to another staging name, and
-                // every result is checked (takeOut(), dropPart()). A same-name
-                // file someone put there meanwhile is not ours and is never
-                // touched.
-                if (ensureZone(file_)) {
+                // The stream moved with the file, still held. Checked again
+                // through the held handle and through the file's handle.
+                // Nothing can change it while held, so a failure here means
+                // the read itself failed; then the file is taken back out
+                // through the handle (back to staging, else another staging
+                // name, else cut, else zeroed, each result checked: takeOut(),
+                // dropPart()). A same-name file someone put there meanwhile
+                // is not ours and is never touched.
+                const bool held = zoneIdFrom(zone) == 3 && ops_.readOn(file_) == 3;
+                CloseHandle(zone);
+                if (held) {
                     ++zone_.marked;
                     CloseHandle(file_);
                     file_ = INVALID_HANDLE_VALUE;
@@ -224,14 +250,13 @@ public:
                 }
                 ++zone_.failed;
                 zoneRefused_ = true;
-                // Stuck under its final name: it leaves that name, or its
-                // bytes go, before anything else.
                 takeOut();
                 return dropPart();
             }
             const DWORD e = GetLastError();
             if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS && e != ERROR_ACCESS_DENIED) break;
         }
+        CloseHandle(zone);
         return dropPart();
     }
 
@@ -264,6 +289,27 @@ private:
             Sleep(50);
         }
         return false;
+    }
+
+    // #60 r6: the staged file's Zone.Identifier stream, open for reading with
+    // readers shared and writers kept out, once ZoneId=3 has been read
+    // through it. (Delete sharing is always added, as NTFS needs it next to
+    // the .jlpart's DELETE handle; it grants nobody anything: the .jlpart
+    // handle shares no delete, so no one else can open any stream of the
+    // file with DELETE.) A writer that changed the mark first is undone by
+    // ensureZone() and tried again for about half a second.
+    // INVALID_HANDLE_VALUE: the mark cannot be held valid.
+    HANDLE lockZone() {
+        for (int i = 0; i < 10; ++i) {
+            if (i > 0 && !ensureZone(file_)) break;
+            HANDLE z = filepull::openZoneStreamOn(file_, GENERIC_READ, FILE_SHARE_READ);
+            if (z != INVALID_HANDLE_VALUE) {
+                if (zoneIdFrom(z) == 3) return z;
+                CloseHandle(z);
+            }
+            Sleep(50);
+        }
+        return INVALID_HANDLE_VALUE;
     }
 
     // #60 r5: moves the open file out of the folder, back to its staging
