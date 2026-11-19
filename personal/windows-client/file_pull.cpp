@@ -283,7 +283,10 @@ ZoneWrite writeInternetZone(const std::wstring& path) {
 
 int readZoneId(const std::wstring& path) {
     const std::wstring stream = path + L":Zone.Identifier";
-    HANDLE h = CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    // Shares delete: a file someone holds open with DELETE access (a .jlpart
+    // being received) can still be read.
+    HANDLE h = CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
     if (h == INVALID_HANDLE_VALUE) return -1;
     char buf[1024] = {};
     DWORD got = 0;
@@ -337,13 +340,17 @@ std::wstring finalPathOf(HANDLE h) {
 }
 
 // The Zone.Identifier stream of the file behind `file`, opened on its
-// current path and only if it is that same file.
+// current path and only if it is that same file. NTFS counts delete access
+// for the whole file, not per stream: while `file` (the push sink's .jlpart)
+// is open with DELETE, a stream open that does not share delete fails, so
+// the stream always shares delete. Readers and writers are still kept out
+// by `share`, and the file id check below still holds.
 HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition) {
     FILE_ID_INFO want{};
     if (!fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
     const std::wstring path = finalPathOf(file);
     if (path.empty()) return INVALID_HANDLE_VALUE;
-    HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share, nullptr, disposition,
+    HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share | FILE_SHARE_DELETE, nullptr, disposition,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (z == INVALID_HANDLE_VALUE) return z;
     FILE_ID_INFO got{};
