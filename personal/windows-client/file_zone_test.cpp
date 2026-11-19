@@ -891,7 +891,7 @@ void gateCases() {
         // search, while another program writes a same-name file in a folder
         // it does search. That file is not linked to this paste: it is never
         // marked or removed, and the paste is refused.
-        const std::wstring far = tempDir(L"gate-far");
+        const std::wstring farDir = tempDir(L"gate-far");
         const std::wstring nearby = tempDir(L"gate-near");
         const std::wstring other = nearby + L"\\same.bin";
         const std::vector<uint8_t> otherBytes = body(n, 83);
@@ -899,7 +899,7 @@ void gateCases() {
         GateCase gc;
         gc.transfer = 32;
         gc.folders = {nearby};
-        gc.dest = far + L"\\same.bin";
+        gc.dest = farDir + L"\\same.bin";
         gc.bytes = body(n, 89);
         gc.childCopy = true;
         gc.beforeCopy = [&] {
