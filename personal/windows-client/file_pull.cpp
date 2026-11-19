@@ -225,7 +225,25 @@ private:
     }
 
     // No gate (no clipboard thread behind us) means no mark: fail closed.
-    bool runGate() { return gate_ && gate_(req_, locked_); }
+    bool runGate() {
+        req_.reader = callerProcess();
+        return gate_ && gate_(req_, locked_);
+    }
+
+    // The process making this Read call (#60 r4): the owner of the calling
+    // thread inside a COM call (S_OK: this process, S_FALSE: another one),
+    // or this process for a direct call that is not a COM call at all.
+    static uint32_t callerProcess() {
+        DWORD tid = 0;
+        const HRESULT hr = CoGetCallerTID(&tid);
+        if (FAILED(hr)) return uint32_t(GetCurrentProcessId());
+        if (tid == 0) return kUnknownReader;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) return kUnknownReader;
+        const DWORD pid = GetProcessIdOfThread(t);
+        CloseHandle(t);
+        return pid ? uint32_t(pid) : kUnknownReader;
+    }
 
     PullHub& hub_;
     uint64_t token_;
@@ -341,21 +359,62 @@ std::wstring finalPathOf(HANDLE h) {
     return {};
 }
 
-// The Zone.Identifier stream of the file behind `file`, opened on its
-// current path and only if it is that same file. NTFS counts delete access
+// NtCreateFile, for a stream opened relative to an open file (#60 r4).
+// Declared here rather than through winternl.h.
+struct JlUnicodeString {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+struct JlObjectAttributes {
+    ULONG Length;
+    HANDLE RootDirectory;
+    JlUnicodeString* ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+};
+struct JlIoStatus {
+    union {
+        LONG Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+};
+using NtCreateFileFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, JlObjectAttributes*, JlIoStatus*, PLARGE_INTEGER, ULONG, ULONG,
+                                    ULONG, ULONG, PVOID, ULONG);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(LONG);
+
+// The Zone.Identifier stream of the very file `file` is open on (#60 r4):
+// opened relative to the handle, not by path, so nothing created or swapped
+// in under the name meanwhile is ever reached, and with OPEN_ALWAYS no
+// empty stream is ever created on another file. NTFS counts delete access
 // for the whole file, not per stream: while `file` (the push sink's .jlpart)
 // is open with DELETE, a stream open that does not share delete fails, so
 // the stream always shares delete. Readers and writers are still kept out
-// by `share`, and the file id check below still holds.
+// by `share`, and the file id is still checked.
 HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition) {
+    static const auto ntCreate = reinterpret_cast<NtCreateFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
+    static const auto toDos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError")));
     FILE_ID_INFO want{};
-    if (!fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
-    const std::wstring path = finalPathOf(file);
-    if (path.empty()) return INVALID_HANDLE_VALUE;
+    if (!ntCreate || !fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
     if (gZoneStreamOpenHook) gZoneStreamOpenHook(file);
-    HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share | FILE_SHARE_DELETE, nullptr, disposition,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (z == INVALID_HANDLE_VALUE) return z;
+    wchar_t name[] = L":Zone.Identifier";
+    JlUnicodeString us{USHORT(sizeof(name) - sizeof(wchar_t)), USHORT(sizeof(name)), name};
+    JlObjectAttributes oa{sizeof(JlObjectAttributes), file, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, nullptr, nullptr};
+    JlIoStatus io{};
+    const ULONG how = disposition == OPEN_ALWAYS ? 3 /* FILE_OPEN_IF */ : 1 /* FILE_OPEN */;
+    const ULONG options = 0x40 /* FILE_NON_DIRECTORY_FILE */ | 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ |
+                          0x200000 /* FILE_OPEN_REPARSE_POINT */;
+    HANDLE z = nullptr;
+    const LONG st = ntCreate(&z, access | SYNCHRONIZE, &oa, &io, nullptr, FILE_ATTRIBUTE_NORMAL, share | FILE_SHARE_DELETE,
+                             how, options, nullptr, 0);
+    if (st < 0 || !z) {
+        SetLastError(toDos ? toDos(st) : ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     FILE_ID_INFO got{};
     if (!fileIdOf(z, got) || !sameFile(got, want)) {
         CloseHandle(z);
@@ -383,6 +442,33 @@ bool beingWritten(HANDLE hint, const FILE_ID_INFO& id) {
         return false;
     }
     return GetLastError() == ERROR_SHARING_VIOLATION;
+}
+
+// Whether process `pid` has the file behind `h` open (#60 r4): the
+// processes holding it, from FileProcessIdsUsingFileInformation (47).
+// False when that cannot be read.
+bool openedBy(HANDLE h, uint32_t pid) {
+    using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, JlIoStatus*, PVOID, ULONG, ULONG);
+    static const auto ntQuery = reinterpret_cast<NtQueryInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    if (!ntQuery || pid == 0 || pid == kUnknownReader) return false;
+    // A ULONG count, then the ids as ULONG_PTRs from the next ULONG_PTR.
+    std::vector<ULONG_PTR> buf(64);
+    for (int i = 0; i < 6; ++i) {
+        JlIoStatus io{};
+        const LONG st = ntQuery(h, &io, buf.data(), ULONG(buf.size() * sizeof(ULONG_PTR)), 47);
+        if (st == LONG(0xC0000004) || st == LONG(0x80000005)) {   // STATUS_INFO_LENGTH_MISMATCH, BUFFER_OVERFLOW
+            buf.assign(buf.size() * 4, 0);
+            continue;
+        }
+        if (st < 0) return false;
+        const ULONG n = *reinterpret_cast<const ULONG*>(buf.data());
+        for (size_t k = 0; k < n && k + 1 < buf.size(); ++k) {
+            if (buf[k + 1] == ULONG_PTR(pid)) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 // SHA-256 of the whole file behind `h`, or empty if it does not read as
@@ -479,6 +565,7 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
     const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
     const uint64_t minSize = r.size > 0 ? r.size - 1 : 0;
     const ULARGE_INTEGER since{r.since.dwLowDateTime, r.since.dwHighDateTime};
+    const uint32_t reader = r.reader ? r.reader : uint32_t(GetCurrentProcessId());
     // Every file that could be this paste's copy, held open by identity. The
     // same file reached through two folder spellings (8.3 and long) counts once.
     struct Candidate {
@@ -527,6 +614,11 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
             // byte; a file nobody writes is not this paste's copy, whatever
             // its name, size or bytes.
             else if (!beingWritten(h, id)) { ++pr.idle; skip = true; }
+            // #60 r4: Explorer writes its copy itself, so the process reading
+            // this stream has the copy open. A same-name file someone else is
+            // writing is not linked to this paste: never marked, held or
+            // removed.
+            else if (!openedBy(h, reader)) { ++pr.unlinked; skip = true; }
             if (skip) {
                 CloseHandle(h);
                 continue;
@@ -794,9 +886,14 @@ struct FileClipboard::Impl {
     static constexpr int kGateWaitMs = 5000;
     // How long a settle waits for the shell to let go of a copy (#60 r3).
     static constexpr int kSettleWaitMs = 10000;
-    // Settle checks still running (guarded by mu); stop() waits for them.
-    int settling = 0;
-    std::condition_variable settled;
+    // #60 r4: every settle thread, joined by stop() (guarded by mu). Once
+    // stopped, a settle runs on the calling thread instead.
+    struct Worker {
+        std::thread t;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<Worker> workers;
+    bool stopped = false;
 
     ZoneOps zone;
 
@@ -1070,7 +1167,7 @@ struct FileClipboard::Impl {
                 " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
                 " small=" + std::to_string(probe.tooSmall) + " larger=" + std::to_string(probe.larger) +
                 " older=" + std::to_string(probe.older) + " open_failed=" + std::to_string(probe.openFailed) +
-                " idle=" + std::to_string(probe.idle) +
+                " idle=" + std::to_string(probe.idle) + " unlinked=" + std::to_string(probe.unlinked) +
                 " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
                 " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
             break;
@@ -1086,25 +1183,41 @@ struct FileClipboard::Impl {
     // kept or removed through its identity. Logs no names.
     void settle(LockedCopy&& copy, SettleRequest s) {
         if (!copy) return;
+        std::vector<Worker> finished;
         {
             std::lock_guard<std::mutex> lock(mu);
-            ++settling;
-        }
-        std::thread([this, c = std::move(copy), s = std::move(s)]() mutable {
-            ZoneMarkStats st;
-            const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
-            const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
-            log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
-                " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                totals.kept += st.kept;
-                totals.removed += st.removed;
-                totals.left += st.left;
-                --settling;
+            if (!stopped) {
+                // Threads already done are joined here, outside the lock.
+                for (auto it = workers.begin(); it != workers.end();) {
+                    if (it->done->load()) {
+                        finished.push_back(std::move(*it));
+                        it = workers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                workers.push_back({std::thread([this, done, c = std::move(copy), s = std::move(s)]() mutable {
+                                       settleOne(c, s);
+                                       *done = true;
+                                   }),
+                                   done});
             }
-            settled.notify_all();
-        }).detach();
+        }
+        for (auto& w : finished) w.t.join();
+        if (copy) settleOne(copy, s);   // stop() already ran: checked here
+    }
+
+    void settleOne(LockedCopy& c, const SettleRequest& s) {
+        ZoneMarkStats st;
+        const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
+        const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
+        log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
+            " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
+        std::lock_guard<std::mutex> lock(mu);
+        totals.kept += st.kept;
+        totals.removed += st.removed;
+        totals.left += st.left;
     }
 };
 
@@ -1126,10 +1239,19 @@ void FileClipboard::stop() {
     if (impl_->hwnd) PostMessageW(impl_->hwnd, kMsgQuit, 0, 0);
     impl_->thread.join();
     impl_->hwnd = nullptr;
-    // Every settle check finishes (each is bounded by kSettleWaitMs and one
-    // read of the copy) before the totals are final.
-    std::unique_lock<std::mutex> lock(impl_->mu);
-    impl_->settled.wait(lock, [&] { return impl_->settling == 0; });
+    // Every settle thread has exited, not just finished its check (each is
+    // bounded by kSettleWaitMs and one read of the copy), before stop()
+    // returns: nothing runs on into a destroyed clipboard (#60 r4).
+    for (;;) {
+        std::vector<Impl::Worker> ws;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mu);
+            impl_->stopped = true;
+            ws.swap(impl_->workers);
+        }
+        if (ws.empty()) break;
+        for (auto& w : ws) w.t.join();
+    }
 }
 
 void FileClipboard::offer(const Manifest& m) {
