@@ -58,6 +58,22 @@ bool deleteOn(HANDLE h) {
     return SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
 }
 
+// #60 r4: deletes the open file `h` now, also when it is read-only and
+// while others hold it open (POSIX semantics: the name goes at once).
+// FileDispositionInfoEx (21) and its flags, declared here for older SDKs.
+bool deleteNowOn(HANDLE h) {
+    struct {
+        ULONG Flags;
+    } del{0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */ | 0x10 /* IGNORE_READONLY_ATTRIBUTE */};
+    return SetFileInformationByHandle(h, FILE_INFO_BY_HANDLE_CLASS(21), &del, sizeof(del)) != 0;
+}
+
+// #60 r4: cuts the open file `h` to zero bytes.
+bool emptyOn(HANDLE h) {
+    FILE_END_OF_FILE_INFO end{};
+    return SetFileInformationByHandle(h, FileEndOfFileInfo, &end, sizeof(end)) != 0;
+}
+
 class FolderSink : public Sink {
 public:
     FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
@@ -156,8 +172,10 @@ public:
                 // under its final name. Without it the file is taken back
                 // out through the handle: back to staging first, so it never
                 // stays under the name it was meant to have, then deleted.
-                // A same-name file someone put there meanwhile is not ours
-                // and is never touched.
+                // If it cannot be moved back, dropPart() still deletes it
+                // there or, failing that, empties it (#60 r4). A same-name
+                // file someone put there meanwhile is not ours and is never
+                // touched.
                 if (ensureZone(file_)) {
                     ++zone_.marked;
                     CloseHandle(file_);
@@ -167,7 +185,8 @@ public:
                 }
                 ++zone_.failed;
                 zoneRefused_ = true;
-                renameTo(file_, longPath(part_));
+                // Stuck under its final name: its bytes go first.
+                if (!renameTo(file_, longPath(part_))) emptyOn(file_);
                 return dropPart();
             }
             const DWORD e = GetLastError();
@@ -207,14 +226,17 @@ private:
         return false;
     }
 
-    // Deletes the partial file through its handle. If that cannot be done
-    // now, its identity is kept for retryCleanup() (#53 r2, #60 r3: never
-    // just forgotten, never retried by name).
+    // Deletes the partial file through its handle, its name gone at once
+    // where the volume allows (#60 r4). If that cannot be done now, its
+    // bytes are cut to zero through the handle (#60 r4) and its identity is
+    // kept for retryCleanup() (#53 r2, #60 r3: never just forgotten, never
+    // retried by name).
     bool dropPart() {
         if (file_ != INVALID_HANDLE_VALUE) {
             FILE_ID_INFO id{};
             const bool known = filepull::fileIdOf(file_, id);
-            const bool gone = deleteOn(file_);
+            const bool gone = deleteNowOn(file_) || deleteOn(file_);
+            if (!gone) emptyOn(file_);
             CloseHandle(file_);
             file_ = INVALID_HANDLE_VALUE;
             if (!gone && known) cleanup_.push_back(id);
