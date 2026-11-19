@@ -439,12 +439,25 @@ bool gStuckBlocked = false;
 // map it: while it is mapped the file can be neither deleted nor cut.
 HANDLE gStuckMap = nullptr;
 void* gStuckView = nullptr;
+// #60 r5: also take every other staging name the sink may move the file to
+// (".2" to ".99"), so the file cannot leave its final name at all.
+bool gStuckAllNames = false;
+
+bool takeName(const std::wstring& path) {
+    HANDLE p = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (p == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(p);
+    return true;
+}
 
 void blockTakeBack(HANDLE h) {
     if (gStuckBlocked) return;
-    HANDLE p = CreateFileW(gStuckPart.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
-    if (p == INVALID_HANDLE_VALUE) return;
-    CloseHandle(p);
+    if (!takeName(gStuckPart)) return;
+    if (gStuckAllNames) {
+        for (int n = 2; n < 100; ++n) {
+            if (!takeName(gStuckPart + L"." + std::to_wstring(n))) return;
+        }
+    }
     FILE_BASIC_INFO b{};
     if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof(b))) return;
     b.FileAttributes |= FILE_ATTRIBUTE_READONLY;
@@ -471,6 +484,28 @@ bool diskSize(const std::wstring& path, bool& exists, uint64_t& size) {
     CloseHandle(h);
     size = uint64_t(s.QuadPart);
     return ok;
+}
+
+// #60 r5: true when `path` is gone, or holds `size` bytes that are all zero
+// (read with sharing, as the file may still be mapped elsewhere). A file that
+// exists but cannot be read in full is a failure.
+bool goneOrZeroed(const std::wstring& path, uint64_t size) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    uint64_t seen = 0;
+    bool zero = true;
+    uint8_t buf[65536];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        for (DWORD i = 0; i < got; ++i) zero = zero && buf[i] == 0;
+        seen += got;
+    }
+    CloseHandle(h);
+    return zero && seen == size;
 }
 
 int countIn(const std::wstring& folder, const wchar_t* pattern) {
@@ -754,6 +789,63 @@ void realFolder() {
         const std::wstring staging = dir + L"\\.jlstaging\\";
         WIN32_FIND_DATAW fd{};
         HANDLE f = FindFirstFileW((staging + L"pinned.exe.jlpart*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                SetFileAttributesW((staging + fd.cFileName).c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW((staging + fd.cFileName).c_str());
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+    }
+    // #60 r5: as above, but every staging name is taken too, so the file
+    // cannot leave its final name; it is mapped, so it cannot be deleted or
+    // cut either. Its bytes must still go: zeroed through the handle.
+    {
+        gStuckPart = dir + L"\\.jlstaging\\pinned2.exe.jlpart";
+        gStuckBlocked = false;
+        gStuckAllNames = true;
+        fpull::ZoneOps stuck;
+        stuck.readOn = [](HANDLE h) {
+            if (!endsWith(pathOf(h), L"\\pinned2.exe")) return fpull::readZoneIdOn(h);
+            blockTakeBack(h);
+            return -1;
+        };
+        stuck.writeOn = [](HANDLE h) {
+            return endsWith(pathOf(h), L"\\pinned2.exe") ? fpull::ZoneWrite::Failed : fpull::writeInternetZoneOn(h);
+        };
+        const std::wstring target = dir + L"\\pinned2.exe";
+        {
+            PushReceiver r(makeFolderSink(dir, {}, stuck), fpull::sha256Digest());
+            auto pp = makePush(59, {{"pinned2.exe", 3000}});
+            offerAll(r, pp);
+            r.nextRequest();
+            r.onData({59, 0, 0, pp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(pp.contents[0].data(), pp.contents[0].size());
+            const auto presOut = r.onFileEnd({59, 0, d->finish()});
+            const auto* pres = only<file::Result>(presOut);
+            expect(pres && pres->status != file::status::kOk,
+                   "folder: a file that cannot leave its final name is not delivered (#60 r5)");
+        }
+        bool exists = false;
+        uint64_t onDisk = 0;
+        const bool known = diskSize(target, exists, onDisk);
+        const bool blank = known && goneOrZeroed(target, onDisk);
+        std::printf("  stuck in place: blocked=%d known=%d exists=%d size=%llu blank=%d\n", int(gStuckBlocked),
+                    int(known), int(exists), (unsigned long long)onDisk, int(blank));
+        expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file");
+        expect(blank,
+               "folder: a file that can neither leave its final name, be deleted nor be cut has its bytes zeroed (#60 r5)");
+        if (gStuckView) UnmapViewOfFile(gStuckView);
+        if (gStuckMap) CloseHandle(gStuckMap);
+        gStuckView = nullptr;
+        gStuckMap = nullptr;
+        gStuckAllNames = false;
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        const std::wstring staging = dir + L"\\.jlstaging\\";
+        WIN32_FIND_DATAW fd{};
+        HANDLE f = FindFirstFileW((staging + L"pinned2.exe.jlpart*").c_str(), &fd);
         if (f != INVALID_HANDLE_VALUE) {
             do {
                 SetFileAttributesW((staging + fd.cFileName).c_str(), FILE_ATTRIBUTE_NORMAL);
