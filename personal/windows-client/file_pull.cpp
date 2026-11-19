@@ -883,9 +883,14 @@ struct FileClipboard::Impl {
     static constexpr int kGateWaitMs = 5000;
     // How long a settle waits for the shell to let go of a copy (#60 r3).
     static constexpr int kSettleWaitMs = 10000;
-    // Settle checks still running (guarded by mu); stop() waits for them.
-    int settling = 0;
-    std::condition_variable settled;
+    // #60 r4: every settle thread, joined by stop() (guarded by mu). Once
+    // stopped, a settle runs on the calling thread instead.
+    struct Worker {
+        std::thread t;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<Worker> workers;
+    bool stopped = false;
 
     ZoneOps zone;
 
@@ -1175,25 +1180,41 @@ struct FileClipboard::Impl {
     // kept or removed through its identity. Logs no names.
     void settle(LockedCopy&& copy, SettleRequest s) {
         if (!copy) return;
+        std::vector<Worker> finished;
         {
             std::lock_guard<std::mutex> lock(mu);
-            ++settling;
-        }
-        std::thread([this, c = std::move(copy), s = std::move(s)]() mutable {
-            ZoneMarkStats st;
-            const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
-            const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
-            log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
-                " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                totals.kept += st.kept;
-                totals.removed += st.removed;
-                totals.left += st.left;
-                --settling;
+            if (!stopped) {
+                // Threads already done are joined here, outside the lock.
+                for (auto it = workers.begin(); it != workers.end();) {
+                    if (it->done->load()) {
+                        finished.push_back(std::move(*it));
+                        it = workers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                workers.push_back({std::thread([this, done, c = std::move(copy), s = std::move(s)]() mutable {
+                                       settleOne(c, s);
+                                       *done = true;
+                                   }),
+                                   done});
             }
-            settled.notify_all();
-        }).detach();
+        }
+        for (auto& w : finished) w.t.join();
+        if (copy) settleOne(copy, s);   // stop() already ran: checked here
+    }
+
+    void settleOne(LockedCopy& c, const SettleRequest& s) {
+        ZoneMarkStats st;
+        const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
+        const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
+        log("file.motw transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) +
+            " settled=" + what + " complete=" + (s.complete ? "1" : "0"));
+        std::lock_guard<std::mutex> lock(mu);
+        totals.kept += st.kept;
+        totals.removed += st.removed;
+        totals.left += st.left;
     }
 };
 
@@ -1215,10 +1236,19 @@ void FileClipboard::stop() {
     if (impl_->hwnd) PostMessageW(impl_->hwnd, kMsgQuit, 0, 0);
     impl_->thread.join();
     impl_->hwnd = nullptr;
-    // Every settle check finishes (each is bounded by kSettleWaitMs and one
-    // read of the copy) before the totals are final.
-    std::unique_lock<std::mutex> lock(impl_->mu);
-    impl_->settled.wait(lock, [&] { return impl_->settling == 0; });
+    // Every settle thread has exited, not just finished its check (each is
+    // bounded by kSettleWaitMs and one read of the copy), before stop()
+    // returns: nothing runs on into a destroyed clipboard (#60 r4).
+    for (;;) {
+        std::vector<Impl::Worker> ws;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mu);
+            impl_->stopped = true;
+            ws.swap(impl_->workers);
+        }
+        if (ws.empty()) break;
+        for (auto& w : ws) w.t.join();
+    }
 }
 
 void FileClipboard::offer(const Manifest& m) {
