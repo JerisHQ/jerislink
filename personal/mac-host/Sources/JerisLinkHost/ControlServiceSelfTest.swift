@@ -1315,7 +1315,7 @@ enum ControlServiceSelfTest {
         return SendWire.submit(zip(leafs, fds).map { (name: Array($0.0.utf8), fd: $0.1) }, path: path, timeout: 15)
     }
 
-    private static func freeLoopbackPort() -> UInt16? {
+    static func freeLoopbackPort() -> UInt16? {
         let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return nil }
         defer { Darwin.close(s) }
@@ -1332,7 +1332,7 @@ enum ControlServiceSelfTest {
         return UInt16(bigEndian: addr.sin_port)
     }
 
-    fileprivate static func loopbackAddress(port: UInt16) -> sockaddr_in {
+    static func loopbackAddress(port: UInt16) -> sockaddr_in {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -1343,7 +1343,7 @@ enum ControlServiceSelfTest {
 }
 
 /// A viewer-side MRC1 connection for the self-test.
-private final class MRC1Client {
+final class MRC1Client {
     private var fd: Int32
 
     init?(port: UInt16) {
@@ -1398,7 +1398,7 @@ private final class MRC1Client {
 }
 
 /// Pasteboard stand-in: counts change-count and content reads.
-private final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
+final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
     struct Counts { var changeCountReads = 0; var textReads = 0 }
     private let lock = NSLock()
     private var count = 1

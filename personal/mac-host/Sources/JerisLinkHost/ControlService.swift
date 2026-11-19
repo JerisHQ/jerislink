@@ -36,13 +36,16 @@ enum ControlService {
     /// `helper`. Only the direct listener answers FILE_HELLO (0x50). On
     /// failure, servers already started are stopped.
     static func startServers(bindIP: String, clientIP: String, port: UInt16, relayPort: UInt16,
-                             inject: Bool, helper: InputHelperClient) throws -> [ControlServer] {
+                             inject: Bool, helper: InputHelperClient,
+                             gate: AuthGate? = nil) throws -> [ControlServer] {
         var servers: [ControlServer] = []
         do {
-            let direct = ControlServer(bindIP: bindIP, allowedClientIP: clientIP,
+            // With a gate the whitelist, blacklist and password live in the
+            // gate; without one (legacy callers) the 0.3 single-IP check.
+            let direct = ControlServer(bindIP: bindIP, allowedClientIP: gate == nil ? clientIP : nil,
                                        port: port, inject: inject,
                                        settingsClientIP: { clientIP }, acceptProxy: false,
-                                       inputHelper: helper, allowFileSessions: true)
+                                       inputHelper: helper, allowFileSessions: true, authGate: gate)
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
@@ -74,12 +77,19 @@ enum ControlService {
         // print() output (connects, warnings) reaches the log promptly.
         setvbuf(stdout, nil, _IOLBF, 0)
         LogFiles.startCapping()
+        if let migrated = ListenMigration.migrate(url: ListenConfig.plistURL) { log(migrated) }
         let endpoint = await ListenConfig.waitForEndpoint(log: log)
         log("starting control \(endpoint.summary) port=\(o.controlPort) relay=\(o.relayPort == 0 ? "off" : "127.0.0.1:\(o.relayPort)")")
+        let gate = authGate(clientIP: endpoint.clientIP)
+        if gate == nil {
+            // Refused: no listener at all until listen.plist changes.
+            ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
+            while true { try? await Task.sleep(for: .seconds(3600)) }
+        }
         do {
             running = try startServers(bindIP: endpoint.bindIP, clientIP: endpoint.clientIP,
                                        port: o.controlPort, relayPort: o.relayPort,
-                                       inject: o.controlInject, helper: InputHelperClient())
+                                       inject: o.controlInject, helper: InputHelperClient(), gate: gate)
         } catch {
             // Usually the address went away between the check and bind();
             // launchd restarts us after ThrottleInterval and we wait again.
@@ -106,5 +116,25 @@ enum ControlService {
         while true {
             try? await Task.sleep(for: .seconds(3600))
         }
+    }
+}
+
+extension ControlService {
+    /// v0.4.0 connection password. The Keychain is read only when
+    /// listen.plist says a password was set, so a host without one never
+    /// touches it. Returns nil when the configuration must refuse every
+    /// connection (logged as config.refused).
+    static func authGate(clientIP: String) -> AuthGate? {
+        let plist = ListenConfig.readPlist()
+        let wantsPassword = (plist?["passwordSet"] as? Bool) == true
+        let secret = wantsPassword ? KeychainSecretStore().load() : nil
+        let policy = AuthPolicy.resolve(plist: plist, clientIP: clientIP, secretLoaded: secret != nil)
+        if case .refused(let reason) = policy {
+            log("config.refused reason=\(reason)")
+            return nil
+        }
+        log("auth.policy \(policy.summary)")
+        return AuthGate.make(policy: policy, secret: secret,
+                             blocklist: ListenPlistBlocklist(url: ListenConfig.plistURL))
     }
 }

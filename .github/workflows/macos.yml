@@ -21,7 +21,10 @@ jobs:
       - name: Verify bundle layout, signature and both executables
         working-directory: personal/mac-host
         run: ./Deploy/verify-bundle.sh "$RUNNER_TEMP/build/JerisLink.app"
-      - name: Host self-test (control peer, settings policy)
+      - name: Host self-test (control peer, settings policy, connection password)
+        env:
+          JERISLINK_AUTH_VECTORS: personal/protocol/auth_vectors.json
+          JERISLINK_SELFTEST_KEYCHAIN: '1'
         run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/MacOS/JerisLinkHost" --self-test'
       - name: Input helper self-test (status throttle, display bounds cache)
         run: '"$RUNNER_TEMP/build/JerisLink.app/Contents/Helpers/JerisLink Input Helper.app/Contents/MacOS/JerisLinkInputHelper" --self-test'
