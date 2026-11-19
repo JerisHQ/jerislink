@@ -1127,8 +1127,10 @@ void realFolder() {
     {
         gStuckPart = dir + L"\\.jlstaging\\pinned2.exe.jlpart";
         gStuckBlocked = false;
-        gStuckAllNames = true;
-        gStuckImage = true;
+        // #60 r8: a plain data view: the final name can still be removed
+        // (POSIX delete), but the file cannot be cut while it is mapped.
+        gStuckAllNames = false;
+        gStuckImage = false;
         gStuckMapError = 0;
         gTrace.clear();
         gTakeOutTrace = collectTrace;
@@ -1181,13 +1183,18 @@ void realFolder() {
                     int(gStuckBlocked), (unsigned long)gStuckMapError, int(known), int(exists),
                     (unsigned long long)onDisk, int(blank));
         gTakeOutTrace = nullptr;
-        expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file as an image");
-        // #60 r6/r7: the zero-fill branch is proven taken: the sink's own
-        // results show the cut failed before it zeroed the file.
-        expect(traced("cut") == 0, "folder: take-back branch 2 (zero): the cut failed (image section) (#60 r7)");
+        std::printf("  zero branch: first=%s unlink=%d alone=%d cut=%d zero=%d\n", firstStep().c_str(), traced("unlink"),
+                    traced("alone"), traced("cut"), traced("zero"));
+        expect(gStuckBlocked, "folder: the zero-branch test mapped a view of the file (#60 r8)");
+        // #60 r6/r7/r8: the zero-fill branch is proven taken: the sink's own
+        // results show the final name went first, the staging name was then
+        // the only name, and the cut failed before it zeroed the file.
+        expect(firstStep() == "unlink" && traced("unlink") == 1,
+               "folder: take-back branch 2 (zero): the final name was removed first, before any byte was touched (#60 r8)");
+        expect(traced("alone") == 1, "folder: take-back branch 2 (zero): then the staging name was the file's only name (#60 r8)");
+        expect(traced("cut") == 0, "folder: take-back branch 2 (zero): the cut failed (mapped view) (#60 r8)");
         expect(traced("zero") == 1, "folder: take-back branch 2 (zero): the bytes were overwritten with zeros (#60 r7)");
-        expect(blank,
-               "folder: a file that can neither leave its final name, be deleted nor be cut has its bytes zeroed (#60 r5)");
+        expect(known && !exists && blank, "folder: take-back branch 2 (zero): the file is gone from its final name (#60 r8)");
         if (gStuckView) UnmapViewOfFile(gStuckView);
         if (gStuckMap) CloseHandle(gStuckMap);
         gStuckView = nullptr;
@@ -1274,13 +1281,15 @@ void realFolder() {
         bool exists = false;
         uint64_t onDisk = 0;
         const bool known = diskSize(target, exists, onDisk);
-        std::printf("  branch %d: taken=%d cut=%d zero=%d unlink=%d exists=%d size=%llu\n", names + 1,
-                    int(gBranchTaken), traced("cut"), traced("zero"), traced("unlink"), int(exists),
+        std::printf("  branch %d: taken=%d first=%s unlink=%d alone=%d cut=%d zero=%d exists=%d size=%llu\n", names + 1,
+                    int(gBranchTaken), firstStep().c_str(), traced("unlink"), traced("alone"), traced("cut"), traced("zero"), int(exists),
                     (unsigned long long)onDisk);
         expect(gBranchTaken && res && res->status != file::status::kOk,
                "folder: take-back branch " + std::to_string(names + 1) + ": the check under the final name failed and the file is not delivered (#60 r6)");
+        expect(firstStep() == "unlink" && traced("unlink") == 1,
+               "folder: take-back branch 1 (cut): the final name was removed first, before any byte was touched (#60 r8)");
+        expect(traced("alone") == 1, "folder: take-back branch 1 (cut): then the staging name was the file's only name (#60 r8)");
         expect(traced("cut") == 1, "folder: take-back branch 1 (cut): the file was cut to zero bytes while its mark was held (#60 r7)");
-        expect(traced("unlink") == 1, "folder: take-back branch 1 (cut): then its final name was removed (#60 r7)");
         expect(known && !exists, "folder: take-back branch 1 (cut): the file is gone from its final name (#60 r7)");
         expect(known && (!exists || onDisk == 0),
                "folder: take-back branch " + std::to_string(names + 1) + ": the file's bytes do not stay under its final name (#60 r6)");
@@ -1471,6 +1480,9 @@ void realFolder() {
         int zone = -2;
         int openable = -1;
         bool delivered = true;
+        bool existsIn = false;
+        uint64_t sizeIn = 0, full = 0;
+        int cutIn = -2, zeroIn = -2, unlinkIn = -2;
         {
             PushReceiver r(makeFolderSink(dir, {}, iso), fpull::sha256Digest());
             wchar_t self[MAX_PATH] = {};
@@ -1500,8 +1512,13 @@ void realFolder() {
             const auto* ires = only<file::Result>(iout);
             delivered = ires && ires->status == file::status::kOk;
             // Still inside the sink's life: the leftover is checked now.
+            full = image.size();
+            diskSize(target, existsIn, sizeIn);
             zone = fpull::readZoneId(target);
             openable = zoneOpenable(target);
+            cutIn = traced("cut");
+            zeroIn = traced("zero");
+            unlinkIn = traced("unlink");
         }
         gPublishHook = nullptr;
         gUnlinkStage = -1;
@@ -1517,12 +1534,18 @@ void realFolder() {
         expect(gStuckBlocked && gIsoLocked,
                "folder: the isolation test took every staging name, mapped the file as an image and locked it (#60 r7)");
         expect(!delivered, "folder: a file that fails its last check and cannot be taken back is not delivered (#60 r7)");
-        expect(traced("cut") == 0 && traced("zero") == 0,
-               "folder: isolation: the cut and the zero-fill both failed, so the file stayed under its final name (#60 r7)");
-        expect(zone == 3,
+        // #60 r8: whether an image section keeps the final name from being
+        // removed decides which way this goes; both ways are checked.
+        std::printf("  isolated (in sink): unlink=%d cut=%d zero=%d exists=%d size=%llu of %llu\n", unlinkIn, cutIn, zeroIn,
+                    int(existsIn), (unsigned long long)sizeIn, (unsigned long long)full);
+        expect(!existsIn || (cutIn == -1 && zeroIn == -1 && sizeIn == full),
+               "folder: isolation: a file that still has its final name is never cut or zeroed; it stays whole (#60 r8)");
+        expect(!existsIn || zone == 3,
                "folder: a file left under its final name because it cannot be taken back still carries ZoneId=3 while the sink lives (#60 r7)");
-        expect(openable == 0,
+        expect(!existsIn || openable == 0,
                "folder: while the sink lives nobody can write or remove the Zone.Identifier of a file it cannot take back (#60 r7)");
+        expect(existsIn || unlinkIn == 1,
+               "folder: isolation: a file no longer under its final name lost it through the take-back, by file id (#60 r8)");
         if (gIsoLock != INVALID_HANDLE_VALUE) CloseHandle(gIsoLock);
         gIsoLock = INVALID_HANDLE_VALUE;
         if (gStuckView) UnmapViewOfFile(gStuckView);

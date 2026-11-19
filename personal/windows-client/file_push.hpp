@@ -390,7 +390,8 @@ std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(con
 // commit() with the open file and stage 0 just before the file gets its
 // final name, and stage 1 just after it, before the last check.
 // gTakeOutTrace is called with each take-back and cleanup step's name
-// (#60 r7: "cut", "zero", "unlink", "drop.cut", "drop.zero", "drop.unlink")
+// (#60 r7/r8: "unlink", "alone", "cut", "zero", "drop.cut", "drop.zero",
+// "drop.unlink")
 // and whether it worked.
 extern void (*gPublishHook)(HANDLE file, int stage);
 extern void (*gTakeOutTrace)(const char* step, bool ok);

@@ -149,6 +149,13 @@ bool unlinkName(const std::wstring& path, const FILE_ID_INFO& id) {
     return ok;
 }
 
+// #60 r8: true when the open file `h` has exactly one name left.
+bool oneName(HANDLE h) {
+    FILE_STANDARD_INFO info{};
+    return GetFileInformationByHandleEx(h, FileStandardInfo, &info, sizeof(info)) && info.NumberOfLinks == 1 &&
+           !info.DeletePending;
+}
+
 // #60 r5/r7: true once the open file `h` holds no bytes of what was received:
 // cut to zero, else every byte overwritten with zeros. Results checked.
 bool blankOn(HANDLE h, const char* cut, const char* zero) {
@@ -269,29 +276,39 @@ public:
             const LONG st = linkTo(file_, longPath(final));
             if (st >= 0) {
                 if (gPublishHook) gPublishHook(file_, 1);
+                // #60 r8: the final link is held from here until commit()
+                // returns: opened through the final name without delete
+                // sharing (NTFS applies delete sharing per name, so the
+                // staging handle alone does not keep the final name from
+                // being renamed or removed), its file id checked.
+                HANDLE pin = pinFinal(final, id);
                 if (gFinalHook) gFinalHook(final, 1);
-                // Checked again through the held handle and as the file is
-                // seen under its final name (opened there, its file id
-                // checked). Nothing can change or remove the mark while it is
-                // held, so a failure here means the read failed or the name
-                // no longer leads to this file; then the file is taken back
-                // (takeOut()).
-                const bool held = zoneIdFrom(zone) == 3 && readUnder(final, id) == 3;
+                // Checked again through the held stream and through the
+                // held final link. Nothing can change or remove the mark or
+                // the name while they are held, so a failure here means a
+                // read failed or the name did not lead to this file; then the
+                // file is taken back (takeOut()).
+                const bool held = pin != INVALID_HANDLE_VALUE && zoneIdFrom(zone) == 3 && ops_.readOn(pin) == 3;
                 if (!held) {
                     ++zone_.failed;
                     zoneRefused_ = true;
-                    takeOut(zone, final, id);
+                    takeOut(zone, pin, final, id);
                     return false;
                 }
                 ++zone_.marked;
+                if (gFinalHook) gFinalHook(final, 2);
+                // Success is decided with the mark, the bytes and the final
+                // name all still held; only then are the handles closed. The
+                // staging name is removed afterwards by name and file id
+                // (retryCleanup(), from finished(), the next file or the
+                // sink's end): removing it here would need the held
+                // handles closed first.
+                names_.push_back({part_, id});
+                part_.clear();
+                CloseHandle(pin);
                 CloseHandle(zone);
                 CloseHandle(file_);
                 file_ = INVALID_HANDLE_VALUE;
-                // The staging name goes; if it cannot go now it is kept,
-                // with its file id, and retried. It is the delivered file.
-                if (!unlinkName(part_, id)) names_.push_back({part_, id});
-                part_.clear();
-                if (gFinalHook) gFinalHook(final, 2);
                 return true;
             }
             if (st != kNameCollision) break;
@@ -341,16 +358,22 @@ private:
         return false;
     }
 
-    // #60 r7: the ZoneId of the file `id` as opened under `path`; -1 when
-    // the name cannot be opened, leads to another file, or reads unmarked.
-    int readUnder(const std::wstring& path, const FILE_ID_INFO& id) {
+    // #60 r8: the file `id` opened under its final name `path`, without
+    // delete sharing: while this handle is open nobody can rename or remove
+    // that name. (Write sharing is given because the sink's own staging
+    // handle writes; that handle shares only reading, so nobody else can
+    // write.) INVALID_HANDLE_VALUE when the name cannot be opened or leads
+    // to another file.
+    static HANDLE pinFinal(const std::wstring& path, const FILE_ID_INFO& id) {
         HANDLE h = CreateFileW(longPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return -1;
+        if (h == INVALID_HANDLE_VALUE) return h;
         FILE_ID_INFO got{};
-        const int zone = filepull::fileIdOf(h, got) && filepull::sameFile(got, id) ? ops_.readOn(h) : -1;
-        CloseHandle(h);
-        return zone;
+        if (!filepull::fileIdOf(h, got) || !filepull::sameFile(got, id)) {
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;
+        }
+        return h;
     }
 
     // #60 r6/r7: the staged file's Zone.Identifier stream, open for reading
@@ -371,25 +394,38 @@ private:
         return INVALID_HANDLE_VALUE;
     }
 
-    // #60 r7: takes a file that failed its last check back out of the folder.
-    // Its bytes go first, through the handle, while the mark is still held:
-    // cut, else zeroed. Then the handles are closed and its final and
-    // staging names removed (each kept and retried if it cannot go now).
-    // If neither cut nor zero works, both handles are kept: the file stays
-    // under its final name with the mark still held (nobody can change or
-    // remove it, nor write or delete the file), and retryCleanup() tries
-    // again while the sink lives.
-    void takeOut(HANDLE zone, const std::wstring& final, const FILE_ID_INFO& id) {
-        if (!blankOn(file_, "cut", "zero")) {
-            held_.push_back({file_, zone, final, part_, id});
-        } else {
-            CloseHandle(zone);
-            CloseHandle(file_);
-            forget(final, part_, id, "unlink");
-        }
+    // #60 r8: takes a file that failed its last check back out of the
+    // folder (release()). The sink's own handle on the final name is closed
+    // first: it would keep the name from going.
+    void takeOut(HANDLE zone, HANDLE pin, const std::wstring& final, const FILE_ID_INFO& id) {
+        if (pin != INVALID_HANDLE_VALUE) CloseHandle(pin);
+        Held h{file_, zone, final, part_, id};
         file_ = INVALID_HANDLE_VALUE;
         part_.clear();
         written_ = 0;
+        if (!release(h)) held_.push_back(h);
+    }
+
+    // #60 r8: removes a held file. A published one (its mark held) loses its
+    // final name first, in one step and by file id; its bytes are touched
+    // only once the staging name is the only name it has left (no cut or
+    // zero-fill while any other name leads to it). Until then nothing is
+    // changed: the file and its held mark stay as they are, and
+    // retryCleanup() tries again while the sink lives. Then cut, else zero
+    // through the handle, the handles closed and the staging name removed
+    // (kept and retried if it cannot go now). True once done.
+    bool release(Held& h) {
+        const bool published = h.zone != INVALID_HANDLE_VALUE;
+        if (!h.final.empty()) {
+            if (!traced("unlink", unlinkName(h.final, h.id))) return false;
+            h.final.clear();
+        }
+        if (published && !traced("alone", oneName(h.file))) return false;
+        if (!blankOn(h.file, published ? "cut" : "drop.cut", published ? "zero" : "drop.zero")) return false;
+        if (h.zone != INVALID_HANDLE_VALUE) CloseHandle(h.zone);
+        CloseHandle(h.file);
+        forget({}, h.part, h.id, "drop.unlink");
+        return true;
     }
 
     // #60 r7: removes a closed file's names, keeping each that cannot go now.
@@ -425,14 +461,8 @@ private:
     // True once nothing is left to clean up.
     bool retryCleanup() {
         for (auto it = held_.begin(); it != held_.end();) {
-            if (!blankOn(it->file, "drop.cut", "drop.zero")) {
-                ++it;
-                continue;
-            }
-            if (it->zone != INVALID_HANDLE_VALUE) CloseHandle(it->zone);
-            CloseHandle(it->file);
-            forget(it->final, it->part, it->id, "drop.unlink");
-            it = held_.erase(it);
+            if (release(*it)) it = held_.erase(it);
+            else ++it;
         }
         for (auto it = names_.begin(); it != names_.end();) {
             if (unlinkName(it->first, it->second)) it = names_.erase(it);
