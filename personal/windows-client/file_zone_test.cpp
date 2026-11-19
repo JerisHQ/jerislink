@@ -685,10 +685,16 @@ struct SlowExit {
     }
 };
 
+// The gate reads the mark twice on the clipboard thread; the third read off
+// this thread is the settle check, which is held 4 s so that it is still
+// running when the test calls stop().
+std::atomic<int> gOffMainReads{0};
+
 int slowExitReadOn(HANDLE h) {
     if (GetCurrentThreadId() != gMainThread) {
         thread_local SlowExit mark;
         (void)mark;
+        if (++gOffMainReads >= 3) Sleep(4000);
     }
     return readZoneIdOn(h);
 }
@@ -919,6 +925,7 @@ void gateCases() {
         gMainThread = GetCurrentThreadId();
         gExitIn = 0;
         gExitOut = 0;
+        gOffMainReads = 0;
         const std::wstring dir = tempDir(L"gate-stop");
         GateCase gc;
         gc.transfer = 33;
