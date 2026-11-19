@@ -225,7 +225,22 @@ private:
     }
 
     // No gate (no clipboard thread behind us) means no mark: fail closed.
-    bool runGate() { return gate_ && gate_(req_, locked_); }
+    bool runGate() {
+        req_.reader = callerProcess();
+        return gate_ && gate_(req_, locked_);
+    }
+
+    // The process making this Read call (#60 r4): the caller across COM, or
+    // this process for a call from inside it.
+    static uint32_t callerProcess() {
+        DWORD tid = 0;
+        if (CoGetCallerTID(&tid) != S_OK) return uint32_t(GetCurrentProcessId());
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) return kUnknownReader;
+        const DWORD pid = GetProcessIdOfThread(t);
+        CloseHandle(t);
+        return pid ? uint32_t(pid) : kUnknownReader;
+    }
 
     PullHub& hub_;
     uint64_t token_;
@@ -426,6 +441,33 @@ bool beingWritten(HANDLE hint, const FILE_ID_INFO& id) {
     return GetLastError() == ERROR_SHARING_VIOLATION;
 }
 
+// Whether process `pid` has the file behind `h` open (#60 r4): the
+// processes holding it, from FileProcessIdsUsingFileInformation (47).
+// False when that cannot be read.
+bool openedBy(HANDLE h, uint32_t pid) {
+    using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, JlIoStatus*, PVOID, ULONG, ULONG);
+    static const auto ntQuery = reinterpret_cast<NtQueryInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    if (!ntQuery || pid == 0 || pid == kUnknownReader) return false;
+    // A ULONG count, then the ids as ULONG_PTRs from the next ULONG_PTR.
+    std::vector<ULONG_PTR> buf(64);
+    for (int i = 0; i < 6; ++i) {
+        JlIoStatus io{};
+        const LONG st = ntQuery(h, &io, buf.data(), ULONG(buf.size() * sizeof(ULONG_PTR)), 47);
+        if (st == LONG(0xC0000004) || st == LONG(0x80000005)) {   // STATUS_INFO_LENGTH_MISMATCH, BUFFER_OVERFLOW
+            buf.assign(buf.size() * 4, 0);
+            continue;
+        }
+        if (st < 0) return false;
+        const ULONG n = *reinterpret_cast<const ULONG*>(buf.data());
+        for (size_t k = 0; k < n && k + 1 < buf.size(); ++k) {
+            if (buf[k + 1] == ULONG_PTR(pid)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 // SHA-256 of the whole file behind `h`, or empty if it does not read as
 // exactly `size` bytes.
 std::vector<uint8_t> hashOf(HANDLE h, uint64_t size) {
@@ -520,6 +562,7 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
     const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
     const uint64_t minSize = r.size > 0 ? r.size - 1 : 0;
     const ULARGE_INTEGER since{r.since.dwLowDateTime, r.since.dwHighDateTime};
+    const uint32_t reader = r.reader ? r.reader : uint32_t(GetCurrentProcessId());
     // Every file that could be this paste's copy, held open by identity. The
     // same file reached through two folder spellings (8.3 and long) counts once.
     struct Candidate {
@@ -568,6 +611,11 @@ GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& fold
             // byte; a file nobody writes is not this paste's copy, whatever
             // its name, size or bytes.
             else if (!beingWritten(h, id)) { ++pr.idle; skip = true; }
+            // #60 r4: Explorer writes its copy itself, so the process reading
+            // this stream has the copy open. A same-name file someone else is
+            // writing is not linked to this paste: never marked, held or
+            // removed.
+            else if (!openedBy(h, reader)) { ++pr.unlinked; skip = true; }
             if (skip) {
                 CloseHandle(h);
                 continue;
@@ -1111,7 +1159,7 @@ struct FileClipboard::Impl {
                 " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
                 " small=" + std::to_string(probe.tooSmall) + " larger=" + std::to_string(probe.larger) +
                 " older=" + std::to_string(probe.older) + " open_failed=" + std::to_string(probe.openFailed) +
-                " idle=" + std::to_string(probe.idle) +
+                " idle=" + std::to_string(probe.idle) + " unlinked=" + std::to_string(probe.unlinked) +
                 " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
                 " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
             break;
