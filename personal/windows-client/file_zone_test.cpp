@@ -12,14 +12,17 @@
 #include <windows.h>
 #include <ole2.h>
 #include <shlobj.h>
+#include <shellapi.h>
 
 #include "file_pull.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -152,6 +155,28 @@ ZoneOps swappingOps() {
     z.write = [](const std::wstring& path) { swapNow(); return writeInternetZone(path); };
     z.writeOn = [](HANDLE h) { swapNow(); return writeInternetZoneOn(h); };
     return z;
+}
+
+// #60 r4 item 2: the second zone call on a pinned file (the mark's write,
+// after the first read) swaps a newcomer in under the copy's name just
+// before the Zone.Identifier stream is opened.
+std::wstring gPinPath;
+std::vector<uint8_t> gPinBytes;
+int gPinCalls = 0;
+bool gPinSwapped = false;
+
+void pinSwap(HANDLE) {
+    if (++gPinCalls != 2 || gPinSwapped || gPinPath.empty()) return;
+    gPinSwapped = MoveFileExW(gPinPath.c_str(), (gPinPath + L".moved").c_str(), 0) && writeFile(gPinPath, gPinBytes);
+}
+
+// Whether `path` has a Zone.Identifier stream at all (an empty one too).
+bool hasZoneStream(const std::wstring& path) {
+    HANDLE h = CreateFileW((path + L":Zone.Identifier").c_str(), FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
 }
 
 void helpers() {
@@ -290,6 +315,30 @@ void helpers() {
                    readFile(gSwapPath) == gSwapBytes,
                "unit: a file swapped in under the copy's name while it is marked is not marked; the copy is (#60 r3)");
         gSwapPath.clear();
+    }
+    {
+        // #60 r4 item 2: a newcomer takes the copy's name after the copy's
+        // identity is pinned and just before its stream is opened. The mark
+        // never creates a Zone.Identifier on the newcomer, not even an empty
+        // one; it goes to the pinned copy.
+        const auto pfull = body(2600, 67);
+        gPinPath = sub + L"\\pinned.bin";
+        gPinBytes = body(2600, 71);
+        gPinCalls = 0;
+        gPinSwapped = false;
+        writeFile(gPinPath, {pfull.begin(), pfull.end() - 1});
+        Writer w(gPinPath);
+        ZoneMarkStats zst;
+        gZoneStreamOpenHook = pinSwap;
+        const GateOutcome g = gateFile(requestFor(L"pinned.bin", pfull, since), {sub}, {}, zst);
+        gZoneStreamOpenHook = nullptr;
+        w.close();
+        std::printf("  pinned: swapped=%d gate=%d newcomer stream=%d copy zone=%d\n", int(gPinSwapped), int(g),
+                    int(hasZoneStream(gPinPath)), readZoneId(gPinPath + L".moved"));
+        expect(gPinSwapped && !hasZoneStream(gPinPath) && readFile(gPinPath) == gPinBytes,
+               "unit: a file that takes the name just before the stream opens gets no Zone.Identifier, not even an empty one (#60 r4)");
+        expect(g == GateOutcome::Marked && readZoneId(gPinPath + L".moved") == 3, "unit: the mark goes to the pinned copy (#60 r4)");
+        gPinPath.clear();
     }
 
     // #60 r3 item 2: after the paste the locked copy is kept only when it is
@@ -580,7 +629,69 @@ struct GateCase {
     int holdMs = 0;
     int64_t presize = -1;
     std::function<void()> beforeCopy;
+    bool childCopy = false;              // #60 r4: the stand-in runs in another process, as Explorer does
 };
+
+// #60 r4: the stand-in copy in a child process (this test, run with
+// --copy DEST SIZE RESULT), so the stream is read across processes as
+// Explorer reads it. Waits up to 60 s.
+FakeCopy childExplorerCopy(const std::wstring& dest, uint64_t size) {
+    FakeCopy r;
+    r.readFailed = true;
+    wchar_t exe[MAX_PATH * 2] = {};
+    GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe)));
+    const std::wstring result = dest + L".result";
+    DeleteFileW(result.c_str());
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --copy \"" + dest + L"\" " + std::to_wstring(size) + L" \"" + result + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return r;
+    CloseHandle(pi.hThread);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < end) {
+        if (MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, 20, QS_ALLINPUT) == WAIT_OBJECT_0) break;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (WaitForSingleObject(pi.hProcess, 0) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 3);
+    CloseHandle(pi.hProcess);
+    const auto text = readFile(result);
+    unsigned long long got = 0;
+    int failed = 1;
+    if (std::sscanf(std::string(text.begin(), text.end()).c_str(), "%llu %d", &got, &failed) == 2) {
+        r.got = got;
+        r.readFailed = failed != 0;
+    }
+    DeleteFileW(result.c_str());
+    return r;
+}
+
+// #60 r4 item 4: a thread-local object with a slow destructor on every
+// thread (other than this one) that makes a zone call: once stop() has
+// returned, each of those threads must have exited.
+DWORD gMainThread = 0;
+std::atomic<int> gExitIn{0};
+std::atomic<int> gExitOut{0};
+
+struct SlowExit {
+    SlowExit() { ++gExitIn; }
+    ~SlowExit() {
+        Sleep(400);
+        ++gExitOut;
+    }
+};
+
+int slowExitReadOn(HANDLE h) {
+    if (GetCurrentThreadId() != gMainThread) {
+        thread_local SlowExit mark;
+        (void)mark;
+    }
+    return readZoneIdOn(h);
+}
 
 // One paste of `same.bin` through the stand-in, with its own clipboard, hub
 // and host. Waits 3.5 s after the stream is released.
@@ -603,7 +714,9 @@ FakeCopy runGateCase(const GateCase& gc) {
     pump(300);
     if (gc.beforeCopy) gc.beforeCopy();
     IDataObject* obj = nullptr;
-    if (SUCCEEDED(OleGetClipboard(&obj)) && obj) {
+    if (gc.childCopy) {
+        c = childExplorerCopy(gc.dest, gc.bytes.size());
+    } else if (SUCCEEDED(OleGetClipboard(&obj)) && obj) {
         c = fakeExplorerCopy(obj, gc.dest, gc.bytes.size(), gc.presetZone, gc.holdMs, gc.presize);
         obj->Release();
     }
@@ -758,11 +871,98 @@ void gateCases() {
             expect(readFile(gc.dest) == gc.bytes && readZoneId(gc.dest) == 3, "gate: our copy beside it is kept with ZoneId=3");
         }
     }
+    {   // #60 r4: a copy written by the process that reads the stream (made
+        // in a child process, as Explorer does) is linked to this paste,
+        // marked and kept.
+        const std::wstring dir = tempDir(L"gate-child");
+        GateCase gc;
+        gc.transfer = 31;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 79);
+        gc.childCopy = true;
+        const FakeCopy c = runGateCase(gc);
+        std::printf("  child copy: got=%llu failed=%d zone=%d\n", static_cast<unsigned long long>(c.got), int(c.readFailed),
+                    readZoneId(gc.dest));
+        expect(c.got == n && !c.readFailed && readFile(gc.dest) == gc.bytes && readZoneId(gc.dest) == 3,
+               "gate: a copy written by the process reading the stream is marked and kept (#60 r4)");
+    }
+    {   // #60 r4 item 1: the paste lands in a folder the gate does not
+        // search, while another program writes a same-name file in a folder
+        // it does search. That file is not linked to this paste: it is never
+        // marked or removed, and the paste is refused.
+        const std::wstring far = tempDir(L"gate-far");
+        const std::wstring nearby = tempDir(L"gate-near");
+        const std::wstring other = nearby + L"\\same.bin";
+        const std::vector<uint8_t> otherBytes = body(n, 83);
+        std::unique_ptr<Writer> holder;
+        GateCase gc;
+        gc.transfer = 32;
+        gc.folders = {nearby};
+        gc.dest = far + L"\\same.bin";
+        gc.bytes = body(n, 89);
+        gc.childCopy = true;
+        gc.beforeCopy = [&] {
+            writeFile(other, otherBytes);
+            holder = std::make_unique<Writer>(other);
+        };
+        const FakeCopy c = runGateCase(gc);
+        holder.reset();
+        std::printf("  unlinked: got=%llu failed=%d other exists=%d zone=%d stream=%d\n", static_cast<unsigned long long>(c.got),
+                    int(c.readFailed), int(exists(other)), readZoneId(other), int(hasZoneStream(other)));
+        expect(exists(other) && readFile(other) == otherBytes && !hasZoneStream(other),
+               "gate: a same-name file another program is writing, not linked to this paste, is never marked or removed (#60 r4)");
+        expect(c.readFailed, "gate: with no linked copy found the paste is refused (#60 r4)");
+    }
+    {   // #60 r4 item 4: stop() returns only once every settle thread has
+        // exited, so nothing runs on after the clipboard is gone.
+        gMainThread = GetCurrentThreadId();
+        gExitIn = 0;
+        gExitOut = 0;
+        const std::wstring dir = tempDir(L"gate-stop");
+        GateCase gc;
+        gc.transfer = 33;
+        gc.ops.readOn = slowExitReadOn;
+        gc.folders = {dir};
+        gc.dest = dir + L"\\same.bin";
+        gc.bytes = body(n, 97);
+        runGateCase(gc);   // returns after clip.stop() and the clipboard's destruction
+        const int in = gExitIn;
+        const int out = gExitOut;
+        std::printf("  stop: zone threads=%d exited=%d zone=%d\n", in, out, readZoneId(gc.dest));
+        expect(in >= 2 && out == in, "gate: stop() returns only after every settle thread has exited (#60 r4)");
+        Sleep(1000);   // a thread still running (old code) ends before the next test
+    }
+}
+
+// --copy DEST SIZE RESULT: the stand-in copy from another process (#60 r4).
+int childCopyMain() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv || argc != 5) return 2;
+    const std::wstring dest = argv[2];
+    const uint64_t size = _wcstoui64(argv[3], nullptr, 10);
+    const std::wstring result = argv[4];
+    LocalFree(argv);
+    FakeCopy c;
+    c.readFailed = true;
+    if (SUCCEEDED(OleInitialize(nullptr))) {
+        IDataObject* obj = nullptr;
+        if (SUCCEEDED(OleGetClipboard(&obj)) && obj) {
+            c = fakeExplorerCopy(obj, dest, size, nullptr, 0, -1);
+            obj->Release();
+        }
+        OleUninitialize();
+    }
+    const std::string line = std::to_string(c.got) + " " + (c.readFailed ? "1" : "0");
+    writeFile(result, {line.begin(), line.end()});
+    return 0;
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 5 && std::strcmp(argv[1], "--copy") == 0) return childCopyMain();
     if (FAILED(OleInitialize(nullptr))) {
         std::printf("FAIL OleInitialize\n");
         return 1;
@@ -770,8 +970,8 @@ int main() {
     // A refused paste can leave the shell's copy (and its error dialog)
     // blocking this thread; fail with a line instead of the step timeout.
     std::thread([] {
-        Sleep(120000);
-        std::printf("FAIL watchdog: the test did not finish in 120 s (shell paste blocked)\n");
+        Sleep(170000);
+        std::printf("FAIL watchdog: the test did not finish in 170 s (shell paste blocked)\n");
         std::fflush(stdout);
         ExitProcess(2);
     }).detach();

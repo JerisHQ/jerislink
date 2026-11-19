@@ -546,6 +546,11 @@ bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id);
 // stream held; Failed on volumes without streams (FAT, exFAT).
 ZoneWrite writeInternetZoneOn(HANDLE file);
 int readZoneIdOn(HANDLE file);
+// Test seam (#60 r4): called by the two calls above once the file's
+// identity is pinned, just before its Zone.Identifier stream is opened, so
+// a test can swap another file in under the name at that moment. Never set
+// outside tests.
+extern void (*gZoneStreamOpenHook)(HANDLE file);
 
 // The zone calls, swappable so a test can stand in for a volume without
 // streams (FAT, exFAT), a mark that cannot be fixed, or a file swapped

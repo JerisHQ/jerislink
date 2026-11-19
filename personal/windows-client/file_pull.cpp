@@ -268,6 +268,8 @@ std::vector<std::wstring> topNames(const std::wstring& top) {
 
 }  // namespace
 
+void (*gZoneStreamOpenHook)(HANDLE file) = nullptr;
+
 ZoneWrite writeInternetZone(const std::wstring& path) {
     const std::wstring stream = path + L":Zone.Identifier";
     HANDLE h = CreateFileW(stream.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -350,6 +352,7 @@ HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition)
     if (!fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
     const std::wstring path = finalPathOf(file);
     if (path.empty()) return INVALID_HANDLE_VALUE;
+    if (gZoneStreamOpenHook) gZoneStreamOpenHook(file);
     HANDLE z = CreateFileW((path + L":Zone.Identifier").c_str(), access, share | FILE_SHARE_DELETE, nullptr, disposition,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (z == INVALID_HANDLE_VALUE) return z;
