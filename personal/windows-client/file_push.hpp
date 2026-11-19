@@ -394,6 +394,10 @@ std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(con
 // and whether it worked.
 extern void (*gPublishHook)(HANDLE file, int stage);
 extern void (*gTakeOutTrace)(const char* step, bool ok);
+// #60 r8: gFinalHook is called by commit() with the file's final name at
+// stage 1, just after the file gets it and before the last check, and at
+// stage 2, after the last check, just before commit() reports success.
+extern void (*gFinalHook)(const std::wstring& final, int stage);
 
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
 // Windows does not know the Downloads folder.

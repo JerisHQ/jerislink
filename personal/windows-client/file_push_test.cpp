@@ -538,9 +538,11 @@ int gUnmarkStage = -1;
 int gUnmarkResult[2] = {0, 0};   // 1 = the open was refused, 2 = opened and ZoneId=0 written
 DWORD gUnmarkError[2] = {0, 0};
 
-void tryUnmark(HANDLE file, int stage) {
-    if (stage != gUnmarkStage) return;
-    const std::wstring p = pathOf(file) + L":Zone.Identifier";
+// #60 r8: stage 1 goes through the final name itself (tryUnmarkFinal).
+std::wstring plainPath(const std::wstring& p) { return p.rfind(L"\\\\?\\", 0) == 0 ? p.substr(4) : p; }
+
+void unmarkAt(const std::wstring& path, int stage) {
+    const std::wstring p = path + L":Zone.Identifier";
     HANDLE z = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (z == INVALID_HANDLE_VALUE) {
@@ -553,6 +555,14 @@ void tryUnmark(HANDLE file, int stage) {
     const bool ok = WriteFile(z, kZero, DWORD(sizeof(kZero) - 1), &w, nullptr) && SetEndOfFile(z);
     CloseHandle(z);
     gUnmarkResult[stage] = ok ? 2 : 1;
+}
+
+void tryUnmark(HANDLE file, int stage) {
+    if (stage == 0 && stage == gUnmarkStage) unmarkAt(pathOf(file), stage);
+}
+
+void tryUnmarkFinal(const std::wstring& final, int stage) {
+    if (stage == 1 && stage == gUnmarkStage) unmarkAt(plainPath(final), stage);
 }
 
 // #60 r6: every take-back and cleanup step the sink reports, in order.
@@ -629,9 +639,9 @@ int gUnlinkStage = -1;
 int gUnlinkResult[2] = {0, 0};   // 1 = refused, 2 = the stream was opened with delete access and marked for deletion
 DWORD gUnlinkError[2] = {0, 0};
 
-void tryUnlink(HANDLE file, int stage) {
-    if (stage != gUnlinkStage) return;
-    const std::wstring p = pathOf(file) + L":Zone.Identifier";
+// #60 r8: stage 1 goes through the final name itself (tryUnlinkFinal).
+void unlinkAt(const std::wstring& path, int stage) {
+    const std::wstring p = path + L":Zone.Identifier";
     HANDLE z = CreateFileW(p.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (z == INVALID_HANDLE_VALUE) {
@@ -645,6 +655,14 @@ void tryUnlink(HANDLE file, int stage) {
     if (!ok) gUnlinkError[stage] = GetLastError();
     CloseHandle(z);
     gUnlinkResult[stage] = ok ? 2 : 1;
+}
+
+void tryUnlink(HANDLE file, int stage) {
+    if (stage == 0 && stage == gUnlinkStage) unlinkAt(pathOf(file), stage);
+}
+
+void tryUnlinkFinal(const std::wstring& final, int stage) {
+    if (stage == 1 && stage == gUnlinkStage) unlinkAt(plainPath(final), stage);
 }
 
 // #60 r7: whether another program could open `path`'s Zone.Identifier for
@@ -784,6 +802,54 @@ void sharingProbe(const std::wstring& dir) {
     DeleteFileW((dir + L"\\probeB.bin").c_str());
     DeleteFileW((dir + L"\\probeC.bin").c_str());
 }
+
+// #60 r8: through the final name itself, someone tries to remove the file's
+// Zone.Identifier stream and to take the name away (rename it), just after
+// the link and before the last check (stage 1), or after the last check,
+// just before commit() reports success (stage 2).
+int gFinalStage = -1;
+int gFinalZone[3] = {0, 0, 0};    // 1 = refused, 2 = the stream was opened with delete access and marked for deletion
+int gFinalMove[3] = {0, 0, 0};    // 1 = refused, 2 = the final name was renamed away
+DWORD gFinalMoveError[3] = {0, 0, 0};
+
+void tryTakeFinal(const std::wstring& final, int stage) {
+    if (stage != gFinalStage) return;
+    const std::wstring p = plainPath(final);
+    HANDLE z = CreateFileW((p + L":Zone.Identifier").c_str(), DELETE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (z == INVALID_HANDLE_VALUE) {
+        gFinalZone[stage] = 1;
+    } else {
+        FILE_DISPOSITION_INFO del{};
+        del.DeleteFile = TRUE;
+        const bool ok = SetFileInformationByHandle(z, FileDispositionInfo, &del, sizeof(del)) != 0;
+        CloseHandle(z);
+        gFinalZone[stage] = ok ? 2 : 1;
+    }
+    if (MoveFileExW(p.c_str(), (p + L".moved").c_str(), 0)) {
+        gFinalMove[stage] = 2;
+    } else {
+        gFinalMove[stage] = 1;
+        gFinalMoveError[stage] = GetLastError();
+    }
+}
+
+// #60 r8 item 2: another program holds the file open under its final name
+// without delete sharing from just after the link, and the last check under
+// that name fails: the final name cannot be removed while it is held.
+std::wstring gPinName;
+HANDLE gPin = INVALID_HANDLE_VALUE;
+
+void pinFinal(const std::wstring& final, int stage) {
+    if (stage != 1 || gPin != INVALID_HANDLE_VALUE || !endsWith(final, L"\\" + gPinName)) return;
+    gPin = CreateFileW(plainPath(final).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                       OPEN_EXISTING, 0, nullptr);
+}
+
+int pinRead(HANDLE h) { return endsWith(pathOf(h), L"\\" + gPinName) ? -1 : fpull::readZoneIdOn(h); }
+
+// #60 r8: the step the sink reported first (empty when none).
+std::string firstStep() { return gTrace.empty() ? std::string() : gTrace.front().first; }
 
 void realFolder() {
     const std::wstring dir = tempFolder();
@@ -1149,6 +1215,7 @@ void realFolder() {
         const std::wstring target = dir + L"\\" + std::wstring(leaf.begin(), leaf.end());
         gUnmarkStage = stage;
         gPublishHook = tryUnmark;
+        gFinalHook = tryUnmarkFinal;
         PushReceiver::Out out;
         {
             PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
@@ -1161,6 +1228,7 @@ void realFolder() {
             out = r.onFileEnd({70 + uint32_t(stage), 0, d->finish()});
         }
         gPublishHook = nullptr;
+        gFinalHook = nullptr;
         gUnmarkStage = -1;
         const auto* res = only<file::Result>(out);
         const int zone = fpull::readZoneId(target);
@@ -1230,6 +1298,7 @@ void realFolder() {
         const std::wstring target = dir + L"\\" + std::wstring(leaf.begin(), leaf.end());
         gUnlinkStage = stage;
         gPublishHook = tryUnlink;
+        gFinalHook = tryUnlinkFinal;
         PushReceiver::Out out;
         {
             PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
@@ -1242,6 +1311,7 @@ void realFolder() {
             out = r.onFileEnd({75 + uint32_t(stage), 0, d->finish()});
         }
         gPublishHook = nullptr;
+        gFinalHook = nullptr;
         gUnlinkStage = -1;
         const auto* res = only<file::Result>(out);
         const int zone = fpull::readZoneId(target);
@@ -1256,6 +1326,125 @@ void realFolder() {
                           : "folder: a file whose mark someone tries to remove after the rename is never delivered without ZoneId=3 (#60 r7)");
         DeleteFileW(target.c_str());
         clearStaging(dir, std::wstring(leaf.begin(), leaf.end()));
+    }
+    // #60 r8 item 1: the final link is held from the check under the final
+    // name until commit() returns. Through the final name itself, nobody can
+    // remove the mark or take the name away, either before the last check
+    // (stage 1) or after it (stage 2), and a push that reports success leaves
+    // the checked file under its final name with ZoneId=3.
+    for (int stage = 1; stage < 3; ++stage) {
+        const std::string leaf = stage == 1 ? "final1.exe" : "final2.exe";
+        const std::wstring wleaf(leaf.begin(), leaf.end());
+        const std::wstring target = dir + L"\\" + wleaf;
+        gFinalStage = stage;
+        gFinalHook = tryTakeFinal;
+        PushReceiver::Out out;
+        {
+            PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
+            auto gp = makePush(80 + uint32_t(stage), {{leaf, 2048}});
+            offerAll(r, gp);
+            r.nextRequest();
+            r.onData({80 + uint32_t(stage), 0, 0, gp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(gp.contents[0].data(), gp.contents[0].size());
+            out = r.onFileEnd({80 + uint32_t(stage), 0, d->finish()});
+        }
+        gFinalHook = nullptr;
+        gFinalStage = -1;
+        const auto* res = only<file::Result>(out);
+        const bool delivered = res && res->status == file::status::kOk;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        diskSize(target, exists, onDisk);
+        const int zone = fpull::readZoneId(target);
+        const bool moved = GetFileAttributesW((target + L".moved").c_str()) != INVALID_FILE_ATTRIBUTES;
+        std::printf("  final link stage %d: zone-remove=%d move=%d err=%lu delivered=%d exists=%d size=%llu zone=%d moved=%d\n",
+                    stage, gFinalZone[stage], gFinalMove[stage], (unsigned long)gFinalMoveError[stage], int(delivered),
+                    int(exists), (unsigned long long)onDisk, zone, int(moved));
+        expect(gFinalMove[stage] == 1,
+               stage == 1 ? "folder: between the link and the last check nobody can rename or remove the final name (#60 r8)"
+                          : "folder: between the last check and the end of commit nobody can rename or remove the final name (#60 r8)");
+        expect(gFinalZone[stage] == 1,
+               stage == 1 ? "folder: between the link and the last check nobody can remove the Zone.Identifier through the final name (#60 r8)"
+                          : "folder: between the last check and the end of commit nobody can remove the Zone.Identifier through the final name (#60 r8)");
+        expect(!delivered || (exists && onDisk == 2048 && zone == 3 && !moved),
+               stage == 1 ? "folder: a push that reports success leaves the checked file under its final name with ZoneId=3 (stage 1) (#60 r8)"
+                          : "folder: a push that reports success leaves the checked file under its final name with ZoneId=3 (stage 2) (#60 r8)");
+        expect(delivered, stage == 1 ? "folder: the file is delivered when nobody could take its final name (stage 1) (#60 r8)"
+                                     : "folder: the file is delivered when nobody could take its final name (stage 2) (#60 r8)");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        DeleteFileW((target + L".moved").c_str());
+        clearStaging(dir, wleaf);
+    }
+    // #60 r8 item 2: the last check fails while another program holds the
+    // file open under its final name (no delete sharing), so the final name
+    // cannot be removed. The take-back must not cut or zero a file that
+    // still has its final name: it stays there whole, its mark held, while
+    // the sink lives; once the name is free the sink removes it.
+    {
+        gPinName = L"heldname.exe";
+        gPin = INVALID_HANDLE_VALUE;
+        gFinalHook = pinFinal;
+        gTrace.clear();
+        gTakeOutTrace = collectTrace;
+        fpull::ZoneOps pin;
+        pin.readOn = pinRead;
+        const std::wstring target = dir + L"\\heldname.exe";
+        bool delivered = true;
+        bool pinned = false;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        int zone = -2;
+        int openable = -1;
+        int cut = -2, zero = -2, unlink = -2;
+        std::string first;
+        {
+            PushReceiver r(makeFolderSink(dir, {}, pin), fpull::sha256Digest());
+            auto pp = makePush(83, {{"heldname.exe", 4096}});
+            offerAll(r, pp);
+            r.nextRequest();
+            r.onData({83, 0, 0, pp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(pp.contents[0].data(), pp.contents[0].size());
+            const auto out = r.onFileEnd({83, 0, d->finish()});
+            const auto* res = only<file::Result>(out);
+            delivered = res && res->status == file::status::kOk;
+            pinned = gPin != INVALID_HANDLE_VALUE;
+            // Still inside the sink's life, with the name still held.
+            diskSize(target, exists, onDisk);
+            zone = fpull::readZoneId(target);
+            openable = zoneOpenable(target);
+            cut = traced("cut");
+            zero = traced("zero");
+            unlink = traced("unlink");
+            first = firstStep();
+            if (gPin != INVALID_HANDLE_VALUE) CloseHandle(gPin);
+            gPin = INVALID_HANDLE_VALUE;
+        }
+        gFinalHook = nullptr;
+        gTakeOutTrace = nullptr;
+        bool after = true;
+        uint64_t afterSize = 0;
+        const bool afterKnown = diskSize(target, after, afterSize);
+        const int parts = countIn(dir + L"\\.jlstaging", L"heldname.exe.jlpart*");
+        std::printf("  held final name: pinned=%d delivered=%d first=%s unlink=%d cut=%d zero=%d exists=%d size=%llu "
+                    "zone=%d openable=%d after=%d parts=%d\n",
+                    int(pinned), int(delivered), first.c_str(), unlink, cut, zero, int(exists),
+                    (unsigned long long)onDisk, zone, openable, int(after), parts);
+        expect(pinned && !delivered,
+               "folder: the pinned-name test held the final name and the file failed its last check (#60 r8)");
+        expect(unlink == 0, "folder: take-back: the final name was held by another program, so it could not be removed (#60 r8)");
+        expect(cut == -1 && zero == -1, "folder: take-back never cuts or zeroes a file that still has its final name (#60 r8)");
+        expect(exists && onDisk == 4096 && zone == 3,
+               "folder: a file whose final name cannot be removed stays there whole, with ZoneId=3, while the sink lives (#60 r8)");
+        expect(openable == 0,
+               "folder: while the sink lives nobody can write or remove the Zone.Identifier of a file whose final name is held (#60 r8)");
+        expect(afterKnown && !after && parts == 0,
+               "folder: once the final name is free the sink removes the file before it goes (#60 r8)");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        clearStaging(dir, L"heldname.exe");
     }
     // #60 r7 item 2: a file that can be neither taken back, deleted, cut nor
     // zeroed (every staging name taken, mapped as an image, locked) after

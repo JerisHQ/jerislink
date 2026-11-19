@@ -16,6 +16,7 @@ namespace jl::filepush {
 
 void (*gPublishHook)(HANDLE file, int stage) = nullptr;
 void (*gTakeOutTrace)(const char* step, bool ok) = nullptr;
+void (*gFinalHook)(const std::wstring& final, int stage) = nullptr;
 
 namespace {
 
@@ -268,6 +269,7 @@ public:
             const LONG st = linkTo(file_, longPath(final));
             if (st >= 0) {
                 if (gPublishHook) gPublishHook(file_, 1);
+                if (gFinalHook) gFinalHook(final, 1);
                 // Checked again through the held handle and as the file is
                 // seen under its final name (opened there, its file id
                 // checked). Nothing can change or remove the mark while it is
@@ -289,6 +291,7 @@ public:
                 // with its file id, and retried. It is the delivered file.
                 if (!unlinkName(part_, id)) names_.push_back({part_, id});
                 part_.clear();
+                if (gFinalHook) gFinalHook(final, 2);
                 return true;
             }
             if (st != kNameCollision) break;
