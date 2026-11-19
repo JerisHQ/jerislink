@@ -7,8 +7,9 @@
 // session. The viewer accepts at once (Q1: no confirm click), then pulls the
 // files one after another with REQUEST, like a paste but with a plain file
 // writer and no clipboard. Files land in %USERPROFILE%\Downloads\JerisLink:
-// each is written to a ".jlpart" file, and only when FILE_END's SHA-256
-// matched it is renamed to its name, or "name (2).ext" ... when that name is
+// each is written to a ".jlpart" file in the hidden ".jlstaging" folder
+// there, and only when FILE_END's SHA-256
+// matched it gets its name (#60 r7: a second link, then the staging name goes), or "name (2).ext" ... when that name is
 // taken, and gets Zone.Identifier ZoneId=3. Nothing is ever opened; Explorer
 // shows the folder when every file arrived. The viewer ends every push with
 // RESULT (ok or why not) so the Mac lets go of the files.
@@ -47,6 +48,10 @@ public:
     // The file is complete and verified: close it, give it its name (or the
     // next free "name (n).ext"), mark it as from the Internet.
     virtual bool commit() = 0;
+    // #60 r9: the caller is done with a commit() that returned true. Until
+    // then the sink may keep the delivered file's final name and mark held;
+    // here it lets go. PushReceiver calls it right after commit().
+    virtual void settle() {}
     // Closes and deletes the partial file, if there is one.
     virtual void abort() = 0;
     // Every file arrived: show the folder.
@@ -58,6 +63,9 @@ public:
         uint32_t failed = 0;
     };
     virtual ZoneCounts zoneCounts() const { return {}; }
+    // The last commit() failed because ZoneId=3 could not be put on the
+    // file (#53): the file was not delivered.
+    virtual bool zoneRefused() const { return false; }
 };
 
 enum class Outcome { None, Done, Failed, Cancelled };
@@ -229,7 +237,11 @@ public:
         const std::vector<uint8_t> sha = hash_ ? hash_->finish() : std::vector<uint8_t>{};
         hash_.reset();
         if (sha.empty() || sha != f.sha256) return failLocked("hash", file::status::kFailed);
-        if (!sink_->commit()) return failLocked("rename", file::status::kNoSpace);
+        if (!sink_->commit()) {
+            if (sink_->zoneRefused()) return failLocked("motw", file::status::kFailed);
+            return failLocked("rename", file::status::kNoSpace);
+        }
+        sink_->settle();
         ++cur_;
         if (cur_ < items_.size()) {
             if (!startFileLocked()) return failLocked("create", file::status::kNoSpace);
@@ -357,13 +369,44 @@ private:
 
 #ifdef _WIN32
 // Writes into `folder` (normally %USERPROFILE%\Downloads\JerisLink, see
-// downloadsFolder()). Partial files are "<name>.<n>.jlpart", created with
-// CREATE_NEW; a verified file is moved to "<name>" with no overwrite, and on
-// a clash to "name (2).ext", "name (3).ext" ... (up to 999). Zone.Identifier
-// ZoneId=3 is written on the partial file and moves with the rename; after
-// the rename it is checked and, if missing, written again (zoneCounts()).
+// downloadsFolder()). Partial files are "<name>.<n>.jlpart" in the hidden
+// "<folder>\.jlstaging", created with CREATE_NEW and held open (#60 r3). A
+// verified file (its size and ZoneId=3 checked in staging) is given the name
+// "<name>" through that handle as a hard link, with no overwrite, and on a
+// clash "name (2).ext", "name (3).ext" ... (up to 999); then its staging name
+// is removed. Zone.Identifier ZoneId=3 is written on the partial file, so the
+// final name has it from the start; it is checked again through the handle
+// after the link. #60 r7: the .jlpart is open without DELETE access, so from
+// the staging check until that last check the Zone.Identifier stream is held
+// with neither write nor delete sharing: nobody can change or remove the
+// mark, and if it cannot be held with ZoneId=3 the file is not published.
+// A file that fails is cut (else zeroed) through the handle and its final
+// name removed; a file that can be neither cut nor zeroed keeps both handles
+// (the mark still held) while the sink lives, and is retried. A file that
+// cannot carry the mark (a volume without streams) fails with reason "motw"
+// (#53). A name that cannot be removed at once is kept with its file id and
+// retried; a same-name file someone else put there is never touched.
 // `open` shows the folder in Explorer when a push finished (tests pass a no-op).
-std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open);
+// `zone` is for tests only.
+std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
+                                     filepull::ZoneOps zone = {});
+
+// Test seams (#60 r6), never set outside tests. gPublishHook is called by
+// commit() with the open file and stage 0 just before the file gets its
+// final name, and stage 1 just after it, before the last check.
+// gTakeOutTrace is called with each take-back and cleanup step's name
+// (#60 r7/r8: "unlink", "alone", "cut", "zero", "drop.cut", "drop.zero",
+// "drop.unlink")
+// and whether it worked.
+extern void (*gPublishHook)(HANDLE file, int stage);
+extern void (*gTakeOutTrace)(const char* step, bool ok);
+// #60 r8: gFinalHook is called by commit() with the file's final name at
+// stage 1, just after the file gets it and before the last check, and at
+// stage 2, after the last check, just before commit() reports success.
+extern void (*gFinalHook)(const std::wstring& final, int stage);
+// #60 r9: gIdLookupHook is asked just before the sink reads the file id of
+// a name it is about to remove; true makes that lookup fail.
+extern bool (*gIdLookupHook)(const std::wstring& path);
 
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
 // Windows does not know the Downloads folder.

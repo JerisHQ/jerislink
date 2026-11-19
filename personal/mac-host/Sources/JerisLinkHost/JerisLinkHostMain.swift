@@ -284,10 +284,10 @@ struct JerisLinkHostMain {
                 exit(2)
             }
             do {
-                let control = ControlServer(bindIP: bindIP,
-                                            allowedClientIP: o.controlClientIP,
-                                            port: o.controlPort,
-                                            inject: o.controlInject)
+                let control = ControlServer.legacyListener(bindIP: bindIP,
+                                                           allowedClientIP: o.controlClientIP,
+                                                           port: o.controlPort,
+                                                           inject: o.controlInject)
                 try control.start()
                 print("JerisLink control-only service")
                 print("Control MRC1: \(bindIP):\(o.controlPort), allowedClient=\(o.controlClientIP ?? "any"), inject=\(o.controlInject ? "requested" : "off")")
@@ -354,8 +354,8 @@ struct JerisLinkHostMain {
                     mouseUDP = server
                 }
                 if o.controlServerEnabled {
-                    control = ControlServer(bindIP: bindIP, allowedClientIP: o.controlClientIP,
-                                            port: o.controlPort, inject: o.controlInject)
+                    control = ControlServer.legacyListener(bindIP: bindIP, allowedClientIP: o.controlClientIP,
+                                                           port: o.controlPort, inject: o.controlInject)
                     try control?.start()
                 }
             }

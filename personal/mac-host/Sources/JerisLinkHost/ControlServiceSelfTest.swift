@@ -67,18 +67,14 @@ enum ControlServiceSelfTest {
         _ = direct?.send(type: 0x24, payload: [0x0d, 0x05, 0x11, 0x5c]) // MOUSE_MOVE_ABS_NORM 3333,4444
 
         // Relay path (video service -> 127.0.0.1:38411): the real relay
-        // client's mouse move, plus a key on a second relay connection.
+        // client's mouse move (MOUSE_MOVE_ABS_NORM, the one message it sends).
         let relayMouse = LocalControlMouseClient(port: relayPort)
         expect(relayMouse.sendMouseMoveNormalized(nx: 1111, ny: 2222), "control e2e: relay client sends mouse move")
-        let relayKey = MRC1Client(port: relayPort)
-        expect(relayKey != nil, "control e2e: second client connects to relay listener")
-        _ = relayKey?.send(type: 0x10, payload: [1, 0, 66])          // KEY down, semantic 'B' -> macCG 11
 
         let want: [(String, FakeInputHelper.Event)] = [
             ("direct key A (macCG 0)", .init(type: 0x10, payload: [1, 0, 0])),
             ("direct mouse 3333,4444", .init(type: 0x24, payload: [0x0d, 0x05, 0x11, 0x5c])),
             ("relay mouse 1111,2222", .init(type: 0x24, payload: [0x04, 0x57, 0x08, 0xae])),
-            ("relay key B (macCG 11)", .init(type: 0x10, payload: [1, 0, 11])),
         ]
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline, !want.allSatisfy({ helper.received($0.1) }) {
@@ -88,6 +84,77 @@ enum ControlServiceSelfTest {
             expect(helper.received(event), "control e2e: helper received \(name)")
         }
         expect(helper.maxConcurrentConnections == 1, "control e2e: one helper connection for both listeners")
+
+        // #58 r2: the relay takes MOUSE_MOVE_ABS_NORM (0x24) only. A key,
+        // button or scroll sent there never reaches the helper.
+        let eventsBefore = helper.snapshot().count
+        let relayKey = MRC1Client(port: relayPort)
+        expect(relayKey != nil, "control e2e: second client connects to relay listener")
+        _ = relayKey?.send(type: 0x10, payload: [1, 0, 66])          // KEY down, semantic 'B' -> macCG 11
+        _ = relayKey?.send(type: 0x21, payload: [0, 1])              // MOUSE_BUTTON left down
+        _ = relayKey?.send(type: 0x22, payload: [0, 0, 0, 5])        // MOUSE_SCROLL
+        usleep(700_000)
+        expect(!helper.received(.init(type: 0x10, payload: [1, 0, 11])),
+               "control e2e: relay KEY never reaches the helper (relay takes 0x24 only)")
+        expect(helper.snapshot().count == eventsBefore,
+               "control e2e: relay MOUSE_BUTTON and MOUSE_SCROLL never reach the helper")
+
+        // Only the video service may use the relay. Another local process
+        // (an old `tailscale serve` forward, any program) gets nothing
+        // through it, not even a mouse move. /usr/bin/nc stands in for it.
+        let foreignMove = FakeInputHelper.Event(type: 0x24, payload: [0x01, 0x02, 0x03, 0x04])
+        let nc = Process()
+        nc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        nc.arguments = [ListenConfig.loopbackIP, String(relayPort)]
+        let ncInput = Pipe()
+        nc.standardInput = ncInput
+        nc.standardOutput = FileHandle.nullDevice
+        nc.standardError = FileHandle.nullDevice
+        var ncStarted = false
+        do { try nc.run(); ncStarted = true } catch {}
+        if ncStarted {
+            ncInput.fileHandleForWriting.write(Data([0x4d, 0x52, 0x43, 0x31, 1, 0x24, 0, 4] + foreignMove.payload))
+            usleep(1_000_000)
+            nc.terminate()
+            nc.waitUntilExit()
+        }
+        expect(ncStarted && !helper.received(foreignMove),
+               "control e2e: relay refuses a mouse move from another process (video service only)")
+        expect(relayMouse.sendMouseMoveNormalized(nx: 2222, ny: 1111), "control e2e: relay client sends a second mouse move")
+        wait(until: { helper.received(.init(type: 0x24, payload: [0x08, 0xae, 0x04, 0x57])) })
+        expect(helper.received(.init(type: 0x24, payload: [0x08, 0xae, 0x04, 0x57])),
+               "control e2e: the video service's relay mouse still reaches the helper")
+
+        // #58: FORCE_QUIT_OPEN and CLIPBOARD_HELLO are for the configured
+        // viewer only. The relay (127.0.0.1:38411, also where an old
+        // `tailscale serve` forward lands) cannot prove who is behind it, so
+        // it refuses both; the direct listener still serves them.
+        let forceQuit = FakeInputHelper.Event(type: InputHelperClient.forceQuitOpenType, payload: [])
+        let relayQuit = MRC1Client(port: relayPort)
+        _ = relayQuit?.send(type: 0x60, payload: [])
+        _ = relayQuit?.send(type: 0x01, payload: [7, 7, 7, 7])     // PING: the relay has read the 0x60
+        _ = relayQuit?.receive(timeout: 2)
+        usleep(300_000)
+        expect(relayQuit != nil && helper.count(type: InputHelperClient.forceQuitOpenType) == 0,
+               "control e2e: relay FORCE_QUIT_OPEN never reaches the helper")
+        _ = direct?.send(type: 0x60, payload: [])
+        let quitDeadline = Date().addingTimeInterval(5)
+        while Date() < quitDeadline, !helper.received(forceQuit) { usleep(20_000) }
+        expect(helper.count(type: InputHelperClient.forceQuitOpenType) == 1,
+               "control e2e: direct FORCE_QUIT_OPEN reaches the helper once")
+        relayQuit?.close()
+        // A refused CLIPBOARD_HELLO closes the connection at once; an
+        // accepted one keeps a clipboard session open with nothing to send.
+        func clipboardClosedAtOnce(_ port: UInt16) -> Bool {
+            guard let c = MRC1Client(port: port) else { return false }
+            defer { c.close() }
+            _ = c.send(type: 0x30, payload: [])
+            let t0 = Date()
+            let got = c.receive(timeout: 1.5)
+            return got == nil && Date().timeIntervalSince(t0) < 1.0
+        }
+        expect(clipboardClosedAtOnce(relayPort), "control e2e: relay CLIPBOARD_HELLO is refused (connection closed at once)")
+        expect(!clipboardClosedAtOnce(directPort), "control e2e: direct CLIPBOARD_HELLO keeps a clipboard session open")
 
         // F3 session lifecycle: one SESSION_START before a viewer connection's
         // first key or mouse message, one SESSION_END when it closes. Nothing
@@ -148,7 +215,116 @@ enum ControlServiceSelfTest {
         failures += mainThreadHopCounter(expect)
         failures += fileSessions(expect)
         failures += finderPasteRefused(expect)
+        failures += legacyListenerUsesItsClientIP(expect)
+        failures += relayCallerDecisions(expect)
         return failures == 0 ? 0 : 1
+    }
+
+    /// #60 r3: who may use the relay, decided on a played process table.
+    /// The relay is TCP on 127.0.0.1, so the caller is found by the socket's
+    /// ports; every process holding that socket must be ours, and the pid
+    /// must be the same process before and after its path is read.
+    private static func relayCallerDecisions(_ expect: (Bool, String) -> Void) -> Int {
+        let me = "/Applications/JerisLink Host.app/Contents/MacOS/JerisLinkHost"
+        let ours: pid_t = 4100
+        let other: pid_t = 4200
+        func lookup(holders: @escaping () -> [pid_t], start: @escaping (pid_t) -> UInt64? = { _ in 77 })
+            -> RelayCaller.Lookup {
+            RelayCaller.Lookup(holders: { _, _ in holders() }, startTime: start,
+                               path: { $0 == ours ? me : "/usr/bin/nc" }, selfPath: { me })
+        }
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [ours] }))
+                   == .allow(pid: ours),
+               "relay caller: our own executable alone on the socket is allowed")
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [other] }))
+                   == .reject("other-executable"),
+               "relay caller: another executable is refused")
+        expect(RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: lookup(holders: { [] }))
+                   == .reject("no-owner"),
+               "relay caller: a socket nobody visible holds is refused")
+        // A socket shared with another process (passed on, or inherited):
+        // that process can write to the relay too. Refused (#60 r3).
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411,
+                                            lookup: lookup(holders: { [ours, other] })) {
+            expect(false, "relay caller: a socket also held by another executable is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a socket also held by another executable is refused (#60 r3)")
+        }
+        // The pid is reused between finding it and reading its path: its
+        // start time changes. Refused (#60 r3).
+        var starts: [UInt64] = [77, 78, 78, 78]
+        let reused = lookup(holders: { [ours] }, start: { _ in starts.isEmpty ? 78 : starts.removeFirst() })
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: reused) {
+            expect(false, "relay caller: a pid whose process changed while it was checked is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a pid whose process changed while it was checked is refused (#60 r3)")
+        }
+        // The process lets go of the socket after its path was read (it
+        // exited, and its pid may be someone else's next). Refused (#60 r3).
+        var lists: [[pid_t]] = [[ours], []]
+        let gone = lookup(holders: { lists.isEmpty ? [] : lists.removeFirst() })
+        if case .allow = RelayCaller.decide(clientPort: 50000, serverPort: 38411, lookup: gone) {
+            expect(false, "relay caller: a pid that no longer holds the socket after the check is refused (#60 r3)")
+        } else {
+            expect(true, "relay caller: a pid that no longer holds the socket after the check is refused (#60 r3)")
+        }
+        // The live lookup on a real loopback connection made by this process.
+        var live = false
+        if let port = freeLoopbackPort() {
+            let ls = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            var addr = loopbackAddress(port: port)
+            var one: Int32 = 1
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+            let bound = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(ls, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            if bound == 0, Darwin.listen(ls, 1) == 0 {
+                let cs = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+                let connected = withUnsafePointer(to: &addr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(cs, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+                var local = sockaddr_in()
+                var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let named = withUnsafeMutablePointer(to: &local) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(cs, $0, &len) }
+                }
+                if connected == 0, named == 0 {
+                    let clientPort = UInt16(bigEndian: local.sin_port)
+                    live = RelayCaller.check(clientPort: clientPort, serverPort: port) == .allow(pid: getpid())
+                }
+                Darwin.close(cs)
+            }
+            Darwin.close(ls)
+        }
+        expect(live, "relay caller: the live lookup allows this process on a real loopback connection")
+        return 0
+    }
+
+    /// #58 r2: a legacy listener started with an explicit
+    /// --control-client-ip decides CLIPBOARD/FORCE_QUIT (and VIDEO_CONFIG)
+    /// by that address, not by the network.conf viewer, which may name
+    /// another machine. Without the flag it still follows network.conf.
+    private static func legacyListenerUsesItsClientIP(_ expect: (Bool, String) -> Void) -> Int {
+        func clipboardKept(allowedClientIP: String?) -> Bool? {
+            guard let port = freeLoopbackPort() else { return nil }
+            let server = ControlServer.legacyListener(bindIP: ListenConfig.loopbackIP, allowedClientIP: allowedClientIP,
+                                                      port: port, inject: false,
+                                                      globalClientIP: { "100.64.0.99" },
+                                                      clipboard: FakeClipboard(text: "legacy"))
+            do { try server.start() } catch { return nil }
+            defer { server.stop() }
+            guard let c = MRC1Client(port: port) else { return nil }
+            defer { c.close() }
+            _ = c.send(type: 0x30, payload: [])                      // CLIPBOARD_HELLO
+            let t0 = Date()
+            let got = c.receive(timeout: 1.5)
+            return !(got == nil && Date().timeIntervalSince(t0) < 1.0)
+        }
+        expect(clipboardKept(allowedClientIP: ListenConfig.loopbackIP) == true,
+               "legacy listener: the --control-client-ip viewer keeps clipboard when network.conf names another viewer")
+        expect(clipboardKept(allowedClientIP: nil) == false,
+               "legacy listener: without --control-client-ip, network.conf still decides (clipboard refused)")
+        return 0
     }
 
     private static func wait(until cond: () -> Bool, seconds: Double = 5) {

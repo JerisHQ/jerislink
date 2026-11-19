@@ -80,6 +80,18 @@ final class ControlServer: @unchecked Sendable {
     /// Answer FILE_HELLO (0x50). Only the viewer-facing direct listener;
     /// the loopback relay and the legacy listeners refuse it (design D13).
     private let allowFileSessions: Bool
+    /// FORCE_QUIT_OPEN (0x60) and CLIPBOARD_HELLO (0x30) act for the viewer
+    /// beyond keys and mouse. False on the loopback relay: its one real
+    /// client (the video service) sends only mouse moves, and a loopback
+    /// peer (or an old `tailscale serve` forward to 38411) cannot prove it
+    /// is the configured viewer. Elsewhere SettingsAuthority decides.
+    private let allowSensitiveControl: Bool
+    /// The loopback relay (#58 r2): only the video service's mouse relay may
+    /// connect (RelayCaller), and it may send MOUSE_MOVE_ABS_NORM (0x24) only.
+    /// Any other message closes the connection.
+    private let relayMouseOnly: Bool
+    private let relayCaller: (_ clientPort: UInt16, _ serverPort: UInt16) -> RelayCaller.Decision
+    private(set) var relayRejected: UInt64 = 0
     /// Where paste uploads are staged (a temp folder in the self-test).
     private let fileStagingRoot: URL
     /// Where drops land and what REVEAL opens (a temp folder in the self-test).
@@ -99,6 +111,9 @@ final class ControlServer: @unchecked Sendable {
          inputHelper: InputHelperClient? = nil,
          announceInputSessions: Bool = true,
          allowFileSessions: Bool = false,
+         allowSensitiveControl: Bool = true,
+         relayMouseOnly: Bool = false,
+         relayCaller: @escaping (_ clientPort: UInt16, _ serverPort: UInt16) -> RelayCaller.Decision = RelayCaller.check,
          fileStagingRoot: URL = FileUploadReceiver.defaultRoot,
          fileSendFolder: FileSendFolder = .shared,
          clipboard: ClipboardBackend = SystemClipboard.shared,
@@ -112,6 +127,9 @@ final class ControlServer: @unchecked Sendable {
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
+        self.allowSensitiveControl = allowSensitiveControl
+        self.relayMouseOnly = relayMouseOnly
+        self.relayCaller = relayCaller
         self.fileStagingRoot = fileStagingRoot
         self.fileSendFolder = fileSendFolder
         self.inputHelper = inputHelper
@@ -120,6 +138,17 @@ final class ControlServer: @unchecked Sendable {
         self.port = port
         self.injectRequested = inject
         self.settingsClientIP = settingsClientIP
+    }
+
+    /// The legacy listeners: `--control-only`, and control inside the video
+    /// host (--bind-ip/--client-ip). `globalClientIP` is the network.conf
+    /// viewer (a fixed value in the self-test).
+    static func legacyListener(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
+                               globalClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
+                               clipboard: ClipboardBackend = SystemClipboard.shared) -> ControlServer {
+        // The listener's own --control-client-ip wins; network.conf only decides when it is not set.
+        ControlServer(bindIP: bindIP, allowedClientIP: allowedClientIP, port: port, inject: inject,
+                      settingsClientIP: { allowedClientIP ?? globalClientIP() }, clipboard: clipboard)
     }
 
     func start() throws {
@@ -214,7 +243,7 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) file_sessions=\(fileSessions) file_refused=\(fileRefused) \(fileStatsText()) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
+        "control_messages=\(messages) control_key_events=\(keyEvents) control_mouse_events=\(mouseEvents) clipboard_tx=\(clipboardSent) clipboard_rx=\(clipboardReceived) control_rejected_clients=\(rejectedClients) settings_rejected=\(settingsRejected) relay_rejected=\(relayRejected) file_sessions=\(fileSessions) file_refused=\(fileRefused) \(fileStatsText()) helper_send_failures=\(helperSendFailures) main_hops=\(MainThreadHops.total)"
     }
 
     private func acceptLoop() {
@@ -258,7 +287,7 @@ final class ControlServer: @unchecked Sendable {
                     Darwin.close(c)
                     return
                 }
-                self.handleClient(c, tcpPeerIP: peerIP)
+                self.handleClient(c, tcpPeerIP: peerIP, tcpPeerPort: peerPort)
                 self.lock.lock()
                 self.clientFDs.remove(c)
                 self.lock.unlock()
@@ -294,7 +323,14 @@ final class ControlServer: @unchecked Sendable {
         return on && idle && interval && count
     }
 
-    private func handleClient(_ fd: Int32, tcpPeerIP: String) {
+    private func handleClient(_ fd: Int32, tcpPeerIP: String, tcpPeerPort: UInt16) {
+        if relayMouseOnly {
+            if case .reject(let reason) = relayCaller(tcpPeerPort, port) {
+                relayRejected += 1
+                print("Control relay reject peer=\(tcpPeerIP):\(tcpPeerPort) on \(bindIP):\(port) reason=\(reason); connection closed")
+                return
+            }
+        }
         guard var pending = recvExact(fd, count: 8) else { return }
         var peer = ControlPeer(ip: tcpPeerIP, verified: !ControlPeer.isLoopback(tcpPeerIP))
         // Only a local forwarder (tailscale serve --proxy-protocol) may name
@@ -340,6 +376,15 @@ final class ControlServer: @unchecked Sendable {
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
             messages += 1
             connectionMessages += 1
+            if relayMouseOnly && type != 0x24 {
+                relayRejected += 1
+                if type == FileProto.MsgType.hello {
+                    fileRefused += 1
+                    print("file.session=refused")
+                }
+                print("Control relay reject type=0x\(String(type, radix: 16)) on \(bindIP):\(port) reason=mouse-move-only; connection closed")
+                return
+            }
             if !sessionStarted && announceInputSessions && Self.isInputMessage(type) {
                 pasteGate = FinderPasteGate()  // no Cmd held over from an earlier viewer
                 sessionStarted = startInputSession(sessionID)
@@ -359,6 +404,7 @@ final class ControlServer: @unchecked Sendable {
                 return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
+                guard sensitiveAllowed(type: type, peer: peer) else { return }
                 print("Clipboard session connected")
                 handleClipboardSession(fd)
                 print("Clipboard session ended")
@@ -419,11 +465,29 @@ final class ControlServer: @unchecked Sendable {
                     handleMouseMoveNormalized(nx: nx, ny: ny)
                 }
             case 0x60: // FORCE_QUIT_OPEN, empty payload
-                if payload.isEmpty { handleForceQuitOpen() }
+                if payload.isEmpty, sensitiveAllowed(type: type, peer: peer) { handleForceQuitOpen() }
             default:
                 print("Control unknown type=\(type) len=\(length)")
             }
         }
+    }
+
+    /// FORCE_QUIT_OPEN and CLIPBOARD_HELLO: refused on the loopback relay,
+    /// and elsewhere allowed only for the configured viewer (the same check
+    /// as VIDEO_CONFIG_SET), so a peer that cannot be verified gets neither.
+    private func sensitiveAllowed(type: UInt8, peer: ControlPeer) -> Bool {
+        let reason: String
+        if !allowSensitiveControl {
+            reason = "relay"
+        } else {
+            let clientIP = settingsClientIP()
+            switch SettingsAuthority.check(peer: peer, clientIP: clientIP) {
+            case .allow: return true
+            case .reject(let why): reason = why
+            }
+        }
+        print("Control sensitive reject type=0x\(String(type, radix: 16)) peer=\(peer.ip) verified=\(peer.verified) on \(bindIP):\(port) reason=\(reason)")
+        return false
     }
 
     private static func isInputMessage(_ type: UInt8) -> Bool {

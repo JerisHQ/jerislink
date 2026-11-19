@@ -139,8 +139,10 @@ inline std::string buildManifest(const file::Offer& offer, const std::vector<fil
             if (e.size != 0) return "size";
             dirs[v.original] = name;
         } else {
+            // #49/#53: checked before adding. Added first, a sum past 2^64
+            // wraps, slips under the limit and can match offer.total.
+            if (e.size > file::kMaxTotalBytes || e.size > file::kMaxTotalBytes - total) return "too_big";
             total += e.size;
-            if (total > file::kMaxTotalBytes) return "too_big";
             ++out.files;
         }
         if (renamed) ++out.renamed;
@@ -479,18 +481,38 @@ private:
 // SHA-256 through BCrypt, for PullHub.
 DigestFactory sha256Digest();
 
-// ---- Mark of the Web for pasted Mac files (F3 r2) ----------------------
+// ---- Mark of the Web for pasted Mac files (F3 r2, #53 r2, #60 r3) -------
 //
 // Explorer writes a virtual-file paste (FileGroupDescriptorW + FileContents)
 // itself and, as the F3 hand test showed, adds no Zone.Identifier to it,
 // whatever the source says in "UntrustedDragDrop". The viewer never learns
-// the destination folder either. So once Explorer has read a file to its
-// end, FileClipboard looks for it: in folders where the shell reported new
-// items during the paste, in folders open in Explorer windows, and on the
-// Desktop. A file counts only when it has the manifest's path (or Explorer's
-// "name (2).ext" for the top item), the manifest's size, and was created
-// after the paste started. Each one found gets ZoneId=3 (Internet), the mark
-// a browser download gets. An existing Zone.Identifier is never replaced.
+// the destination folder either. So the last byte of each file (for an
+// empty file, the end of its stream) waits for the mark: when Explorer asks
+// for it, FileClipboard looks for the copy on disk (in folders where the
+// shell reported new items during the paste, in folders open in Explorer
+// windows when the paste started, and on the Desktop), settles on this
+// paste's copy, and makes sure it carries ZoneId=3 (Internet), the mark a
+// browser download gets. Only then does Explorer get the last byte. If no
+// copy is found, more than one could be ours, or the mark cannot be written
+// and read back, the read fails and Explorer never completes the file.
+//
+// A file is this paste's copy only when it has the manifest's path (or
+// Explorer's "name (2).ext" for the top item), is a plain file (no folder,
+// no link at the name), was created after the paste started, is at least as
+// long as the bytes handed out, and is open for writing right now: Explorer
+// holds it so until it has the last byte. No bytes are sampled; a file
+// nobody writes is never taken, whatever it holds. Explorer may size the
+// copy past the manifest before it writes, so a longer file is taken here
+// and judged after the paste. Exactly one such file must exist. It is held
+// open by identity (volume and file id) from then on: the mark, its read
+// back and any later delete go to that file, never to whatever has its name.
+//
+// After Explorer lets go of the stream, settleCopy() waits until nobody
+// writes the copy, then keeps it only when every byte was handed out, it is
+// exactly the manifest size, its SHA-256 is that of the bytes handed out and
+// it carries ZoneId=3 (or 4). Anything else (a refused paste the shell had
+// already sized to full length, a copy that ended longer, a mark that went
+// away) is deleted through its identity. Nothing else is marked or deleted.
 
 enum class ZoneWrite { Written, Exists, Failed };
 
@@ -501,17 +523,168 @@ ZoneWrite writeInternetZone(const std::wstring& path);
 // Reads `path`:Zone.Identifier's ZoneId, or -1 if there is none.
 int readZoneId(const std::wstring& path);
 
-struct ZoneMarkStats {
-    uint32_t written = 0;  // Zone.Identifier added
-    uint32_t existed = 0;  // already had one (kept)
-    uint32_t failed = 0;   // found but could not be marked
+// A file's identity: its volume and 128-bit file id (#60 r3). A handle to a
+// file keeps pointing at that file when it is renamed or another file takes
+// its name; checks and cleanups go through the identity, never the name.
+bool fileIdOf(HANDLE h, FILE_ID_INFO& out);
+bool sameFile(const FILE_ID_INFO& a, const FILE_ID_INFO& b);
+// Opens the file with identity `id` on the volume of `hint` (any handle on
+// that volume). INVALID_HANDLE_VALUE if it is gone or cannot be opened so;
+// GetLastError() says why.
+HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share);
+// Deletes the file with identity `id` on the volume of `hint`, never
+// whatever has its name. NTFS does not delete through a handle opened by
+// id, so the file is reopened under its current name with delete access
+// and used only if it is still the same file. True once it is gone (or
+// already going); false while it cannot be deleted yet.
+bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id);
+
+// The zone calls on an open file (#60 r3, r4): the Zone.Identifier stream
+// is opened relative to the file's handle, never by path, and used only
+// when it belongs to the same file (volume and file id), so a file swapped
+// in under the name is never marked, read, or given an empty stream. writeInternetZoneOn replaces whatever the
+// stream held; Failed on volumes without streams (FAT, exFAT).
+ZoneWrite writeInternetZoneOn(HANDLE file);
+int readZoneIdOn(HANDLE file);
+// Test seam (#60 r4): called by the two calls above once the file's
+// identity is pinned, just before its Zone.Identifier stream is opened, so
+// a test can swap another file in under the name at that moment. Never set
+// outside tests.
+extern void (*gZoneStreamOpenHook)(HANDLE file);
+// The existing Zone.Identifier stream of the file `file` is open on, opened
+// the same way (relative to the handle, file id checked) with `access` and
+// exactly `share` (#60 r7: no delete sharing is added; the caller, the push
+// sink, holds the stream and must open its file without DELETE access).
+HANDLE openZoneStreamOn(HANDLE file, DWORD access, DWORD share);
+
+// The zone calls, swappable so a test can stand in for a volume without
+// streams (FAT, exFAT), a mark that cannot be fixed, or a file swapped
+// under its name while it is checked.
+struct ZoneOps {
+    ZoneWrite (*write)(const std::wstring&) = writeInternetZone;
+    int (*read)(const std::wstring&) = readZoneId;
+    ZoneWrite (*writeOn)(HANDLE) = writeInternetZoneOn;
+    int (*readOn)(HANDLE) = readZoneIdOn;
 };
 
-// Marks the manifest files listed in `want` (indexes Explorer read to the
-// end) that are found under one of `folders`, created at or after `since`.
-// Found indexes move from `want` to `done`.
-ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
-                            std::set<uint32_t>& want, std::set<uint32_t>& done);
+struct ZoneMarkStats {
+    uint32_t written = 0;  // Zone.Identifier ZoneId=3 added (or a weaker zone replaced)
+    uint32_t existed = 0;  // already ZoneId=3 or 4 (kept)
+    uint32_t failed = 0;   // found, but could not be marked: the last byte was withheld
+    uint32_t kept = 0;     // settled: complete, the right bytes, ZoneId=3 or 4
+    uint32_t removed = 0;  // settled: deleted (#60 r5: never, kept for the log format)
+    uint32_t left = 0;     // settled: anything else, left untouched, the paste failed (#60 r5)
+};
+
+// The copy the gate settled on, held open (attributes only, every sharing
+// mode, so nobody is blocked) for as long as the paste runs: the mark, the
+// final check and any cleanup go to this file, never to whatever has its
+// name by then. Move-only.
+class LockedCopy {
+public:
+    LockedCopy() = default;
+    ~LockedCopy() { reset(); }
+    LockedCopy(LockedCopy&& o) noexcept { *this = std::move(o); }
+    LockedCopy& operator=(LockedCopy&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h_ = o.h_;
+            id_ = o.id_;
+            o.h_ = INVALID_HANDLE_VALUE;
+            o.id_ = FILE_ID_INFO{};
+        }
+        return *this;
+    }
+    LockedCopy(const LockedCopy&) = delete;
+    LockedCopy& operator=(const LockedCopy&) = delete;
+
+    explicit operator bool() const { return h_ != INVALID_HANDLE_VALUE; }
+    HANDLE handle() const { return h_; }
+    const FILE_ID_INFO& id() const { return id_; }
+    void adopt(HANDLE h, const FILE_ID_INFO& id) {
+        reset();
+        h_ = h;
+        id_ = id;
+    }
+    void reset() {
+        if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_);
+        h_ = INVALID_HANDLE_VALUE;
+        id_ = FILE_ID_INFO{};
+    }
+
+private:
+    HANDLE h_ = INVALID_HANDLE_VALUE;
+    FILE_ID_INFO id_{};
+};
+
+// One file's gate: asked before Explorer gets the file's last byte.
+struct GateRequest {
+    uint32_t transfer = 0;
+    uint32_t index = 0;
+    std::wstring rel;            // manifest path, Windows-mapped
+    uint64_t size = 0;           // manifest size
+    FILETIME since{};            // a copy must be created at or after this
+    // #60 r4: the process reading this file's stream (Explorer, which writes
+    // the copy itself). A copy is taken only if this process has it open.
+    // #60 r5: 0 or kUnknownReader means it could not be identified, and no
+    // copy is taken.
+    uint32_t reader = 0;
+};
+// A reader that could not be identified: no file is ever linked to it.
+constexpr uint32_t kUnknownReader = 0xFFFFFFFFu;
+
+enum class GateOutcome {
+    Marked,        // the one copy carries ZoneId=3 (or 4)
+    NotFound,      // no file could be this paste's copy
+    WriteFailed,   // a copy found, the mark could not be written (a volume without streams)
+    Invalid,       // a copy found, its Zone.Identifier never read back as ZoneId=3
+    Ambiguous,     // more than one copy could be ours: none is marked or taken
+};
+
+// Why no copy was proven: counts and sizes only, never names, for the log.
+struct GateProbe {
+    uint32_t paths = 0;       // candidate paths tried
+    uint32_t present = 0;     // of those, a file is there
+    uint32_t tooSmall = 0;    // shorter than the bytes handed out
+    uint32_t larger = 0;      // longer than the manifest size (Explorer sized it first; not a refusal)
+    uint32_t older = 0;       // created before the paste started
+    uint32_t openFailed = 0;  // there, but could not be opened to check it
+    uint32_t idle = 0;        // nobody is writing it: not a copy in progress
+    uint32_t unlinked = 0;    // being written, but not by the process reading the stream (#60 r4)
+    uint32_t candidates = 0;  // copies taken (more than one: ambiguous)
+    uint64_t lastSize = 0;    // size of the last file found
+    int64_t lastAgeMs = 0;    // its creation time minus `since`
+    uint32_t openError = 0;   // GetLastError of the last open that failed
+};
+
+// Looks for `r`'s copy under `folders` (name, time, size, being written,
+// open in the reading process, exactly one) and marks it through its handle. Counts the outcome once in
+// `stats`; `probe`, if given, says why nothing was taken.
+// `locked`, if given, receives the copy (also when its mark failed) for
+// settleCopy().
+GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
+                     ZoneMarkStats& stats, GateProbe* probe = nullptr, LockedCopy* locked = nullptr);
+
+// What a stream knew when Explorer let go of it.
+struct SettleRequest {
+    uint32_t transfer = 0;
+    uint32_t index = 0;
+    uint64_t size = 0;             // manifest size
+    std::vector<uint8_t> sha256;   // SHA-256 of every byte handed out
+    bool complete = false;         // the gate passed and every byte was handed out
+};
+
+enum class SettleOutcome { None, Kept, Removed, Left };
+
+// After the paste (#60 r3): waits up to `waitMs` until nobody writes the
+// locked copy any more, then keeps it only when it is complete, exactly the
+// manifest size, has the SHA-256 of the bytes handed out and carries
+// ZoneId=3 or 4. #60 r5: anything else is left untouched (never deleted:
+// the copy is linked only by the reading process) and counts as a failed
+// paste. Counts the
+// outcome in `stats` and releases `copy`.
+SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps& zone, ZoneMarkStats& stats,
+                         int waitMs);
 
 // The Windows clipboard object for an announce, on its own STA thread.
 // offer() and withdraw() return at once; the thread does the OLE calls.
@@ -520,7 +693,9 @@ ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& 
 class FileClipboard {
 public:
     using LogFn = std::function<void(const std::string&)>;
-    FileClipboard(PullHub& hub, LogFn log);
+    // `zone`: the Zone.Identifier calls (a test stands in for a volume
+    // without streams, or a mark that cannot be fixed).
+    FileClipboard(PullHub& hub, LogFn log, ZoneOps zone = {});
     ~FileClipboard();
     FileClipboard(const FileClipboard&) = delete;
     FileClipboard& operator=(const FileClipboard&) = delete;

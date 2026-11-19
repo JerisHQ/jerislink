@@ -7,10 +7,26 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 namespace jl::filepush {
+
+void (*gPublishHook)(HANDLE file, int stage) = nullptr;
+void (*gTakeOutTrace)(const char* step, bool ok) = nullptr;
+void (*gFinalHook)(const std::wstring& final, int stage) = nullptr;
+
+bool (*gIdLookupHook)(const std::wstring& path) = nullptr;
+
 namespace {
+
+// #60 r6: reports a take-back or cleanup step's result to a test.
+bool traced(const char* step, bool ok) {
+    if (gTakeOutTrace) gTakeOutTrace(step, ok);
+    return ok;
+}
 
 std::string toUtf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -36,36 +52,173 @@ std::wstring longPath(const std::wstring& p) {
     return L"\\\\?\\" + p;
 }
 
+// #60 r7: gives the open file `h` the extra name `target` (a "\\?\" long
+// path), never over an existing file: a hard link, made through the handle.
+// Unlike a rename it needs no DELETE access, so the sink can hold the
+// Zone.Identifier stream with delete sharing denied while it is done.
+// Returns the NTSTATUS (0 = linked).
+constexpr LONG kNameCollision = LONG(0xC0000035);   // STATUS_OBJECT_NAME_COLLISION
+LONG linkTo(HANDLE h, const std::wstring& target) {
+    using NtSetInformationFileFn = LONG(NTAPI*)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+    static const auto ntSet = reinterpret_cast<NtSetInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile")));
+    if (!ntSet || target.rfind(L"\\\\?\\", 0) != 0) return LONG(0xC0000001);   // STATUS_UNSUCCESSFUL
+    const std::wstring nt = L"\\??\\" + target.substr(4);
+    const size_t nameBytes = nt.size() * sizeof(wchar_t);
+    // FILE_LINK_INFORMATION has the layout of FILE_RENAME_INFO.
+    std::vector<uint8_t> buf(sizeof(FILE_RENAME_INFO) + nameBytes, 0);
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+    info->ReplaceIfExists = FALSE;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = DWORD(nameBytes);
+    std::memcpy(info->FileName, nt.data(), nameBytes);
+    ULONG_PTR io[2] = {};
+    return ntSet(h, io, info, ULONG(buf.size()), 11 /* FileLinkInformation */);
+}
+
+// Marks the open file `h` for deletion (it goes when the last handle closes).
+bool deleteOn(HANDLE h) {
+    FILE_DISPOSITION_INFO del{};
+    del.DeleteFile = TRUE;
+    return SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
+}
+
+// #60 r4: deletes the open file `h` now, also when it is read-only and
+// while others hold it open (POSIX semantics: the name goes at once).
+// FileDispositionInfoEx (21) and its flags, declared here for older SDKs.
+bool deleteNowOn(HANDLE h) {
+    struct {
+        ULONG Flags;
+    } del{0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */ | 0x10 /* IGNORE_READONLY_ATTRIBUTE */};
+    return SetFileInformationByHandle(h, FILE_INFO_BY_HANDLE_CLASS(21), &del, sizeof(del)) != 0;
+}
+
+// #60 r4: cuts the open file `h` to zero bytes.
+bool emptyOn(HANDLE h) {
+    FILE_END_OF_FILE_INFO end{};
+    return SetFileInformationByHandle(h, FileEndOfFileInfo, &end, sizeof(end)) != 0;
+}
+
+// #60 r5: overwrites every byte of the open file `h` with zeros, for a file
+// that can be neither deleted nor cut (another program has it mapped).
+bool zeroOn(HANDLE h) {
+    LARGE_INTEGER size{};
+    LARGE_INTEGER zero{};
+    if (!GetFileSizeEx(h, &size) || !SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) return false;
+    static const std::vector<uint8_t> zeros(1u << 16, 0);
+    uint64_t left = uint64_t(size.QuadPart);
+    while (left > 0) {
+        const DWORD n = DWORD(std::min<uint64_t>(left, zeros.size()));
+        DWORD wrote = 0;
+        if (!WriteFile(h, zeros.data(), n, &wrote, nullptr) || wrote != n) return false;
+        left -= n;
+    }
+    return FlushFileBuffers(h) != 0;
+}
+
+// #60 r6: the ZoneId in the Zone.Identifier stream open as `z`, read
+// through that handle from its start; -1 when it cannot be read.
+int zoneIdFrom(HANDLE z) {
+    char buf[1024] = {};
+    DWORD got = 0;
+    OVERLAPPED at{};
+    if (!ReadFile(z, buf, sizeof(buf) - 1, &got, &at)) return -1;
+    const char* id = std::strstr(buf, "ZoneId=");
+    return id ? std::atoi(id + 7) : -1;
+}
+
+// #60 r7: removes the name `path` if it still names the file `id`. The
+// name is opened without following a link and its file id checked, so a
+// file someone else put under the name is never touched. True when the name
+// is gone or no longer ours; false when it is ours and could not be removed
+// now (someone holds the file without delete sharing, or it is mapped as an
+// image), and (#60 r9) when its file id could not be read: then nobody knows
+// whose the name is, so it is kept and tried again.
+bool unlinkName(const std::wstring& path, const FILE_ID_INFO& id) {
+    HANDLE h = CreateFileW(longPath(path).c_str(), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    FILE_ID_INFO got{};
+    if ((gIdLookupHook && gIdLookupHook(path)) || !filepull::fileIdOf(h, got)) {
+        CloseHandle(h);
+        return false;
+    }
+    if (!filepull::sameFile(got, id)) {
+        CloseHandle(h);
+        return true;
+    }
+    const bool ok = deleteNowOn(h) || deleteOn(h);
+    CloseHandle(h);
+    return ok;
+}
+
+// #60 r8: true when the open file `h` has exactly one name left.
+bool oneName(HANDLE h) {
+    FILE_STANDARD_INFO info{};
+    return GetFileInformationByHandleEx(h, FileStandardInfo, &info, sizeof(info)) && info.NumberOfLinks == 1 &&
+           !info.DeletePending;
+}
+
+// #60 r5/r7: true once the open file `h` holds no bytes of what was received:
+// cut to zero, else every byte overwritten with zeros. Results checked.
+bool blankOn(HANDLE h, const char* cut, const char* zero) {
+    return traced(cut, emptyOn(h)) || traced(zero, zeroOn(h));
+}
+
 class FolderSink : public Sink {
 public:
-    FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open)
-        : folder_(std::move(folder)), open_(std::move(open)) {}
-    ~FolderSink() override { abort(); }
+    FolderSink(std::wstring folder, std::function<void(const std::wstring&)> open, filepull::ZoneOps zone)
+        : folder_(std::move(folder)), staging_(folder_ + L"\\.jlstaging"), open_(std::move(open)), ops_(zone) {}
+    ~FolderSink() override {
+        abort();
+        // #53 r2: a file that failed its check, or a .jlpart, that could not
+        // be removed at once: retried for about a second more before the sink goes.
+        for (int i = 0; i < 20 && !retryCleanup(); ++i) Sleep(50);
+        for (const Held& h : held_) {
+            if (h.zone != INVALID_HANDLE_VALUE) CloseHandle(h.zone);
+            CloseHandle(h.file);
+        }
+    }
 
     bool prepare() override {
         if (folder_.empty()) return false;
         // The folder and its parents (Downloads normally exists already).
         const int rc = SHCreateDirectoryExW(nullptr, folder_.c_str(), nullptr);
         if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) return false;
-        const DWORD a = GetFileAttributesW(longPath(folder_).c_str());
-        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+        if (!plainFolder(folder_)) return false;
+        // #60 r3: partial files live in a hidden folder inside it, so nothing
+        // unverified ever sits in Downloads\JerisLink itself.
+        if (!CreateDirectoryW(longPath(staging_).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        if (!plainFolder(staging_)) return false;
+        const DWORD a = GetFileAttributesW(longPath(staging_).c_str());
+        if (!(a & FILE_ATTRIBUTE_HIDDEN)) SetFileAttributesW(longPath(staging_).c_str(), a | FILE_ATTRIBUTE_HIDDEN);
+        return true;
     }
 
     bool begin(const std::wstring& name) override {
         abort();
+        retryCleanup();
         name_ = name;
         for (int n = 1; n < 1000; ++n) {
-            const std::wstring part = folder_ + L"\\" + name + (n == 1 ? L"" : L"." + std::to_wstring(n)) + L".jlpart";
-            HANDLE h = CreateFileW(longPath(part).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            const std::wstring part = staging_ + L"\\" + name + (n == 1 ? L"" : L"." + std::to_wstring(n)) + L".jlpart";
+            // #60 r7: no DELETE access and no delete sharing. Nobody can
+            // delete or rename the file while it is open, and the sink can
+            // hold its Zone.Identifier stream with delete sharing denied
+            // (NTFS refuses that next to an open of the file with DELETE).
+            HANDLE h = CreateFileW(longPath(part).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
                 file_ = h;
                 part_ = part;
-                // Mark of the Web goes on the partial file first: the stream
-                // moves with the rename, so the file never has its final name
-                // without it (a scanner opening a new .exe right after the
-                // rename can no longer make the mark fail). commit() checks.
-                filepull::writeInternetZone(longPath(part));
+                written_ = 0;
+                // Mark of the Web goes on the partial file first: the final
+                // name is a link to this same file, so it never has that
+                // name without it. commit() checks.
+                ops_.writeOn(file_);
                 return true;
             }
             if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
@@ -81,80 +234,288 @@ public:
             if (!WriteFile(file_, data, chunk, &wrote, nullptr) || wrote == 0) return false;
             data += wrote;
             size -= wrote;
+            written_ += wrote;
         }
         return true;
     }
 
     bool commit() override {
+        zoneRefused_ = false;
+        retryCleanup();
         if (file_ == INVALID_HANDLE_VALUE) return false;
-        const BOOL flushed = FlushFileBuffers(file_);
-        CloseHandle(file_);
-        file_ = INVALID_HANDLE_VALUE;
-        if (!flushed) return dropPart();
-        // No overwrite: an existing name moves on to "name (2).ext" ...
+        // In staging: every byte on disk, exactly as many as were written.
+        LARGE_INTEGER size{};
+        if (!FlushFileBuffers(file_) || !GetFileSizeEx(file_, &size) || uint64_t(size.QuadPart) != written_) {
+            return dropPart();
+        }
+        // #53: no file reaches the folder without ZoneId=3. On a volume
+        // without streams (FAT, exFAT) the mark cannot be written, and the
+        // file is dropped, not delivered.
+        if (!ensureZone(file_)) {
+            ++zone_.failed;
+            zoneRefused_ = true;
+            return dropPart();
+        }
+        // #60 r6/r7: the mark is held, not just seen. The Zone.Identifier
+        // stream is opened with read sharing only (no write, no delete) and
+        // ZoneId=3 is read through that handle; it stays open while the file
+        // gets its final name and through the check there, so nobody can
+        // change or remove the mark in between. If the stream cannot be held
+        // with ZoneId=3, the file is not published.
+        HANDLE zone = lockZone();
+        if (zone == INVALID_HANDLE_VALUE) {
+            ++zone_.failed;
+            zoneRefused_ = true;
+            return dropPart();
+        }
+        FILE_ID_INFO id{};
+        if (!filepull::fileIdOf(file_, id)) {
+            CloseHandle(zone);
+            return dropPart();
+        }
+        // The final name is a hard link made through the handle, no
+        // overwrite: an existing name moves on to "name (2).ext" ...
         const std::string utf8 = toUtf8(name_);
+        if (gPublishHook) gPublishHook(file_, 0);
         for (int n = 1; n < 1000; ++n) {
             const std::wstring leaf = n == 1 ? name_ : toWide(file::path::clashName(utf8, n));
-            const std::wstring target = folder_ + L"\\" + leaf;
-            if (MoveFileExW(longPath(part_).c_str(), longPath(target).c_str(), MOVEFILE_WRITE_THROUGH)) {
+            const std::wstring final = folder_ + L"\\" + leaf;
+            const LONG st = linkTo(file_, longPath(final));
+            if (st >= 0) {
+                if (gPublishHook) gPublishHook(file_, 1);
+                // #60 r8: the final link is held from here until commit()
+                // returns: opened through the final name without delete
+                // sharing (NTFS applies delete sharing per name, so the
+                // staging handle alone does not keep the final name from
+                // being renamed or removed), its file id checked.
+                HANDLE pin = pinFinal(final, id);
+                if (gFinalHook) gFinalHook(final, 1);
+                // Checked again through the held stream and through the
+                // held final link. Nothing can change or remove the mark or
+                // the name while they are held, so a failure here means a
+                // read failed or the name did not lead to this file; then the
+                // file is taken back (takeOut()).
+                const bool held = pin != INVALID_HANDLE_VALUE && zoneIdFrom(zone) == 3 && ops_.readOn(pin) == 3;
+                if (!held) {
+                    ++zone_.failed;
+                    zoneRefused_ = true;
+                    takeOut(zone, pin, final, id);
+                    return false;
+                }
+                ++zone_.marked;
+                if (gFinalHook) gFinalHook(final, 2);
+                // Success is decided with the mark, the bytes and the final
+                // name all still held. #60 r9: they stay held past the
+                // return; the caller lets go with settle() (so does the next
+                // begin(), abort(), finished() or the sink's end). The
+                // staging name is removed after that by name and file id
+                // (retryCleanup()): removing it needs the handles closed.
+                names_.push_back({part_, id});
                 part_.clear();
-                ensureZone(longPath(target));
+                done_[0] = pin;
+                done_[1] = zone;
+                done_[2] = file_;
+                file_ = INVALID_HANDLE_VALUE;
                 return true;
             }
-            const DWORD e = GetLastError();
-            if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS && e != ERROR_ACCESS_DENIED) break;
+            if (st != kNameCollision) break;
         }
+        CloseHandle(zone);
         return dropPart();
     }
 
     void abort() override {
-        if (file_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(file_);
-            file_ = INVALID_HANDLE_VALUE;
-        }
+        letGo();
         dropPart();
+        retryCleanup();
+    }
+
+    void settle() override {
+        letGo();
+        retryCleanup();
     }
 
     void finished(uint32_t) override {
+        letGo();
+        retryCleanup();
         if (open_) open_(folder_);
     }
 
     ZoneCounts zoneCounts() const override { return zone_; }
+    bool zoneRefused() const override { return zoneRefused_; }
 
 private:
-    // The file must carry ZoneId=3 (Q1). Normally it came with the rename;
-    // otherwise write it, retrying for about a second while something
-    // (Defender scanning a new .exe) holds the file.
-    void ensureZone(const std::wstring& path) {
-        for (int i = 0; i < 20; ++i) {
-            if (filepull::readZoneId(path) == 3) {
-                ++zone_.marked;
-                return;
-            }
-            if (filepull::writeInternetZone(path) == filepull::ZoneWrite::Written) continue;
-            Sleep(50);
-        }
-        ++zone_.failed;
+    // #60 r7: a file whose bytes could not be removed yet: its handle, the
+    // held Zone.Identifier stream (if it was published), and its names.
+    struct Held {
+        HANDLE file;
+        HANDLE zone;
+        std::wstring final;   // empty while it never had one
+        std::wstring part;
+        FILE_ID_INFO id;
+    };
+
+    static bool plainFolder(const std::wstring& path) {
+        const DWORD a = GetFileAttributesW(longPath(path).c_str());
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
     }
 
-    bool dropPart() {
-        if (!part_.empty()) DeleteFileW(longPath(part_).c_str());
-        part_.clear();
+    // True when the open file carries ZoneId=3 (Q1). Normally it is there
+    // already; otherwise write it, retrying for about a second while
+    // something (Defender scanning a new .exe) holds the stream.
+    bool ensureZone(HANDLE h) {
+        for (int i = 0; i < 20; ++i) {
+            if (ops_.readOn(h) == 3) return true;
+            if (ops_.writeOn(h) == filepull::ZoneWrite::Written) continue;
+            Sleep(50);
+        }
         return false;
     }
 
+    // #60 r8: the file `id` opened under its final name `path`, without
+    // delete sharing: while this handle is open nobody can rename or remove
+    // that name. (Write sharing is given because the sink's own staging
+    // handle writes; that handle shares only reading, so nobody else can
+    // write.) INVALID_HANDLE_VALUE when the name cannot be opened or leads
+    // to another file.
+    static HANDLE pinFinal(const std::wstring& path, const FILE_ID_INFO& id) {
+        HANDLE h = CreateFileW(longPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return h;
+        FILE_ID_INFO got{};
+        if (!filepull::fileIdOf(h, got) || !filepull::sameFile(got, id)) {
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;
+        }
+        return h;
+    }
+
+    // #60 r6/r7: the staged file's Zone.Identifier stream, open for reading
+    // with only readers shared (writers and deleters kept out), once ZoneId=3
+    // has been read through it. A writer that changed the mark first is
+    // undone by ensureZone() and tried again for about half a second.
+    // INVALID_HANDLE_VALUE: the mark cannot be held valid.
+    HANDLE lockZone() {
+        for (int i = 0; i < 10; ++i) {
+            if (i > 0 && !ensureZone(file_)) break;
+            HANDLE z = filepull::openZoneStreamOn(file_, GENERIC_READ, FILE_SHARE_READ);
+            if (z != INVALID_HANDLE_VALUE) {
+                if (zoneIdFrom(z) == 3) return z;
+                CloseHandle(z);
+            }
+            Sleep(50);
+        }
+        return INVALID_HANDLE_VALUE;
+    }
+
+    // #60 r8: takes a file that failed its last check back out of the
+    // folder (release()). The sink's own handle on the final name is closed
+    // first: it would keep the name from going.
+    void takeOut(HANDLE zone, HANDLE pin, const std::wstring& final, const FILE_ID_INFO& id) {
+        if (pin != INVALID_HANDLE_VALUE) CloseHandle(pin);
+        Held h{file_, zone, final, part_, id};
+        file_ = INVALID_HANDLE_VALUE;
+        part_.clear();
+        written_ = 0;
+        if (!release(h)) held_.push_back(h);
+    }
+
+    // #60 r8: removes a held file. A published one (its mark held) loses its
+    // final name first, in one step and by file id; its bytes are touched
+    // only once the staging name is the only name it has left (no cut or
+    // zero-fill while any other name leads to it). Until then nothing is
+    // changed: the file and its held mark stay as they are, and
+    // retryCleanup() tries again while the sink lives. Then cut, else zero
+    // through the handle, the handles closed and the staging name removed
+    // (kept and retried if it cannot go now). True once done.
+    bool release(Held& h) {
+        const bool published = h.zone != INVALID_HANDLE_VALUE;
+        if (!h.final.empty()) {
+            if (!traced("unlink", unlinkName(h.final, h.id))) return false;
+            h.final.clear();
+        }
+        if (published && !traced("alone", oneName(h.file))) return false;
+        if (!blankOn(h.file, published ? "cut" : "drop.cut", published ? "zero" : "drop.zero")) return false;
+        if (h.zone != INVALID_HANDLE_VALUE) CloseHandle(h.zone);
+        CloseHandle(h.file);
+        forget({}, h.part, h.id, "drop.unlink");
+        return true;
+    }
+
+    // #60 r7: removes a closed file's names, keeping each that cannot go now.
+    void forget(const std::wstring& final, const std::wstring& part, const FILE_ID_INFO& id, const char* step) {
+        if (!final.empty() && !traced(step, unlinkName(final, id))) names_.push_back({final, id});
+        if (!part.empty() && !unlinkName(part, id)) names_.push_back({part, id});
+    }
+
+    // The partial file, never published: its bytes are cut (else zeroed)
+    // through the handle (#60 r4/r5), then the handle is closed and its
+    // staging name removed by name and file id (#60 r7: the handle has no
+    // DELETE access). A name that cannot go now is kept and retried (#53 r2,
+    // #60 r3: never just forgotten). If neither cut nor zero works, the
+    // handle is kept (nobody else can write, delete or rename the file
+    // meanwhile) and retryCleanup() tries again through it.
+    bool dropPart() {
+        if (file_ != INVALID_HANDLE_VALUE) {
+            FILE_ID_INFO id{};
+            const bool known = filepull::fileIdOf(file_, id);
+            if (blankOn(file_, "drop.cut", "drop.zero")) {
+                CloseHandle(file_);
+                if (known) forget({}, part_, id, "drop.unlink");
+            } else {
+                held_.push_back({file_, INVALID_HANDLE_VALUE, {}, part_, id});
+            }
+            file_ = INVALID_HANDLE_VALUE;
+        }
+        part_.clear();
+        written_ = 0;
+        return false;
+    }
+
+    // #60 r9: closes the delivered file's final name, mark and file handles
+    // that commit() kept open for its caller.
+    void letGo() {
+        for (HANDLE& h : done_) {
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            h = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    // True once nothing is left to clean up.
+    bool retryCleanup() {
+        for (auto it = held_.begin(); it != held_.end();) {
+            if (release(*it)) it = held_.erase(it);
+            else ++it;
+        }
+        for (auto it = names_.begin(); it != names_.end();) {
+            if (unlinkName(it->first, it->second)) it = names_.erase(it);
+            else ++it;
+        }
+        return names_.empty() && held_.empty();
+    }
+
     std::wstring folder_;
+    std::wstring staging_;   // folder_\.jlstaging (hidden)
     std::function<void(const std::wstring&)> open_;
+    filepull::ZoneOps ops_;
     std::wstring name_;
     std::wstring part_;
+    uint64_t written_ = 0;
+    std::vector<std::pair<std::wstring, FILE_ID_INFO>> names_;   // #60 r7: names still to remove, with their file id
+    std::vector<Held> held_;                                     // #60 r5/r7: files whose bytes could not be removed yet
     HANDLE file_ = INVALID_HANDLE_VALUE;
+    // #60 r9: the last delivered file's pinned final name, held mark and
+    // file handle, kept from commit() until settle().
+    HANDLE done_[3] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
     ZoneCounts zone_;
+    bool zoneRefused_ = false;
 };
 
 }  // namespace
 
-std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open) {
-    return std::make_unique<FolderSink>(std::move(folder), std::move(open));
+std::unique_ptr<Sink> makeFolderSink(std::wstring folder, std::function<void(const std::wstring&)> open,
+                                     filepull::ZoneOps zone) {
+    return std::make_unique<FolderSink>(std::move(folder), std::move(open), zone);
 }
 
 std::wstring downloadsFolder() {

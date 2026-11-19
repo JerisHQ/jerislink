@@ -37,9 +37,7 @@ constexpr UINT kMsgWithdraw = WM_APP + 2;
 constexpr UINT kMsgQuit = WM_APP + 3;
 // F3 r2, Mark of the Web: posted by the clipboard object to the STA window.
 constexpr UINT kMsgPasteStart = WM_APP + 4;  // wParam transfer
-constexpr UINT kMsgDelivered = WM_APP + 5;   // wParam transfer, lParam manifest index
 constexpr UINT kMsgShellChange = WM_APP + 6; // SHChangeNotifyRegister
-constexpr UINT_PTR kMarkTimer = 1;
 // What the paste source says about its data (design (j)): the shell's
 // "high risk" URL action, so Explorer treats the files as from the Internet
 // zone. Its effect on Mark of the Web is checked in the hand test.
@@ -90,16 +88,24 @@ HGLOBAL globalCopy(const void* data, size_t size) {
     return h;
 }
 
-// One file's bytes for Explorer. Sequential only: Seek may only report or
-// keep the current position.
-// Called once when Explorer releases a FileContents stream: whether it read
-// the file to its end (F3 r2, Mark of the Web).
-using StreamEndFn = std::function<void(bool delivered)>;
+// Asked once per file, before Explorer gets its last byte (#53 r2; for an
+// empty file, before its end): true only when the copy on disk was found and
+// carries ZoneId=3. The copy it settled on, if any, goes into `locked` (#60 r3).
+using GateFn = std::function<bool(const GateRequest&, LockedCopy&)>;
+// Called once per stream when Explorer lets go of it, with the copy the gate
+// locked (possibly none) and what the stream handed out (#60 r3).
+using SettleFn = std::function<void(LockedCopy&&, SettleRequest)>;
 
+// One file's bytes for Explorer. Sequential only: Seek may only report or
+// keep the current position. The last byte (for an empty file, the end) is
+// held back until the gate passes; if it fails, this read and every later
+// one fail, so Explorer never completes the file.
 class PullStream : public IStream {
 public:
-    PullStream(PullHub& hub, uint64_t token, uint64_t size, std::wstring leaf, StreamEndFn onEnd = {})
-        : hub_(hub), token_(token), size_(size), leaf_(std::move(leaf)), onEnd_(std::move(onEnd)) {}
+    PullStream(PullHub& hub, uint64_t token, uint64_t size, std::wstring leaf, GateRequest req, GateFn gate,
+               SettleFn settle)
+        : hub_(hub), token_(token), size_(size), leaf_(std::move(leaf)), req_(std::move(req)), gate_(std::move(gate)),
+          settle_(std::move(settle)) {}
 
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** out) override {
@@ -123,12 +129,40 @@ public:
     STDMETHODIMP Read(void* out, ULONG size, ULONG* read) override {
         if (read) *read = 0;
         if (!out) return STG_E_INVALIDPOINTER;
+        if (gateFailed_) return STG_E_READFAULT;
+        // An empty file has no last byte to hold back: the gate runs before
+        // Explorer learns the stream has ended (#60 r3).
+        if (size_ == 0 && !gatePassed_) {
+            if (!runGate()) {
+                gateFailed_ = true;
+                return STG_E_READFAULT;
+            }
+            gatePassed_ = true;
+        }
         auto* p = static_cast<uint8_t*>(out);
         ULONG done = 0;
+        bool atGate = false;
         while (done < size) {
+            uint64_t want = size - done;
+            if (!gatePassed_ && size_ > 0) {
+                const uint64_t at = pos_ + done;
+                if (at == size_ - 1) {
+                    // The last byte: hand over what this call has first, then
+                    // run the gate on the next call, once Explorer wrote it.
+                    if (done > 0) { atGate = true; break; }
+                    if (!runGate()) {
+                        gateFailed_ = true;
+                        return STG_E_READFAULT;
+                    }
+                    gatePassed_ = true;
+                } else if (at < size_ - 1) {
+                    want = std::min<uint64_t>(want, size_ - 1 - at);
+                }
+            }
             size_t got = 0;
-            const auto r = hub_.read(token_, p + done, size - done, got, kReadTimeoutMs);
+            const auto r = hub_.read(token_, p + done, size_t(want), got, kReadTimeoutMs);
             if (r == PullHub::ReadResult::Ok) {
+                sha_.update(p + done, got);
                 done += ULONG(got);
                 continue;
             }
@@ -139,6 +173,7 @@ public:
         }
         pos_ += done;
         if (read) *read = done;
+        if (atGate) return S_OK;
         return done < size ? S_FALSE : S_OK;
     }
     STDMETHODIMP Write(const void*, ULONG, ULONG*) override { return STG_E_ACCESSDENIED; }
@@ -176,10 +211,40 @@ public:
     STDMETHODIMP Clone(IStream**) override { return E_NOTIMPL; }
 
 private:
+    // Explorer let go: the locked copy is checked once nobody writes it.
     ~PullStream() {
         hub_.close(token_);
-        // Explorer may stop at the size without asking again for the end.
-        if (onEnd_) onEnd_(pos_ == size_);
+        if (!settle_) return;
+        SettleRequest s;
+        s.transfer = req_.transfer;
+        s.index = req_.index;
+        s.size = size_;
+        s.sha256 = sha_.finish();
+        s.complete = gatePassed_ && pos_ == size_;
+        settle_(std::move(locked_), std::move(s));
+    }
+
+    // No gate (no clipboard thread behind us) means no mark: fail closed.
+    bool runGate() {
+        req_.reader = callerProcess();
+        return gate_ && gate_(req_, locked_);
+    }
+
+    // The process making this Read call (#60 r4): the owner of the calling
+    // thread inside a COM call (S_OK: this process, S_FALSE: another one).
+    // #60 r5: a call whose caller cannot be told (not a COM call, or the
+    // call fails) is an unknown reader, never this process: no copy is
+    // linked to it and the paste fails closed.
+    static uint32_t callerProcess() {
+        DWORD tid = 0;
+        const HRESULT hr = CoGetCallerTID(&tid);
+        if (FAILED(hr)) return kUnknownReader;
+        if (tid == 0) return kUnknownReader;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) return kUnknownReader;
+        const DWORD pid = GetProcessIdOfThread(t);
+        CloseHandle(t);
+        return pid ? uint32_t(pid) : kUnknownReader;
     }
 
     PullHub& hub_;
@@ -187,7 +252,13 @@ private:
     uint64_t size_;
     std::wstring leaf_;
     uint64_t pos_ = 0;
-    StreamEndFn onEnd_;
+    GateRequest req_;
+    GateFn gate_;
+    SettleFn settle_;
+    LockedCopy locked_;
+    BCryptDigest sha_;   // every byte handed out
+    bool gatePassed_ = false;
+    bool gateFailed_ = false;
     std::atomic<long> refs_{1};
 };
 
@@ -215,11 +286,9 @@ std::vector<std::wstring> topNames(const std::wstring& top) {
     return out;
 }
 
-bool sameOrLater(const FILETIME& a, const FILETIME& since) {
-    return CompareFileTime(&a, &since) >= 0;
-}
-
 }  // namespace
+
+void (*gZoneStreamOpenHook)(HANDLE file) = nullptr;
 
 ZoneWrite writeInternetZone(const std::wstring& path) {
     const std::wstring stream = path + L":Zone.Identifier";
@@ -236,7 +305,10 @@ ZoneWrite writeInternetZone(const std::wstring& path) {
 
 int readZoneId(const std::wstring& path) {
     const std::wstring stream = path + L":Zone.Identifier";
-    HANDLE h = CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    // Shares delete: a file someone holds open with DELETE access (a .jlpart
+    // being received) can still be read.
+    HANDLE h = CreateFileW(stream.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
     if (h == INVALID_HANDLE_VALUE) return -1;
     char buf[1024] = {};
     DWORD got = 0;
@@ -246,46 +318,383 @@ int readZoneId(const std::wstring& path) {
     return z ? std::atoi(z + 7) : -1;
 }
 
-ZoneMarkStats markDelivered(const Manifest& m, const std::vector<std::wstring>& folders, const FILETIME& since,
-                            std::set<uint32_t>& want, std::set<uint32_t>& done) {
-    ZoneMarkStats stats;
-    for (auto it = want.begin(); it != want.end();) {
-        const uint32_t i = *it;
-        if (i >= m.items.size() || m.items[i].dir) { it = want.erase(it); continue; }
-        const Item& item = m.items[i];
-        const size_t cut = item.rel.find(L'\\');
-        const std::wstring top = cut == std::wstring::npos ? item.rel : item.rel.substr(0, cut);
-        const std::wstring rest = cut == std::wstring::npos ? L"" : item.rel.substr(cut);
-        // Counted once per item: the same file can be reached through two
-        // folder spellings (a short 8.3 path and its long name).
-        bool found = false, wrote = false, existed = false, failed = false;
-        for (const auto& folder : folders) {
-            for (const auto& name : topNames(top)) {
-                const std::wstring path = folder + L"\\" + name + rest;
-                WIN32_FILE_ATTRIBUTE_DATA a{};
-                if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) continue;
-                if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                const uint64_t size = (uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
-                if (size != item.size || !sameOrLater(a.ftCreationTime, since)) continue;
-                found = true;
-                switch (writeInternetZone(path)) {
-                case ZoneWrite::Written: wrote = true; break;
-                case ZoneWrite::Exists: existed = true; break;
-                case ZoneWrite::Failed: failed = true; break;
-                }
-            }
+bool fileIdOf(HANDLE h, FILE_ID_INFO& out) {
+    out = FILE_ID_INFO{};
+    return h != INVALID_HANDLE_VALUE && GetFileInformationByHandleEx(h, FileIdInfo, &out, sizeof(out));
+}
+
+bool sameFile(const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
+    return a.VolumeSerialNumber == b.VolumeSerialNumber &&
+           std::memcmp(a.FileId.Identifier, b.FileId.Identifier, sizeof(a.FileId.Identifier)) == 0;
+}
+
+HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share) {
+    FILE_ID_DESCRIPTOR d{};
+    d.dwSize = sizeof(d);
+    d.Type = ExtendedFileIdType;
+    d.ExtendedFileId = id.FileId;
+    HANDLE h = OpenFileById(hint, &d, access, share, nullptr, FILE_FLAG_OPEN_REPARSE_POINT);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    FILE_ID_INFO got{};
+    if (!fileIdOf(h, got) || !sameFile(got, id)) {
+        CloseHandle(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+namespace {
+
+// The file's current full path ("\\?\C:\..."), or "" when it has none.
+std::wstring finalPathOf(HANDLE h) {
+    std::wstring out(512, L'\0');
+    for (int i = 0; i < 2; ++i) {
+        const DWORD n = GetFinalPathNameByHandleW(h, out.data(), DWORD(out.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (n == 0) return {};
+        if (n < out.size()) {
+            out.resize(n);
+            return out;
         }
-        if (wrote) ++stats.written;
-        else if (failed) ++stats.failed;
-        else if (existed) ++stats.existed;
-        if (found) {
-            done.insert(i);
-            it = want.erase(it);
-        } else {
-            ++it;
+        out.assign(size_t(n) + 1, L'\0');
+    }
+    return {};
+}
+
+// NtCreateFile, for a stream opened relative to an open file (#60 r4).
+// Declared here rather than through winternl.h.
+struct JlUnicodeString {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+struct JlObjectAttributes {
+    ULONG Length;
+    HANDLE RootDirectory;
+    JlUnicodeString* ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+};
+struct JlIoStatus {
+    union {
+        LONG Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+};
+using NtCreateFileFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, JlObjectAttributes*, JlIoStatus*, PLARGE_INTEGER, ULONG, ULONG,
+                                    ULONG, ULONG, PVOID, ULONG);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(LONG);
+
+// The Zone.Identifier stream of the very file `file` is open on (#60 r4):
+// opened relative to the handle, not by path, so nothing created or swapped
+// in under the name meanwhile is ever reached, and with OPEN_ALWAYS no
+// empty stream is ever created on another file. NTFS counts delete access
+// for the whole file, not per stream: while `file` (the push sink's .jlpart)
+// is open with DELETE, a stream open that does not share delete fails, so
+// the stream always shares delete. Readers and writers are still kept out
+// by `share`, and the file id is still checked. #60 r7: the push sink, whose
+// .jlpart has no DELETE access, asks for `share` exactly (addShareDelete
+// false), so it can hold the stream with delete sharing denied.
+HANDLE openZoneStream(HANDLE file, DWORD access, DWORD share, DWORD disposition, bool addShareDelete = true) {
+    static const auto ntCreate = reinterpret_cast<NtCreateFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
+    static const auto toDos = reinterpret_cast<RtlNtStatusToDosErrorFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError")));
+    FILE_ID_INFO want{};
+    if (!ntCreate || !fileIdOf(file, want)) return INVALID_HANDLE_VALUE;
+    if (gZoneStreamOpenHook) gZoneStreamOpenHook(file);
+    wchar_t name[] = L":Zone.Identifier";
+    JlUnicodeString us{USHORT(sizeof(name) - sizeof(wchar_t)), USHORT(sizeof(name)), name};
+    JlObjectAttributes oa{sizeof(JlObjectAttributes), file, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, nullptr, nullptr};
+    JlIoStatus io{};
+    const ULONG how = disposition == OPEN_ALWAYS ? 3 /* FILE_OPEN_IF */ : 1 /* FILE_OPEN */;
+    const ULONG options = 0x40 /* FILE_NON_DIRECTORY_FILE */ | 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ |
+                          0x200000 /* FILE_OPEN_REPARSE_POINT */;
+    HANDLE z = nullptr;
+    const LONG st = ntCreate(&z, access | SYNCHRONIZE, &oa, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
+                             share | (addShareDelete ? FILE_SHARE_DELETE : 0),
+                             how, options, nullptr, 0);
+    if (st < 0 || !z) {
+        SetLastError(toDos ? toDos(st) : ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    FILE_ID_INFO got{};
+    if (!fileIdOf(z, got) || !sameFile(got, want)) {
+        CloseHandle(z);
+        return INVALID_HANDLE_VALUE;
+    }
+    return z;
+}
+
+
+// A file's attributes, opened without following a link at the name and
+// without blocking anyone (every sharing mode, no read or write access).
+HANDLE openAttributes(const std::wstring& path) {
+    return CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+// Whether someone has the file open for writing (or keeps readers out):
+// a read open that refuses to share writing then fails with a sharing
+// violation.
+bool beingWritten(HANDLE hint, const FILE_ID_INFO& id) {
+    HANDLE h = openById(hint, id, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        return false;
+    }
+    return GetLastError() == ERROR_SHARING_VIOLATION;
+}
+
+// Whether process `pid` has the file behind `h` open (#60 r4): the
+// processes holding it, from FileProcessIdsUsingFileInformation (47).
+// False when that cannot be read.
+bool openedBy(HANDLE h, uint32_t pid) {
+    using NtQueryInformationFileFn = LONG(NTAPI*)(HANDLE, JlIoStatus*, PVOID, ULONG, ULONG);
+    static const auto ntQuery = reinterpret_cast<NtQueryInformationFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    if (!ntQuery || pid == 0 || pid == kUnknownReader) return false;
+    // A ULONG count, then the ids as ULONG_PTRs from the next ULONG_PTR.
+    std::vector<ULONG_PTR> buf(64);
+    for (int i = 0; i < 6; ++i) {
+        JlIoStatus io{};
+        const LONG st = ntQuery(h, &io, buf.data(), ULONG(buf.size() * sizeof(ULONG_PTR)), 47);
+        if (st == LONG(0xC0000004) || st == LONG(0x80000005)) {   // STATUS_INFO_LENGTH_MISMATCH, BUFFER_OVERFLOW
+            buf.assign(buf.size() * 4, 0);
+            continue;
+        }
+        if (st < 0) return false;
+        const ULONG n = *reinterpret_cast<const ULONG*>(buf.data());
+        for (size_t k = 0; k < n && k + 1 < buf.size(); ++k) {
+            if (buf[k + 1] == ULONG_PTR(pid)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// SHA-256 of the whole file behind `h`, or empty if it does not read as
+// exactly `size` bytes.
+std::vector<uint8_t> hashOf(HANDLE h, uint64_t size) {
+    BCryptDigest d;
+    std::vector<uint8_t> buf(256 * 1024);
+    uint64_t total = 0;
+    for (;;) {
+        OVERLAPPED o{};
+        o.Offset = DWORD(total & 0xffffffffu);
+        o.OffsetHigh = DWORD(total >> 32);
+        DWORD got = 0;
+        if (!ReadFile(h, buf.data(), DWORD(buf.size()), &got, &o)) {
+            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            return {};
+        }
+        if (got == 0) break;
+        d.update(buf.data(), got);
+        total += got;
+        if (total > size) return {};
+    }
+    if (total != size) return {};
+    return d.finish();
+}
+
+}  // namespace
+
+bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id) {
+    const DWORD all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE byId = openById(hint, id, FILE_READ_ATTRIBUTES | SYNCHRONIZE, all);
+    if (byId == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_PARAMETER;
+    }
+    FILE_STANDARD_INFO st{};
+    if (GetFileInformationByHandleEx(byId, FileStandardInfo, &st, sizeof(st)) && st.DeletePending) {
+        CloseHandle(byId);
+        return true;
+    }
+    const std::wstring path = finalPathOf(byId);
+    CloseHandle(byId);
+    if (path.empty()) return false;
+    HANDLE h = CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, all, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    // Another file may have taken the name since: then nothing is deleted.
+    FILE_ID_INFO got{};
+    bool ok = false;
+    if (fileIdOf(h, got) && sameFile(got, id)) {
+        FILE_DISPOSITION_INFO del{};
+        del.DeleteFile = TRUE;
+        ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof(del)) != 0;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+ZoneWrite writeInternetZoneOn(HANDLE file) {
+    HANDLE z = openZoneStream(file, GENERIC_WRITE, 0, OPEN_ALWAYS);
+    if (z == INVALID_HANDLE_VALUE) return ZoneWrite::Failed;
+    static const char kBody[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(z, kBody, DWORD(sizeof(kBody) - 1), &wrote, nullptr) && wrote == sizeof(kBody) - 1 &&
+                    SetEndOfFile(z);
+    CloseHandle(z);
+    return ok ? ZoneWrite::Written : ZoneWrite::Failed;
+}
+
+HANDLE openZoneStreamOn(HANDLE file, DWORD access, DWORD share) {
+    return openZoneStream(file, access, share, OPEN_EXISTING, false);
+}
+
+int readZoneIdOn(HANDLE file) {
+    HANDLE z = openZoneStream(file, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+    if (z == INVALID_HANDLE_VALUE) return -1;
+    char buf[1024] = {};
+    DWORD got = 0;
+    ReadFile(z, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(z);
+    const char* id = std::strstr(buf, "ZoneId=");
+    return id ? std::atoi(id + 7) : -1;
+}
+
+GateOutcome gateFile(const GateRequest& r, const std::vector<std::wstring>& folders, const ZoneOps& zone,
+                     ZoneMarkStats& stats, GateProbe* probe, LockedCopy* locked) {
+    GateProbe local;
+    GateProbe& pr = probe ? *probe : local;
+    const size_t cut = r.rel.find(L'\\');
+    const std::wstring top = cut == std::wstring::npos ? r.rel : r.rel.substr(0, cut);
+    const std::wstring rest = cut == std::wstring::npos ? L"" : r.rel.substr(cut);
+    const uint64_t minSize = r.size > 0 ? r.size - 1 : 0;
+    const ULARGE_INTEGER since{r.since.dwLowDateTime, r.since.dwHighDateTime};
+    // #60 r5: 0 is an unidentified reader too (openedBy() links nothing to it).
+    const uint32_t reader = r.reader ? r.reader : kUnknownReader;
+    // Every file that could be this paste's copy, held open by identity. The
+    // same file reached through two folder spellings (8.3 and long) counts once.
+    struct Candidate {
+        HANDLE h;
+        FILE_ID_INFO id;
+    };
+    std::vector<Candidate> found;
+    for (const auto& folder : folders) {
+        for (const auto& name : topNames(top)) {
+            const std::wstring path = folder + L"\\" + name + rest;
+            ++pr.paths;
+            HANDLE h = openAttributes(path);
+            if (h == INVALID_HANDLE_VALUE) {
+                const DWORD e = GetLastError();
+                if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                    ++pr.openFailed;
+                    pr.openError = e;
+                }
+                continue;
+            }
+            FILE_BASIC_INFO basic{};
+            FILE_STANDARD_INFO standard{};
+            FILE_ID_INFO id{};
+            if (!GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic)) ||
+                !GetFileInformationByHandleEx(h, FileStandardInfo, &standard, sizeof(standard)) || !fileIdOf(h, id)) {
+                ++pr.openFailed;
+                pr.openError = GetLastError();
+                CloseHandle(h);
+                continue;
+            }
+            // Folders and links (a junction or symlink under the name) are never ours.
+            if (standard.Directory ||
+                (basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+                CloseHandle(h);
+                continue;
+            }
+            const uint64_t size = uint64_t(standard.EndOfFile.QuadPart);
+            ++pr.present;
+            pr.lastSize = size;
+            pr.lastAgeMs = (basic.CreationTime.QuadPart - int64_t(since.QuadPart)) / 10000;
+            bool skip = false;
+            if (size < minSize) { ++pr.tooSmall; skip = true; }
+            else if (basic.CreationTime.QuadPart < int64_t(since.QuadPart)) { ++pr.older; skip = true; }
+            else if (std::any_of(found.begin(), found.end(), [&](const Candidate& c) { return sameFile(c.id, id); })) skip = true;
+            // Explorer holds the copy open for writing until it has the last
+            // byte; a file nobody writes is not this paste's copy, whatever
+            // its name, size or bytes.
+            else if (!beingWritten(h, id)) { ++pr.idle; skip = true; }
+            // #60 r4: Explorer writes its copy itself, so the process reading
+            // this stream has the copy open. A same-name file someone else is
+            // writing is not linked to this paste: never marked, held or
+            // removed.
+            else if (!openedBy(h, reader)) { ++pr.unlinked; skip = true; }
+            if (skip) {
+                CloseHandle(h);
+                continue;
+            }
+            // Explorer may size the copy past the manifest before it writes:
+            // taken, and settleCopy() keeps it only at the exact size.
+            if (size > r.size) ++pr.larger;
+            found.push_back({h, id});
         }
     }
-    return stats;
+    if (found.empty()) return GateOutcome::NotFound;
+    if (found.size() > 1) {
+        // Which one is ours cannot be told: none is marked or taken.
+        pr.candidates = uint32_t(found.size());
+        for (auto& c : found) CloseHandle(c.h);
+        ++stats.failed;
+        return GateOutcome::Ambiguous;
+    }
+    pr.candidates = 1;
+    HANDLE h = found[0].h;
+    // Mark and read back through the handle: a file swapped in under the
+    // name meanwhile is never marked instead.
+    GateOutcome out = GateOutcome::Marked;
+    bool wrote = false;
+    const int before = zone.readOn(h);
+    if (before != 3 && before != 4) {
+        ZoneWrite w = ZoneWrite::Failed;
+        for (int n = 0; n < 10 && !wrote; ++n) {
+            if (n) Sleep(100);
+            w = zone.writeOn(h);
+            wrote = zone.readOn(h) == 3;
+        }
+        if (!wrote) out = w == ZoneWrite::Failed ? GateOutcome::WriteFailed : GateOutcome::Invalid;
+    }
+    // Held also when the mark failed: settleCopy() removes it then.
+    if (locked) locked->adopt(h, found[0].id);
+    else CloseHandle(h);
+    if (out != GateOutcome::Marked) ++stats.failed;
+    else if (wrote) ++stats.written;
+    else ++stats.existed;
+    return out;
+}
+
+SettleOutcome settleCopy(LockedCopy& copy, const SettleRequest& s, const ZoneOps& zone, ZoneMarkStats& stats,
+                         int waitMs) {
+    if (!copy) return SettleOutcome::None;
+    const HANDLE h = copy.handle();
+    const FILE_ID_INFO id = copy.id();
+    const ULONGLONG until = GetTickCount64() + ULONGLONG(waitMs > 0 ? waitMs : 0);
+    while (beingWritten(h, id) && GetTickCount64() < until) Sleep(50);
+    // Kept only when complete, exactly the manifest size, the bytes handed
+    // out and marked. Checked under a handle that keeps writers out.
+    bool keep = false;
+    if (s.complete && !s.sha256.empty()) {
+        HANDLE rd = openById(h, id, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+        if (rd != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(rd, &size) && uint64_t(size.QuadPart) == s.size && hashOf(rd, s.size) == s.sha256) {
+                const int z = zone.readOn(rd);
+                keep = z == 3 || z == 4;
+            }
+            CloseHandle(rd);
+        }
+    }
+    // #60 r5: anything else is left exactly as it is and the paste counts
+    // as failed. The copy is linked to this paste only by the process that
+    // read the stream, so it may not be ours: our code never deletes it.
+    const SettleOutcome out = keep ? SettleOutcome::Kept : SettleOutcome::Left;
+    copy.reset();
+    if (out == SettleOutcome::Kept) ++stats.kept;
+    else if (out == SettleOutcome::Removed) ++stats.removed;
+    else ++stats.left;
+    return out;
 }
 
 namespace {
@@ -293,8 +702,10 @@ namespace {
 // The clipboard object for one announce.
 class PullDataObject : public IDataObject {
 public:
-    PullDataObject(PullHub& hub, Manifest m, std::function<void(const std::string&)> log, HWND notify)
-        : hub_(hub), m_(std::move(m)), log_(std::move(log)), notify_(notify) {
+    PullDataObject(PullHub& hub, Manifest m, std::function<void(const std::string&)> log, HWND notify, GateFn gate,
+                   SettleFn settle)
+        : hub_(hub), m_(std::move(m)), log_(std::move(log)), notify_(notify), gate_(std::move(gate)),
+          settle_(std::move(settle)) {
         cfDescriptor_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
         cfContents_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_FILECONTENTS));
         cfDropEffect_ = CLIPFORMAT(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT));
@@ -364,19 +775,21 @@ public:
             const Item& it = m_.items[size_t(index)];
             const size_t cut = it.rel.find_last_of(L'\\');
             std::wstring leaf = cut == std::wstring::npos ? it.rel : it.rel.substr(cut + 1);
-            // Tell the STA window a paste is running and, when Explorer is
-            // done with this file, whether it got all of it.
-            const HWND w = notify_;
-            const uint32_t t = m_.transfer;
-            if (w) PostMessageW(w, kMsgPasteStart, WPARAM(t), 0);
-            StreamEndFn onEnd;
-            if (w) {
-                onEnd = [w, t, index](bool delivered) {
-                    if (delivered) PostMessageW(w, kMsgDelivered, WPARAM(t), LPARAM(index));
-                };
-            }
+            // Tell the STA window a paste is running, so it watches the shell
+            // for the folder the copy lands in.
+            if (notify_) PostMessageW(notify_, kMsgPasteStart, WPARAM(m_.transfer), 0);
+            GateRequest req;
+            req.transfer = m_.transfer;
+            req.index = uint32_t(index);
+            req.rel = it.rel;
+            req.size = it.size;
+            // A little before now: file times and clocks are coarse.
+            GetSystemTimeAsFileTime(&req.since);
+            ULARGE_INTEGER u{req.since.dwLowDateTime, req.since.dwHighDateTime};
+            u.QuadPart -= 5ull * 10000000ull;
+            req.since = FILETIME{u.LowPart, u.HighPart};
             med->tymed = TYMED_ISTREAM;
-            med->pstm = new PullStream(hub_, token, it.size, std::move(leaf), std::move(onEnd));
+            med->pstm = new PullStream(hub_, token, it.size, std::move(leaf), std::move(req), gate_, settle_);
             return S_OK;
         }
         DWORD value = fe->cfFormat == cfDropEffect_ ? DROPEFFECT_COPY : kUrlActionShellExecuteHighRisk;
@@ -429,6 +842,8 @@ private:
     Manifest m_;
     std::function<void(const std::string&)> log_;
     HWND notify_ = nullptr;
+    GateFn gate_;
+    SettleFn settle_;
     CLIPFORMAT cfDescriptor_ = 0;
     CLIPFORMAT cfContents_ = 0;
     CLIPFORMAT cfDropEffect_ = 0;
@@ -452,30 +867,36 @@ struct FileClipboard::Impl {
     std::optional<Manifest> pending;   // guarded by mu
     std::vector<std::wstring> extraFolders;  // guarded by mu
     ZoneMarkStats totals;                    // guarded by mu
+    // Folders where the shell reported new items during the paste, and the
+    // folders open in Explorer windows when it started (guarded by mu).
+    std::vector<std::wstring> seen;
+    std::vector<std::wstring> windowFolders;
     PullDataObject* current = nullptr; // STA thread only
+    std::optional<Manifest> offered;   // the manifest behind `current` (STA thread only)
+    uint32_t watching = 0;             // the transfer the shell watch is for (STA thread only)
+    ULONG notifyId = 0;                // STA thread only
+    DWORD threadId = 0;
 
-    // Mark of the Web for the paste running now (STA thread only).
-    struct MarkJob {
-        Manifest m;
-        FILETIME since{};
-        std::set<uint32_t> want;   // read to the end, not found yet
-        std::set<uint32_t> done;   // marked (or found already marked)
-        std::vector<std::wstring> seen;  // folders the shell reported new items in
-        ULONG notifyId = 0;
-        int misses = 0;            // passes that found nothing new
+    // How long the gate looks for a copy before it gives up.
+    static constexpr int kGateWaitMs = 5000;
+    // How long a settle waits for the shell to let go of a copy (#60 r3).
+    static constexpr int kSettleWaitMs = 10000;
+    // #60 r4: every settle thread, joined by stop() (guarded by mu). Once
+    // stopped, a settle runs on the calling thread instead.
+    struct Worker {
+        std::thread t;
+        std::shared_ptr<std::atomic<bool>> done;
     };
-    std::optional<MarkJob> job;
-    std::optional<Manifest> offered;  // the manifest behind `current`
+    std::vector<Worker> workers;
+    bool stopped = false;
 
-    static constexpr int kMarkDelayMs = 1500;
-    static constexpr int kMarkRetries = 8;   // about 12 s after the last file
+    ZoneOps zone;
 
-    Impl(PullHub& h, LogFn l) : hub(h), log(std::move(l)) {}
+    Impl(PullHub& h, LogFn l, ZoneOps z) : hub(h), log(std::move(l)), zone(z) {}
 
     static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(w, GWLP_USERDATA));
         if (self) {
-            if (msg == WM_TIMER && wp == kMarkTimer) { self->markPass(); return 0; }
             if (msg == kMsgShellChange) { self->shellChange(wp, lp); return 0; }
         }
         return DefWindowProcW(w, msg, wp, lp);
@@ -498,6 +919,7 @@ struct FileClipboard::Impl {
             ready.set_value(nullptr);
             return;
         }
+        threadId = GetCurrentThreadId();
         HWND w = createWindow();
         if (w) SetWindowLongPtrW(w, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
         hwnd = w;
@@ -522,10 +944,6 @@ struct FileClipboard::Impl {
                     pasteStarted(uint32_t(msg.wParam));
                     continue;
                 }
-                if (msg.hwnd == w && msg.message == kMsgDelivered) {
-                    delivered(uint32_t(msg.wParam), uint32_t(msg.lParam));
-                    continue;
-                }
                 if (msg.hwnd == w && msg.message == kMsgQuit) {
                     withdraw(0);
                     break;
@@ -533,7 +951,7 @@ struct FileClipboard::Impl {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            endJob();
+            endWatch();
             SetWindowLongPtrW(w, GWLP_USERDATA, 0);
             DestroyWindow(w);
         }
@@ -557,7 +975,8 @@ struct FileClipboard::Impl {
         withdraw(0);
         const uint32_t t = m.transfer;
         const size_t entries = m.items.size();
-        auto* obj = new PullDataObject(hub, m, log, hwnd);
+        auto* obj = new PullDataObject(hub, m, log, hwnd, [this](const GateRequest& r, LockedCopy& c) { return gate(r, c); },
+                                       [this](LockedCopy&& c, SettleRequest s) { settle(std::move(c), std::move(s)); });
         const HRESULT hr = setClipboard(obj);
         if (FAILED(hr)) {
             obj->Release();
@@ -573,7 +992,7 @@ struct FileClipboard::Impl {
 
     // Clears Windows' clipboard only while it still holds our object: a copy
     // the user made on Windows since then is never wiped. A paste already
-    // running keeps its mark job.
+    // running keeps its gate.
     void withdraw(uint32_t t) {
         if (!current) return;
         if (t != 0 && current->transfer() != t) return;
@@ -586,33 +1005,31 @@ struct FileClipboard::Impl {
     // ---- Mark of the Web ----
 
     void pasteStarted(uint32_t t) {
-        if (job && job->m.transfer == t) return;
+        if (watching == t) return;
         if (!offered || offered->transfer != t) return;
-        endJob();   // an earlier paste: one last look first
-        MarkJob j;
-        j.m = *offered;
-        // A little before now: file times and clocks are coarse.
-        GetSystemTimeAsFileTime(&j.since);
-        ULARGE_INTEGER u{j.since.dwLowDateTime, j.since.dwHighDateTime};
-        u.QuadPart -= 5ull * 10000000ull;
-        j.since = FILETIME{u.LowPart, u.HighPart};
+        endWatch();
+        std::vector<std::wstring> wins;
+        openWindowFolders(wins);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            seen.clear();
+            windowFolders = std::move(wins);
+        }
         // New items anywhere under the desktop namespace, while this paste runs.
         PIDLIST_ABSOLUTE desk = nullptr;
         if (SUCCEEDED(SHGetSpecialFolderLocation(nullptr, CSIDL_DESKTOP, &desk)) && desk) {
             SHChangeNotifyEntry e{desk, TRUE};
-            j.notifyId = SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel | SHCNRF_NewDelivery,
-                                                SHCNE_CREATE | SHCNE_MKDIR | SHCNE_RENAMEITEM, kMsgShellChange, 1, &e);
+            notifyId = SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel | SHCNRF_NewDelivery,
+                                              SHCNE_CREATE | SHCNE_MKDIR | SHCNE_RENAMEITEM, kMsgShellChange, 1, &e);
             CoTaskMemFree(desk);
         }
-        job = std::move(j);
+        watching = t;
     }
 
-    void delivered(uint32_t t, uint32_t index) {
-        if (!job || job->m.transfer != t) return;
-        job->done.erase(index);   // the same copy pasted again somewhere else
-        job->want.insert(index);
-        job->misses = 0;
-        SetTimer(hwnd, kMarkTimer, kMarkDelayMs, nullptr);
+    void endWatch() {
+        if (notifyId) SHChangeNotifyDeregister(notifyId);
+        notifyId = 0;
+        watching = 0;
     }
 
     void shellChange(WPARAM wp, LPARAM lp) {
@@ -620,7 +1037,7 @@ struct FileClipboard::Impl {
         LONG event = 0;
         HANDLE lock = SHChangeNotification_Lock(reinterpret_cast<HANDLE>(wp), DWORD(lp), &pidls, &event);
         if (!lock) return;
-        if (job && pidls) {
+        if (watching && pidls) {
             PIDLIST_ABSOLUTE item = (event & SHCNE_RENAMEITEM) && pidls[1] ? pidls[1] : pidls[0];
             wchar_t path[MAX_PATH * 2] = {};
             if (item && SHGetPathFromIDListEx(item, path, DWORD(std::size(path)), GPFIDL_DEFAULT)) {
@@ -629,7 +1046,7 @@ struct FileClipboard::Impl {
                 if (cut != std::wstring::npos && cut > 0) {
                     std::wstring dir = p.substr(0, cut);
                     if (dir.size() == 2 && dir[1] == L':') dir += L'\\';
-                    auto& seen = job->seen;
+                    std::lock_guard<std::mutex> guard(mu);
                     if (std::find(seen.begin(), seen.end(), dir) == seen.end() && seen.size() < 64) seen.push_back(dir);
                 }
             }
@@ -676,12 +1093,12 @@ struct FileClipboard::Impl {
 
     std::vector<std::wstring> searchFolders() {
         std::vector<std::wstring> out;
-        if (job) out = job->seen;
         {
             std::lock_guard<std::mutex> lock(mu);
+            out = seen;
             out.insert(out.end(), extraFolders.begin(), extraFolders.end());
+            out.insert(out.end(), windowFolders.begin(), windowFolders.end());
         }
-        openWindowFolders(out);
         PWSTR desktop = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop)) && desktop) out.emplace_back(desktop);
         CoTaskMemFree(desktop);
@@ -696,48 +1113,114 @@ struct FileClipboard::Impl {
         return unique;
     }
 
-    void markPass() {
-        if (!job) { KillTimer(hwnd, kMarkTimer); return; }
-        const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done);
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            totals.written += stats.written;
-            totals.existed += stats.existed;
-            totals.failed += stats.failed;
-        }
-        if (stats.written || stats.existed || stats.failed) {
-            log("file.motw transfer=" + std::to_string(job->m.transfer) + " written=" + std::to_string(stats.written) +
-                " existed=" + std::to_string(stats.existed) + " failed=" + std::to_string(stats.failed));
-        }
-        if (job->want.empty()) {
-            KillTimer(hwnd, kMarkTimer);   // the next delivered file restarts it
-            if (job->done.size() >= job->m.files) endJob();
-            return;
-        }
-        if (stats.written + stats.existed + stats.failed == 0 && ++job->misses >= kMarkRetries) {
-            KillTimer(hwnd, kMarkTimer);
-            log("file.motw transfer=" + std::to_string(job->m.transfer) + " not_found=" +
-                std::to_string(job->want.size()));
-            job->want.clear();
+    // Shell notifications and paste starts that arrived while a gate runs
+    // inside Explorer's Read (STA thread only).
+    void pumpShell() {
+        MSG msg;
+        while (hwnd && PeekMessageW(&msg, hwnd, kMsgPasteStart, kMsgShellChange, PM_REMOVE)) {
+            if (msg.message == kMsgPasteStart) pasteStarted(uint32_t(msg.wParam));
+            else if (msg.message == kMsgShellChange) shellChange(msg.wParam, msg.lParam);
         }
     }
 
-    void endJob() {
-        if (!job) return;
-        KillTimer(hwnd, kMarkTimer);
-        if (!job->want.empty()) {
-            const auto stats = markDelivered(job->m, searchFolders(), job->since, job->want, job->done);
-            std::lock_guard<std::mutex> lock(mu);
-            totals.written += stats.written;
-            totals.existed += stats.existed;
-            totals.failed += stats.failed;
+    // #53 r2: runs before Explorer gets a file's last byte. True only when
+    // the copy on disk is proven ours and carries ZoneId=3. Logs no names.
+    bool gate(const GateRequest& r, LockedCopy& locked) {
+        const bool onSta = GetCurrentThreadId() == threadId;
+        if (onSta) {
+            pumpShell();
+            pasteStarted(r.transfer);
         }
-        if (job->notifyId) SHChangeNotifyDeregister(job->notifyId);
-        job.reset();
+        const ULONGLONG until = GetTickCount64() + kGateWaitMs;
+        GateOutcome got = GateOutcome::NotFound;
+        ZoneMarkStats st;
+        GateProbe probe;
+        size_t folders = 0;
+        for (;;) {
+            st = ZoneMarkStats{};
+            probe = GateProbe{};
+            const auto where = searchFolders();
+            folders = where.size();
+            got = gateFile(r, where, zone, st, &probe, &locked);
+            if (got != GateOutcome::NotFound || GetTickCount64() >= until) break;
+            Sleep(100);
+            if (onSta) pumpShell();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            totals.written += st.written;
+            totals.existed += st.existed;
+            totals.failed += st.failed;
+        }
+        const std::string head = "file.motw transfer=" + std::to_string(r.transfer) + " index=" + std::to_string(r.index);
+        switch (got) {
+        case GateOutcome::Marked:
+            log(head + (st.written ? " marked=written" : " marked=existed"));
+            return true;
+        case GateOutcome::NotFound:
+            log(head + " refused reason=not_found sta=" + (onSta ? "1" : "0") + " folders=" + std::to_string(folders) +
+                " paths=" + std::to_string(probe.paths) + " present=" + std::to_string(probe.present) +
+                " small=" + std::to_string(probe.tooSmall) + " larger=" + std::to_string(probe.larger) +
+                " older=" + std::to_string(probe.older) + " open_failed=" + std::to_string(probe.openFailed) +
+                " idle=" + std::to_string(probe.idle) + " unlinked=" + std::to_string(probe.unlinked) +
+                " size=" + std::to_string(probe.lastSize) + "/" + std::to_string(r.size) +
+                " age_ms=" + std::to_string(probe.lastAgeMs) + " open_error=" + std::to_string(probe.openError));
+            break;
+        case GateOutcome::WriteFailed: log(head + " refused reason=zone_write_failed"); break;
+        case GateOutcome::Invalid: log(head + " refused reason=zone_invalid"); break;
+        case GateOutcome::Ambiguous: log(head + " refused reason=ambiguous candidates=" + std::to_string(probe.candidates)); break;
+        }
+        return false;
+    }
+
+    // #60 r3: once Explorer lets go of a stream, its locked copy is checked
+    // on a thread of its own (the shell may still hold the file a while) and
+    // kept or removed through its identity. Logs no names.
+    void settle(LockedCopy&& copy, SettleRequest s) {
+        if (!copy) return;
+        std::vector<Worker> finished;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!stopped) {
+                // Threads already done are joined here, outside the lock.
+                for (auto it = workers.begin(); it != workers.end();) {
+                    if (it->done->load()) {
+                        finished.push_back(std::move(*it));
+                        it = workers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                workers.push_back({std::thread([this, done, c = std::move(copy), s = std::move(s)]() mutable {
+                                       settleOne(c, s);
+                                       *done = true;
+                                   }),
+                                   done});
+            }
+        }
+        for (auto& w : finished) w.t.join();
+        if (copy) settleOne(copy, s);   // stop() already ran: checked here
+    }
+
+    void settleOne(LockedCopy& c, const SettleRequest& s) {
+        ZoneMarkStats st;
+        const SettleOutcome o = settleCopy(c, s, zone, st, kSettleWaitMs);
+        const char* what = o == SettleOutcome::Kept ? "kept" : o == SettleOutcome::Removed ? "removed" : "left";
+        // #60 r5: a copy that is not kept is an error, reported here; the
+        // file is left untouched.
+        log(std::string(o == SettleOutcome::Kept ? "file.motw" : "file.motw error=paste_failed") +
+            " transfer=" + std::to_string(s.transfer) + " index=" + std::to_string(s.index) + " settled=" + what +
+            " complete=" + (s.complete ? "1" : "0"));
+        std::lock_guard<std::mutex> lock(mu);
+        totals.kept += st.kept;
+        totals.removed += st.removed;
+        totals.left += st.left;
     }
 };
 
-FileClipboard::FileClipboard(PullHub& hub, LogFn log) : impl_(std::make_unique<Impl>(hub, std::move(log))) {}
+FileClipboard::FileClipboard(PullHub& hub, LogFn log, ZoneOps zone)
+    : impl_(std::make_unique<Impl>(hub, std::move(log), zone)) {}
 
 FileClipboard::~FileClipboard() { stop(); }
 
@@ -754,6 +1237,19 @@ void FileClipboard::stop() {
     if (impl_->hwnd) PostMessageW(impl_->hwnd, kMsgQuit, 0, 0);
     impl_->thread.join();
     impl_->hwnd = nullptr;
+    // Every settle thread has exited, not just finished its check (each is
+    // bounded by kSettleWaitMs and one read of the copy), before stop()
+    // returns: nothing runs on into a destroyed clipboard (#60 r4).
+    for (;;) {
+        std::vector<Impl::Worker> ws;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mu);
+            impl_->stopped = true;
+            ws.swap(impl_->workers);
+        }
+        if (ws.empty()) break;
+        for (auto& w : ws) w.t.join();
+    }
 }
 
 void FileClipboard::offer(const Manifest& m) {
