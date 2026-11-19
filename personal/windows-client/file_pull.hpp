@@ -539,10 +539,10 @@ HANDLE openById(HANDLE hint, const FILE_ID_INFO& id, DWORD access, DWORD share);
 // already going); false while it cannot be deleted yet.
 bool deleteFileById(HANDLE hint, const FILE_ID_INFO& id);
 
-// The zone calls on an open file (#60 r3): the Zone.Identifier stream is
-// opened on the file's current path and used only when it belongs to the
-// same file (volume and file id), so a file swapped in under the name is
-// never marked or read instead. writeInternetZoneOn replaces whatever the
+// The zone calls on an open file (#60 r3, r4): the Zone.Identifier stream
+// is opened relative to the file's handle, never by path, and used only
+// when it belongs to the same file (volume and file id), so a file swapped
+// in under the name is never marked, read, or given an empty stream. writeInternetZoneOn replaces whatever the
 // stream held; Failed on volumes without streams (FAT, exFAT).
 ZoneWrite writeInternetZoneOn(HANDLE file);
 int readZoneIdOn(HANDLE file);
@@ -619,7 +619,13 @@ struct GateRequest {
     std::wstring rel;            // manifest path, Windows-mapped
     uint64_t size = 0;           // manifest size
     FILETIME since{};            // a copy must be created at or after this
+    // #60 r4: the process reading this file's stream (Explorer, which writes
+    // the copy itself); 0 means this process. A copy is taken only if this
+    // process has it open.
+    uint32_t reader = 0;
 };
+// A reader that could not be identified: no file is ever linked to it.
+constexpr uint32_t kUnknownReader = 0xFFFFFFFFu;
 
 enum class GateOutcome {
     Marked,        // the one copy carries ZoneId=3 (or 4)
@@ -638,6 +644,7 @@ struct GateProbe {
     uint32_t older = 0;       // created before the paste started
     uint32_t openFailed = 0;  // there, but could not be opened to check it
     uint32_t idle = 0;        // nobody is writing it: not a copy in progress
+    uint32_t unlinked = 0;    // being written, but not by the process reading the stream (#60 r4)
     uint32_t candidates = 0;  // copies taken (more than one: ambiguous)
     uint64_t lastSize = 0;    // size of the last file found
     int64_t lastAgeMs = 0;    // its creation time minus `since`
@@ -645,7 +652,7 @@ struct GateProbe {
 };
 
 // Looks for `r`'s copy under `folders` (name, time, size, being written,
-// exactly one) and marks it through its handle. Counts the outcome once in
+// open in the reading process, exactly one) and marks it through its handle. Counts the outcome once in
 // `stats`; `probe`, if given, says why nothing was taken.
 // `locked`, if given, receives the copy (also when its mark failed) for
 // settleCopy().
