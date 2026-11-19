@@ -8,6 +8,7 @@
 #include "file_push.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -620,6 +621,169 @@ int countParts(const std::wstring& folder) {
     return n;
 }
 
+// #60 r7: someone tries to remove the file's Zone.Identifier stream (an
+// open of the stream with delete access, then delete-on-close) just before
+// the rename to its final name (stage 0) or just after it (stage 1).
+int gUnlinkStage = -1;
+int gUnlinkResult[2] = {0, 0};   // 1 = refused, 2 = the stream was opened with delete access and marked for deletion
+DWORD gUnlinkError[2] = {0, 0};
+
+void tryUnlink(HANDLE file, int stage) {
+    if (stage != gUnlinkStage) return;
+    const std::wstring p = pathOf(file) + L":Zone.Identifier";
+    HANDLE z = CreateFileW(p.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (z == INVALID_HANDLE_VALUE) {
+        gUnlinkResult[stage] = 1;
+        gUnlinkError[stage] = GetLastError();
+        return;
+    }
+    FILE_DISPOSITION_INFO del{};
+    del.DeleteFile = TRUE;
+    const bool ok = SetFileInformationByHandle(z, FileDispositionInfo, &del, sizeof(del)) != 0;
+    if (!ok) gUnlinkError[stage] = GetLastError();
+    CloseHandle(z);
+    gUnlinkResult[stage] = ok ? 2 : 1;
+}
+
+// #60 r7: whether another program could open `path`'s Zone.Identifier for
+// writing (1) or with delete access (2) right now; 0 when both are refused.
+int zoneOpenable(const std::wstring& path) {
+    const std::wstring p = path + L":Zone.Identifier";
+    const DWORD all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    int r = 0;
+    HANDLE w = CreateFileW(p.c_str(), GENERIC_WRITE, all, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (w != INVALID_HANDLE_VALUE) {
+        r |= 1;
+        CloseHandle(w);
+    }
+    HANDLE d = CreateFileW(p.c_str(), DELETE, all, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (d != INVALID_HANDLE_VALUE) {
+        r |= 2;
+        CloseHandle(d);
+    }
+    return r;
+}
+
+// #60 r7: the file named gIsoName cannot be taken back at all: every
+// staging name is taken, it is mapped as an image (no delete, no cut) and
+// another handle holds an exclusive lock on all of it (no zero-fill).
+std::wstring gIsoName;
+HANDLE gIsoLock = INVALID_HANDLE_VALUE;
+bool gIsoLocked = false;
+
+int isoRead(HANDLE h) {
+    if (!endsWith(pathOf(h), L"\\" + gIsoName)) return fpull::readZoneIdOn(h);
+    if (!gStuckBlocked) {
+        blockTakeBack(h);
+        gIsoLock = CreateFileW(pathOf(h).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        OVERLAPPED at{};
+        gIsoLocked = gIsoLock != INVALID_HANDLE_VALUE &&
+                     LockFileEx(gIsoLock, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &at);
+    }
+    return -1;
+}
+
+// #60 r7 probe (printed, not asserted): how NTFS applies delete sharing
+// between a file's main stream and its Zone.Identifier stream.
+using NtSetInfoFn = LONG(NTAPI*)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+LONG ntLink(HANDLE h, const std::wstring& target) {
+    static const auto fn = reinterpret_cast<NtSetInfoFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile")));
+    const std::wstring nt = L"\\??\\" + target;
+    const size_t bytes = nt.size() * sizeof(wchar_t);
+    std::vector<uint8_t> buf(sizeof(FILE_RENAME_INFO) + bytes, 0);
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+    info->FileNameLength = DWORD(bytes);
+    std::memcpy(info->FileName, nt.data(), bytes);
+    ULONG_PTR io[2] = {};
+    return fn ? fn(h, io, info, ULONG(buf.size()), 11 /* FileLinkInformation */) : -1;
+}
+
+unsigned long openErr(const std::wstring& p, DWORD access, DWORD share, HANDLE* keep = nullptr) {
+    HANDLE h = CreateFileW(p.c_str(), access, share, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError();
+    if (keep) *keep = h;
+    else CloseHandle(h);
+    return 0;
+}
+
+void sharingProbe(const std::wstring& dir) {
+    const DWORD R = FILE_SHARE_READ, RD = FILE_SHARE_READ | FILE_SHARE_DELETE,
+                ALL = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    auto mk = [&](const std::wstring& n) {
+        const std::wstring p = dir + L"\\" + n;
+        HANDLE f = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        WriteFile(f, "data", 4, &w, nullptr);
+        CloseHandle(f);
+        HANDLE z = CreateFileW((p + L":Zone.Identifier").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        static const char k3[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
+        WriteFile(z, k3, DWORD(sizeof(k3) - 1), &w, nullptr);
+        CloseHandle(z);
+        return p;
+    };
+    // A: main open with delete access, sharing read only (the r6 .jlpart).
+    {
+        const std::wstring p = mk(L"probeA.bin");
+        const std::wstring zs = p + L":Zone.Identifier";
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, R, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE z = INVALID_HANDLE_VALUE;
+        const unsigned long a1 = openErr(zs, GENERIC_READ, R);
+        const unsigned long a2 = openErr(zs, GENERIC_READ, RD, &z);
+        const unsigned long a3 = openErr(zs, DELETE, ALL);
+        const unsigned long a4 = openErr(p, DELETE, ALL);
+        std::printf("  r7 probe A (main RW+DELETE share R, h=%d): zone R/shareR=%lu zone R/shareRD=%lu "
+                    "other zone DELETE=%lu other main DELETE=%lu\n",
+                    int(h != INVALID_HANDLE_VALUE), a1, a2, a3, a4);
+        if (z != INVALID_HANDLE_VALUE) CloseHandle(z);
+        CloseHandle(h);
+    }
+    // B: main open without delete access, sharing read only; the zone
+    // stream held with no write or delete sharing.
+    {
+        const std::wstring p = mk(L"probeB.bin");
+        const std::wstring zs = p + L":Zone.Identifier";
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, R, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE z = INVALID_HANDLE_VALUE;
+        const unsigned long b1 = openErr(zs, GENERIC_READ, R, &z);
+        const unsigned long b2 = openErr(zs, DELETE, ALL);
+        const unsigned long b3 = openErr(zs, GENERIC_WRITE, ALL);
+        const unsigned long b4 = openErr(p, DELETE, ALL);
+        const LONG b5 = ntLink(h, dir + L"\\probeB-final.bin");
+        const unsigned long b6 = openErr(dir + L"\\probeB-final.bin:Zone.Identifier", DELETE, ALL);
+        const unsigned long b7 = openErr(dir + L"\\probeB-final.bin", DELETE, ALL);
+        if (z != INVALID_HANDLE_VALUE) CloseHandle(z);
+        const unsigned long b8 = openErr(dir + L"\\probeB-final.bin", DELETE, ALL);
+        std::printf("  r7 probe B (main RW share R, h=%d): hold zone R/shareR=%lu other zone DELETE=%lu "
+                    "other zone WRITE=%lu other main DELETE=%lu link=0x%08lx final zone DELETE=%lu final main DELETE=%lu "
+                    "after zone closed final main DELETE=%lu\n",
+                    int(h != INVALID_HANDLE_VALUE), b1, b2, b3, b4, (unsigned long)b5, b6, b7, b8);
+        CloseHandle(h);
+        DeleteFileW((dir + L"\\probeB-final.bin").c_str());
+    }
+    // C: as B, but the main handle shares read and delete.
+    {
+        const std::wstring p = mk(L"probeC.bin");
+        const std::wstring zs = p + L":Zone.Identifier";
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, RD, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE z = INVALID_HANDLE_VALUE;
+        const unsigned long c1 = openErr(zs, GENERIC_READ, R, &z);
+        const unsigned long c2 = openErr(p, DELETE, ALL);
+        const unsigned long c3 = openErr(zs, DELETE, ALL);
+        if (z != INVALID_HANDLE_VALUE) CloseHandle(z);
+        const unsigned long c4 = openErr(p, DELETE, ALL);
+        std::printf("  r7 probe C (main RW share RD, h=%d): hold zone R/shareR=%lu other main DELETE=%lu "
+                    "other zone DELETE=%lu after zone closed other main DELETE=%lu\n",
+                    int(h != INVALID_HANDLE_VALUE), c1, c2, c3, c4);
+        CloseHandle(h);
+    }
+    DeleteFileW((dir + L"\\probeA.bin").c_str());
+    DeleteFileW((dir + L"\\probeB.bin").c_str());
+    DeleteFileW((dir + L"\\probeC.bin").c_str());
+}
+
 void realFolder() {
     const std::wstring dir = tempFolder();
     std::vector<std::wstring> opened;
@@ -1064,6 +1228,132 @@ void realFolder() {
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
         DeleteFileW(target.c_str());
         clearStaging(dir, gBranchName);
+    }
+    // #60 r7 probe: NTFS delete sharing between the main stream and the mark.
+    sharingProbe(dir);
+    // #60 r7 item 1: from the staging check through the rename and the last
+    // check nobody can remove the Zone.Identifier stream either, and a file
+    // whose mark someone tried to remove is never delivered without it.
+    for (int stage = 0; stage < 2; ++stage) {
+        const std::string leaf = stage == 0 ? "keep0.exe" : "keep1.exe";
+        const std::wstring target = dir + L"\\" + std::wstring(leaf.begin(), leaf.end());
+        gUnlinkStage = stage;
+        gPublishHook = tryUnlink;
+        PushReceiver::Out out;
+        {
+            PushReceiver r(makeFolderSink(dir, {}), fpull::sha256Digest());
+            auto gp = makePush(75 + uint32_t(stage), {{leaf, 2048}});
+            offerAll(r, gp);
+            r.nextRequest();
+            r.onData({75 + uint32_t(stage), 0, 0, gp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(gp.contents[0].data(), gp.contents[0].size());
+            out = r.onFileEnd({75 + uint32_t(stage), 0, d->finish()});
+        }
+        gPublishHook = nullptr;
+        gUnlinkStage = -1;
+        const auto* res = only<file::Result>(out);
+        const int zone = fpull::readZoneId(target);
+        const bool delivered = res && res->status == file::status::kOk;
+        std::printf("  remove window stage %d: unlink=%d err=%lu ok=%d zone=%d\n", stage, gUnlinkResult[stage],
+                    (unsigned long)gUnlinkError[stage], int(delivered), zone);
+        expect(gUnlinkResult[stage] == 1,
+               stage == 0 ? "folder: between the staging check and the rename nobody can remove the file's Zone.Identifier (#60 r7)"
+                          : "folder: between the rename and the last check nobody can remove the file's Zone.Identifier (#60 r7)");
+        expect(!delivered || zone == 3,
+               stage == 0 ? "folder: a file whose mark someone tries to remove before the rename is never delivered without ZoneId=3 (#60 r7)"
+                          : "folder: a file whose mark someone tries to remove after the rename is never delivered without ZoneId=3 (#60 r7)");
+        DeleteFileW(target.c_str());
+        clearStaging(dir, std::wstring(leaf.begin(), leaf.end()));
+    }
+    // #60 r7 item 2: a file that can be neither taken back, deleted, cut nor
+    // zeroed (every staging name taken, mapped as an image, locked) after
+    // someone tried to remove its mark before the rename: while the sink
+    // lives it stays isolated, still marked ZoneId=3, and nobody can write
+    // or remove its Zone.Identifier.
+    {
+        gIsoName = L"isolated.exe";
+        gStuckPart = dir + L"\\.jlstaging\\isolated.exe.jlpart";
+        gStuckBlocked = false;
+        gStuckAllNames = true;
+        gStuckImage = true;
+        gStuckMapError = 0;
+        gIsoLocked = false;
+        gUnlinkStage = 0;
+        gUnlinkResult[0] = 0;
+        gUnlinkError[0] = 0;
+        gPublishHook = tryUnlink;
+        gTrace.clear();
+        gTakeOutTrace = collectTrace;
+        fpull::ZoneOps iso;
+        iso.readOn = isoRead;
+        const std::wstring target = dir + L"\\isolated.exe";
+        int zone = -2;
+        int openable = -1;
+        bool delivered = true;
+        {
+            PushReceiver r(makeFolderSink(dir, {}, iso), fpull::sha256Digest());
+            wchar_t self[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, self, MAX_PATH);
+            const std::vector<uint8_t> image = readAll(self);
+            auto ip = makePush(77, {{"isolated.exe", image.size()}});
+            ip.contents[0] = image;
+            offerAll(r, ip);
+            PushReceiver::Out iout;
+            uint64_t sent = 0;
+            while (iout.empty()) {
+                auto q = r.nextRequest();
+                if (!q || q->offset != sent) break;
+                const uint64_t end = std::min<uint64_t>(image.size(), q->offset + q->length);
+                while (iout.empty() && sent < end) {
+                    const uint64_t n = std::min<uint64_t>(file::kMaxChunk, end - sent);
+                    iout = r.onData({77, 0, sent, std::vector<uint8_t>(image.begin() + std::ptrdiff_t(sent),
+                                                                      image.begin() + std::ptrdiff_t(sent + n))});
+                    sent += n;
+                }
+                if (iout.empty() && sent == image.size()) {
+                    auto d = fpull::sha256Digest()();
+                    d->update(image.data(), image.size());
+                    iout = r.onFileEnd({77, 0, d->finish()});
+                }
+            }
+            const auto* ires = only<file::Result>(iout);
+            delivered = ires && ires->status == file::status::kOk;
+            // Still inside the sink's life: the leftover is checked now.
+            zone = fpull::readZoneId(target);
+            openable = zoneOpenable(target);
+        }
+        gPublishHook = nullptr;
+        gUnlinkStage = -1;
+        gTakeOutTrace = nullptr;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        diskSize(target, exists, onDisk);
+        std::printf("  isolated: blocked=%d locked=%d maperr=%lu unlink=%d err=%lu delivered=%d zone=%d openable=%d "
+                    "back=%d cut=%d zero=%d exists=%d size=%llu\n",
+                    int(gStuckBlocked), int(gIsoLocked), (unsigned long)gStuckMapError, gUnlinkResult[0],
+                    (unsigned long)gUnlinkError[0], int(delivered), zone, openable, traced("back"), traced("cut"),
+                    traced("zero"), int(exists), (unsigned long long)onDisk);
+        expect(gStuckBlocked && gIsoLocked,
+               "folder: the isolation test took every staging name, mapped the file as an image and locked it (#60 r7)");
+        expect(!delivered, "folder: a file that fails its last check and cannot be taken back is not delivered (#60 r7)");
+        expect(traced("cut") == 0 && traced("zero") == 0,
+               "folder: isolation: the cut and the zero-fill both failed, so the file stayed under its final name (#60 r7)");
+        expect(zone == 3,
+               "folder: a file left under its final name because it cannot be taken back still carries ZoneId=3 while the sink lives (#60 r7)");
+        expect(openable == 0,
+               "folder: while the sink lives nobody can write or remove the Zone.Identifier of a file it cannot take back (#60 r7)");
+        if (gIsoLock != INVALID_HANDLE_VALUE) CloseHandle(gIsoLock);
+        gIsoLock = INVALID_HANDLE_VALUE;
+        if (gStuckView) UnmapViewOfFile(gStuckView);
+        if (gStuckMap) CloseHandle(gStuckMap);
+        gStuckView = nullptr;
+        gStuckMap = nullptr;
+        gStuckAllNames = false;
+        gStuckImage = false;
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        clearStaging(dir, gIsoName);
     }
     // Disconnect mid-file removes the partial file.
     {
