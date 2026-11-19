@@ -48,6 +48,10 @@ public:
     // The file is complete and verified: close it, give it its name (or the
     // next free "name (n).ext"), mark it as from the Internet.
     virtual bool commit() = 0;
+    // #60 r9: the caller is done with a commit() that returned true. Until
+    // then the sink may keep the delivered file's final name and mark held;
+    // here it lets go. PushReceiver calls it right after commit().
+    virtual void settle() {}
     // Closes and deletes the partial file, if there is one.
     virtual void abort() = 0;
     // Every file arrived: show the folder.
@@ -237,6 +241,7 @@ public:
             if (sink_->zoneRefused()) return failLocked("motw", file::status::kFailed);
             return failLocked("rename", file::status::kNoSpace);
         }
+        sink_->settle();
         ++cur_;
         if (cur_ < items_.size()) {
             if (!startFileLocked()) return failLocked("create", file::status::kNoSpace);
@@ -399,6 +404,9 @@ extern void (*gTakeOutTrace)(const char* step, bool ok);
 // stage 1, just after the file gets it and before the last check, and at
 // stage 2, after the last check, just before commit() reports success.
 extern void (*gFinalHook)(const std::wstring& final, int stage);
+// #60 r9: gIdLookupHook is asked just before the sink reads the file id of
+// a name it is about to remove; true makes that lookup fail.
+extern bool (*gIdLookupHook)(const std::wstring& path);
 
 // %USERPROFILE%\Downloads\JerisLink from FOLDERID_Downloads, or "" if
 // Windows does not know the Downloads folder.

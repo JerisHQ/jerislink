@@ -18,6 +18,8 @@ void (*gPublishHook)(HANDLE file, int stage) = nullptr;
 void (*gTakeOutTrace)(const char* step, bool ok) = nullptr;
 void (*gFinalHook)(const std::wstring& final, int stage) = nullptr;
 
+bool (*gIdLookupHook)(const std::wstring& path) = nullptr;
+
 namespace {
 
 // #60 r6: reports a take-back or cleanup step's result to a test.
@@ -140,7 +142,7 @@ bool unlinkName(const std::wstring& path, const FILE_ID_INFO& id) {
         return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
     }
     FILE_ID_INFO got{};
-    if (!filepull::fileIdOf(h, got) || !filepull::sameFile(got, id)) {
+    if ((gIdLookupHook && gIdLookupHook(path)) || !filepull::fileIdOf(h, got) || !filepull::sameFile(got, id)) {
         CloseHandle(h);
         return true;
     }

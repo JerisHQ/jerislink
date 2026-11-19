@@ -808,9 +808,10 @@ void sharingProbe(const std::wstring& dir) {
 // the link and before the last check (stage 1), or after the last check,
 // just before commit() reports success (stage 2).
 int gFinalStage = -1;
-int gFinalZone[3] = {0, 0, 0};    // 1 = refused, 2 = the stream was opened with delete access and marked for deletion
-int gFinalMove[3] = {0, 0, 0};    // 1 = refused, 2 = the final name was renamed away
-DWORD gFinalMoveError[3] = {0, 0, 0};
+// #60 r9: stage 3 is after commit() returned, before the caller's settle().
+int gFinalZone[4] = {0, 0, 0, 0};    // 1 = refused, 2 = the stream was opened with delete access and marked for deletion
+int gFinalMove[4] = {0, 0, 0, 0};    // 1 = refused, 2 = the final name was renamed away
+DWORD gFinalMoveError[4] = {0, 0, 0, 0};
 
 void tryTakeFinal(const std::wstring& final, int stage) {
     if (stage != gFinalStage) return;
@@ -847,6 +848,11 @@ void pinFinal(const std::wstring& final, int stage) {
 }
 
 int pinRead(HANDLE h) { return endsWith(pathOf(h), L"\\" + gPinName) ? -1 : fpull::readZoneIdOn(h); }
+
+// #60 r9 item 2: the sink's file id lookup on the final name gIdFailName
+// fails while gIdFailOn is set.
+bool gIdFailOn = false;
+bool idLookupFails(const std::wstring& path) { return gIdFailOn && endsWith(path, L"\\idfail.exe"); }
 
 // #60 r8: the step the sink reported first (empty when none).
 std::string firstStep() { return gTrace.empty() ? std::string() : gTrace.front().first; }
@@ -1385,6 +1391,120 @@ void realFolder() {
         DeleteFileW(target.c_str());
         DeleteFileW((target + L".moved").c_str());
         clearStaging(dir, wleaf);
+    }
+    // #60 r9 item 1: commit() hands the delivered file over with its final
+    // name, its mark and its bytes still held; the caller lets go with
+    // settle(). From the last check until after commit() returns, nobody can
+    // rename or remove the final name or change its Zone.Identifier.
+    {
+        const std::wstring target = dir + L"\\handover.exe";
+        std::vector<uint8_t> bytes(3000);
+        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i * 7);
+        bool committed = false;
+        int openable = -1;
+        bool held = false;
+        uint64_t heldSize = 0;
+        int heldZone = -2;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        int zone = -2;
+        bool freed = false;
+        {
+            auto sink = makeFolderSink(dir, {});
+            committed = sink->prepare() && sink->begin(L"handover.exe") && sink->write(bytes.data(), bytes.size()) &&
+                        sink->commit();
+            // commit() has returned; the caller has not let go yet.
+            openable = zoneOpenable(target);
+            gFinalStage = 3;
+            tryTakeFinal(target, 3);
+            gFinalStage = -1;
+            diskSize(target, held, heldSize);
+            heldZone = fpull::readZoneId(target);
+            sink->settle();
+            diskSize(target, exists, onDisk);
+            zone = fpull::readZoneId(target);
+            // Once let go the name is like any downloaded file's.
+            freed = MoveFileExW(target.c_str(), (target + L".freed").c_str(), 0) != 0;
+            if (freed) MoveFileExW((target + L".freed").c_str(), target.c_str(), 0);
+        }
+        const int parts = countIn(dir + L"\\.jlstaging", L"handover.exe.jlpart*");
+        const bool moved = GetFileAttributesW((target + L".moved").c_str()) != INVALID_FILE_ATTRIBUTES;
+        std::printf("  handover: committed=%d openable=%d zone-remove=%d move=%d err=%lu held=%d size=%llu zone=%d "
+                    "settled: exists=%d size=%llu zone=%d freed=%d moved=%d parts=%d\n",
+                    int(committed), openable, gFinalZone[3], gFinalMove[3], (unsigned long)gFinalMoveError[3], int(held),
+                    (unsigned long long)heldSize, heldZone, int(exists), (unsigned long long)onDisk, zone, int(freed),
+                    int(moved), parts);
+        expect(committed, "folder: the handover push is committed (#60 r9)");
+        expect(gFinalMove[3] == 1,
+               "folder: after commit() returns and before settle() nobody can rename or remove the final name (#60 r9)");
+        expect(gFinalZone[3] == 1,
+               "folder: after commit() returns and before settle() nobody can remove the Zone.Identifier through the final name (#60 r9)");
+        expect(openable == 0,
+               "folder: after commit() returns and before settle() nobody can write or remove the final name's Zone.Identifier (#60 r9)");
+        expect(held && heldSize == 3000 && heldZone == 3 && !moved,
+               "folder: until settle() the committed file stays under its final name, whole, with ZoneId=3 (#60 r9)");
+        expect(exists && onDisk == 3000 && zone == 3 && freed && parts == 0,
+               "folder: after settle() the file is delivered with ZoneId=3, the name is let go and no staging name is left (#60 r9)");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        DeleteFileW((target + L".moved").c_str());
+        clearStaging(dir, L"handover.exe");
+    }
+    // #60 r9 item 2: the last check fails and the take-back cannot read the
+    // final name's file id. That is not a removal: the final name is kept,
+    // the file stays whole with ZoneId=3 and the removal is retried; once
+    // the lookup works again the sink removes the file before it goes.
+    {
+        gPinName = L"idfail.exe";
+        gIdFailOn = true;
+        gIdLookupHook = idLookupFails;
+        gTrace.clear();
+        gTakeOutTrace = collectTrace;
+        fpull::ZoneOps fail;
+        fail.readOn = pinRead;
+        const std::wstring target = dir + L"\\idfail.exe";
+        bool delivered = true;
+        bool exists = false;
+        uint64_t onDisk = 0;
+        int zone = -2;
+        int unlink = -2, cut = -2, zero = -2;
+        {
+            PushReceiver r(makeFolderSink(dir, {}, fail), fpull::sha256Digest());
+            auto pp = makePush(84, {{"idfail.exe", 4096}});
+            offerAll(r, pp);
+            r.nextRequest();
+            r.onData({84, 0, 0, pp.contents[0]});
+            auto d = fpull::sha256Digest()();
+            d->update(pp.contents[0].data(), pp.contents[0].size());
+            const auto out = r.onFileEnd({84, 0, d->finish()});
+            const auto* res = only<file::Result>(out);
+            delivered = res && res->status == file::status::kOk;
+            diskSize(target, exists, onDisk);
+            zone = fpull::readZoneId(target);
+            unlink = traced("unlink");
+            cut = traced("cut");
+            zero = traced("zero");
+            // The lookup works again while the sink still lives.
+            gIdFailOn = false;
+        }
+        gIdLookupHook = nullptr;
+        gTakeOutTrace = nullptr;
+        gPinName.clear();
+        bool after = true;
+        uint64_t afterSize = 0;
+        const bool afterKnown = diskSize(target, after, afterSize);
+        const int parts = countIn(dir + L"\\.jlstaging", L"idfail.exe.jlpart*");
+        std::printf("  id lookup fails: delivered=%d unlink=%d cut=%d zero=%d exists=%d size=%llu zone=%d after=%d parts=%d\n",
+                    int(delivered), unlink, cut, zero, int(exists), (unsigned long long)onDisk, zone, int(after), parts);
+        expect(!delivered, "folder: the id-lookup test failed its last check and was not delivered (#60 r9)");
+        expect(unlink == 0, "folder: take-back: a final name whose file id could not be read counts as not removed (#60 r9)");
+        expect(exists && onDisk == 4096 && zone == 3 && cut == -1 && zero == -1,
+               "folder: while the id lookup fails the file stays whole under its final name with ZoneId=3, never cut or zeroed (#60 r9)");
+        expect(afterKnown && !after && parts == 0,
+               "folder: once the id lookup works again the sink removes the final name and the file before it goes (#60 r9)");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(target.c_str());
+        clearStaging(dir, L"idfail.exe");
     }
     // #60 r8 item 2: the last check fails while another program holds the
     // file open under its final name (no delete sharing), so the final name
