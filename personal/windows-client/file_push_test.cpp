@@ -442,6 +442,12 @@ void* gStuckView = nullptr;
 // #60 r5: also take every other staging name the sink may move the file to
 // (".2" to ".99"), so the file cannot leave its final name at all.
 bool gStuckAllNames = false;
+// #60 r5: map the file as an executable image, as Windows does for a
+// program that runs, and as a scanner may: while an image section exists
+// the file can be neither deleted nor cut (a plain data view still lets
+// a POSIX delete through, so it does not block the delete).
+bool gStuckImage = false;
+DWORD gStuckMapError = 0;
 
 bool takeName(const std::wstring& path) {
     HANDLE p = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
@@ -462,8 +468,22 @@ void blockTakeBack(HANDLE h) {
     if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof(b))) return;
     b.FileAttributes |= FILE_ATTRIBUTE_READONLY;
     if (SetFileInformationByHandle(h, FileBasicInfo, &b, sizeof(b)) == 0) return;
-    gStuckMap = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (gStuckImage) {
+        const std::wstring p = pathOf(h);
+        const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        HANDLE x = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_EXECUTE, share, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (x == INVALID_HANDLE_VALUE) {
+            gStuckMapError = GetLastError();
+            return;
+        }
+        gStuckMap = CreateFileMappingW(x, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+        if (!gStuckMap) gStuckMapError = GetLastError();
+        CloseHandle(x);
+    } else {
+        gStuckMap = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    }
     if (gStuckMap) gStuckView = MapViewOfFile(gStuckMap, FILE_MAP_READ, 0, 0, 0);
+    if (gStuckMap && !gStuckView) gStuckMapError = GetLastError();
     gStuckBlocked = gStuckView != nullptr;
 }
 
@@ -776,7 +796,7 @@ void realFolder() {
         const bool known = diskSize(target, exists, onDisk);
         std::printf("  take-back: blocked=%d known=%d exists=%d size=%llu zone=%d\n", int(gStuckBlocked), int(known),
                     int(exists), (unsigned long long)onDisk, fpull::readZoneId(target));
-        expect(gStuckBlocked, "folder: the take-back test blocked the move back, the delete and the cut");
+        expect(gStuckBlocked, "folder: the take-back test blocked the move back and mapped the file");
         expect(known && (!exists || onDisk == 0),
                "folder: when the move back, the delete and the cut all fail, the file's bytes do not stay under its final name (#60 r5)");
         if (gStuckView) UnmapViewOfFile(gStuckView);
@@ -798,12 +818,15 @@ void realFolder() {
         }
     }
     // #60 r5: as above, but every staging name is taken too, so the file
-    // cannot leave its final name; it is mapped, so it cannot be deleted or
-    // cut either. Its bytes must still go: zeroed through the handle.
+    // cannot leave its final name; it is a real program (this test's own
+    // .exe) mapped as an image, so it can be neither deleted nor cut. Its
+    // bytes must not stay under its final name.
     {
         gStuckPart = dir + L"\\.jlstaging\\pinned2.exe.jlpart";
         gStuckBlocked = false;
         gStuckAllNames = true;
+        gStuckImage = true;
+        gStuckMapError = 0;
         fpull::ZoneOps stuck;
         stuck.readOn = [](HANDLE h) {
             if (!endsWith(pathOf(h), L"\\pinned2.exe")) return fpull::readZoneIdOn(h);
@@ -816,13 +839,31 @@ void realFolder() {
         const std::wstring target = dir + L"\\pinned2.exe";
         {
             PushReceiver r(makeFolderSink(dir, {}, stuck), fpull::sha256Digest());
-            auto pp = makePush(59, {{"pinned2.exe", 3000}});
+            wchar_t self[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, self, MAX_PATH);
+            const std::vector<uint8_t> image = readAll(self);
+            auto pp = makePush(59, {{"pinned2.exe", image.size()}});
+            pp.contents[0] = image;
             offerAll(r, pp);
-            r.nextRequest();
-            r.onData({59, 0, 0, pp.contents[0]});
-            auto d = fpull::sha256Digest()();
-            d->update(pp.contents[0].data(), pp.contents[0].size());
-            const auto presOut = r.onFileEnd({59, 0, d->finish()});
+            PushReceiver::Out presOut;
+            uint64_t sent = 0;
+            while (presOut.empty()) {
+                auto q = r.nextRequest();
+                if (!q || q->offset != sent) break;
+                const uint64_t end = std::min<uint64_t>(image.size(), q->offset + q->length);
+                while (presOut.empty() && sent < end) {
+                    const uint64_t n = std::min<uint64_t>(file::kMaxChunk, end - sent);
+                    presOut = r.onData({59, 0, sent, std::vector<uint8_t>(image.begin() + std::ptrdiff_t(sent),
+                                                                         image.begin() + std::ptrdiff_t(sent + n))});
+                    sent += n;
+                }
+                if (presOut.empty() && sent == image.size()) {
+                    auto d = fpull::sha256Digest()();
+                    d->update(image.data(), image.size());
+                    presOut = r.onFileEnd({59, 0, d->finish()});
+                }
+            }
+            std::printf("  stuck in place: image=%zu bytes sent=%llu\n", image.size(), (unsigned long long)sent);
             const auto* pres = only<file::Result>(presOut);
             expect(pres && pres->status != file::status::kOk,
                    "folder: a file that cannot leave its final name is not delivered (#60 r5)");
@@ -831,9 +872,10 @@ void realFolder() {
         uint64_t onDisk = 0;
         const bool known = diskSize(target, exists, onDisk);
         const bool blank = known && goneOrZeroed(target, onDisk);
-        std::printf("  stuck in place: blocked=%d known=%d exists=%d size=%llu blank=%d\n", int(gStuckBlocked),
-                    int(known), int(exists), (unsigned long long)onDisk, int(blank));
-        expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file");
+        std::printf("  stuck in place: blocked=%d maperr=%lu known=%d exists=%d size=%llu blank=%d\n",
+                    int(gStuckBlocked), (unsigned long)gStuckMapError, int(known), int(exists),
+                    (unsigned long long)onDisk, int(blank));
+        expect(gStuckBlocked, "folder: the stuck-in-place test took every staging name and mapped the file as an image");
         expect(blank,
                "folder: a file that can neither leave its final name, be deleted nor be cut has its bytes zeroed (#60 r5)");
         if (gStuckView) UnmapViewOfFile(gStuckView);
@@ -841,6 +883,7 @@ void realFolder() {
         gStuckView = nullptr;
         gStuckMap = nullptr;
         gStuckAllNames = false;
+        gStuckImage = false;
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
         DeleteFileW(target.c_str());
         const std::wstring staging = dir + L"\\.jlstaging\\";
