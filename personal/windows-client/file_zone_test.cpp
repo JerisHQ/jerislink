@@ -358,18 +358,20 @@ void helpers() {
 
     // #60 r3 item 2: after the paste the locked copy is kept only when it is
     // complete, exactly the manifest size, has the bytes handed out and
-    // carries ZoneId=3. Anything else is removed through its identity.
+    // carries ZoneId=3. #60 r5: anything else is left untouched (the copy
+    // may not be ours) and the settle reports it as failed.
     {
         struct Settle {
             const wchar_t* name;
-            int kind;   // 0 good, 1 longer than the manifest, 2 mark gone, 3 paste not complete
+            int kind;   // 0 good, 1 longer than the manifest, 2 mark gone, 3 paste not complete, 4 other bytes
             const char* what;
         };
         const Settle cases[] = {
             {L"keep.bin", 0, "unit: settle keeps a complete, marked copy with the right bytes"},
-            {L"long.bin", 1, "unit: settle removes a copy that ends longer than the manifest (#60 r3)"},
-            {L"nomark2.bin", 2, "unit: settle removes a complete copy whose mark is gone (#60 r3)"},
-            {L"cut.bin", 3, "unit: settle removes a copy whose paste did not complete (#60 r3)"},
+            {L"long.bin", 1, "unit: settle never deletes a copy that ends longer than the manifest: left, failed (#60 r5)"},
+            {L"nomark2.bin", 2, "unit: settle never deletes a complete copy whose mark is gone: left, failed (#60 r5)"},
+            {L"cut.bin", 3, "unit: settle never deletes a copy whose paste did not complete: left, failed (#60 r5)"},
+            {L"other.bin", 4, "unit: settle never deletes a copy whose bytes differ (SHA-256 mismatch): left, failed (#60 r5)"},
         };
         const std::wstring sd = dir + L"\\settle";
         CreateDirectoryW(sd.c_str(), nullptr);
@@ -381,7 +383,7 @@ void helpers() {
             ZoneMarkStats zst;
             LockedCopy locked;
             const GateOutcome g = gateFile(requestFor(c.name, full, since), {sd}, {}, zst, nullptr, &locked);
-            w.append({full.back()});
+            w.append({uint8_t(c.kind == 4 ? full.back() ^ 0x5a : full.back())});
             if (c.kind == 1) w.append(body(100, 61));
             if (c.kind == 2) DeleteFileW((path + L":Zone.Identifier").c_str());
             w.close();
@@ -393,7 +395,7 @@ void helpers() {
             const bool there = exists(path);
             std::printf("  settle %ls: gate=%d outcome=%d exists=%d\n", c.name, int(g), int(o), int(there));
             if (c.kind == 0) expect(o == SettleOutcome::Kept && there && readFile(path) == full && readZoneId(path) == 3, c.what);
-            else expect(o == SettleOutcome::Removed && !there, c.what);
+            else expect(o == SettleOutcome::Left && there, c.what);
         }
     }
 
@@ -826,8 +828,8 @@ void gateCases() {
     }
     {   // #60 r3 item 2: the mark fails, and the shell had sized the copy to
         // its full length first and keeps it open (no delete sharing) for a
-        // while. Once it lets go the copy is removed: no full-size unmarked
-        // file stays.
+        // while. #60 r5: the last byte is withheld, and the copy is left as
+        // the shell made it (never deleted by us; the paste fails).
         const std::wstring dir = tempDir(L"gate-held");
         GateCase gc;
         gc.transfer = 23;
@@ -841,8 +843,9 @@ void gateCases() {
         std::printf("  held copy: got=%llu failed=%d exists=%d size=%llu zone=%d\n", static_cast<unsigned long long>(c.got),
                     int(c.readFailed), int(exists(gc.dest)), static_cast<unsigned long long>(sizeOf(gc.dest)),
                     readZoneId(gc.dest));
-        expect(c.readFailed && !exists(gc.dest),
-               "gate: a refused copy the shell sized to full length is removed once the shell lets go (#60 r3)");
+        expect(c.readFailed && c.got == n - 1,
+               "gate: a refused copy the shell sized to full length never gets its last byte (#60 r3)");
+        expect(exists(gc.dest), "gate: a refused copy is never deleted by us, even once the shell lets go (#60 r5)");
     }
     {   // An existing Zone.Identifier with ZoneId=0 (Local machine).
         const std::wstring dir = tempDir(L"gate-zone0");
