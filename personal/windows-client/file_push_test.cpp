@@ -435,6 +435,10 @@ void swapOnce(const std::wstring& path) {
 // and makes the file read-only (so a plain delete fails).
 std::wstring gStuckPart;
 bool gStuckBlocked = false;
+// #60 r5: a read-only view of the file mapped here, as another program can
+// map it: while it is mapped the file can be neither deleted nor cut.
+HANDLE gStuckMap = nullptr;
+void* gStuckView = nullptr;
 
 void blockTakeBack(HANDLE h) {
     if (gStuckBlocked) return;
@@ -444,7 +448,29 @@ void blockTakeBack(HANDLE h) {
     FILE_BASIC_INFO b{};
     if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof(b))) return;
     b.FileAttributes |= FILE_ATTRIBUTE_READONLY;
-    gStuckBlocked = SetFileInformationByHandle(h, FileBasicInfo, &b, sizeof(b)) != 0;
+    if (SetFileInformationByHandle(h, FileBasicInfo, &b, sizeof(b)) == 0) return;
+    gStuckMap = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (gStuckMap) gStuckView = MapViewOfFile(gStuckMap, FILE_MAP_READ, 0, 0, 0);
+    gStuckBlocked = gStuckView != nullptr;
+}
+
+// #60 r5: the real size of `path`, without reading it. False when the file
+// exists but cannot be opened: that is a failure, never an empty file.
+bool diskSize(const std::wstring& path, bool& exists, uint64_t& size) {
+    exists = false;
+    size = 0;
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    exists = true;
+    LARGE_INTEGER s{};
+    const bool ok = GetFileSizeEx(h, &s) != 0;
+    CloseHandle(h);
+    size = uint64_t(s.QuadPart);
+    return ok;
 }
 
 int countIn(const std::wstring& folder, const wchar_t* pattern) {
@@ -684,7 +710,8 @@ void realFolder() {
     // #60 r4 item 3: the check under the final name fails, and taking the
     // file back out fails both ways: its staging name is taken meanwhile and
     // it was made read-only. It must not stay in the folder under its final
-    // name with its bytes, unmarked.
+    // name with its bytes, unmarked. #60 r5: the file is also mapped
+    // elsewhere, so it can be neither deleted nor cut (both results checked).
     {
         gStuckPart = dir + L"\\.jlstaging\\pinned.exe.jlpart";
         fpull::ZoneOps stuck;
@@ -709,16 +736,31 @@ void realFolder() {
             const auto* pres = only<file::Result>(presOut);
             expect(pres && pres->status != file::status::kOk, "folder: a file whose take-back fails is not delivered (#60 r4)");
         }
-        const DWORD ta = GetFileAttributesW(target.c_str());
-        const std::vector<uint8_t> left = readAll(target);
-        std::printf("  take-back: blocked=%d exists=%d bytes=%zu zone=%d\n", int(gStuckBlocked), int(ta != INVALID_FILE_ATTRIBUTES),
-                    left.size(), fpull::readZoneId(target));
-        expect(gStuckBlocked, "folder: the take-back test blocked the move back and the delete");
-        expect(ta == INVALID_FILE_ATTRIBUTES || left.empty(),
-               "folder: when the move back and the delete both fail, the file's bytes do not stay under its final name (#60 r4)");
-        if (ta != INVALID_FILE_ATTRIBUTES) SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+        bool exists = false;
+        uint64_t onDisk = 0;
+        const bool known = diskSize(target, exists, onDisk);
+        std::printf("  take-back: blocked=%d known=%d exists=%d size=%llu zone=%d\n", int(gStuckBlocked), int(known),
+                    int(exists), (unsigned long long)onDisk, fpull::readZoneId(target));
+        expect(gStuckBlocked, "folder: the take-back test blocked the move back, the delete and the cut");
+        expect(known && (!exists || onDisk == 0),
+               "folder: when the move back, the delete and the cut all fail, the file's bytes do not stay under its final name (#60 r5)");
+        if (gStuckView) UnmapViewOfFile(gStuckView);
+        if (gStuckMap) CloseHandle(gStuckMap);
+        gStuckView = nullptr;
+        gStuckMap = nullptr;
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
         DeleteFileW(target.c_str());
-        DeleteFileW(gStuckPart.c_str());
+        // The staging name taken by the test, and wherever r5 moved the file.
+        const std::wstring staging = dir + L"\\.jlstaging\\";
+        WIN32_FIND_DATAW fd{};
+        HANDLE f = FindFirstFileW((staging + L"pinned.exe.jlpart*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                SetFileAttributesW((staging + fd.cFileName).c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW((staging + fd.cFileName).c_str());
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
     }
     // Disconnect mid-file removes the partial file.
     {

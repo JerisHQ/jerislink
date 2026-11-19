@@ -78,12 +78,13 @@ std::vector<uint8_t> body(size_t n, unsigned seed) {
 
 std::vector<uint8_t> bytesOf(const std::string& s) { return {s.begin(), s.end()}; }
 
-// The gate request a PullStream builds for `full`.
+// The gate request a PullStream builds for `full`, read by this process.
 GateRequest requestFor(const std::wstring& rel, const std::vector<uint8_t>& full, const FILETIME& since) {
     GateRequest r;
     r.rel = rel;
     r.size = full.size();
     r.since = since;
+    r.reader = GetCurrentProcessId();   // this test writes the copies itself
     return r;
 }
 
@@ -240,6 +241,20 @@ void helpers() {
     expect(gateFile(requestFor(L"wrong-size.bin", body(77, 7), since), folders, {}, st) == GateOutcome::NotFound &&
                readZoneId(sub + L"\\wrong-size.bin") == -1,
            "unit: a file shorter than the bytes handed out is not ours and left alone");
+    // #60 r5 item A: a reader that was not identified (0) links no copy; it
+    // is not taken to be this process. The copy this process is writing is
+    // neither marked nor held.
+    {
+        const auto un = body(900, 21);
+        expect(writeFile(sub + L"\\unknown.bin", {un.begin(), un.end() - 1}), "unit: a copy for an unidentified reader");
+        Writer wUn(sub + L"\\unknown.bin");
+        GateRequest r = requestFor(L"unknown.bin", un, since);
+        r.reader = 0;
+        const GateOutcome o = gateFile(r, folders, {}, st);
+        std::printf("  unknown reader: outcome=%d zone=%d\n", int(o), readZoneId(sub + L"\\unknown.bin"));
+        expect(wUn.ok() && o == GateOutcome::NotFound && readZoneId(sub + L"\\unknown.bin") == -1,
+               "unit: a reader that could not be identified links no copy: not marked, left as it was (#60 r5)");
+    }
     expect(gateFile(requestFor(L"sized.bin", sized, since), folders, {}, st) == GateOutcome::Marked &&
                readZoneId(sub + L"\\sized.bin") == 3,
            "unit: a copy Explorer sized past the manifest size, its end not written yet, is proven and marked");
