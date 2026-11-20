@@ -1345,12 +1345,19 @@ enum ControlServiceSelfTest {
 /// A viewer-side MRC1 connection for the self-test.
 final class MRC1Client {
     private var fd: Int32
+    /// r9: the host closed the connection (a read saw EOF).
+    private(set) var sawEOF = false
 
-    init?(port: UInt16) {
+    /// `receiveBuffer` (r9): a small SO_RCVBUF, set before connecting, so a
+    /// test viewer that stops reading holds the host's sends back.
+    init?(port: UInt16, receiveBuffer: Int32? = nil) {
         let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return nil }
         var noSigPipe: Int32 = 1
         setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        if var size = receiveBuffer {
+            setsockopt(s, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        }
         var addr = ControlServiceSelfTest.loopbackAddress(port: port)
         let rc = withUnsafePointer(to: &addr) { p in
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
@@ -1394,6 +1401,7 @@ final class MRC1Client {
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             guard Darwin.poll(&pfd, 1, left) > 0 else { return nil }
             let n = out.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: off), count - off, 0) }
+            if n == 0 { sawEOF = true }
             if n <= 0 { return nil }
             off += n
         }

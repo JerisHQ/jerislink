@@ -220,6 +220,11 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// host: one stat while listen.plist is unchanged, a read when it moved),
     /// so a password set between two polls drops the very next move.
     private let inputAllowed: @Sendable () -> Bool
+    /// r9: the viewer's block (listen.plist `blockedIPs`, the pending
+    /// journal). Asked before each pong and cursor-shape datagram: nothing
+    /// goes back to a blocked viewer, while password mode (input off) still
+    /// answers pings.
+    private let outputAllowed: @Sendable () -> Bool
     /// Set once by `revokeInput`; never cleared (a restart reopens input).
     private var inputRevoked = false
     var inputEnabled: Bool {
@@ -247,11 +252,13 @@ final class MouseMoveUDPServer: @unchecked Sendable {
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil,
          relayPort: UInt16 = 38411,
-         inputAllowed: @escaping @Sendable () -> Bool = { true }) {
+         inputAllowed: @escaping @Sendable () -> Bool = { true },
+         outputAllowed: @escaping @Sendable () -> Bool = { true }) {
         self.relayPort = relayPort
         self.controlRelay = LocalControlMouseClient(port: relayPort)
         self.presence = presence
         self.inputAllowed = inputAllowed
+        self.outputAllowed = outputAllowed
         self.bindIP = bindIP
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -435,6 +442,11 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             UInt8((seq >> 8) & 0xff), UInt8(seq & 0xff),
             shape.rawValue
         ]
+        // r9: no cursor shape to a blocked viewer.
+        guard outputAllowed() else {
+            lock.lock(); lastCursorShape = nil; lock.unlock()
+            return
+        }
         var destination = peer
         let n = packet.withUnsafeBytes { raw -> Int in
             guard let base = raw.baseAddress else { return -1 }
@@ -583,6 +595,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                     continue
                 }
                 pingRx &+= 1
+                // r9: a blocked viewer gets no pong.
+                guard outputAllowed() else { pongDrops &+= 1; continue }
                 var pong = Array(buffer[0..<18])
                 pong[5] = 0x44
                 var destination = peer

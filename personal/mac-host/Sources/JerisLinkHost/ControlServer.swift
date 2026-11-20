@@ -677,9 +677,22 @@ final class ControlServer: @unchecked Sendable {
                                              maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
         guard let ackBytes = ack.encode(), sendPacket(fd, type: ack.type, payload: ackBytes) else { return }
         print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16)) peer_caps=0x\(String(peerCaps, radix: 16))")
+        // r9: every frame to the viewer asks first (the policy, then this
+        // peer's block), so a block that lands mid-transfer stops a 4 MiB
+        // pull or push before its next frame, not after it; the session
+        // then closes and the socket with it. One stat each per frame.
+        var revoked = false
+        func sendGuarded(_ type: UInt8, _ payload: [UInt8]) -> Bool {
+            if sessionRevoked("file", peerIP: peerIP) { revoked = true; return false }
+            return sendPacket(fd, type: type, payload: payload)
+        }
+        func sendMessage(_ m: FileProto.Message) -> Bool {
+            guard let bytes = m.encode() else { return false }
+            return sendGuarded(m.type, bytes)
+        }
         func sendAll(_ msgs: [FileProto.Message]) -> Bool {
             for out in msgs {
-                guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else { return false }
+                guard sendMessage(out) else { return false }
             }
             return true
         }
@@ -704,6 +717,7 @@ final class ControlServer: @unchecked Sendable {
             push = nil
         }
         defer {
+            if revoked { reason = "policy_changed" }
             endPush()
             pushBroker.unregister(pushSession)
             receiver.abort(reason: reason)
@@ -786,10 +800,9 @@ final class ControlServer: @unchecked Sendable {
             guard let msg = FileProto.decode(type: type, payload: payload) else { reason = "malformed"; return }
             switch msg {
             case .ping:
-                guard sendPacket(fd, type: type, payload: payload) else { reason = "send_failed"; return }
+                guard sendGuarded(type, payload) else { reason = "send_failed"; return }
             case .request(let t, let index, let offset, let length) where push != nil && t == push?.transfer:
-                guard let p = push, p.serve(index: index, offset: offset, length: length,
-                                            send: { m in m.encode().map { sendPacket(fd, type: m.type, payload: $0) } ?? false }) else {
+                guard let p = push, p.serve(index: index, offset: offset, length: length, send: sendMessage) else {
                     reason = "send_failed"; return
                 }
                 lastMessage = Date()
@@ -806,8 +819,7 @@ final class ControlServer: @unchecked Sendable {
                     continue
                 }
                 if t == announcer.current { notePullServe() }
-                guard announcer.serve(transfer: t, index: index, offset: offset, length: length,
-                                      send: { m in m.encode().map { sendPacket(fd, type: m.type, payload: $0) } ?? false }) else {
+                guard announcer.serve(transfer: t, index: index, offset: offset, length: length, send: sendMessage) else {
                     reason = "send_failed"; return
                 }
                 // Serving can take a while on a slow link; it is activity.
@@ -822,9 +834,7 @@ final class ControlServer: @unchecked Sendable {
                 let step = receiver.handle(msg)
                 noteUpload(&uploading, active: receiver.isActive)
                 for out in step.send {
-                    guard let bytes = out.encode(), sendPacket(fd, type: out.type, payload: bytes) else {
-                        reason = "send_failed"; return
-                    }
+                    guard sendMessage(out) else { reason = "send_failed"; return }
                 }
                 if let why = step.close { reason = why; return }
             case .reveal(let transfer):
@@ -832,8 +842,7 @@ final class ControlServer: @unchecked Sendable {
                 receiver.reveal(transfer)
             case .offer(let transfer, _, _, _):
                 refused += 1
-                let reply = FileProto.Message.reply(transfer: transfer, status: FileProto.Status.denied)
-                guard let bytes = reply.encode(), sendPacket(fd, type: reply.type, payload: bytes) else {
+                guard sendMessage(.reply(transfer: transfer, status: FileProto.Status.denied)) else {
                     reason = "send_failed"; return
                 }
             case .hello, .helloAck, .notice:

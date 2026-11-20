@@ -373,6 +373,13 @@ struct JerisLinkHostMain {
                 // blacklist (listen.plist or the pending journal).
                 let journalHold = PendingJournalHold()
                 let legacy = LegacyAuthWatch()
+                // r9: nor does video, audio or a NACK resend go to a blocked
+                // viewer (or while the journal does not read): asked per frame.
+                if let sender {
+                    let streamHold = PendingJournalHold(entry: "udp_stream")
+                    let streamViewer = clientIP
+                    sender.setStreamGate { streamHold.reason(for: streamViewer) == nil }
+                }
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
                     presence = viewer
@@ -381,7 +388,8 @@ struct JerisLinkHostMain {
                                                     allowedClientIP: udpViewer,
                                                     port: mouseUDPPort, presence: viewer,
                                                     inputAllowed: PendingJournalHold.udpInputAllowed(legacy: legacy, hold: journalHold,
-                                                                                                     viewerIP: udpViewer))
+                                                                                                     viewerIP: udpViewer),
+                                                    outputAllowed: { journalHold.reason(for: udpViewer) == nil })
                     legacy.onClose { reason in server.revokeInput(reason: reason) }
                     try server.start()
                     mouseUDP = server
@@ -502,7 +510,7 @@ struct JerisLinkHostMain {
                         // D2-B: a NACK the cache cannot serve becomes one
                         // keyframe, through the same gate as viewer requests.
                         if keyframeGate.allow() { encoder.requestKeyframe() }
-                    case .sent, .disabled:
+                    case .sent, .disabled, .held:
                         break
                     }
                 }

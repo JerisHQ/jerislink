@@ -138,6 +138,11 @@ final class UDPFrameSender: @unchecked Sendable {
     private var sentPackets: UInt64 = 0
     private var sentBytes: UInt64 = 0
     private var sendErrors: UInt64 = 0
+    /// r9: the viewer's block (listen.plist `blockedIPs`, the pending
+    /// journal), asked once per video frame, per NACK resend and per audio
+    /// packet. While it says no nothing goes to the viewer; counted here.
+    private var streamAllowed: @Sendable () -> Bool = { true }
+    private var streamHeld: UInt64 = 0
     private var maxPacketsPerFrame: UInt64 = 0
     private var maxFrameBytes: UInt64 = 0
     private var keyFrames: UInt64 = 0
@@ -177,6 +182,7 @@ final class UDPFrameSender: @unchecked Sendable {
         case miss        // frame no longer cached (or never was)
         case overBudget  // would pass 20% of the bitrate in this 100 ms
         case disabled
+        case held        // r9: the viewer is blocked; nothing resent
     }
 
     // NACK retransmit (design doc section 1), guarded by `lock`.
@@ -305,8 +311,24 @@ final class UDPFrameSender: @unchecked Sendable {
         }
     }
 
+    /// r9: sets the gate `streamAllowed` asks (video service: the viewer
+    /// not blocked, the journal reading).
+    func setStreamGate(_ gate: @escaping @Sendable () -> Bool) {
+        lock.lock(); streamAllowed = gate; lock.unlock()
+    }
+
+    /// r9: true while the stream may go to the viewer; a refusal is counted.
+    private func streamOpen() -> Bool {
+        lock.lock(); let gate = streamAllowed; lock.unlock()
+        if gate() { return true }
+        lock.lock(); streamHeld &+= 1; lock.unlock()
+        return false
+    }
+
     private func sendFrame(frameID: UInt64, data: Data, keyFrame: Bool, packetCount: Int,
                            enqueuedNanos: UInt64, paced: Bool) {
+        // r9: a frame queued before a block does not leave after it.
+        guard streamOpen() else { return }
         let payloadCapacity = packetBytes - headerBytes
         var frameHadError = false
         var frameWaits: UInt64 = 0
@@ -350,6 +372,7 @@ final class UDPFrameSender: @unchecked Sendable {
     /// originals except for MR02 flag 0x04.
     func retransmit(frameID: UInt64, ranges: [NackRange]) -> RetransmitResult {
         guard retransmitEnabled else { return .disabled }
+        guard streamOpen() else { return .held }
         let now = DispatchTime.now().uptimeNanoseconds
         let payloadCapacity = packetBytes - headerBytes
         lock.lock()
@@ -480,6 +503,12 @@ final class UDPFrameSender: @unchecked Sendable {
 
     /// On `sendQueue` only (paced mode).
     private func drainRetransmits(paced: Bool) {
+        lock.lock(); let pending = !pendingRetransmit.isEmpty; lock.unlock()
+        // r9: resends queued before a block are dropped, not sent.
+        if pending, !streamOpen() {
+            lock.lock(); pendingRetransmit.removeAll(); lock.unlock()
+            return
+        }
         while true {
             lock.lock()
             guard !pendingRetransmit.isEmpty else {
@@ -497,6 +526,7 @@ final class UDPFrameSender: @unchecked Sendable {
     /// (the port its MRM1 0x45 request named). Not paced and not counted in
     /// the video stats; AudioStreamer keeps its own counters.
     func sendAudio(_ packet: Data, port: UInt16) -> Bool {
+        guard streamOpen() else { return false }
         var dest = destination
         dest.sin_port = port.bigEndian
         let result: ssize_t = packet.withUnsafeBytes { raw in
@@ -595,6 +625,7 @@ final class UDPFrameSender: @unchecked Sendable {
             + "nack=\(retransmitEnabled ? "on" : "off") nack_rx=\(nackRequests) nack_packets_resent=\(nackPacketsResent) "
             + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) "
             + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
+            + (streamHeld > 0 ? " stream_held=\(streamHeld)" : "")
             + (statsSuffix.map { " " + $0() } ?? "")
     }
 

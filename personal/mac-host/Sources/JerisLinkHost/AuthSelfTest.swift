@@ -40,6 +40,7 @@ enum AuthSelfTest {
         r6RelayLockdown(expect)
         r7RelayBlacklist(expect)
         r8DirectBlacklist(expect)
+        r9InFlightBlock(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -1625,5 +1626,125 @@ enum AuthSelfTest {
         expect(!bCtlAfter && !bFileAfter && pong(cCtl) && fileEcho(cFile) && watch.appliedChange == nil
                && gate.guardian.isBlocked(vb) && !gate.guardian.isBlocked(vc),
                "r8 b5 direct: per peer: a listen.plist block for a second viewer closes its control connection and file session on the next message; the third viewer goes on, no restart")
+    }
+
+    // MARK: r9: a block stops a transfer already in flight
+
+    /// r9 (Pepper): r8 closed a blocked viewer's file session on its next
+    /// inbound message, but a REQUEST already taken went on sending up to
+    /// 4 MiB. Every outbound frame now asks first: a block that lands
+    /// mid-pull stops it before the next frame and closes the socket, and
+    /// another viewer's pull of the same file, in flight across the block,
+    /// finishes. Real sockets, one viewer per address through a PROXY
+    /// forwarder, the direct listener's wiring. The blocked viewer reads
+    /// through an 8 KiB receive buffer, so the host is mid-REQUEST when the
+    /// block lands; what the kernel already held still drains.
+    private static func r9InFlightBlock(_ expect: Expect) {
+        typealias M = FileProto.Message
+        let fm = FileManager.default
+        let me = ListenConfig.loopbackIP
+        let vx = "100.64.0.31", vy = "100.64.0.32"
+        let body = FileAnnounceSelfTest.body(Int(FileAnnouncer.maxRequest))
+        let chunk = Int(FileProto.maxChunk)
+        for viaJournal in [true, false] {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let name = "r9 in-flight: a block from \(source) lands mid-pull (one 4 MiB REQUEST): the blocked viewer gets no further frame, no FILE_END, and its socket closes; the other viewer's pull in flight finishes with every byte and FILE_END; no restart"
+            let dir = tempDir()
+            defer { try? fm.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("listen.plist")
+            let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+            try? fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let src = dir.appendingPathComponent("src/big.bin")
+            try? fm.createDirectory(at: src.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: src.path, contents: Data(body))
+            let local = [LocalAddress(interface: "lo0", ip: me)]
+            let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+                let plist = ListenConfig.readPlist(url: url)
+                return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+            }
+            writePlist(["mode": "loopback", "clientIP": me, "allowedIPs": [vx, vy], "passwordSet": false], url)
+            let (resolution, plist) = read()
+            guard case .ready(let ep) = resolution, let port = ControlServiceSelfTest.freeLoopbackPort() else {
+                expect(false, name); continue
+            }
+            let (made, snapshot) = ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil,
+                                                           blocklist: ListenPlistBlocklist(url: url),
+                                                           journal: PendingBlockFile(url: journalURL))
+            guard let gate = made else { expect(false, name); continue }
+            let watch = PolicyWatch(started: ep, snapshot: snapshot, gate: gate, read: read, loadSecret: { nil },
+                                    stamp: { ListenFileStamp.of(url) })
+            let board = FakeClipboard(text: "before")
+            let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                        fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                        openFolder: { _ in })
+            let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
+                                       settingsClientIP: { vy }, acceptProxy: true, allowFileSessions: true,
+                                       fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
+                                       fileSendFolder: folder, clipboard: board, authGate: gate,
+                                       admitConnection: { watch.admitNew() }, admitMessage: { watch.stillCurrent() },
+                                       admitPeerMessage: ControlService.peerCheck(gate))
+            func viewer(_ ip: String, receiveBuffer: Int32? = nil) -> MRC1Client? {
+                guard let cl = MRC1Client(port: port, receiveBuffer: receiveBuffer),
+                      cl.sendRaw(Array("PROXY TCP4 \(ip) \(me) 40000 \(port)\r\n".utf8)) else { return nil }
+                return cl
+            }
+            guard (try? server.start()) != nil, let x = viewer(vx, receiveBuffer: 8 * 1024), let y = viewer(vy) else {
+                server.stop(); expect(false, name); continue
+            }
+            defer { x.close(); y.close(); server.stop() }
+            func next(_ c: MRC1Client, _ timeout: Double = 3) -> M? {
+                c.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+            }
+            func announced(_ c: MRC1Client) -> UInt32? {
+                guard case let .offer(t, _, _, _)? = next(c), case .entry? = next(c) else { return nil }
+                return t
+            }
+            func request(_ c: MRC1Client, _ t: UInt32) {
+                _ = c.send(type: FileProto.MsgType.request,
+                           payload: M.request(transfer: t, index: 0, offset: 0, length: UInt32(body.count)).encode()!)
+            }
+            _ = x.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+            _ = y.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+            guard case .helloAck? = next(x), case .helloAck? = next(y),
+                  settle({ board.counts.changeCountReads >= 6 }) else { expect(false, name); continue }
+            board.localCopyFiles([src])
+            guard let tx = announced(x), let ty = announced(y) else { expect(false, name); continue }
+            request(x, tx)
+            request(y, ty)
+            // x's pull is under way: two chunks read, the host waits on x.
+            var xBytes = 0, xFrames = 0, xEnd = false
+            while xBytes < 2 * chunk, let m = next(x) {
+                if case let .data(_, _, _, b) = m { xBytes += b.count }
+            }
+            let started = xBytes >= 2 * chunk
+            if viaJournal {
+                _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: vx, at: Date(), reason: "20 wrong passwords")])
+            } else {
+                var d = readPlist(url) ?? [:]
+                d["blockedIPs"] = ((d["blockedIPs"] as? [Any]) ?? []) + [vx]
+                writePlist(d, url)
+            }
+            let atBlock = xBytes
+            Thread.sleep(forTimeInterval: 0.3)
+            // Only what the kernel already held drains; then EOF.
+            while let m = next(x, 2) {
+                xFrames += 1
+                if case let .data(_, _, _, b) = m { xBytes += b.count }
+                if case .fileEnd = m { xEnd = true }
+            }
+            var yBody: [UInt8] = []
+            var yEnd: M?
+            while let m = next(y) {
+                if case let .data(_, _, off, b) = m, off == UInt64(yBody.count) { yBody += b }
+                if case .fileEnd = m { yEnd = m; break }
+                if case .reply = m { break }
+            }
+            print("r9 in-flight info: source=\(viaJournal ? "journal" : "listen.plist") blocked_viewer bytes_at_block=\(atBlock) bytes_total=\(xBytes) of \(body.count) frames_after_block=\(xFrames) file_end=\(xEnd) eof=\(x.sawEOF); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
+            expect(started && !xEnd && xBytes < body.count && x.sawEOF
+                   && yBody == body && yEnd == .fileEnd(transfer: ty, index: 0, sha256: FileUploadSelfTest.sha(body))
+                   && server.rejectedClients >= 1 && watch.appliedChange == nil && !gate.isRevoked
+                   && gate.guardian.isBlocked(vx) && !gate.guardian.isBlocked(vy),
+                   name)
+        }
     }
 }

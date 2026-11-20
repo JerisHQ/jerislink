@@ -484,18 +484,24 @@ final class PendingJournalHold: @unchecked Sendable {
     private var knownBlocked: ListenFileStamp?
     private var blockedIPs: Set<String> = []
     private var lastVerdict: String?
+    /// What the hold's log lines name: `udp_input` (0x24 in), r9
+    /// `udp_stream` (video, audio and resends out).
+    private let entry: String
 
     /// The live journal next to listen.plist, and listen.plist itself.
-    convenience init(url: URL = ListenConfig.pendingBlocksURL, plistURL: URL = ListenConfig.plistURL) {
+    convenience init(url: URL = ListenConfig.pendingBlocksURL, plistURL: URL = ListenConfig.plistURL,
+                     entry: String = "udp_input") {
         let file = PendingBlockFile(url: url)
         self.init(load: { file.load() }, stamp: { ListenFileStamp.of(url) },
                   loadBlocked: { ListenConfig.readPlist(url: plistURL).map(ListenPlistBlocklist.entries(in:)) ?? [] },
-                  blockedStamp: { ListenFileStamp.of(plistURL) })
+                  blockedStamp: { ListenFileStamp.of(plistURL) }, entry: entry)
     }
 
     init(load: @escaping @Sendable () -> [BlockedEntry]?, stamp: @escaping @Sendable () -> ListenFileStamp?,
          loadBlocked: @escaping @Sendable () -> [BlockedEntry] = { [] },
-         blockedStamp: @escaping @Sendable () -> ListenFileStamp? = { ListenFileStamp(exists: false) }) {
+         blockedStamp: @escaping @Sendable () -> ListenFileStamp? = { ListenFileStamp(exists: false) },
+         entry: String = "udp_input") {
+        self.entry = entry
         self.load = load
         self.stamp = stamp
         self.loadBlocked = loadBlocked
@@ -536,8 +542,9 @@ final class PendingJournalHold: @unchecked Sendable {
         lastVerdict = verdict
         lock.unlock()
         if changed {
-            print(verdict.map { "auth.lockdown_hold reason=\($0) entry=udp_input peer=\(viewerIP ?? "-"); UDP 0x24 dropped until it clears" }
-                  ?? "auth.lockdown_cleared entry=udp_input (UDP input goes on)")
+            let what = entry == "udp_input" ? ("UDP 0x24 dropped", "UDP input goes on") : ("nothing sent to the viewer", "the stream goes on")
+            print(verdict.map { "auth.lockdown_hold reason=\($0) entry=\(entry) peer=\(viewerIP ?? "-"); \(what.0) until it clears" }
+                  ?? "auth.lockdown_cleared entry=\(entry) (\(what.1))")
             fflush(stdout)
         }
         return verdict

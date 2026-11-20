@@ -109,6 +109,7 @@ enum RetransmitSelfTest {
         expect(CaptureClock.elapsedMS(since: 0, now: 5) == 0 && CaptureClock.elapsedMS(since: 9, now: 5) == 0, "latency: unknown or future capture is 0")
 
         loopback(expect)
+        r9StreamBlock(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -181,6 +182,65 @@ enum RetransmitSelfTest {
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline, got.get() == nil { usleep(5_000) }
         check(got.get()?.0 == 42 && got.get()?.1 == [.init(start: 1, count: 2)], "loopback: NACK reaches the handler")
+    }
+}
+
+extension RetransmitSelfTest {
+    /// r9: nothing goes to a blocked viewer over UDP either: video frames,
+    /// NACK resends, audio, pongs. Real sockets on 127.0.0.1; the gates
+    /// the video service wires (PendingJournalHold on a listen.plist and a
+    /// journal in a temp folder), a block added from each.
+    fileprivate static func r9StreamBlock(_ check: (Bool, String) -> Void) {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("jl-r9-udp-\(getpid())", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let plistURL = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("pending-blocks.plist")
+        let me = "127.0.0.1"
+        func writePlist(_ d: [String: Any]) {
+            if let data = try? PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0) {
+                try? data.write(to: plistURL, options: .atomic)
+            }
+        }
+        let ping: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x43, 0, 0, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8]
+        for viaJournal in [true, false] {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let name = "r9 udp: a block from \(source) stops video frames, NACK resends, audio and pongs to the viewer from the next frame"
+            try? fm.removeItem(at: journalURL)
+            writePlist(["mode": "loopback", "clientIP": me])
+            guard let viewer = TestUDPSocket(), let mousePort = TestUDPSocket.freePort(),
+                  let sender = try? UDPFrameSender(bindIP: me, clientIP: me, clientPort: viewer.port,
+                                                   packetBytes: 1200, retransmit: true, videoBitrateMbps: 20) else {
+                check(false, name); continue
+            }
+            defer { viewer.close() }
+            let streamHold = PendingJournalHold(url: journalURL, plistURL: plistURL, entry: "udp_stream")
+            sender.setStreamGate { streamHold.reason(for: me) == nil }
+            let inHold = PendingJournalHold(url: journalURL, plistURL: plistURL)
+            let server = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: mousePort,
+                                            outputAllowed: { inHold.reason(for: me) == nil })
+            guard (try? server.start()) != nil else { check(false, name); continue }
+            defer { server.stop() }
+            let frame = Data((0..<(1180 * 3)).map { UInt8($0 & 0xff) })
+            sender.send(frameID: 1, data: frame, keyFrame: true)
+            let videoBefore = viewer.receiveAll(expect: 3).count == 3
+            viewer.send(ping, toPort: mousePort)
+            let pongBefore = viewer.receiveAll(expect: 1).count == 1
+            let audioBefore = sender.sendAudio(Data([1, 2, 3, 4]), port: viewer.port) && viewer.receiveAll(expect: 1).count == 1
+            if viaJournal {
+                _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: me, at: Date(), reason: "20 wrong passwords")])
+            } else {
+                writePlist(["mode": "loopback", "clientIP": me, "blockedIPs": [me]])
+            }
+            sender.send(frameID: 2, data: frame, keyFrame: true)
+            let resend = sender.retransmit(frameID: 1, ranges: [.wholeFrame])
+            let audioAfter = sender.sendAudio(Data([1, 2, 3, 4]), port: viewer.port)
+            viewer.send(ping, toPort: mousePort)
+            let after = viewer.receiveAll(expect: 8)
+            check(videoBefore && pongBefore && audioBefore && after.isEmpty && resend == .held && !audioAfter
+                  && sender.statsLine().contains("stream_held="), name)
+        }
     }
 }
 
