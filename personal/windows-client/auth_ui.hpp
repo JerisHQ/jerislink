@@ -249,4 +249,22 @@ private:
     Clock::time_point lockedUntil_{};
 };
 
+// r5: the one-line notice when background channels stop after their
+// NoChallenge retries. Short names so the longest case (all three) fits the
+// 500 px notice chip without an ellipsis (measured on win01 with Segoe UI
+// Semibold 9 pt: about 410 px of the 476 px text area).
+inline std::string channelPausedText(bool control, bool clipboard, bool file) {
+    std::string names;
+    const auto add = [&names](const char* n) {
+        if (!names.empty()) names += ", ";
+        names += n;
+    };
+    if (control) add("input");
+    if (clipboard) add("clipboard");
+    if (file) add("file transfer");
+    if (names.empty()) return {};
+    return "Mac not answering: " + names + " paused." +
+           (control ? " Press a key to retry." : " Video keeps going.");
+}
+
 }  // namespace jl::auth::ui

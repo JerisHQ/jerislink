@@ -216,7 +216,26 @@ void hostBindingTests() {
            "r5 handoff: an invalid host is not encoded");
 }
 
+// r5: the channel-paused notice fits the notice chip. Every combination
+// was measured on win01 (Segoe UI Semibold 9 pt, 476 px text area); the
+// longest is 80 characters and 410 px.
+void channelPausedTests() {
+    expect(channelPausedText(false, false, false).empty(), "r5 paused notice: nothing paused, no text");
+    expect(channelPausedText(true, false, false) == "Mac not answering: input paused. Press a key to retry.",
+           "r5 paused notice: input only names the retry key");
+    expect(channelPausedText(false, true, false) == "Mac not answering: clipboard paused. Video keeps going.",
+           "r5 paused notice: clipboard only says video keeps going");
+    for (int m = 1; m < 8; ++m) {
+        const std::string t = channelPausedText((m & 1) != 0, (m & 2) != 0, (m & 4) != 0);
+        expect(!t.empty() && t.size() <= 80,
+               "r5 paused notice: combination " + std::to_string(m) + " is " + std::to_string(t.size()) + " chars (<= 80)");
+        expect(((m & 1) != 0) == (t.find("Press a key") != std::string::npos),
+               "r5 paused notice: retry hint only when input paused, combination " + std::to_string(m));
+    }
+}
+
 int main() {
+    channelPausedTests();
     hostBindingTests();
     probeRaceTests();
     handoffTests();

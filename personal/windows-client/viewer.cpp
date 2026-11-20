@@ -3612,16 +3612,14 @@ static void fileChipNotice(const std::string& text, bool error, double ms) {
 static void showChannelPaused(uint32_t paused) {
     using jl::auth::Channel;
     const auto bit = [](Channel c) { return 1u << unsigned(c); };
-    std::string names;
     for (Channel c : {Channel::Control, Channel::Clipboard, Channel::File}) {
-        if (!(paused & bit(c))) continue;
-        logLine(std::string("session.channel_paused chan=") + jl::auth::channelName(c) + " reason=no_challenge");
-        if (!names.empty()) names += ", ";
-        names += c == Channel::Control ? "keyboard and mouse" : c == Channel::Clipboard ? "clipboard" : "file transfer";
+        if (paused & bit(c))
+            logLine(std::string("session.channel_paused chan=") + jl::auth::channelName(c) + " reason=no_challenge");
     }
-    if (names.empty()) return;
-    std::string text = "The Mac did not answer in time: " + names + " paused. Video keeps going.";
-    if (paused & bit(Channel::Control)) text += " Input tries again on your next key or click.";
+    const std::string text = jl::auth::ui::channelPausedText((paused & bit(Channel::Control)) != 0,
+                                                             (paused & bit(Channel::Clipboard)) != 0,
+                                                             (paused & bit(Channel::File)) != 0);
+    if (text.empty()) return;
     fileChipNotice(text, true, 8000);
 }
 
