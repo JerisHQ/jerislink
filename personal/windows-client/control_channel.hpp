@@ -67,6 +67,7 @@ public:
         if (a->worker.joinable()) a->worker.join();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::lock_guard<std::mutex> g(a->m);
+        a->connecting = false;  // a cut-short attempt is over: nothing connects any more
         if (!a->stats.joined) {
             a->stats.joined = true;
             a->stats.joinMs = ms;
