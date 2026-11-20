@@ -1030,40 +1030,33 @@ final class ControlServer: @unchecked Sendable {
     // MARK: Connection password (v0.4.0)
 
     /// Password mode: address checks and waits, then CHALLENGE, then one
-    /// RESPONSE within `gate.timeout`. Returns the channel the viewer proved
-    /// it holds K for, or nil (connection closes). Never logs nonces, K or
-    /// MACs.
+    /// RESPONSE within `gate.timeout` (monotonic clock). Returns the channel
+    /// the viewer proved it holds K for, or nil (connection closes). The
+    /// answer is settled by `AuthGuard.settle`, which checks the waits again
+    /// under the same lock, so a challenge sent before a wait or a blacklist
+    /// entry cannot get OK afterwards. Never logs nonces, K or MACs.
     private func authenticate(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> ConnAuth.Channel? {
         guard let secret = gate.secret else { return nil }
         let ip = peer.ip
-        switch gate.guardian.admit(ip) {
-        case .blocked:
-            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
-            print("auth.blocked peer=\(ip); connection closed")
+        let admission = gate.guardian.admit(ip)
+        guard admission == .challenge else {
+            refuse(fd, ip: ip, admission: admission, afterChallenge: false)
             return nil
-        case .notAllowed:
-            rejectedClients += 1
-            print("Control reject peer=\(ip) expected=whitelist on \(bindIP):\(port); connection closed")
-            return nil
-        case .locked(let retry, let stage):
-            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage); connection closed")
-            return nil
-        case .globalLocked(let retry):
-            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.global_locked peer=\(ip) retry_s=\(retry); connection closed")
-            return nil
-        case .challenge:
-            break
         }
         let hostNonce = ConnAuth.random(ConnAuth.nonceBytes)
         let challenge = ConnAuth.Challenge(hostNonce: hostNonce, salt: secret.salt, iterations: secret.iterations,
                                            kdfID: ConnAuth.kdfPBKDF2SHA256, hostID: secret.hostID)
         guard sendPacket(fd, type: ConnAuth.MsgType.challenge, payload: challenge.payload) else { return nil }
 
-        let deadline = Date().addingTimeInterval(gate.timeout)
-        guard let header = recvExact(fd, count: 8, deadline: deadline) else {
-            authFailed(fd, ip: ip, gate: gate, reason: "timeout", reply: nil)
+        let deadline = ProcessInfo.processInfo.systemUptime + gate.timeout
+        let header: [UInt8]
+        switch recvExact(fd, count: 8, deadline: deadline) {
+        case .ok(let bytes): header = bytes
+        case .timeout:
+            settleFailure(fd, ip: ip, gate: gate, reason: "timeout", reply: nil)
+            return nil
+        case let other:
+            noteNoResponse(ip: ip, outcome: other)
             return nil
         }
         let type = header[5]
@@ -1072,20 +1065,37 @@ final class ControlServer: @unchecked Sendable {
         guard isMRC1, type == ConnAuth.MsgType.response else {
             // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...) or noise.
             print("auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16))")
-            authFailed(fd, ip: ip, gate: gate, reason: "auth_required", reply: .authRequired)
+            settleFailure(fd, ip: ip, gate: gate, reason: "auth_required", reply: .authRequired)
             return nil
         }
-        guard length == 64, let body = recvExact(fd, count: length, deadline: deadline),
-              let response = ConnAuth.Response.decode(body) else {
-            authFailed(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
+        guard length == 64 else {
+            settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
             return nil
         }
-        guard let channel = ConnAuth.matchChannel(mac: response.mac, key: secret.key, hostNonce: hostNonce,
-                                                   clientNonce: response.clientNonce, hostID: secret.hostID) else {
-            authFailed(fd, ip: ip, gate: gate, reason: "wrong_password", reply: nil)
+        let body: [UInt8]
+        switch recvExact(fd, count: length, deadline: deadline) {
+        case .ok(let bytes): body = bytes
+        case .timeout:
+            settleFailure(fd, ip: ip, gate: gate, reason: "timeout", reply: nil)
+            return nil
+        case let other:
+            noteNoResponse(ip: ip, outcome: other)
             return nil
         }
-        gate.guardian.recordSuccess(ip)
+        guard let response = ConnAuth.Response.decode(body) else {
+            settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
+            return nil
+        }
+        var matched: ConnAuth.Channel?
+        let settlement = gate.guardian.settle(ip) {
+            matched = ConnAuth.matchChannel(mac: response.mac, key: secret.key, hostNonce: hostNonce,
+                                            clientNonce: response.clientNonce, hostID: secret.hostID)
+            return matched != nil
+        }
+        guard settlement == .ok, let channel = matched else {
+            finishFailure(fd, ip: ip, settlement: settlement, reason: "wrong_password", reply: nil)
+            return nil
+        }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
         let macH = ConnAuth.macHost(key: secret.key, hostNonce: hostNonce, clientNonce: response.clientNonce, channel: channel)
         guard sendPacket(fd, type: ConnAuth.MsgType.result,
@@ -1094,12 +1104,59 @@ final class ControlServer: @unchecked Sendable {
         return channel
     }
 
-    /// Counts one failure and answers with the outcome. `reply` overrides
-    /// the plain FAIL (AUTH_REQUIRED for an old viewer); LOCKED and BLOCKED
-    /// always win so the viewer learns the wait.
-    private func authFailed(_ fd: Int32, ip: String, gate: AuthGate, reason: String, reply: ConnAuth.Result?) {
-        authFailures += 1
-        let r = gate.guardian.recordFailure(ip)
+    /// No challenge, or a challenge whose answer came after a wait or the
+    /// blacklist started: the viewer learns why, nothing is counted.
+    private func refuse(_ fd: Int32, ip: String, admission: AuthGuard.Admission, afterChallenge: Bool) {
+        let note = afterChallenge ? " after_challenge=1 counted=0" : ""
+        switch admission {
+        case .blocked:
+            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
+            print("auth.blocked peer=\(ip)\(note); connection closed")
+        case .notAllowed:
+            rejectedClients += 1
+            print("Control reject peer=\(ip) expected=whitelist on \(bindIP):\(port)\(note); connection closed")
+        case .locked(let retry, let stage):
+            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
+            print("auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)\(note); connection closed")
+        case .globalLocked(let retry):
+            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
+            print("auth.global_locked peer=\(ip) retry_s=\(retry)\(note); connection closed")
+        case .challenge:
+            break
+        }
+    }
+
+    /// The viewer closed (or the socket failed) before answering: no
+    /// password was tried, so nothing is counted.
+    private func noteNoResponse(ip: String, outcome: RecvOutcome) {
+        switch outcome {
+        case .error(let code): print("auth.no_response peer=\(ip) reason=read_error errno=\(code) counted=0")
+        default: print("auth.no_response peer=\(ip) reason=closed counted=0")
+        }
+    }
+
+    /// A timeout, an old viewer or a malformed answer: settled like a wrong
+    /// password, so the waits are checked again first.
+    private func settleFailure(_ fd: Int32, ip: String, gate: AuthGate, reason: String, reply: ConnAuth.Result?) {
+        finishFailure(fd, ip: ip, settlement: gate.guardian.settle(ip) { false }, reason: reason, reply: reply)
+    }
+
+    /// Answers a failed settlement. `reply` overrides the plain FAIL
+    /// (AUTH_REQUIRED for an old viewer); LOCKED and BLOCKED always win so
+    /// the viewer learns the wait. The blacklist log says whether
+    /// listen.plist was really written.
+    private func finishFailure(_ fd: Int32, ip: String, settlement: AuthGuard.Settlement, reason: String, reply: ConnAuth.Result?) {
+        let r: AuthGuard.Failure
+        switch settlement {
+        case .ok:
+            return
+        case .refused(let admission):
+            refuse(fd, ip: ip, admission: admission, afterChallenge: true)
+            return
+        case .failed(let failure):
+            r = failure
+        }
+        lock.lock(); authFailures += 1; lock.unlock()   // connections settle concurrently
         let result: ConnAuth.Result
         switch r.outcome {
         case .retry(let tries):
@@ -1109,10 +1166,12 @@ final class ControlServer: @unchecked Sendable {
             result = .locked(retrySeconds: retry)
             print("auth.fail peer=\(ip) chan=unknown reason=\(reason) failures=\(r.failures)")
             print("auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)")
-        case .blacklisted:
+        case .blacklisted(let persisted):
             result = .blocked
             print("auth.fail peer=\(ip) chan=unknown reason=\(reason) failures=\(r.failures)")
-            print("auth.blocked peer=\(ip) failures=\(r.failures) persisted=listen.plist")
+            print(persisted
+                  ? "auth.blocked peer=\(ip) failures=\(r.failures) persisted=listen.plist"
+                  : "auth.blocked peer=\(ip) failures=\(r.failures) persisted=no attempts=\(AuthGuard.saveAttempts) (blocked in memory until restart)")
         }
         if r.globalTriggered {
             print("auth.global_locked retry_s=\(UInt32(AuthGuard.globalWait))")
@@ -1148,25 +1207,43 @@ final class ControlServer: @unchecked Sendable {
         }
     }
 
-    /// recvExact with an absolute deadline (poll before each read).
-    private func recvExact(_ fd: Int32, count: Int, deadline: Date) -> [UInt8]? {
-        if count == 0 { return [] }
+    /// How a deadline read ended. `closed` (the peer shut down) and `error`
+    /// are not timeouts: no answer was tried.
+    enum RecvOutcome {
+        case ok([UInt8])
+        case timeout
+        case closed
+        case error(Int32)
+    }
+
+    /// recvExact with an absolute deadline on the monotonic clock
+    /// (`ProcessInfo.systemUptime`), polling before each read, so a wall
+    /// clock change cannot stretch or cut the AUTH window.
+    private func recvExact(_ fd: Int32, count: Int, deadline: TimeInterval) -> RecvOutcome {
+        if count == 0 { return .ok([]) }
         var out = [UInt8](repeating: 0, count: count)
         var offset = 0
         while offset < count {
-            let remaining = deadline.timeIntervalSinceNow
-            if remaining <= 0 { return nil }
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 { return .timeout }
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, Int32(max(1, min(remaining * 1000, 60_000))))
-            if ready < 0 && errno == EINTR { continue }
-            if ready <= 0 { return nil }
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return .error(errno)
+            }
+            if ready == 0 { continue }   // the loop re-checks the deadline
             let n = out.withUnsafeMutableBytes { raw -> Int in
                 Darwin.recv(fd, raw.baseAddress!.advanced(by: offset), count - offset, 0)
             }
-            if n <= 0 { return nil }
+            if n == 0 { return .closed }
+            if n < 0 {
+                if errno == EINTR || errno == EAGAIN { continue }
+                return .error(errno)
+            }
             offset += n
         }
-        return out
+        return .ok(out)
     }
 
     private func recvExact(_ fd: Int32, count: Int) -> [UInt8]? {

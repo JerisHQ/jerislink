@@ -284,6 +284,12 @@ struct JerisLinkHostMain {
                 fputs("Fatal: --control-only requires --bind-ip\n", stderr)
                 exit(2)
             }
+            // This listener has no AUTH step: with a password set it must
+            // not open at all (--service control is the authenticated one).
+            guard !ListenConfig.passwordModeRequested() else {
+                fputs("config.refused reason=legacy_listener_without_auth entry=--control-only (connection password set; use --service control)\n", stderr)
+                exit(78)
+            }
             do {
                 let control = ControlServer.legacyListener(bindIP: bindIP,
                                                            allowedClientIP: o.controlClientIP,
@@ -345,16 +351,23 @@ struct JerisLinkHostMain {
                                             retransmit: o.nackEnabled,
                                             videoBitrateMbps: o.bitrateMbps,
                                             nominalFps: Int(o.fps))
+                // Password set: no listener without AUTH. UDP input is only
+                // IP-checked, so it stays off until PR-C binds it to an
+                // authenticated session; video, audio and presence go on.
+                let passwordMode = ListenConfig.passwordModeRequested()
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
                     presence = viewer
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
-                                                    port: mouseUDPPort, presence: viewer)
+                                                    port: mouseUDPPort, presence: viewer,
+                                                    inputEnabled: !passwordMode)
                     try server.start()
                     mouseUDP = server
                 }
-                if o.controlServerEnabled {
+                if o.controlServerEnabled && passwordMode {
+                    print("config.refused reason=legacy_listener_without_auth entry=video-control (connection password set; use --service control)")
+                } else if o.controlServerEnabled {
                     control = ControlServer.legacyListener(bindIP: bindIP, allowedClientIP: o.controlClientIP,
                                                            port: o.controlPort, inject: o.controlInject)
                     try control?.start()

@@ -110,6 +110,12 @@ enum ListenConfig {
         }
     }
 
+    /// listen.plist says a connection password is set (v0.4.0). Listeners
+    /// that cannot check it (the legacy entries, UDP input) stay off then.
+    static func passwordModeRequested() -> Bool {
+        (readPlist()?["passwordSet"] as? Bool) == true
+    }
+
     static func readPlist() -> [String: Any]? {
         guard let data = try? Data(contentsOf: plistURL) else { return nil }
         let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
@@ -180,21 +186,27 @@ enum ListenConfig {
     /// in a row (address gone, mode or viewer changed). launchd (KeepAlive)
     /// starts the service again, and it waits in `waitForEndpoint`. The video
     /// and control services both do this, so they always move together.
-    static func exitWhenEndpointChanges(from started: ListenEndpoint, log: @escaping @Sendable (String) -> Void) {
+    ///
+    /// `alsoStopWhen` adds other settings (the auth policy): it returns
+    /// what changed, or nil. The same two-checks rule applies.
+    static func exitWhenEndpointChanges(from started: ListenEndpoint, log: @escaping @Sendable (String) -> Void,
+                                        alsoStopWhen: (@Sendable () -> String?)? = nil) {
         Task.detached {
             var misses = 0
             while true {
                 try? await Task.sleep(for: .seconds(2))
                 let now = current()
-                if now == .ready(started) { misses = 0; continue }
+                let what: String
+                switch now {
+                case .ready(let ep) where ep == started:
+                    guard let other = alsoStopWhen?() else { misses = 0; continue }
+                    what = other
+                case .ready(let ep): what = "endpoint changed to \(ep.summary)"
+                case .notConfigured(let reason): what = "not configured: \(reason)"
+                case .waiting(let reason): what = reason
+                }
                 misses += 1
                 if misses >= 2 {
-                    let what: String
-                    switch now {
-                    case .ready(let ep): what = "endpoint changed to \(ep.summary)"
-                    case .notConfigured(let reason): what = "not configured: \(reason)"
-                    case .waiting(let reason): what = reason
-                    }
                     log("stopping: \(what) (was \(started.summary)); launchd restarts the service, which waits for the endpoint")
                     exit(0)
                 }

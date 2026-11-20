@@ -49,7 +49,11 @@ enum ControlService {
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
-            if relayPort != 0 && !relayIsDirect {
+            // Password mode: the relay carries UDP mouse input that is only
+            // IP-checked (MouseMoveUDPServer), so it stays closed until PR-C
+            // binds that input to an authenticated session.
+            let relayAllowed = !(gate?.requiresPassword ?? false)
+            if relayPort != 0 && !relayIsDirect && relayAllowed {
                 let relay = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                           port: relayPort, inject: inject,
                                           settingsClientIP: { clientIP }, acceptProxy: false,
@@ -80,11 +84,15 @@ enum ControlService {
         if let migrated = ListenMigration.migrate(url: ListenConfig.plistURL) { log(migrated) }
         let endpoint = await ListenConfig.waitForEndpoint(log: log)
         log("starting control \(endpoint.summary) port=\(o.controlPort) relay=\(o.relayPort == 0 ? "off" : "127.0.0.1:\(o.relayPort)")")
-        let gate = authGate(clientIP: endpoint.clientIP)
+        let (gate, snapshot) = authGate(clientIP: endpoint.clientIP)
+        let watch = authChanged(from: snapshot, guardian: gate?.guardian)
         if gate == nil {
             // Refused: no listener at all until listen.plist changes.
-            ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
+            ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log, alsoStopWhen: watch)
             while true { try? await Task.sleep(for: .seconds(3600)) }
+        }
+        if gate?.requiresPassword == true && o.relayPort != 0 {
+            log("relay off: password mode (UDP mouse input waits for session binding, PR-C)")
         }
         do {
             running = try startServers(bindIP: endpoint.bindIP, clientIP: endpoint.clientIP,
@@ -112,7 +120,7 @@ enum ControlService {
             let pbs = JerisLinkSendService.refreshServicesMenu()
             log("file.push_service=\(registered ? "registered" : "register_failed") pbs_update=\(pbs.map(String.init) ?? "failed")")
         }
-        ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
+        ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log, alsoStopWhen: watch)
         while true {
             try? await Task.sleep(for: .seconds(3600))
         }
@@ -124,17 +132,41 @@ extension ControlService {
     /// listen.plist says a password was set, so a host without one never
     /// touches it. Returns nil when the configuration must refuse every
     /// connection (logged as config.refused).
-    static func authGate(clientIP: String) -> AuthGate? {
-        let plist = ListenConfig.readPlist()
-        let wantsPassword = (plist?["passwordSet"] as? Bool) == true
-        let secret = wantsPassword ? KeychainSecretStore().load() : nil
+    static func authGate(clientIP: String) -> (AuthGate?, AuthConfigSnapshot) {
+        let (plist, secret) = readAuthInputs()
+        let snapshot = AuthConfigSnapshot.read(plist: plist, secret: secret)
         let policy = AuthPolicy.resolve(plist: plist, clientIP: clientIP, secretLoaded: secret != nil)
         if case .refused(let reason) = policy {
             log("config.refused reason=\(reason)")
-            return nil
+            return (nil, snapshot)
         }
         log("auth.policy \(policy.summary)")
-        return AuthGate.make(policy: policy, secret: secret,
-                             blocklist: ListenPlistBlocklist(url: ListenConfig.plistURL))
+        return (AuthGate.make(policy: policy, secret: secret,
+                              blocklist: ListenPlistBlocklist(url: ListenConfig.plistURL)), snapshot)
+    }
+
+    static func readAuthInputs(loadSecret: () -> ConnSecret? = { KeychainSecretStore().load() }) -> ([String: Any]?, ConnSecret?) {
+        let plist = ListenConfig.readPlist()
+        let wantsPassword = (plist?["passwordSet"] as? Bool) == true
+        return (plist, wantsPassword ? loadSecret() : nil)
+    }
+
+    /// For the watcher: passwordSet, allowedIPs, allowedIPsSource or
+    /// the password itself changed, or blockedIPs was edited outside this
+    /// service. The service then exits and launchd starts it with the new
+    /// policy; exiting closes every connection admitted under the old one.
+    static func authChanged(from started: AuthConfigSnapshot, guardian: AuthGuard?,
+                            loadSecret: @escaping @Sendable () -> ConnSecret? = { KeychainSecretStore().load() })
+        -> @Sendable () -> String? {
+        let url = ListenConfig.plistURL
+        return {
+            let (plist, secret) = readAuthInputs(loadSecret: loadSecret)
+            let now = AuthConfigSnapshot.read(plist: plist, secret: secret)
+            if now != started { return "config.auth_changed keys=\(now.changes(from: started))" }
+            if let guardian, Set(ListenPlistBlocklist(url: url).load().map(\.ip)) != guardian.persistedIPs {
+                return "config.auth_changed keys=blockedIPs"
+            }
+            return nil
+        }
     }
 }

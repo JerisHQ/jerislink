@@ -17,11 +17,16 @@ enum AuthSelfTest {
         crypto(expect)
         rules(expect)
         ladder(expect)
+        settleAtomic(expect)
+        saveFailures(expect)
         blocklist(expect)
         policy(expect)
         migration(expect)
         keychain(expect)
         endToEnd(expect)
+        concurrentEndToEnd(expect)
+        failClosed(expect)
+        configWatch(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -116,7 +121,7 @@ enum AuthSelfTest {
         clock.t += 600
         expect(fail(5) == .locked(retrySeconds: 900, stage: 3), "ladder: 15 failures lock 15 min")
         clock.t += 900
-        expect(fail(5) == .blacklisted, "ladder: 20 failures blacklist")
+        expect(fail(5) == .blacklisted(persisted: true), "ladder: 20 failures blacklist")
         expect(g.admit(ip) == .blocked && store.load().map(\.ip) == [ip], "ladder: blacklisted IP is stored")
 
         let other = "100.64.0.8"
@@ -180,7 +185,7 @@ enum AuthSelfTest {
         expect(saved?["bindIP"] as? String == "100.64.0.1" && saved?["clientIP"] as? String == "100.64.0.2",
                "blacklist write keeps the other listen.plist keys")
         expect(reloaded.blockedEntries.first?.reason == "20 wrong passwords", "blacklist entry has its reason")
-        expect(reloaded.release("100.64.0.7") && AuthGuard(whitelist: [], blocklist: ListenPlistBlocklist(url: url)).admit("100.64.0.7") == .challenge,
+        expect(reloaded.release("100.64.0.7") == .released && AuthGuard(whitelist: [], blocklist: ListenPlistBlocklist(url: url)).admit("100.64.0.7") == .challenge,
                "release removes the IP and is saved")
         let missing = dir.appendingPathComponent("absent.plist")
         expect(!ListenPlistBlocklist(url: missing).save([BlockedEntry(ip: "100.64.0.7", at: Date(), reason: "t")])
@@ -198,6 +203,24 @@ enum AuthSelfTest {
                == .refused(reason: "password_unreadable"), "policy: passwordSet without Keychain item refuses")
         expect(AuthPolicy.resolve(plist: ["allowedIPs": [String]()], clientIP: nil, secretLoaded: false)
                == .refused(reason: "no_password_no_ip"), "policy: no password and no IP refuses")
+        // Deploy/README.md: change clientIP only. Migrated allowedIPs follows it.
+        let migrated: [String: Any] = ["clientIP": "100.64.0.6", "allowedIPs": ["100.64.0.16"],
+                                       "allowedIPsSource": "clientIP", "passwordSet": false]
+        expect(AuthPolicy.resolve(plist: migrated, clientIP: "100.64.0.6", secretLoaded: false)
+               == .transition(whitelist: ["100.64.0.6"]), "policy: transition, changing only clientIP moves the whitelist")
+        expect(AuthPolicy.resolve(plist: ["clientIP": "100.64.0.6", "allowedIPs": ["100.64.0.16"], "passwordSet": false],
+                                  clientIP: "100.64.0.6", secretLoaded: false)
+               == .transition(whitelist: ["100.64.0.16"]), "policy: hand-edited allowedIPs (no source key) wins")
+        expect(AuthPolicy.resolve(plist: ["allowedIPs": ["100.64.0.3", "nonsense"], "passwordSet": true], clientIP: "100.64.0.2", secretLoaded: true)
+               == .refused(reason: "invalid_allowed_ips"), "policy: password mode refuses an invalid allowedIPs entry")
+        expect(AuthPolicy.resolve(plist: ["allowedIPs": ["nonsense"], "passwordSet": true], clientIP: "100.64.0.2", secretLoaded: true)
+               == .refused(reason: "invalid_allowed_ips"), "policy: password mode, only invalid entries: refused, not any")
+        expect(AuthPolicy.resolve(plist: ["allowedIPs": "100.64.0.3", "passwordSet": true], clientIP: "100.64.0.2", secretLoaded: true)
+               == .refused(reason: "invalid_allowed_ips"), "policy: password mode refuses allowedIPs that is not a list")
+        expect(AuthPolicy.resolve(plist: ["allowedIPs": [String](), "passwordSet": true], clientIP: "100.64.0.2", secretLoaded: true)
+               == .password(whitelist: []), "policy: password mode, explicit empty allowedIPs = any (design)")
+        expect(AuthPolicy.resolve(plist: ["allowedIPs": ["nonsense"]], clientIP: nil, secretLoaded: false)
+               == .refused(reason: "no_password_no_ip"), "policy: transition never widens on invalid entries")
     }
 
     private static func migration(_ expect: Expect) {
@@ -213,7 +236,16 @@ enum AuthSelfTest {
         expect(after?["allowedIPs"] as? [String] == ["100.64.0.2"] && after?["passwordSet"] as? Bool == false
                && after?["clientIP"] as? String == "100.64.0.2", "migration: allowedIPs=[clientIP], passwordSet=false, clientIP kept")
         expect((try? Data(contentsOf: backup)) == original, "migration: listen.plist.pre-0.4 is the old file")
+        expect(after?["allowedIPsSource"] as? String == "clientIP", "migration: marks allowedIPs as following clientIP")
         expect(ListenMigration.migrate(url: url) == nil, "migration: runs once")
+
+        // A plist migrated by the first PR-A build (no source key).
+        writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "allowedIPs": ["100.64.0.2"], "passwordSet": false], url)
+        expect(ListenMigration.migrate(url: url) == "config.migrated allowed_ips_source=clientIP"
+               && readPlist(url)?["allowedIPsSource"] as? String == "clientIP", "migration: earlier v0.4 plist gets the source key")
+        writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "allowedIPs": ["100.64.0.9"], "passwordSet": false], url)
+        expect(ListenMigration.migrate(url: url) == nil && readPlist(url)?["allowedIPsSource"] == nil,
+               "migration: a hand-edited allowedIPs is left alone")
     }
 
     // MARK: Keychain (opt-in)
@@ -230,6 +262,9 @@ enum AuthSelfTest {
             return
         }
         expect(store.save(secret) && store.load() == secret, "keychain: K, salt, iterations, host id round trip")
+        if let next = ConnSecret.make(password: "Selftest-Next-\(UUID().uuidString.prefix(6))", hostID: secret.hostID, iterations: 1000) {
+            expect(store.save(next) && store.load() == next, "keychain: a password change updates the item in place")
+        }
         expect(store.delete() && store.load() == nil, "keychain: item deleted")
     }
 
@@ -368,5 +403,246 @@ enum AuthSelfTest {
             expect(r.flatMap({ ConnAuth.Result.decode($0.payload) }) == .blocked, "e2e: transition, blacklisted IP gets BLOCKED")
             s.stop()
         }
+    }
+
+    // MARK: r2: settle is atomic with the limits
+
+    /// Thread-safe result collector for concurrentPerform.
+    private final class Box<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [T] = []
+        func add(_ item: T) { lock.lock(); items.append(item); lock.unlock() }
+        var all: [T] { lock.lock(); defer { lock.unlock() }; return items }
+    }
+
+    private static func settleAtomic(_ expect: Expect) {
+        // 30 challenges out at once, all answered wrong at once: only the
+        // first 5 count, the 5th locks, the other 25 are refused uncounted.
+        let ip = "100.64.0.7"
+        let g = AuthGuard(whitelist: [], blocklist: MemoryBlocklist())
+        let admitted = (0..<30).map { _ in g.admit(ip) }
+        expect(admitted.allSatisfy { $0 == .challenge }, "settle: 30 challenges issued before any answer")
+        let results = Box<AuthGuard.Settlement>()
+        DispatchQueue.concurrentPerform(iterations: 30) { _ in results.add(g.settle(ip) { false }) }
+        let failed = results.all.filter { if case .failed = $0 { return true }; return false }
+        let refusedLocked = results.all.filter { if case .refused(.locked) = $0 { return true }; return false }
+        expect(failed.count == 5 && refusedLocked.count == 25 && g.failures(ip) == 5,
+               "settle: concurrent wrong answers count 5, the other 25 get LOCKED uncounted")
+        var macChecked = false
+        let late = g.settle(ip) { macChecked = true; return true }
+        var lateLocked = false
+        if case .refused(.locked) = late { lateLocked = true }
+        expect(lateLocked && !macChecked, "settle: right answer to a pre-lock challenge gets LOCKED, MAC not even checked")
+
+        // Blacklisted while a challenge was out: BLOCKED, never OK.
+        let clock = Clock()
+        let bg = AuthGuard(whitelist: [], blocklist: MemoryBlocklist(), now: { clock.t })
+        for _ in 0..<3 {
+            for _ in 0..<5 { _ = bg.settle(ip) { false }; clock.t += 61 }
+            clock.t += 900
+        }
+        for _ in 0..<4 { _ = bg.settle(ip) { false }; clock.t += 61 }
+        expect(bg.admit(ip) == .challenge, "settle: 19 failures, a challenge goes out")
+        _ = bg.settle(ip) { false }   // the 20th, from another connection
+        expect(bg.settle(ip) { true } == .refused(.blocked), "settle: right answer after the blacklist gets BLOCKED")
+
+        // Host-wide: 40 IPs answer wrong at once: 20 count, 20 refused;
+        // a challenge out before the wait gets LOCKED.
+        let hg = AuthGuard(whitelist: [], blocklist: MemoryBlocklist())
+        expect(hg.admit("100.64.9.9") == .challenge, "settle: victim challenge out before the host-wide wait")
+        let host = Box<AuthGuard.Settlement>()
+        DispatchQueue.concurrentPerform(iterations: 40) { i in host.add(hg.settle("100.64.8.\(i)") { false }) }
+        let counted = host.all.filter { if case .failed = $0 { return true }; return false }.count
+        let triggered = host.all.filter { if case .failed(let f) = $0 { return f.globalTriggered }; return false }.count
+        expect(counted == 20 && triggered == 1, "settle: concurrent host-wide limit counts exactly 20, triggers once")
+        if case .refused(.globalLocked) = hg.settle("100.64.9.9", check: { true }) {
+            expect(true, "settle: right answer during the host-wide wait gets LOCKED")
+        } else { expect(false, "settle: right answer during the host-wide wait gets LOCKED") }
+    }
+
+    private static func saveFailures(_ expect: Expect) {
+        let ip = "100.64.0.7"
+        func blacklist(_ store: MemoryBlocklist) -> (AuthGuard, AuthGuard.FailureOutcome?) {
+            let clock = Clock()
+            let g = AuthGuard(whitelist: [], blocklist: store, now: { clock.t }, pause: { _ in })
+            var last: AuthGuard.FailureOutcome?
+            for i in 1...20 {
+                last = g.recordFailure(ip).outcome
+                clock.t += i % 5 == 0 ? 961 : 61
+            }
+            return (g, last)
+        }
+        let flaky = MemoryBlocklist()
+        flaky.failNextSaves = 2
+        let (_, retried) = blacklist(flaky)
+        expect(retried == .blacklisted(persisted: true) && flaky.saveCalls == 3 && flaky.entries.map(\.ip) == [ip],
+               "blacklist write: 2 failures then success, persisted")
+        let broken = MemoryBlocklist()
+        broken.failNextSaves = 99
+        let (g, lost) = blacklist(broken)
+        expect(lost == .blacklisted(persisted: false) && broken.saveCalls == AuthGuard.saveAttempts && g.admit(ip) == .blocked
+               && !g.persistedIPs.contains(ip), "blacklist write: all attempts fail, reported unpersisted, still blocked in memory")
+
+        let store = MemoryBlocklist([BlockedEntry(ip: ip, at: Date(), reason: "t")])
+        let rg = AuthGuard(whitelist: [], blocklist: store, pause: { _ in })
+        store.failNextSaves = 99
+        expect(rg.release(ip) == .saveFailed && rg.admit(ip) == .blocked && store.entries.count == 1,
+               "release: write fails, IP stays blocked (memory and file agree)")
+        store.failNextSaves = 0
+        expect(rg.release(ip) == .released && rg.admit(ip) == .challenge && store.entries.isEmpty,
+               "release: written, IP open")
+        expect(rg.release(ip) == .notBlocked, "release: IP not blocked")
+    }
+
+    // MARK: r2: concurrent AUTH over sockets
+
+    private static func concurrentEndToEnd(_ expect: Expect) {
+        let password = "Concurrent-\(UUID().uuidString.prefix(8))!"
+        guard let secret = ConnSecret.make(password: password, iterations: 1000),
+              let port = ControlServiceSelfTest.freeLoopbackPort() else {
+            expect(false, "e2e concurrent: setup")
+            return
+        }
+        let me = ListenConfig.loopbackIP
+        let gate = AuthGate(policy: .password(whitelist: [me]),
+                            guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist()),
+                            secret: secret, timeout: 5)
+        let s = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
+                              settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                              clipboard: FakeClipboard(text: nil), authGate: gate)
+        guard (try? s.start()) != nil else { expect(false, "e2e concurrent: listener starts"); return }
+        defer { s.stop() }
+
+        // 13 connections, all challenged before anyone answers.
+        var pending: [(MRC1Client, ConnAuth.Challenge)] = []
+        for _ in 0..<13 {
+            guard let c = MRC1Client(port: port), let ch = c.receive(timeout: 2), ch.type == ConnAuth.MsgType.challenge,
+                  let challenge = ConnAuth.Challenge.decode(ch.payload) else { continue }
+            pending.append((c, challenge))
+        }
+        guard pending.count == 13,
+              let key = ConnAuth.deriveKey(password: password, salt: pending[0].1.salt, iterations: pending[0].1.iterations) else {
+            expect(false, "e2e concurrent: 13 challenges issued")
+            return
+        }
+        let wrongKey = ConnAuth.deriveKey(password: "Wrong-Password!", salt: pending[0].1.salt, iterations: pending[0].1.iterations) ?? []
+        func respond(_ c: MRC1Client, _ challenge: ConnAuth.Challenge, key: [UInt8]) -> ConnAuth.Result? {
+            let cn = ConnAuth.random(ConnAuth.nonceBytes)
+            let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: .control, hostID: challenge.hostID)
+            _ = c.send(type: ConnAuth.MsgType.response, payload: ConnAuth.Response(clientNonce: cn, mac: mac).payload)
+            guard let r = c.receive(timeout: 3), r.type == ConnAuth.MsgType.result else { return nil }
+            return ConnAuth.Result.decode(r.payload)
+        }
+        let wrong = Array(pending.prefix(12))
+        let results = Box<ConnAuth.Result?>()
+        DispatchQueue.concurrentPerform(iterations: wrong.count) { i in results.add(respond(wrong[i].0, wrong[i].1, key: wrongKey)) }
+        let fails = results.all.filter { if case .fail? = $0 { return true }; return false }.count
+        let locked = results.all.filter { if case .locked? = $0 { return true }; return false }.count
+        expect(fails == 4 && locked == 8 && s.authFailures == 5,
+               "e2e concurrent: 12 wrong answers at once: 4 FAIL + 8 LOCKED, auth_failures 5 (got \(fails)/\(locked)/\(s.authFailures))")
+        let late = respond(pending[12].0, pending[12].1, key: key)
+        if case .locked? = late { expect(s.authFailures == 5, "e2e concurrent: right password on a pre-lock challenge gets LOCKED, uncounted") }
+        else { expect(false, "e2e concurrent: right password on a pre-lock challenge gets LOCKED, uncounted") }
+
+        // Closing before answering is not a failure.
+        guard let p2 = ControlServiceSelfTest.freeLoopbackPort() else { return }
+        let g2 = AuthGuard(whitelist: [me], blocklist: MemoryBlocklist())
+        let s2 = ControlServer(bindIP: me, allowedClientIP: nil, port: p2, inject: false,
+                               settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                               clipboard: FakeClipboard(text: nil),
+                               authGate: AuthGate(policy: .password(whitelist: [me]), guardian: g2, secret: secret, timeout: 2))
+        guard (try? s2.start()) != nil else { expect(false, "e2e: listener 2 starts"); return }
+        defer { s2.stop() }
+        for _ in 0..<6 {
+            let c = MRC1Client(port: p2)
+            _ = c?.receive(timeout: 2)
+            c?.close()
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(s2.authFailures == 0 && g2.failures(me) == 0 && g2.admit(me) == .challenge,
+               "e2e: 6 disconnects before answering count nothing, no lock")
+    }
+
+    // MARK: r2: fail closed without AUTH
+
+    private static func failClosed(_ expect: Expect) {
+        let me = ListenConfig.loopbackIP
+        guard let secret = ConnSecret.make(password: "FailClosed-\(UUID().uuidString.prefix(8))!", iterations: 1000) else { return }
+        func listenerCount(_ policy: AuthPolicy, secret: ConnSecret?) -> Int? {
+            guard let p = ControlServiceSelfTest.freeLoopbackPort(), let r = ControlServiceSelfTest.freeLoopbackPort(), p != r else { return nil }
+            let gate = AuthGate(policy: policy, guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist()), secret: secret)
+            guard let servers = try? ControlService.startServers(bindIP: me, clientIP: me, port: p, relayPort: r, inject: false,
+                                                                 helper: InputHelperClient(port: 9), gate: gate) else { return nil }
+            defer { servers.forEach { $0.stop() } }
+            return servers.count
+        }
+        expect(listenerCount(.password(whitelist: [me]), secret: secret) == 1, "fail closed: password mode starts no mouse relay listener")
+        expect(listenerCount(.transition(whitelist: [me]), secret: nil) == 2, "fail closed: transition mode keeps the relay")
+
+        // MouseMoveUDPServer with input off drops 0x24 but still answers ping.
+        guard let up = ControlServiceSelfTest.freeLoopbackPort() else { return }
+        let udp = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: up, inputEnabled: false)
+        guard (try? udp.start()) != nil else { expect(false, "fail closed: UDP server starts"); return }
+        defer { udp.stop() }
+        let s = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        defer { Darwin.close(s) }
+        var addr = ControlServiceSelfTest.loopbackAddress(port: up)
+        func send(_ bytes: [UInt8]) {
+            _ = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bytes.withUnsafeBytes { Darwin.sendto(s, $0.baseAddress!, bytes.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+            }
+        }
+        send([0x4d, 0x52, 0x4d, 0x31, 1, 0x24, 0, 0, 0, 1, 0x80, 0, 0x80, 0])
+        send([0x4d, 0x52, 0x4d, 0x31, 1, 0x43, 0, 0, 0, 2] + [UInt8](repeating: 7, count: 8))
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var buf = [UInt8](repeating: 0, count: 64)
+        let n = buf.withUnsafeMutableBytes { Darwin.recv(s, $0.baseAddress!, 64, 0) }
+        expect(udp.inputDropped == 1 && udp.forwarded == 0, "fail closed: password mode drops UDP mouse input")
+        expect(n == 18 && buf[5] == 0x44, "fail closed: UDP ping still answered with input off")
+
+        // Legacy entries read passwordSet from listen.plist.
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir); unsetenv("JERISLINK_LISTEN_PLIST") }
+        let url = dir.appendingPathComponent("listen.plist")
+        setenv("JERISLINK_LISTEN_PLIST", url.path, 1)
+        writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "passwordSet": true], url)
+        let on = ListenConfig.passwordModeRequested()
+        writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "passwordSet": false], url)
+        expect(on && !ListenConfig.passwordModeRequested(), "fail closed: legacy entries see passwordSet")
+    }
+
+    // MARK: r2: auth config changes restart the service
+
+    private static func configWatch(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir); unsetenv("JERISLINK_LISTEN_PLIST") }
+        let url = dir.appendingPathComponent("listen.plist")
+        setenv("JERISLINK_LISTEN_PLIST", url.path, 1)
+        let base: [String: Any] = ["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "allowedIPs": ["100.64.0.2"],
+                                   "allowedIPsSource": "clientIP", "passwordSet": false]
+        writePlist(base, url)
+        let guardian = AuthGuard(whitelist: ["100.64.0.2"], blocklist: ListenPlistBlocklist(url: url), pause: { _ in })
+        let started = AuthConfigSnapshot.read(plist: ListenConfig.readPlist(), secret: nil)
+        let check = ControlService.authChanged(from: started, guardian: guardian, loadSecret: { nil })
+        expect(check() == nil, "watch: unchanged config, no restart")
+        var edited = base; edited["allowedIPs"] = ["100.64.0.2", "100.64.0.3"]; edited["allowedIPsSource"] = nil
+        writePlist(edited, url)
+        expect(check() == "config.auth_changed keys=allowedIPs,allowedIPsSource", "watch: allowedIPs edit restarts")
+        var pw = base; pw["passwordSet"] = true
+        writePlist(pw, url)
+        expect(check()?.hasPrefix("config.auth_changed keys=passwordSet") == true, "watch: passwordSet change restarts")
+        writePlist(base, url)
+        for _ in 0..<20 { _ = guardian.recordFailure("100.64.0.7") }
+        expect(check() == nil, "watch: the service's own blacklist write does not restart it")
+        var outside = readPlist(url) ?? base
+        outside["blockedIPs"] = ["100.64.0.8"]
+        writePlist(outside, url)
+        expect(check() == "config.auth_changed keys=blockedIPs", "watch: blockedIPs edited outside restarts")
+        let a = AuthConfigSnapshot.read(plist: ["passwordSet": true], secret: ConnSecret(key: [1], salt: [2], iterations: 1, hostID: [3]))
+        let b = AuthConfigSnapshot.read(plist: ["passwordSet": true], secret: ConnSecret(key: [1], salt: [4], iterations: 1, hostID: [3]))
+        expect(b.changes(from: a) == "password", "watch: a new password (new salt) restarts")
     }
 }

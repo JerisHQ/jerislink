@@ -209,6 +209,13 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var receiverReportRejected: UInt64 = 0  // short or inconsistent 0x42
     private(set) var pongDrops: UInt64 = 0
     private(set) var audioRequestRx: UInt64 = 0
+    /// 0x24 moves dropped because input is off (password mode).
+    private(set) var inputDropped: UInt64 = 0
+
+    /// False in password mode: UDP input is only IP-checked, so it stays off
+    /// until it is bound to an authenticated session (PR-C). Presence,
+    /// keyframe, NACK, receiver report, ping and audio still work.
+    let inputEnabled: Bool
 
     /// Told about every valid datagram from the allowed client (video
     /// service: capture runs only while a viewer is heard).
@@ -216,8 +223,10 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// A new source port not yet passed to `presence` (receive loop only).
     private var presenceNewSession = false
 
-    init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil) {
+    init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil,
+         inputEnabled: Bool = true) {
         self.presence = presence
+        self.inputEnabled = inputEnabled
         self.bindIP = bindIP
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -268,7 +277,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lastCursorProbeNs = 0
         lock.unlock()
 
-        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), relay=127.0.0.1:38411, cursor_state=move-triggered")
+        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), relay=\(inputEnabled ? "127.0.0.1:38411" : "off (password mode)"), cursor_state=move-triggered")
         queue.async { [weak self] in self?.receiveLoop() }
     }
 
@@ -494,6 +503,14 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             case 0x24:
                 guard n == 14 else {
                     badPackets &+= 1
+                    continue
+                }
+                guard inputEnabled else {
+                    inputDropped &+= 1
+                    if inputDropped == 1 {
+                        print("MouseMove UDP input.dropped reason=password_mode peer=\(peerIP) (logged once)")
+                        fflush(stdout)
+                    }
                     continue
                 }
                 let nx = UInt16(buffer[10]) << 8 | UInt16(buffer[11])

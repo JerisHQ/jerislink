@@ -234,7 +234,7 @@ enum ConnAuth {
 }
 
 /// What the host keeps for the password: K, never the password itself.
-struct ConnSecret: Equatable {
+struct ConnSecret: Equatable, Sendable {
     var key: [UInt8]
     var salt: [UInt8]
     var iterations: UInt32
@@ -306,14 +306,21 @@ final class KeychainSecretStore: ConnSecretStore {
         return ConnSecret(data: data)
     }
 
+    /// Updates the existing item in place; adds one only when there is
+    /// none. Any other failure leaves the old item (and the old password)
+    /// as it was, so a failed change never leaves the host without one.
     func save(_ secret: ConnSecret) -> Bool {
         guard let data = secret.data else { return false }
-        delete()
-        var q = query
-        q[kSecValueData as String] = data
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        q[kSecAttrLabel as String] = "JerisLink connection password"
-        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecAttrLabel as String: "JerisLink connection password",
+        ]
+        let updated = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else { return false }
+        let added = SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
+        return added == errSecSuccess
     }
 
     @discardableResult func delete() -> Bool {
