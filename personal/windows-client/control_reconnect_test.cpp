@@ -18,6 +18,9 @@
 // not sent twice; a down that never went out (dropped from the queue, or
 // its send failed) is dropped with its up. Once the retries ran out only a
 // fresh key press starts a new round (pointer moves and auto-repeat do not).
+// r7: input dropped unsent on any path (aged out, full queue, paused, a
+// flush that failed before any byte went out) keeps downs and ups paired on
+// the Mac; a button up not sent again takes its queued position along.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -27,6 +30,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -1036,6 +1040,342 @@ void r6Tests() {
     setCurrent(nullptr);
 }
 
+// Host side of the r7 checks: every key or button the Mac gets down also
+// gets its up, and no up arrives for something it does not hold. `held` is
+// what it already holds when these frames start.
+bool pairedOnly(const std::vector<std::pair<uint8_t, Bytes>>& got, std::set<int> held, std::string& why) {
+    for (size_t i = 0; i < got.size(); ++i) {
+        const auto& f = got[i];
+        int id = -1, down = 0;
+        if (f.first == 0x10 && f.second.size() == 3) { id = (f.second[1] << 8) | f.second[2]; down = f.second[0]; }
+        else if (f.first == 0x21 && f.second.size() == 2) { id = 0x10000 | f.second[0]; down = f.second[1]; }
+        else if (f.first == 0x25 && f.second.size() == 3) { id = 0x10000 | f.second[0]; down = f.second[1]; }
+        else continue;
+        if (down) { held.insert(id); continue; }
+        if (!held.erase(id)) { why = "lone up at frame " + std::to_string(i); return false; }
+    }
+    if (!held.empty()) { why = std::to_string(held.size()) + " left held"; return false; }
+    why = "paired";
+    return true;
+}
+
+// Pepper's r6 review. Item 1: every path that drops input unsent follows one
+// rule (a down that never went out takes its up with it; an up whose down
+// reached the Mac is still delivered). Focus loss and a failed live send
+// are (h)-(l) above; these are the queue's own drops. Item 2: a button up
+// that is not sent again takes its queued pointer position along.
+void r7Tests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    auto isKey = [](const std::pair<uint8_t, Bytes>& f, int down, uint8_t k) {
+        return f.first == 0x10 && f.second.size() == 3 && f.second[0] == down && f.second[2] == k;
+    };
+    const std::string hostKey = "127.0.0.1:" + std::to_string(l.port);
+
+    // (m) Aged out: A reached the Mac down, then the connection dropped. A up and
+    // X down wait while the Mac's challenge is late twice (background
+    // NoChallenge retries), and age out when X up is queued 3.3 s later.
+    // The Mac still gets A up (first, owed) and never a lone X up.
+    {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, hostKey);
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            firstIn = true;
+            for (int i = 0; i < 2; ++i) {
+                SOCKET q = l.accept(5000);
+                if (i == 0) closesocket(s);
+                if (q == INVALID_SOCKET) return;
+                silentConn(q, sec, 2300);
+                closesocket(q);
+            }
+            s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s, 4, 2000);
+            closesocket(s);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.close();                 // the connection dropped
+        control.sendKey(false, 0x0041);  // waits for the reconnect
+        control.sendKey(true, 0x0058);
+        Sleep(DWORD(ControlChannel::kQueueMaxAgeMs + 300));
+        const auto mid = control.reconnectStats();
+        control.sendKey(false, 0x0058);  // A up and X down age out here
+        control.sendKey(true, 0x0042);
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {0x41}, why);
+        expect(auth1 && first.size() == 1 && isKey(first[0], 1, 0x41) && mid.connecting && mid.reconnects == 1,
+               "r7 aged: A down reached the Mac; A up and X down still waited for the reconnect after 3.3 s");
+        expect(auth2 && got.size() == 3 && isKey(got[0], 0, 0x41) && isKey(got[1], 1, 0x42) && isKey(got[2], 0, 0x42) && paired,
+               "  aged out: the Mac got A up first, then B; no lone X up (" + std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.owedOnDrop == 1 && st.swallowed == 1, "  stats: owedOnDrop=1 (A up), swallowed=1 (X up)");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+
+    // (n) Full queue: A reached the Mac down, the connection dropped, and while it
+    // is re-made the queue overflows. A up, X down and the first C down are
+    // pushed out. The Mac gets A up first, the C presses that are whole,
+    // and no lone X up or C up.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok);  // 600 ms: the queue fills meanwhile
+            if (auth2) got = readFrames(s2, 300, 2500);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.close();
+        control.sendKey(false, 0x0041);
+        control.sendKey(true, 0x0058);
+        for (size_t i = 0; i + 2 < ControlChannel::kQueueMax; ++i) control.sendKey(i % 2 == 0, 0x0043);
+        control.sendKey(false, 0x0058);  // pushes out A up
+        control.sendKey(true, 0x0042);   // pushes out X down
+        control.sendKey(false, 0x0042);  // pushes out the first C down
+        host.join();
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {0x41}, why);
+        size_t x = 0, cPairs = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i].first == 0x10 && got[i].second.size() == 3 && got[i].second[2] == 0x58) ++x;
+            if (isKey(got[i], 1, 0x43)) ++cPairs;
+        }
+        const size_t pairs = (ControlChannel::kQueueMax - 2) / 2 - 1;
+        expect(auth1 && auth2 && got.size() == 1 + 2 * pairs + 2 && isKey(got[0], 0, 0x41) && x == 0 && cPairs == pairs &&
+                   isKey(got[got.size() - 2], 1, 0x42) && isKey(got.back(), 0, 0x42) && paired,
+               "r7 full queue: A up first, " + std::to_string(cPairs) + " whole C presses, B; no X, no lone C up (" +
+                   std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.owedOnDrop == 1 && st.swallowed == 2, "  stats: owedOnDrop=1 (A up), swallowed=2 (X up, first C up)");
+        control.stop();
+    }
+
+    // (o) A flush that fails before any byte goes out (send buffer full
+    // for 2 s): X down is dropped there, so X up queued behind it is not
+    // sent on the next connection; A up (A reached the Mac down) still is.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false, auth3 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, mid, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok, 100);
+            if (auth2) mid = readFrames(s2, 1, 3500);  // the viewer gives up on it
+            closesocket(s2);
+            SOCKET s3 = l.accept(8000);
+            if (s3 == INVALID_SOCKET) return;
+            auth3 = hostAuth(s3, sec, Answer::Ok, 100);
+            if (auth3) got = readFrames(s3, 4, 2000);
+            closesocket(s3);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.setFlushWouldBlockForTest(1000000, [] { Sleep(60); });
+        control.close();
+        const auto before = control.reconnectStats();
+        control.sendKey(true, 0x0058);   // the flush of this one fails
+        control.sendKey(false, 0x0041);
+        control.sendKey(false, 0x0058);
+        for (int i = 0; i < 600 && control.reconnectStats().dropped == before.dropped; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.setFlushWouldBlockForTest(0, nullptr);
+        Sleep(DWORD(ControlChannel::kRetryGapMs + 50));  // B may start the next attempt
+        const auto failed = control.reconnectStats();
+        control.sendKey(true, 0x0042);
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {0x41}, why);
+        expect(auth1 && auth2 && mid.empty() && failed.dropped == before.dropped + 1 && failed.flushWaits > 0,
+               "r7 failed flush: nothing of X down went out in 2 s; it was dropped and the connection given up");
+        expect(auth3 && got.size() == 3 && isKey(got[0], 0, 0x41) && isKey(got[1], 1, 0x42) && isKey(got[2], 0, 0x42) && paired,
+               "  next connection: A up, then B; no lone X up (" + std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.swallowed == 1, "  stats: swallowed=1 (X up)");
+        control.stop();
+    }
+
+    // (p) Item 2: the left button went down live with the pointer known
+    // (notePointer, as the viewer does for its UDP moves), the connection
+    // dropped, and focus left: the button up is owed. The viewer's own
+    // button up (releaseRemoteButtons) is queued as a positioned click.
+    // After the reconnect the Mac gets the owed up, and neither that later
+    // up nor its old position: the Mac cursor does not move.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 3, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok);
+            if (auth2) got = readFrames(s2, 4, 2000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0050);  // starts the connection
+        control.sendKey(false, 0x0050);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        control.notePointer(0x5555, 0x6666);
+        control.sendMouseButton(0, true);   // live: the Mac has it down
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        control.close();                    // the connection dropped
+        control.discardQueuedInput();       // focus leaves: button up owed
+        control.sendMouseButton(0, false);  // viewer: releaseRemoteButtons, queued with 0x24
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects < 2; ++i) Sleep(10);
+        control.sendKey(true, 0x0042);
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        size_t positions = 0;
+        for (const auto& f : got) if (f.first == 0x24) ++positions;
+        std::string why;
+        const bool paired = pairedOnly(got, {0x10000}, why);
+        const bool btnUp = !got.empty() && got[0].first == 0x21 && got[0].second.size() == 2 && got[0].second[0] == 0 &&
+                           got[0].second[1] == 0;
+        expect(auth1 && first.size() == 3 && first[2].first == 0x21 && st.positioned == 1,
+               "r7 position: left button down went out live; its later up was queued with the pointer position");
+        expect(auth2 && got.size() == 3 && btnUp && positions == 0 && isKey(got[1], 1, 0x42) && isKey(got[2], 0, 0x42) && paired,
+               "  after the reconnect: the owed button up, then B; no 0x24, the Mac cursor did not move (" +
+                   std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.released == 1 && st.swallowed == 1 && st.positionsSkipped == 1,
+               "  stats: released=1, swallowed=1, positionsSkipped=1");
+        control.stop();
+    }
+    setCurrent(nullptr);
+
+    // (q) Paused: A and B reached the Mac down, then the Mac stays silent through
+    // every retry. A up waited in the queue (dropped when control paused);
+    // B up and a whole X press come while paused. A fresh key press
+    // reconnects: the Mac gets A up and B up first, then E; no X.
+    {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, hostKey);
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::atomic<int> silent{0};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 2, 2000);
+            firstIn = true;
+            for (int i = 0; i < 1 + kNoChallengeRetries; ++i) {
+                SOCKET q = l.accept(8000);
+                if (i == 0) closesocket(s);
+                if (q == INVALID_SOCKET) return;
+                ++silent;
+                silentConn(q, sec, 2300);
+                closesocket(q);
+            }
+            s = l.accept(20000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s, 5, 2000);
+            closesocket(s);
+        });
+        control.sendKey(true, 0x0041);
+        control.sendKey(true, 0x0042);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.close();
+        control.sendKey(false, 0x0041);  // waits through the retries
+        for (int i = 0; i < 3000 && control.reconnectStats().paused == 0; ++i) Sleep(10);
+        control.sendKey(false, 0x0042);  // paused: dropped, B up owed
+        control.sendKey(true, 0x0058);   // paused: a whole press dropped
+        control.sendKey(false, 0x0058);
+        control.sendMouseMoveAbsolute(300, 300);
+        const auto mid = control.reconnectStats();
+        const bool resumed = control.resumeOnUserKey();
+        control.sendKey(true, 0x0045);
+        control.sendKey(false, 0x0045);
+        host.join();
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {0x41, 0x42}, why);
+        expect(auth1 && first.size() == 2 && silent == 1 + kNoChallengeRetries && mid.pausedNow && mid.owedOnDrop == 2 &&
+                   mid.pausedDrops == 4,
+               "r7 paused: A up dropped at the pause and B up while paused are owed (" + std::to_string(mid.owedOnDrop) +
+                   "), X press and a move dropped");
+        expect(resumed && auth2 && got.size() == 4 && isKey(got[0], 0, 0x41) && isKey(got[1], 0, 0x42) &&
+                   isKey(got[2], 1, 0x45) && isKey(got[3], 0, 0x45) && paired,
+               "  fresh key: the Mac got A up and B up first, then E; no X (" + std::to_string(got.size()) + " frames, " +
+                   why + ")");
+        expect(st.released == 2, "  stats: released=2");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1047,6 +1387,7 @@ int main() {
     r4InputTests();
     r5Tests();
     r6Tests();
+    r7Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

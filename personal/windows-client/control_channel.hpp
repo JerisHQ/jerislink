@@ -121,6 +121,8 @@ public:
         uint64_t swallowed = 0;    // r6: later ups for those, not sent again
         uint64_t pausedDrops = 0;  // r6: events dropped while paused (moves, auto-repeat...)
         uint64_t resumes = 0;      // r6: fresh key presses that ended a pause
+        uint64_t owedOnDrop = 0;   // r7: ups dropped unsent while the Mac had their down: sent later instead
+        uint64_t positionsSkipped = 0;  // r7: click positions left out with a button up not sent again
         bool pausedNow = false;    // r6: paused right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
@@ -151,7 +153,7 @@ public:
         ++a->discardWaiting;
         std::unique_lock<std::mutex> g(a->m);
         const size_t n = a->queue.size();
-        for (const auto& q : a->queue) dropDownsLocked(*a, q.bytes);
+        for (const auto& q : a->queue) dropItemLocked(*a, q.bytes);
         a->queue.clear();
         ++a->generation;
         a->stats.dropped += n;
@@ -590,13 +592,28 @@ private:
 
     // r6: the bytes of an item that go on the wire: an up already sent for
     // a key or button released on focus loss is left out. No state changes.
-    static std::vector<uint8_t> wireBytesLocked(const Async& a, const std::vector<uint8_t>& item) {
+    // r7 (Pepper's r6 review, item 2): a button up that is left out takes
+    // the pointer position queued with it (PositionedClick) along, so a
+    // click the user made before focus left cannot move the Mac cursor
+    // after the reconnect. `positionsSkipped` counts those positions.
+    static std::vector<uint8_t> wireBytesLocked(const Async& a, const std::vector<uint8_t>& item,
+                                                uint64_t* positionsSkipped = nullptr) {
+        auto skipFrame = [&](uint8_t type, const uint8_t* p, size_t n) {
+            if (type == 0x10 && n >= 3 && p[0] == 0) return a.swallowKeys.count(uint16_t((p[1] << 8) | p[2])) != 0;
+            if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) return p[1] == 0 && a.swallowButtons.count(p[0]) != 0;
+            return false;
+        };
+        bool buttonSkipped = false;
+        forEachFrame(item, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
+            if ((type == 0x21 || type == 0x25) && skipFrame(type, p, n)) buttonSkipped = true;
+        });
         std::vector<uint8_t> out;
         forEachFrame(item, [&](size_t off, size_t len, uint8_t type, const uint8_t* p, size_t n) {
-            bool skip = false;
-            if (type == 0x10 && n >= 3 && p[0] == 0) skip = a.swallowKeys.count(uint16_t((p[1] << 8) | p[2])) != 0;
-            if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) skip = p[1] == 0 && a.swallowButtons.count(p[0]) != 0;
-            if (!skip) out.insert(out.end(), item.begin() + off, item.begin() + off + len);
+            if (buttonSkipped && type == 0x24) {
+                if (positionsSkipped) ++*positionsSkipped;
+                return;
+            }
+            if (!skipFrame(type, p, n)) out.insert(out.end(), item.begin() + off, item.begin() + off + len);
         });
         return out;
     }
@@ -618,14 +635,50 @@ private:
         });
     }
 
-    // r6: downs dropped on focus loss never reached the Mac, so their ups
-    // are not sent either (wireBytesLocked leaves them out). A new down of
-    // the same key or button clears this (noteWireLocked).
-    static void dropDownsLocked(Async& a, const std::vector<uint8_t>& item) {
+    // r7 (Pepper's r6 review, item 1): the one rule for an item dropped
+    // without being sent, on every path: aged out, pushed out of a full
+    // queue, paused, the attempt ended, focus loss (queued or cancelled in
+    // flight), and a flush whose send failed before any byte went out.
+    // - A down that never reached the Mac: its later up is not sent either
+    //   (wireBytesLocked leaves it out), so the Mac never gets a lone up.
+    //   A repeat of a key or button the Mac already has down changes
+    //   nothing: the Mac still holds it and its up still goes.
+    // - An up whose down reached the Mac: the release is owed and goes
+    //   first on the next connection (takeOwedLocked), so nothing stays
+    //   held. A later up of the same press is not sent again.
+    // - An up whose down was dropped too: nothing to send.
+    // A new down of the same key or button clears a pending skip
+    // (noteWireLocked).
+    static void dropItemLocked(Async& a, const std::vector<uint8_t>& item) {
         forEachFrame(item, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
-            if (type == 0x10 && n >= 3 && p[0]) a.swallowKeys.insert(uint16_t((p[1] << 8) | p[2]));
-            else if (((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) && p[1]) a.swallowButtons.insert(p[0]);
+            if (type == 0x10 && n >= 3) {
+                const uint16_t k = uint16_t((p[1] << 8) | p[2]);
+                if (p[0]) {
+                    if (!a.keysDown.count(k)) a.swallowKeys.insert(k);
+                } else if (a.keysDown.erase(k)) {
+                    a.owedKeys.insert(k);
+                    a.swallowKeys.insert(k);
+                    ++a.stats.owedOnDrop;
+                }
+            } else if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) {
+                if (p[1]) {
+                    if (!a.buttonsDown.count(p[0])) a.swallowButtons.insert(p[0]);
+                } else {
+                    const auto it = a.buttonsDown.find(p[0]);
+                    if (it != a.buttonsDown.end()) {
+                        a.owedButtons[p[0]] = it->second;
+                        a.buttonsDown.erase(it);
+                        a.swallowButtons.insert(p[0]);
+                        ++a.stats.owedOnDrop;
+                    }
+                }
+            }
         });
+    }
+    static void dropQueueLocked(Async& a) {
+        for (const auto& q : a.queue) dropItemLocked(a, q.bytes);
+        a.stats.dropped += a.queue.size();
+        a.queue.clear();
     }
 
     // r6: what noteWireLocked changes, so a send that failed can undo it.
@@ -722,6 +775,12 @@ private:
     enum class Flush { Sent, Discarded, Stopped, Failed };
     static Flush flushOneLocked(Async& a, std::unique_lock<std::mutex>& lk, SOCKET s, const Queued& q) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushSendTimeoutMs);
+        // r7: nothing of the item went out; the caller drops it (an owed
+        // Release is restored by the caller instead).
+        const auto failedUnsent = [&] {
+            if (q.kind != Kind::Release) dropItemLocked(a, q.bytes);
+            return Flush::Failed;
+        };
         for (;;) {
             if (a.discardWaiting.load()) {
                 // A focus loss is waiting for the lock: it goes first, so
@@ -734,16 +793,20 @@ private:
             if (a.stopping) return Flush::Stopped;
             if (q.kind != Kind::Release && q.generation != a.generation) {
                 // Focus left after it was taken from the queue: stale.
-                dropDownsLocked(a, q.bytes);
+                dropItemLocked(a, q.bytes);
                 ++a.stats.dropped;
                 ++a.stats.discarded;
                 return Flush::Discarded;
             }
             if (a.atCommit && q.kind != Kind::Release) a.atCommit();
             // r6: an up for a key released on focus loss is not sent again.
-            const std::vector<uint8_t> wire = q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, q.bytes);
+            // r7: positions left out are counted once, when the item goes.
+            uint64_t positionsSkipped = 0;
+            const std::vector<uint8_t> wire =
+                q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, q.bytes, &positionsSkipped);
             if (wire.empty()) {
                 noteWireLocked(a, q.bytes);
+                a.stats.positionsSkipped += positionsSkipped;
                 return Flush::Sent;
             }
             int sent = SOCKET_ERROR;
@@ -754,15 +817,16 @@ private:
             } else {
                 sent = send(s, reinterpret_cast<const char*>(wire.data()), static_cast<int>(wire.size()), 0);
                 if (sent == SOCKET_ERROR) {
-                    if (WSAGetLastError() != WSAEWOULDBLOCK) return Flush::Failed;
+                    if (WSAGetLastError() != WSAEWOULDBLOCK) return failedUnsent();
                     full = true;
                 } else if (sent == 0) {
-                    return Flush::Failed;
+                    return failedUnsent();
                 }
             }
             if (!full) {
                 // Committed: the Mac has (or will have) these downs and ups.
                 if (q.kind != Kind::Release) noteWireLocked(a, q.bytes);
+                a.stats.positionsSkipped += positionsSkipped;
                 if (static_cast<size_t>(sent) == wire.size()) return Flush::Sent;
                 lk.unlock();
                 const bool ok = sendRestNonBlocking(s, wire, static_cast<size_t>(sent), deadline, a.cancel);
@@ -776,7 +840,7 @@ private:
             if (gap) gap();
             waitWritable(s, 50);
             lk.lock();
-            if (std::chrono::steady_clock::now() >= deadline) return Flush::Failed;
+            if (std::chrono::steady_clock::now() >= deadline) return failedUnsent();
         }
     }
 
@@ -789,6 +853,7 @@ private:
 
     static void dropAgedLocked(Async& a, std::chrono::steady_clock::time_point now) {
         while (!a.queue.empty() && now - a.queue.front().at > std::chrono::milliseconds(kQueueMaxAgeMs)) {
+            dropItemLocked(a, a.queue.front().bytes);  // r7
             a.queue.pop_front();
             ++a.stats.dropped;
         }
@@ -804,6 +869,7 @@ private:
             return;
         }
         if (a.queue.size() >= kQueueMax) {
+            dropItemLocked(a, a.queue.front().bytes);  // r7
             a.queue.pop_front();
             ++a.stats.dropped;
         }
@@ -863,13 +929,9 @@ private:
                     // a fresh key press (resumeOnUserKey), not the next event.
                     if (!a->paused) ++a->stats.paused;
                     a->paused = true;
-                    a->stats.dropped += a->queue.size();
-                    a->queue.clear();
+                    dropQueueLocked(*a);  // r7: by the drop rule
                 }
-                if (!jl::auth::mayConnect()) {
-                    a->stats.dropped += a->queue.size();
-                    a->queue.clear();
-                }
+                if (!jl::auth::mayConnect()) dropQueueLocked(*a);
                 continue;
             }
             noChallenge.reset();
@@ -962,13 +1024,17 @@ private:
         if (a->stopping) return false;
         if (!jl::auth::mayConnect()) {
             // The attempt ended (wrong password, lockout...): nothing to wait for.
-            a->stats.dropped += a->queue.size() + 1;
-            a->queue.clear();
+            dropQueueLocked(*a);
+            dropItemLocked(*a, b);
+            ++a->stats.dropped;
             return false;
         }
         if (a->paused) {
             // r6: retries ran out. Moves, auto-repeat and the rest start no
             // new round; a fresh key press (resumeOnUserKey) does.
+            // r7: dropped by the same rule: an up whose down the Mac has is
+            // owed and goes first once a fresh key reconnects.
+            dropItemLocked(*a, b);
             ++a->stats.dropped;
             ++a->stats.pausedDrops;
             return false;
