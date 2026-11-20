@@ -941,6 +941,113 @@ void reviewFixTests() {
 }
 
 // Pepper's PR-B review r2 (blockers 1, 4).
+// What a fake host saw on a connection where it sends no challenge (or
+// one too late): any byte from the viewer would be a probe or an answer.
+struct SilentHost {
+    std::atomic<bool> gotData{false};
+    // Waits ms, then (lateChallenge) sends a challenge nobody reads any
+    // more, then watches for anything the viewer sends.
+    void run(SOCKET s, int ms, const Secret* lateChallenge) {
+        uint8_t type = 0;
+        Bytes p;
+        const Io io = hostRecv(s, ms, type, p);
+        if (io == Io::Ok) { gotData = true; return; }
+        if (io == Io::Closed) return;  // the viewer gave up first (its 2 s wait)
+        if (lateChallenge) {
+            std::array<uint8_t, kNonceBytes> hn{};
+            hostSend(s, kTypeChallenge, challengeFor(*lateChallenge, hn));
+        }
+        if (hostRecv(s, 300, type, p) == Io::Ok) gotData = true;
+    }
+};
+
+void r4KnownPasswordTests() {
+    const std::string hostKey = "127.0.0.9:7002";
+    const Secret sec = makeSecret(kGood);
+    // a. Known from an earlier attempt (the relaunch list); the challenge
+    // is lost on a slow line.
+    {
+        clearKnownModesForTest();
+        loadPasswordHosts(hostKey);
+        Logged log;
+        Client::Options o;
+        o.password = kGood;
+        o.hostKey = hostKey;
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        FakeHost host;
+        SilentHost h;
+        const auto t0 = Clock::now();
+        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) { h.run(s, 2300, nullptr); });
+        expect(r.outcome == Outcome::NoChallenge && c->halted() && isTerminal(r.outcome),
+               "r4 known password, challenge lost: no_challenge, ends the attempt");
+        expect(!h.gotData && log.count("auth.probe ") == 0, "  no probe, nothing sent: no try spent");
+        expect(knownMode(hostKey) == HostMode::Password && log.containsText("auth.known_mode_kept reason=no_challenge") &&
+                   !log.containsText("known_mode_cleared"),
+               "  password mark kept (not cleared on a timeout)");
+        expect(msSince(t0) < 3000.0, "  gave up after the 2 s challenge wait");
+    }
+    // b. Learned in this attempt (first connection got a challenge); the
+    // next connection's challenge comes 2.5 s late. Not 'host too old', no
+    // probe, and the late challenge gets no answer.
+    {
+        clearKnownModesForTest();
+        Logged log;
+        Client::Options o;
+        o.password = kGood;
+        o.hostKey = hostKey;
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        FakeHost host;
+        Seen seen;
+        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Ping, seen); });
+        expect(r.outcome == Outcome::Ok && knownMode(hostKey) == HostMode::Password, "r4 learned password mode on the first connection");
+        SilentHost h;
+        r = host.run(*c, Channel::Control, [&](SOCKET s) { h.run(s, 2500, &sec); });
+        expect(r.outcome == Outcome::NoChallenge && !h.gotData && log.count("auth.probe ") == 0,
+               "  late challenge on the next connection: no_challenge, no probe, no answer");
+        expect(knownMode(hostKey) == HostMode::Password, "  mark kept");
+    }
+    // c. The next Connect (a new Client) still never probes: the host's
+    // prompt challenge is answered with the password.
+    {
+        Logged log;
+        Client::Options o;
+        o.password = kGood;
+        o.hostKey = hostKey;
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        FakeHost host;
+        Seen seen;
+        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) {
+            Sleep(900);  // slower than any probe wait: a probe would have gone
+            hostWithPassword(s, sec, HostAnswer::Ok, Channel::Ping, seen);
+        });
+        expect(r.outcome == Outcome::Ok && seen.macValid && !seen.probe && log.count("auth.probe ") == 0,
+               "  next Connect: waits for the challenge (900 ms), no probe, authenticated");
+    }
+    // d. "Retry without password": the user's call forgets the mark; the
+    // next attempt probes and the IP-only Mac lets it in.
+    {
+        expect(forgetPasswordMode(hostKey) && knownMode(hostKey) == HostMode::Unknown && !forgetPasswordMode(hostKey),
+               "retry without password: mark forgotten (once)");
+        expect(encodePasswordHosts().empty(), "  not carried to a relaunch");
+        Logged log;
+        Client::Options o;
+        o.hostKey = hostKey;
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        FakeHost host;
+        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) {
+            uint8_t type = 0;
+            Bytes p;
+            if (hostRecv(s, 3000, type, p) == Io::Ok) hostSend(s, kTypeResult, Bytes{5});
+        });
+        expect(r.outcome == Outcome::Open && log.count("auth.probe ") == 1, "  probes and connects (open_ip_only)");
+        clearKnownModesForTest();
+    }
+}
+
 void r3Tests() {
     const Secret sec = makeSecret(kGood);
 
@@ -1052,33 +1159,11 @@ void r3Tests() {
         clearKnownModesForTest();
     }
 
-    // 1: a "password" mark from an earlier attempt, but the Mac dropped its
-    // password: no challenge comes. Retry once, mark forgotten, then probe.
-    {
-        clearKnownModesForTest();
-        rememberMode("127.0.0.9:7002", HostMode::Password);
-        Logged log;
-        Client::Options o;
-        o.hostKey = "127.0.0.9:7002";
-        o.log = log.fn();
-        auto c = std::make_shared<Client>(std::move(o));
-        FakeHost host;
-        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) {
-            uint8_t type = 0;
-            Bytes p;
-            if (hostRecv(s, 3000, type, p) == Io::Ok) hostSend(s, kTypeResult, Bytes{5});
-        });
-        expect(r.outcome == Outcome::Retry && !c->halted() && log.containsText("auth.known_mode_cleared reason=no_challenge"),
-               "stale password mark: retry, not 'host too old'");
-        expect(knownMode("127.0.0.9:7002") == HostMode::Unknown && c->lastOutcome() == Outcome::Retry, "  mark forgotten");
-        r = host.run(*c, Channel::Ping, [&](SOCKET s) {
-            uint8_t type = 0;
-            Bytes p;
-            if (hostRecv(s, 3000, type, p) == Io::Ok) hostSend(s, kTypeResult, Bytes{5});
-        });
-        expect(r.outcome == Outcome::Open, "  retry probes and connects (open_ip_only)");
-        clearKnownModesForTest();
-    }
+    // r4 (Pepper r3 review, item 1): a host known to want a password
+    // whose challenge is late or lost. The mark stays, nothing probes and
+    // nothing is sent (no try spent); only the user's "Retry without
+    // password" (forgetPasswordMode) lets the next attempt probe.
+    r4KnownPasswordTests();
 
     // 4: an old saved key failed (host distrusted); the user types the
     // right password with Remember: the mark goes once the mutual check

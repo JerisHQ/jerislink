@@ -5279,6 +5279,9 @@ struct LaunchContext {
     bool checking = false;          // connection password check running
     bool quietEdit = false;         // the dialog itself is changing a field
     bool showPassword = false;
+    // "Retry without password" was clicked: this Connect forgets that the
+    // host wants a password, so it is probed again (the user's call only).
+    bool retryWithoutPassword = false;
     wchar_t passwordChar = 0x25CF;
     jl::auth::ui::LaunchState auth;
     // A terminal answer from before this screen (command-line start, or a
@@ -5314,8 +5317,10 @@ static jl::auth::Report authPreflight(const Options& o, std::wstring password, b
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
         // Twice at most, and the second only when the host's answer asked
         // for it (Retry: a probe crossed a late challenge with 2+ tries
-        // left, or a stale "password" mark). A connection that failed
-        // without an answer is not retried here.
+        // left; that reconnect never probes). A host known to want a
+        // password that sends no challenge is not retried or probed:
+        // NoChallenge goes to the user. A connection that failed without
+        // an answer is not retried here.
         for (int attempt = 1; attempt <= 2; ++attempt) {
             if (attempt == 2 && client->lastOutcome() != jl::auth::Outcome::Retry) break;
             ControlChannel ch(o.bindIp, o.sourceIp, o.controlPort);
@@ -5482,6 +5487,13 @@ static bool drawLaunchButton(HWND dlg, const DRAWITEMSTRUCT& di) {
         launchText(dc, text, r, t.label, jl::ui::color::kText, DT_CENTER | DT_VCENTER);
         return true;
     }
+    case IDC_LAUNCH_NO_PASSWORD: {
+        // A text link under Connect, shown only for NoChallenge.
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        launchText(dc, text, r, t.label, down ? a.focusRing : a.accent, DT_LEFT | DT_VCENTER);
+        if (focus) overlayFocusFrame(dc, r, t.dpi);
+        return true;
+    }
     case IDOK:
         if (IsWindowEnabled(di.hwndItem)) {
             jl::ui::drawButton(di, t, true, jl::ui::color::kBody);
@@ -5502,6 +5514,14 @@ static void launchSetError(HWND dlg, const std::wstring& text) {
     InvalidateRect(GetDlgItem(dlg, IDC_LAUNCH_ERROR), nullptr, TRUE);
 }
 
+// "Retry without password" follows the last answer (NoChallenge only) on
+// the Host tab.
+static void launchSyncNoPassword(HWND dlg) {
+    const bool show = gLaunch && !gLaunch->codeTab && !gLaunch->checking &&
+        gLaunch->auth.view(std::chrono::steady_clock::now()).offerNoPassword;
+    ShowWindow(GetDlgItem(dlg, IDC_LAUNCH_NO_PASSWORD), show ? SW_SHOW : SW_HIDE);
+}
+
 // Host tab: address, hint, error line and Connect. Code tab: a note only
 // (pairing codes are reserved for jerispair, not built yet).
 static void launchSetTab(HWND dlg, bool code) {
@@ -5511,6 +5531,7 @@ static void launchSetTab(HWND dlg, bool code) {
         ShowWindow(GetDlgItem(dlg, id), code ? SW_HIDE : SW_SHOW);
     }
     ShowWindow(GetDlgItem(dlg, IDC_LAUNCH_CODE_NOTE), code ? SW_SHOW : SW_HIDE);
+    launchSyncNoPassword(dlg);
     const bool authAllows = !gLaunch ||
         (!gLaunch->checking && gLaunch->auth.view(std::chrono::steady_clock::now()).connectEnabled);
     EnableWindow(GetDlgItem(dlg, IDOK), code || !authAllows ? FALSE : TRUE);
@@ -5557,8 +5578,16 @@ static void launchConnect(HWND dlg) {
     // Connection password check off the UI thread; the answer comes back as
     // WM_MR_AUTH_PREFLIGHT. Connect stays grey meanwhile; nothing is modal.
     if (!gLaunch) { EndDialog(dlg, IDOK); return; }
+    if (gLaunch->retryWithoutPassword) {
+        // The user said the Mac dropped its password: probe it again.
+        gLaunch->retryWithoutPassword = false;
+        const std::string hostKey = request.options.sourceIp + ":" + std::to_string(request.options.controlPort);
+        const bool had = jl::auth::forgetPasswordMode(hostKey);
+        logLine(std::string("auth.known_mode_cleared reason=user had_mark=") + (had ? "1" : "0"));
+    }
     gLaunch->checking = true;
     gLaunch->auth.clear();
+    launchSyncNoPassword(dlg);
     KillTimer(dlg, kLaunchAuthTimer);
     launchSetError(dlg, L"");
     SetDlgItemTextW(dlg, IDOK, L"Connecting\u2026");
@@ -5589,6 +5618,7 @@ static void launchApplyAuthView(HWND dlg, bool tick = false) {
     EnableWindow(ok, v.connectEnabled && !gLaunch->codeTab ? TRUE : FALSE);
     InvalidateRect(ok, nullptr, TRUE);
     HWND pw = GetDlgItem(dlg, IDC_LAUNCH_PASSWORD);
+    launchSyncNoPassword(dlg);
     if (tick) return;  // the countdown only changes the text and the button
     if (v.clearPassword) {
         gLaunch->quietEdit = true;
@@ -5715,6 +5745,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
                 // Another Mac: the last answer (and any countdown) was not about it.
                 if (gLaunch && !gLaunch->checking) {
                     gLaunch->auth.clear();
+                    launchSyncNoPassword(dlg);
                     KillTimer(dlg, kLaunchAuthTimer);
                     EnableWindow(GetDlgItem(dlg, IDOK), gLaunch->codeTab ? FALSE : TRUE);
                 }
@@ -5724,6 +5755,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             if (code == EN_CHANGE && gLaunch && !gLaunch->quietEdit && !gLaunch->checking &&
                 !gLaunch->auth.counting(std::chrono::steady_clock::now())) {
                 gLaunch->auth.clear();
+                launchSyncNoPassword(dlg);
                 launchSetError(dlg, L"");
             }
             return FALSE;
@@ -5743,6 +5775,14 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
                 const bool on = !jl::ui::ownerChecked(dlg, IDC_LAUNCH_REMEMBER);
                 jl::ui::setOwnerChecked(dlg, IDC_LAUNCH_REMEMBER, on);
                 logLine(std::string("launch.remember=") + (on ? "on" : "off"));
+            }
+            return TRUE;
+        case IDC_LAUNCH_NO_PASSWORD:
+            if (code == BN_CLICKED && gLaunch && !gLaunch->checking) {
+                logLine("launch.retry_without_password");
+                gLaunch->retryWithoutPassword = true;
+                launchConnect(dlg);
+                gLaunch->retryWithoutPassword = false;  // also when launchConnect stopped early
             }
             return TRUE;
         case IDOK:

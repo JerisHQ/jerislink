@@ -118,16 +118,29 @@ public:
     };
 
     // The viewer lost focus: input still waiting for a reconnect is stale
-    // (the user is elsewhere) and must not reach the Mac later. Returns how
-    // many events were dropped.
+    // (the user is elsewhere) and must not reach the Mac later. That covers
+    // the queue and an event the worker already took from it but has not
+    // handed to send() yet: the generation moves on, and the worker checks
+    // it (under the lock) right before each send. Returns how many queued
+    // events were dropped; one cancelled in flight is counted in
+    // stats.discarded when the worker drops it.
     size_t discardQueuedInput() {
         if (!async_) return 0;
         std::lock_guard<std::mutex> g(async_->m);
         const size_t n = async_->queue.size();
         async_->queue.clear();
+        ++async_->generation;
         async_->stats.dropped += n;
         async_->stats.discarded += n;
         return n;
+    }
+
+    // Tests: runs on the worker after it took an event from the queue and
+    // before the generation check and send (nullptr: none).
+    void setBeforeFlushSendForTest(std::function<void()> fn) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->beforeFlushSend = std::move(fn);
     }
 
     // The pointer position (MRC1 0x24 units) the viewer last showed the
@@ -432,9 +445,16 @@ private:
     }
 
     // Shared by the UI thread and the worker thread.
+    // One queue item. A click that waits for a reconnect is one item
+    // holding two frames, its pointer position (0x24) then the button: they
+    // age out, are pushed out of a full queue, are discarded and are sent
+    // together, so a click never lands without its position.
+    enum class Kind : uint8_t { Event, Move, PositionedClick };
     struct Queued {
         std::vector<uint8_t> bytes;
         std::chrono::steady_clock::time_point at;
+        Kind kind = Kind::Event;
+        uint64_t generation = 0;  // Async::generation when queued
     };
     struct Async {
         std::mutex m;
@@ -448,6 +468,8 @@ private:
         std::atomic<bool> cancel{false};  // read by the worker's socket waits (jl::auth::tCancel)
         std::chrono::steady_clock::time_point nextTry{};
         std::deque<Queued> queue;
+        uint64_t generation = 0;          // moves on when the viewer loses focus
+        std::function<void()> beforeFlushSend;  // tests only
         ReconnectStats stats;
     };
 
@@ -475,19 +497,20 @@ private:
         }
     }
 
-    static void enqueueLocked(Async& a, std::vector<uint8_t> b, std::chrono::steady_clock::time_point now) {
+    static void enqueueLocked(Async& a, std::vector<uint8_t> b, Kind kind, std::chrono::steady_clock::time_point now) {
         dropAgedLocked(a, now);
-        // Only the latest absolute pointer position matters.
-        if (isMouseMove(b) && !a.queue.empty() && isMouseMove(a.queue.back().bytes) &&
+        // Only the latest absolute pointer position matters (never one that
+        // belongs to a click).
+        if (kind == Kind::Move && !a.queue.empty() && a.queue.back().kind == Kind::Move &&
             a.queue.back().bytes[5] == b[5]) {
-            a.queue.back() = Queued{std::move(b), now};
+            a.queue.back() = Queued{std::move(b), now, kind, a.generation};
             return;
         }
         if (a.queue.size() >= kQueueMax) {
             a.queue.pop_front();
             ++a.stats.dropped;
         }
-        a.queue.push_back(Queued{std::move(b), now});
+        a.queue.push_back(Queued{std::move(b), now, kind, a.generation});
         ++a.stats.queued;
     }
 
@@ -529,6 +552,23 @@ private:
                 if (a->queue.empty()) break;
                 Queued q = std::move(a->queue.front());
                 a->queue.pop_front();
+                if (a->beforeFlushSend) {
+                    auto hook = a->beforeFlushSend;
+                    lk.unlock();
+                    hook();
+                    lk.lock();
+                }
+                if (a->stopping) { ++a->stats.dropped; break; }
+                if (q.generation != a->generation) {
+                    // Focus left after it was taken from the queue: stale.
+                    ++a->stats.dropped;
+                    ++a->stats.discarded;
+                    continue;
+                }
+                // From here the event counts as sent: the check above and
+                // the start of send() are not atomic, but nothing past this
+                // point waits for the user. A focus loss now is like one a
+                // moment after the UI thread sent it directly.
                 lk.unlock();
                 const bool ok = sendAllOn(s, q.bytes);
                 lk.lock();
@@ -577,14 +617,18 @@ private:
         }
         const auto now = std::chrono::steady_clock::now();
         const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
+        Kind kind = isMouseMove(b) ? Kind::Move : Kind::Event;
         if (isMouseButton(b) && (ptr >> 32)) {
-            // The pointer moves by UDP; the click waits here for TCP. Put
-            // its position right in front of it.
-            enqueueLocked(*a, packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
-                                            uint8_t(ptr >> 8), uint8_t(ptr)}), now);
+            // The pointer moves by UDP; the click waits here for TCP. Its
+            // position goes in the same item, right in front of it.
+            std::vector<uint8_t> item = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
+                                                      uint8_t(ptr >> 8), uint8_t(ptr)});
+            item.insert(item.end(), b.begin(), b.end());
+            b = std::move(item);
+            kind = Kind::PositionedClick;
             ++a->stats.positioned;
         }
-        enqueueLocked(*a, std::move(b), now);
+        enqueueLocked(*a, std::move(b), kind, now);
         if (!a->connecting && now >= a->nextTry) {
             a->connecting = true;
             a->wake = true;

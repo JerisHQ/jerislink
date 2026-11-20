@@ -19,6 +19,9 @@ struct View {
     bool connectEnabled = true;  // the Connect button
     bool focusPassword = false;  // put the caret back in the password field
     bool clearPassword = false;  // empty the password field (it was wrong)
+    // Show "Retry without password": the only way a host known to want a
+    // password is probed again (the user says the Mac dropped it).
+    bool offerNoPassword = false;
 };
 
 inline std::wstring waitText(uint32_t seconds) {
@@ -148,6 +151,13 @@ public:
             break;
         case Outcome::LocalError:
             view_.text = L"Windows could not compute the connection check. Nothing was sent; try again.";
+            break;
+        case Outcome::NoChallenge:
+            // Known to want a password, but no challenge came: a slow line
+            // or a busy Mac. Nothing was sent, no try spent, no probe.
+            view_.text = L"This Mac wants a connection password but did not answer in time. Connect again, "
+                         L"or use Retry without password if it no longer has one.";
+            view_.offerNoPassword = true;
             break;
         case Outcome::RaceUnanswered:
             // The Mac switched to a password during our check and did not

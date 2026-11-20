@@ -95,7 +95,8 @@ BEGIN
     CONTROL         "Remember password on this PC", IDC_LAUNCH_REMEMBER, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 169, 250, 12
     LTEXT           "", IDC_LAUNCH_ERROR, 196, 184, 250, 18, SS_NOPREFIX
     CONTROL         "Connect to Mac", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 204, 250, 20
-    CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 240, 250, 24
+    CONTROL         "Retry without password", IDC_LAUNCH_NO_PASSWORD, "Button", BS_OWNERDRAW | WS_TABSTOP | NOT WS_VISIBLE, 196, 227, 250, 10
+    CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 246, 250, 24
     LTEXT           "Joining a Mac with a pairing code is coming soon. For now, use the Mac's address on the Host address tab.", IDC_LAUNCH_CODE_NOTE, 196, 90, 250, 28, SS_NOPREFIX | NOT WS_VISIBLE
 
     LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 296, 48, 9, SS_NOPREFIX

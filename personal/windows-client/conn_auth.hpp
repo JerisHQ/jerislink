@@ -561,6 +561,7 @@ enum class Outcome {
     NeedPassword,  // the Mac wants a password and none is known for it
     LocalError,    // Windows could not compute the HMAC: nothing was sent
     RaceUnanswered,  // probe crossed a late challenge, the host said nothing: maybe one try spent
+    NoChallenge,   // a host known to want a password sent no challenge in 2 s: nothing sent, mode kept
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
     Network,       // connection closed / malformed: an ordinary reconnect
 };
@@ -578,6 +579,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::NeedPassword: return "need_password";
     case Outcome::LocalError: return "local_error";
     case Outcome::RaceUnanswered: return "race_unanswered";
+    case Outcome::NoChallenge: return "no_challenge";
     case Outcome::Retry: return "retry";
     case Outcome::Network: return "network";
     }
@@ -590,7 +592,7 @@ inline bool isTerminal(Outcome o) {
     switch (o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
-    case Outcome::LocalError: case Outcome::RaceUnanswered:
+    case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge:
         return true;
     default:
         return false;
@@ -721,6 +723,14 @@ inline void loadPasswordHosts(const std::string& text) {
         if (ok) rememberMode(item, HostMode::Password);
     }
 }
+// The user said the Mac dropped its password ("Retry without password" on
+// the launch screen): forget the mark, so the next attempt probes as for an
+// unknown host. Never called on a timeout. Returns whether a mark was there.
+inline bool forgetPasswordMode(const std::string& host) {
+    if (knownMode(host) != HostMode::Password) return false;
+    rememberMode(host, HostMode::Unknown);
+    return true;
+}
 inline void clearKnownModesForTest() {
     std::lock_guard<std::mutex> g(knownModeMutex());
     knownModeList().clear();
@@ -747,7 +757,6 @@ public:
           hostKey_(std::move(o.hostKey)) {
         wipe(o.password);
         mode_ = knownMode(hostKey_);
-        modeInherited_ = mode_ == Mode::Password;
     }
     ~Client() {
         std::lock_guard<std::mutex> g(m_);
@@ -840,13 +849,15 @@ private:
         }
         if (io == Io::Timeout) {
             note("auth.no_challenge waited_ms=" + std::to_string(kOldHostTimeoutMs) + (probed ? " probed=1" : " probed=0"));
-            if (known == Mode::Password && inheritedPasswordMode()) {
-                // Only the mark from an earlier attempt said "password": the
-                // Mac may have dropped its password since. Forget the mark;
-                // the next connection probes as for an unknown host.
-                note("auth.known_mode_cleared reason=no_challenge");
-                setMode(Mode::Unknown);
-                rep.outcome = Outcome::Retry;
+            if (known == Mode::Password) {
+                // A host known to want a password, on a slow line or busy:
+                // nothing was sent, so no try was spent. The mark stays and
+                // nothing probes on its own; a probe that met a late
+                // challenge would count as a wrong try. Only the user can
+                // say the Mac dropped its password ("Retry without
+                // password", forgetPasswordMode).
+                note("auth.known_mode_kept reason=no_challenge mode=password");
+                rep.outcome = Outcome::NoChallenge;
                 return rep;
             }
             rep.outcome = Outcome::HostTooOld;
@@ -1105,11 +1116,9 @@ private:
         {
             std::lock_guard<std::mutex> g(m_);
             mode_ = m;
-            modeInherited_ = false;
         }
         rememberMode(hostKey_, m);
     }
-    bool inheritedPasswordMode() const { std::lock_guard<std::mutex> g(m_); return modeInherited_; }
 
     void halt(const Report& r) {
         TerminalFn fn;
@@ -1146,7 +1155,6 @@ private:
     Report terminal_;
     Outcome last_ = Outcome::Network;
     std::string hostKey_;
-    bool modeInherited_ = false;  // mode_ came from knownMode(), not from this host's answer yet
 };
 
 // MARK: Process-wide hook for the channels

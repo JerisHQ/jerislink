@@ -6,6 +6,9 @@
 // r3: stop() cancels a reconnect in progress and joins the worker; input
 // queued before focus left is discarded; a queued click carries its pointer
 // position.
+// r4: focus loss also cancels an event the worker already took from the
+// queue but has not sent; a click and its position are one queue item
+// (pushed out of a full queue and aged out together).
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -379,6 +382,128 @@ void staleInputTests() {
     setCurrent(nullptr);
 }
 
+// Pepper's r3 review, item 2.
+void r4InputTests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    Listener l;
+
+    // (a) In flight: the worker has taken key A down from the queue (held
+    // in the test hook) when focus leaves. Neither it nor key A up reaches
+    // the Mac.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<bool> entered{false}, release{false};
+        control.setBeforeFlushSendForTest([&] {
+            entered = true;
+            for (int i = 0; i < 400 && !release; ++i) Sleep(5);
+        });
+        SOCKET hs = INVALID_SOCKET;
+        bool auth = false;
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        std::thread host([&] {
+            hs = l.accept(5000);
+            if (hs == INVALID_SOCKET) return;
+            auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(hs, 1, 1500);
+        });
+        control.sendKey(true, 0x0041);
+        control.sendKey(false, 0x0041);
+        for (int i = 0; i < 600 && !entered; ++i) Sleep(5);
+        const size_t queued = control.discardQueuedInput();  // WM_KILLFOCUS while key A down is in flight
+        release = true;
+        host.join();
+        for (int i = 0; i < 100 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        const auto st = control.reconnectStats();
+        expect(entered && auth && queued == 1, "r4 in flight: worker held key A down when focus left (1 more queued)");
+        expect(got.empty(), "  nothing reached the Mac (" + std::to_string(got.size()) + " frames)");
+        expect(st.discarded == 2 && st.flushed == 0 && st.reconnects == 1, "  stats: discarded=2 (1 in flight), flushed=0");
+        control.setBeforeFlushSendForTest(nullptr);
+        control.sendKey(true, 0x0042);
+        auto fresh = readFrames(hs, 1, 2000);
+        expect(fresh.size() == 1 && fresh[0].second[2] == 0x42, "  new input after focus returns goes out");
+        control.stop();
+        closesocket(hs);
+    }
+
+    // (b) Full queue: a queued click with its position is at the front when
+    // the queue overflows. Both go; no lone click and no lone position.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<bool> release{false};
+        control.setBeforeFlushSendForTest([&] { for (int i = 0; i < 400 && !release; ++i) Sleep(5); });
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        bool auth = false;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(s, ControlChannel::kQueueMax + 2, 4000);
+            Sleep(100);
+            closesocket(s);
+        });
+        control.notePointer(0x1111, 0x2222);
+        control.sendMouseButtonExtended(0, true, 1);  // one item: 0x24 + 0x25
+        for (size_t i = 0; i < ControlChannel::kQueueMax; ++i) control.sendKey(i % 2 == 0, 0x0041);
+        release = true;
+        host.join();
+        size_t keys = 0, pointer = 0;
+        for (auto& f : got) {
+            if (f.first == 0x10) ++keys;
+            if (f.first == 0x24 || f.first == 0x25) ++pointer;
+        }
+        const auto st = control.reconnectStats();
+        expect(auth && keys == ControlChannel::kQueueMax && pointer == 0,
+               "r4 full queue: click and its position pushed out together (" + std::to_string(keys) + " keys, " +
+                   std::to_string(pointer) + " pointer frames)");
+        expect(st.positioned == 1 && st.dropped == 1 && st.flushed == ControlChannel::kQueueMax,
+               "  stats: positioned=1, dropped=1 item, flushed=" + std::to_string(st.flushed));
+        control.stop();
+    }
+
+    // (c) Too old: the click and its position age out as one item, behind
+    // a key the worker holds past kQueueMaxAgeMs.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<int> calls{0};
+        control.setBeforeFlushSendForTest([&] {
+            if (calls++ == 0) Sleep(DWORD(ControlChannel::kQueueMaxAgeMs + 300));
+        });
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        bool auth = false;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(s, 3, ControlChannel::kQueueMaxAgeMs + 2500);
+            Sleep(100);
+            closesocket(s);
+        });
+        control.notePointer(0x3333, 0x4444);
+        control.sendKey(true, 0x0041);
+        control.sendMouseButtonExtended(0, true, 1);
+        host.join();
+        const auto st = control.reconnectStats();
+        expect(auth && got.size() == 1 && got[0].first == 0x10,
+               "r4 too old: click and its position aged out together (" + std::to_string(got.size()) + " frames)");
+        expect(st.dropped == 1 && st.flushed == 1, "  stats: dropped=1 item, flushed=1");
+        control.stop();
+    }
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -387,6 +512,7 @@ int main() {
     reconnectTests();
     stopTests();
     staleInputTests();
+    r4InputTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -94,6 +94,7 @@ void otherTests() {
         {Outcome::NeedPassword, L"Enter the connection password", false},
         {Outcome::LocalError, L"Nothing was sent", false},
         {Outcome::RaceUnanswered, L"now needs a connection password", false},
+        {Outcome::NoChallenge, L"did not answer in time", false},
     };
     for (const Case& c : cases) {
         expect(s.apply(rep(c.o), t0), std::string("shown: ") + outcomeName(c.o));
@@ -101,7 +102,13 @@ void otherTests() {
         expect(v.text.find(c.needle) != std::wstring::npos, std::string("  text: ") + outcomeName(c.o));
         expect(v.connectEnabled && v.focusPassword, std::string("  Connect on, focus password: ") + outcomeName(c.o));
         expect(v.clearPassword == c.clear, std::string("  clear password: ") + outcomeName(c.o));
+        // r4: "Retry without password" is offered for NoChallenge only.
+        expect(v.offerNoPassword == (c.o == Outcome::NoChallenge),
+               std::string("  retry without password offered: ") + (v.offerNoPassword ? "yes " : "no ") + outcomeName(c.o));
     }
+    s.apply(rep(Outcome::NoChallenge), t0);
+    s.clear();
+    expect(!s.view(t0).offerNoPassword, "clear: retry without password hidden");
     s.clear();
     expect(s.view(t0).text.empty(), "clear: no error");
     expect(waitText(59) == L"Too many wrong tries. Wait 59 s.", "wait text under a minute");
@@ -147,7 +154,7 @@ void handoffTests() {
     expect(back && back->outcome == Outcome::Fail && back->triesLeft == 2 && back->usedSavedKey && back->probeRace,
            "handoff: fail keeps tries, saved key, probe race");
     for (Outcome o : {Outcome::Blocked, Outcome::AuthRequired, Outcome::HostMismatch, Outcome::HostTooOld,
-                      Outcome::NeedPassword, Outcome::LocalError, Outcome::RaceUnanswered}) {
+                      Outcome::NeedPassword, Outcome::LocalError, Outcome::RaceUnanswered, Outcome::NoChallenge}) {
         back = decodeHandoff(encodeHandoff(rep(o), tick0), tick0);
         expect(back && back->outcome == o, std::string("handoff round trip: ") + outcomeName(o));
     }
