@@ -73,7 +73,14 @@ enum VideoService {
         let endpoint = await ListenConfig.waitForEndpoint(log: log)
         let bindIP = endpoint.bindIP
         let clientIP = endpoint.clientIP
-        ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log)
+        // passwordSet decides whether UDP input is on (JerisLinkHostMain):
+        // restart with the control service when it changes.
+        // The UDP input itself closes at once (LegacyAuthWatch); this restart
+        // only reopens it after a password is cleared.
+        let startedPasswordState = ListenConfig.passwordState()
+        ListenConfig.exitWhenEndpointChanges(from: endpoint, log: log) {
+            ListenConfig.passwordState() != startedPasswordState ? "config.auth_changed keys=passwordSet" : nil
+        }
         let settings = PersistedVideoSettings.load(from: VideoSettingsController.defaultFileURL)
         let codec: VideoCodec = settings.codec == "hevc" ? .hevc : .h264
         log("starting video \(endpoint.summary) \(settings.summary)")

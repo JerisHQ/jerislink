@@ -37,11 +37,12 @@ You need a Mac with Apple silicon and macOS 14 or later, and Tailscale signed in
 
    ```sh
    mkdir -p ~/Library/Application\ Support/JerisLink
-   /usr/libexec/PlistBuddy -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' \
-     ~/Library/Application\ Support/JerisLink/listen.plist
+   cd ~/Library/Application\ Support/JerisLink
+   /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy \
+     -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' listen.plist
    ```
 
-   To change it later: `/usr/libexec/PlistBuddy -c 'Set :clientIP 100.a.b.c' ~/Library/Application\ Support/JerisLink/listen.plist`. The services pick up the change within a few seconds.
+   To change it later: `cd ~/Library/Application\ Support/JerisLink && /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy -c 'Set :clientIP 100.a.b.c' listen.plist`. The services pick up the change within a few seconds. Always edit `listen.plist` through `lockf` like this (see "Listen endpoint" below).
 6. On the PC, open JerisLink, type the **Mac's** Tailscale IPv4 on the launch screen, and connect. This PC's address is chosen automatically; both addresses are shown read-only under Connection info.
 
 The Microsoft Store version of the viewer has no "Send to" entry in Explorer. Drag files onto the viewer window or its Files panel instead.
@@ -85,6 +86,8 @@ Video, mouse UDP and control all use one endpoint, so the screen and the input a
   - Any other mode (for example `lan`) is refused; the services log "not configured" and do not listen.
 - Without listen.plist, `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `network.conf` (or the environment) are used as before.
 - Interface gone, or the settings changed: both services stop within about 4 s, launchd starts them again, and they wait for the endpoint. They never fall back to another interface.
+- Editing listen.plist: hold its lock, `/usr/bin/lockf -k listen.plist.lock <command>` in that folder, as in the install steps. The services take the same lock (an flock on `listen.plist.lock`) from read to replace when they write the blacklist or migrate the file, so no edit is lost. An edit made without the lock (a text editor, plain PlistBuddy) can race with a blacklist write and is not supported.
+- A service that cannot take the lock within 0.5 s writes nothing. A new block then stays pending in `auth-state/pending-blocks.plist` and no viewer gets a challenge until it is saved. If that pending file exists but cannot be read, the control service admits no viewer at all until it reads again or is removed; it is never overwritten meanwhile.
 
 ```xml
 <dict>

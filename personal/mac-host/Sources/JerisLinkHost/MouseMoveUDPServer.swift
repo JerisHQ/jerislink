@@ -175,7 +175,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "JerisLink.MouseMoveUDP", qos: .userInteractive)
     private let cursorQueue = DispatchQueue(label: "JerisLink.CursorStateUDP", qos: .userInteractive)
     private let lock = NSLock()
-    private let controlRelay = LocalControlMouseClient()
+    private let controlRelay: LocalControlMouseClient
+    private let relayPort: UInt16
     private var cursorDetector: CursorShapeDetector?
     private var fd: Int32 = -1
     private var stopping = false
@@ -209,6 +210,39 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var receiverReportRejected: UInt64 = 0  // short or inconsistent 0x42
     private(set) var pongDrops: UInt64 = 0
     private(set) var audioRequestRx: UInt64 = 0
+    /// 0x24 moves dropped because input is off (password mode).
+    private(set) var inputDropped: UInt64 = 0
+
+    /// False in password mode: UDP input is only IP-checked, so it stays off
+    /// until it is bound to an authenticated session (PR-C). Presence,
+    /// keyframe, NACK, receiver report, ping and audio still work.
+    /// Asked for every 0x24 datagram (LegacyAuthWatch.check in the video
+    /// host: one stat while listen.plist is unchanged, a read when it moved),
+    /// so a password set between two polls drops the very next move.
+    private let inputAllowed: @Sendable () -> Bool
+    /// r9: the viewer's block (listen.plist `blockedIPs`, the pending
+    /// journal). Asked before each pong and cursor-shape datagram: nothing
+    /// goes back to a blocked viewer, while password mode (input off) still
+    /// answers pings.
+    private let outputAllowed: @Sendable () -> Bool
+    /// Set once by `revokeInput`; never cleared (a restart reopens input).
+    private var inputRevoked = false
+    var inputEnabled: Bool {
+        lock.lock(); let revoked = inputRevoked; lock.unlock()
+        return !revoked && inputAllowed()
+    }
+
+    /// The legacy entries closed (password set or listen.plist unknown): no
+    /// UDP input from now on, and the relay connection to the control
+    /// service is dropped by the receive loop on the next datagram (the
+    /// control service also refuses it on its next message).
+    func revokeInput(reason: String) {
+        lock.lock(); let first = !inputRevoked; inputRevoked = true; lock.unlock()
+        if first {
+            print("MouseMove UDP input.revoked reason=\(reason) (relay closed, 0x24 dropped until restart)")
+            fflush(stdout)
+        }
+    }
 
     /// Told about every valid datagram from the allowed client (video
     /// service: capture runs only while a viewer is heard).
@@ -216,8 +250,15 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// A new source port not yet passed to `presence` (receive loop only).
     private var presenceNewSession = false
 
-    init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil) {
+    init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil,
+         relayPort: UInt16 = 38411,
+         inputAllowed: @escaping @Sendable () -> Bool = { true },
+         outputAllowed: @escaping @Sendable () -> Bool = { true }) {
+        self.relayPort = relayPort
+        self.controlRelay = LocalControlMouseClient(port: relayPort)
         self.presence = presence
+        self.inputAllowed = inputAllowed
+        self.outputAllowed = outputAllowed
         self.bindIP = bindIP
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -268,7 +309,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lastCursorProbeNs = 0
         lock.unlock()
 
-        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), relay=127.0.0.1:38411, cursor_state=move-triggered")
+        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), relay=\(inputEnabled ? "127.0.0.1:\(relayPort)" : "off (password mode)"), cursor_state=move-triggered")
         queue.async { [weak self] in self?.receiveLoop() }
     }
 
@@ -401,6 +442,11 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             UInt8((seq >> 8) & 0xff), UInt8(seq & 0xff),
             shape.rawValue
         ]
+        // r9: no cursor shape to a blocked viewer.
+        guard outputAllowed() else {
+            lock.lock(); lastCursorShape = nil; lock.unlock()
+            return
+        }
         var destination = peer
         let n = packet.withUnsafeBytes { raw -> Int in
             guard let base = raw.baseAddress else { return -1 }
@@ -496,6 +542,16 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                     badPackets &+= 1
                     continue
                 }
+                guard inputEnabled else {
+                    inputDropped &+= 1
+                    // Receive loop only: the relay client is not thread-safe.
+                    controlRelay.closeConnection()
+                    if inputDropped == 1 {
+                        print("MouseMove UDP input.dropped reason=password_mode_or_unknown peer=\(peerIP) (logged once)")
+                        fflush(stdout)
+                    }
+                    continue
+                }
                 let nx = UInt16(buffer[10]) << 8 | UInt16(buffer[11])
                 let ny = UInt16(buffer[12]) << 8 | UInt16(buffer[13])
                 if controlRelay.sendMouseMoveNormalized(nx: nx, ny: ny) {
@@ -539,6 +595,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                     continue
                 }
                 pingRx &+= 1
+                // r9: a blocked viewer gets no pong.
+                guard outputAllowed() else { pongDrops &+= 1; continue }
                 var pong = Array(buffer[0..<18])
                 pong[5] = 0x44
                 var destination = peer

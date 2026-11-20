@@ -201,8 +201,9 @@ struct JerisLinkHostMain {
             let presence = await ViewerPresenceSelfTest.run()
             let video = VideoDiagSelfTest.run()
             let files = FileProtocolSelfTest.run()
+            let auth = AuthSelfTest.run()
             let bundle = JerisLinkBundle.selfTest()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && bundle == 0 ? 0 : 1)
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && auth == 0 && bundle == 0 ? 0 : 1)
         }
         // H.264 encode -> decode check on the hardware encoder at the capped
         // sizes. No screen capture, no network, no settings change.
@@ -283,11 +284,27 @@ struct JerisLinkHostMain {
                 fputs("Fatal: --control-only requires --bind-ip\n", stderr)
                 exit(2)
             }
+            // This listener has no AUTH step: it runs only while listen.plist
+            // says no password, checked again for every connection; once that
+            // stops (password set, file unreadable or invalid) it exits
+            // (--service control is the authenticated one).
+            let legacy = LegacyAuthWatch()
+            guard legacy.isOpen else {
+                fputs("config.refused reason=legacy_listener_without_auth entry=--control-only cause=\(legacy.reason ?? "-") (use --service control)\n", stderr)
+                exit(78)
+            }
             do {
                 let control = ControlServer.legacyListener(bindIP: bindIP,
                                                            allowedClientIP: o.controlClientIP,
                                                            port: o.controlPort,
-                                                           inject: o.controlInject)
+                                                           inject: o.controlInject,
+                                                           admit: { legacy.check() })
+                legacy.onClose { reason in
+                    fputs("config.refused reason=legacy_listener_without_auth entry=--control-only cause=\(reason); exiting\n", stderr)
+                    control.stop()
+                    exit(78)
+                }
+                legacy.startPolling()
                 try control.start()
                 print("JerisLink control-only service")
                 print("Control MRC1: \(bindIP):\(o.controlPort), allowedClient=\(o.controlClientIP ?? "any"), inject=\(o.controlInject ? "requested" : "off")")
@@ -344,20 +361,53 @@ struct JerisLinkHostMain {
                                             retransmit: o.nackEnabled,
                                             videoBitrateMbps: o.bitrateMbps,
                                             nominalFps: Int(o.fps))
+                // Password set (or listen.plist unreadable): no listener
+                // without AUTH. UDP input is only IP-checked, so it stays off
+                // until PR-C binds it to an authenticated session; video,
+                // audio and presence go on. Checked at start, per legacy
+                // connection, per UDP 0x24 datagram and every 0.5 s
+                // (LegacyAuthWatch); closing revokes the UDP input and its
+                // relay connection before anything else is handled.
+                // r6 (B5): and nothing while the pending journal does not read.
+                // r7 (B5): nor while the one viewer it accepts is on the
+                // blacklist (listen.plist or the pending journal).
+                let journalHold = PendingJournalHold()
+                let legacy = LegacyAuthWatch()
+                // r9: nor does video, audio or a NACK resend go to a blocked
+                // viewer (or while the journal does not read): asked per frame.
+                if let sender {
+                    let streamHold = PendingJournalHold(entry: "udp_stream")
+                    let streamViewer = clientIP
+                    sender.setStreamGate { streamHold.reason(for: streamViewer) == nil }
+                }
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
                     presence = viewer
+                    let udpViewer = o.controlClientIP ?? clientIP
                     let server = MouseMoveUDPServer(bindIP: bindIP,
-                                                    allowedClientIP: o.controlClientIP ?? clientIP,
-                                                    port: mouseUDPPort, presence: viewer)
+                                                    allowedClientIP: udpViewer,
+                                                    port: mouseUDPPort, presence: viewer,
+                                                    inputAllowed: PendingJournalHold.udpInputAllowed(legacy: legacy, hold: journalHold,
+                                                                                                     viewerIP: udpViewer),
+                                                    outputAllowed: { journalHold.reason(for: udpViewer) == nil })
+                    legacy.onClose { reason in server.revokeInput(reason: reason) }
                     try server.start()
                     mouseUDP = server
                 }
-                if o.controlServerEnabled {
-                    control = ControlServer.legacyListener(bindIP: bindIP, allowedClientIP: o.controlClientIP,
-                                                           port: o.controlPort, inject: o.controlInject)
+                if o.controlServerEnabled && !legacy.isOpen {
+                    print("config.refused reason=legacy_listener_without_auth entry=video-control cause=\(legacy.reason ?? "-") (use --service control)")
+                } else if o.controlServerEnabled {
+                    let legacyControl = ControlServer.legacyListener(bindIP: bindIP, allowedClientIP: o.controlClientIP,
+                                                                     port: o.controlPort, inject: o.controlInject,
+                                                                     admit: { legacy.check() })
+                    legacy.onClose { reason in
+                        print("config.refused reason=legacy_listener_without_auth entry=video-control cause=\(reason); listener stopped")
+                        legacyControl.stop()
+                    }
+                    control = legacyControl
                     try control?.start()
                 }
+                legacy.startPolling()
             }
             defer { control?.stop() }
             defer { mouseUDP?.stop() }
@@ -460,7 +510,7 @@ struct JerisLinkHostMain {
                         // D2-B: a NACK the cache cannot serve becomes one
                         // keyframe, through the same gate as viewer requests.
                         if keyframeGate.allow() { encoder.requestKeyframe() }
-                    case .sent, .disabled:
+                    case .sent, .disabled, .held:
                         break
                     }
                 }

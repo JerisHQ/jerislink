@@ -41,6 +41,33 @@ struct LocalAddress: Equatable {
     var ip: String
 }
 
+/// What stat(2) says about listen.plist. Any write (an atomic replace, an
+/// edit in place, a delete) changes it, so an unchanged stamp means the file
+/// read last is still the file on disk. It is the per-message fast path of
+/// the auth checks: one stat while nothing changed, a full read otherwise.
+struct ListenFileStamp: Equatable, Sendable {
+    var exists: Bool
+    var dev: Int64 = 0
+    var ino: UInt64 = 0
+    var size: Int64 = 0
+    var mtime: Int64 = 0
+    var mtimeNs: Int = 0
+    var ctime: Int64 = 0
+    var ctimeNs: Int = 0
+
+    /// nil when stat fails for a reason other than "no such file": the
+    /// caller then reads the file in full.
+    static func of(_ url: URL) -> ListenFileStamp? {
+        var st = stat()
+        guard fstatat(AT_FDCWD, url.path, &st, 0) == 0 else {
+            return errno == ENOENT ? ListenFileStamp(exists: false) : nil
+        }
+        return ListenFileStamp(exists: true, dev: Int64(st.st_dev), ino: UInt64(st.st_ino), size: Int64(st.st_size),
+                               mtime: Int64(st.st_mtimespec.tv_sec), mtimeNs: st.st_mtimespec.tv_nsec,
+                               ctime: Int64(st.st_ctimespec.tv_sec), ctimeNs: st.st_ctimespec.tv_nsec)
+    }
+}
+
 enum ListenConfig {
     static let loopbackIP = "127.0.0.1"
 
@@ -49,6 +76,62 @@ enum ListenConfig {
             return URL(fileURLWithPath: path)
         }
         return VideoService.supportDirectory.appendingPathComponent("listen.plist")
+    }
+
+    /// Blocks the control service could not write to listen.plist (B5 r4),
+    /// in a folder of their own so a read-only listen.plist or a listen.plist
+    /// folder that cannot be written does not take this file with it.
+    static var pendingBlocksURL: URL {
+        if let path = ProcessInfo.processInfo.environment["JERISLINK_AUTH_PENDING"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return VideoService.supportDirectory.appendingPathComponent("auth-state", isDirectory: true)
+            .appendingPathComponent("pending-blocks.plist")
+    }
+
+    /// The one locking protocol for listen.plist (r5, B5): every supported
+    /// writer holds an exclusive flock on `<listen.plist>.lock` from its
+    /// read to its replace. The host's writers (blacklist, migration) use
+    /// this; a manual edit uses `lockf -k <listen.plist>.lock PlistBuddy …`
+    /// (Deploy/README.md), which takes the same flock. A writer that skips
+    /// the lock is not supported.
+    ///
+    /// Fails closed: when the lock file cannot be opened or the lock is not
+    /// had within `wait` seconds, `body` does not run and the result is
+    /// nil, so nothing is written without the lock.
+    static func withFileLock<T>(_ url: URL, wait: TimeInterval = 0.5, _ body: () -> T) -> T? {
+        let fd = open(url.path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else {
+            print("config.lock_failed reason=open errno=\(errno) (nothing written)")
+            return nil
+        }
+        defer { close(fd) }
+        let deadline = ProcessInfo.processInfo.systemUptime + wait
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let e = errno
+            guard e == EWOULDBLOCK || e == EINTR, ProcessInfo.processInfo.systemUptime < deadline else {
+                print("config.lock_failed reason=\(e == EWOULDBLOCK ? "busy" : "flock") errno=\(e) (nothing written)")
+                return nil
+            }
+            usleep(10_000)
+        }
+        defer { flock(fd, LOCK_UN) }
+        return body()
+    }
+
+    /// While the endpoint is `waiting`: whether listen.plist now names a
+    /// different endpoint than the one this process started with (another
+    /// mode, viewer or bind address). That is a change to apply now, not an
+    /// address that went down for a moment.
+    static func targetDiffers(plist: [String: Any], from started: ListenEndpoint) -> Bool {
+        guard started.source == "listen.plist" else { return true }
+        let rawMode = (plist["mode"] as? String)?.lowercased() ?? ""
+        guard let mode = ListenMode(rawValue: rawMode), mode == started.mode else { return true }
+        if mode == .tailnet {
+            if plist["clientIP"] as? String != started.clientIP { return true }
+            if let bindIP = plist["bindIP"] as? String, !bindIP.isEmpty, bindIP != started.bindIP { return true }
+        }
+        return false
     }
 
     /// Tailscale's CGNAT range 100.64.0.0/10.
@@ -110,11 +193,66 @@ enum ListenConfig {
         }
     }
 
-    static func readPlist() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: plistURL) else { return nil }
-        let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+    /// What listen.plist says about the connection password (v0.4.0), for
+    /// the entries that cannot check one (`--control-only`, video-control,
+    /// UDP mouse input). Only `off` lets them run: a file that exists but
+    /// cannot be read or parsed, or a `passwordSet` that is not a bool, is
+    /// `unknown` and closes them like `on`. No listen.plist (network.conf
+    /// setups) is `off`.
+    enum PasswordState: Equatable, Sendable {
+        case off
+        case on
+        case unknown(String)
+
+        var reason: String {
+            switch self {
+            case .off: return "password_off"
+            case .on: return "password_set"
+            case .unknown(let why): return why
+            }
+        }
+    }
+
+    static func passwordState(url: URL = plistURL) -> PasswordState {
+        switch readPlistResult(url: url) {
+        case .missing: return .off
+        case .unreadable: return .unknown("listen_plist_unreadable")
+        case .invalid: return .unknown("listen_plist_invalid")
+        case .ok(let dict): return passwordState(plist: dict)
+        }
+    }
+
+    static func passwordState(plist: [String: Any]) -> PasswordState {
+        guard let raw = plist["passwordSet"] else { return .off }
+        guard let set = raw as? Bool else { return .unknown("password_set_invalid") }
+        return set ? .on : .off
+    }
+
+    enum PlistRead {
+        case missing
+        case unreadable
+        case invalid
+        case ok([String: Any])
+    }
+
+    /// Only a file that does not exist counts as missing; any other read
+    /// error is not "no settings".
+    static func readPlistResult(url: URL = plistURL) -> PlistRead {
+        if access(url.path, F_OK) != 0 && errno == ENOENT { return .missing }
+        guard let data = try? Data(contentsOf: url) else { return .unreadable }
+        guard let dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any] else {
+            return .invalid
+        }
+        return .ok(dict)
+    }
+
+    static func readPlist(url: URL = plistURL) -> [String: Any]? {
+        switch readPlistResult(url: url) {
+        case .missing: return nil
         // An unreadable file must not fall back to network.conf.
-        return parsed as? [String: Any] ?? ["mode": "invalid"]
+        case .unreadable, .invalid: return ["mode": "invalid"]
+        case .ok(let dict): return dict
+        }
     }
 
     static func localAddresses() -> [LocalAddress] {
@@ -138,8 +276,14 @@ enum ListenConfig {
         return result
     }
 
-    static func current() -> ListenResolution {
-        resolve(plist: readPlist(), conf: VideoService.loadAddresses(), local: localAddresses())
+    static func current() -> ListenResolution { currentWithPlist().0 }
+
+    /// The resolution and the listen.plist it came from, read once, so the
+    /// control service builds its endpoint and its auth policy from the same
+    /// file contents.
+    static func currentWithPlist(url: URL = plistURL) -> (ListenResolution, [String: Any]?) {
+        let plist = readPlist(url: url)
+        return (resolve(plist: plist, conf: VideoService.loadAddresses(), local: localAddresses()), plist)
     }
 
     /// The configured viewer, even while its interface is down.
@@ -160,11 +304,18 @@ enum ListenConfig {
 
     /// Blocks until the endpoint is ready. Logs each new reason once.
     static func waitForEndpoint(log: (String) -> Void) async -> ListenEndpoint {
+        await waitForEndpointWithPlist(log: log).0
+    }
+
+    /// As `waitForEndpoint`, plus the listen.plist contents the endpoint was
+    /// resolved from.
+    static func waitForEndpointWithPlist(log: (String) -> Void) async -> (ListenEndpoint, [String: Any]?) {
         var lastReason: String?
         while true {
-            switch current() {
+            let (resolution, plist) = currentWithPlist()
+            switch resolution {
             case .ready(let ep):
-                return ep
+                return (ep, plist)
             case .notConfigured(let reason):
                 if reason != lastReason { log("not configured: \(reason) (\(plistURL.path))"); lastReason = reason }
                 try? await Task.sleep(for: endpointWaitInterval)
@@ -180,26 +331,231 @@ enum ListenConfig {
     /// in a row (address gone, mode or viewer changed). launchd (KeepAlive)
     /// starts the service again, and it waits in `waitForEndpoint`. The video
     /// and control services both do this, so they always move together.
-    static func exitWhenEndpointChanges(from started: ListenEndpoint, log: @escaping @Sendable (String) -> Void) {
+    ///
+    /// `alsoStopWhen` adds other settings (the auth policy): it returns
+    /// what changed, or nil. The same two-checks rule applies.
+    static func exitWhenEndpointChanges(from started: ListenEndpoint, log: @escaping @Sendable (String) -> Void,
+                                        alsoStopWhen: (@Sendable () -> String?)? = nil) {
         Task.detached {
             var misses = 0
             while true {
                 try? await Task.sleep(for: .seconds(2))
                 let now = current()
-                if now == .ready(started) { misses = 0; continue }
+                let what: String
+                switch now {
+                case .ready(let ep) where ep == started:
+                    guard let other = alsoStopWhen?() else { misses = 0; continue }
+                    what = other
+                case .ready(let ep): what = "endpoint changed to \(ep.summary)"
+                case .notConfigured(let reason): what = "not configured: \(reason)"
+                case .waiting(let reason): what = reason
+                }
                 misses += 1
                 if misses >= 2 {
-                    let what: String
-                    switch now {
-                    case .ready(let ep): what = "endpoint changed to \(ep.summary)"
-                    case .notConfigured(let reason): what = "not configured: \(reason)"
-                    case .waiting(let reason): what = reason
-                    }
                     log("stopping: \(what) (was \(started.summary)); launchd restarts the service, which waits for the endpoint")
                     exit(0)
                 }
             }
         }
+    }
+}
+
+/// The legacy entries (`--control-only`, control inside the video host,
+/// UDP mouse input) have no AUTH step. They stay open only while listen.plist
+/// says `passwordSet` is off (`ListenConfig.PasswordState.off`). The state is
+/// read again for every legacy TCP connection (`check`) and polled for the
+/// UDP input; the first time it is not `off` the entries close for the life
+/// of the process, and handlers registered with `onClose` stop the
+/// listeners, which also closes their connections. Clearing the password
+/// does not reopen them: that needs a restart.
+///
+/// r4: `check` is also what the UDP input asks for every 0x24 datagram, so
+/// a password set between two polls closes the input on the next datagram.
+/// It costs one stat while listen.plist is unchanged (`ListenFileStamp`) and
+/// reads the file again whenever the stamp moved.
+final class LegacyAuthWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private let read: @Sendable () -> ListenConfig.PasswordState
+    private let stamp: (@Sendable () -> ListenFileStamp?)?
+    private var open: Bool
+    private var closedReason: String?
+    /// The stamp taken just before the last read that said `off`.
+    private var verifiedStamp: ListenFileStamp?
+    private var handlers: [@Sendable (String) -> Void] = []
+
+    /// The live listen.plist.
+    convenience init(url: URL = ListenConfig.plistURL) {
+        self.init(read: { ListenConfig.passwordState(url: url) }, stamp: { ListenFileStamp.of(url) })
+    }
+
+    /// `stamp` nil: every check reads (self-test fakes).
+    init(read: @escaping @Sendable () -> ListenConfig.PasswordState,
+         stamp: (@Sendable () -> ListenFileStamp?)? = nil) {
+        self.read = read
+        self.stamp = stamp
+        let before = stamp?()
+        let state = read()
+        open = state == .off
+        closedReason = state == .off ? nil : state.reason
+        verifiedStamp = state == .off ? before : nil
+    }
+
+    var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return open }
+
+    /// Why the entries are closed (nil while open).
+    var reason: String? { lock.lock(); defer { lock.unlock() }; return closedReason }
+
+    /// Reads listen.plist now. False, and closed from then on, unless it
+    /// still says no password.
+    @discardableResult func check() -> Bool {
+        lock.lock()
+        guard open else { lock.unlock(); return false }
+        let known = verifiedStamp
+        lock.unlock()
+        // Taken before the read: a write after it moves the stamp again.
+        let now = stamp?()
+        if let now, let known, now == known { return true }
+        let state = read()
+        if state == .off {
+            lock.lock(); if open { verifiedStamp = now }; lock.unlock()
+            return true
+        }
+        close(reason: state.reason)
+        return false
+    }
+
+    /// Runs `handler` once when the entries close (at once if already closed).
+    func onClose(_ handler: @escaping @Sendable (String) -> Void) {
+        lock.lock()
+        if open { handlers.append(handler); lock.unlock(); return }
+        let why = closedReason ?? "closed"
+        lock.unlock()
+        handler(why)
+    }
+
+    /// Polls for the UDP input, which is not re-read per packet.
+    func startPolling(interval: TimeInterval = 0.5) {
+        let t = Thread { [self] in
+            while isOpen {
+                Thread.sleep(forTimeInterval: interval)
+                check()
+            }
+        }
+        t.name = "legacy-auth-watch"
+        t.start()
+    }
+
+    private func close(reason: String) {
+        lock.lock()
+        guard open else { lock.unlock(); return }
+        open = false
+        closedReason = reason
+        let run = handlers
+        handlers = []
+        lock.unlock()
+        print("config.legacy_closed reason=\(reason) (entries without AUTH stop; a restart is needed to reopen them)")
+        fflush(stdout)
+        run.forEach { $0(reason) }
+    }
+}
+
+/// r6 (B5): the video service's side of the control service's journal
+/// lockdown. UDP mouse input has no AuthGuard in this process, so it reads
+/// the pending journal itself: while the file exists but does not read
+/// (corrupt, unreadable, its folder unreadable) every 0x24 is dropped. One
+/// stat per datagram while the file is unchanged (`ListenFileStamp`); read
+/// again whenever the stamp moves or stat fails. Not a latch: input comes
+/// back once the journal reads or is removed, as admission does in the
+/// control service.
+///
+/// r7 (B5): and the blacklist, as the control service's guard holds it:
+/// a viewer in listen.plist `blockedIPs` or in a journal that reads (a
+/// block restored from it, not yet in listen.plist) is dropped too. The
+/// same stamp check covers listen.plist.
+final class PendingJournalHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let load: @Sendable () -> [BlockedEntry]?
+    private let stamp: @Sendable () -> ListenFileStamp?
+    private let loadBlocked: @Sendable () -> [BlockedEntry]
+    private let blockedStamp: @Sendable () -> ListenFileStamp?
+    private var known: ListenFileStamp?
+    private var held = false
+    private var journalIPs: Set<String> = []
+    private var knownBlocked: ListenFileStamp?
+    private var blockedIPs: Set<String> = []
+    private var lastVerdict: String?
+    /// What the hold's log lines name: `udp_input` (0x24 in), r9
+    /// `udp_stream` (video, audio and resends out).
+    private let entry: String
+
+    /// The live journal next to listen.plist, and listen.plist itself.
+    convenience init(url: URL = ListenConfig.pendingBlocksURL, plistURL: URL = ListenConfig.plistURL,
+                     entry: String = "udp_input") {
+        let file = PendingBlockFile(url: url)
+        self.init(load: { file.load() }, stamp: { ListenFileStamp.of(url) },
+                  loadBlocked: { ListenConfig.readPlist(url: plistURL).map(ListenPlistBlocklist.entries(in:)) ?? [] },
+                  blockedStamp: { ListenFileStamp.of(plistURL) }, entry: entry)
+    }
+
+    init(load: @escaping @Sendable () -> [BlockedEntry]?, stamp: @escaping @Sendable () -> ListenFileStamp?,
+         loadBlocked: @escaping @Sendable () -> [BlockedEntry] = { [] },
+         blockedStamp: @escaping @Sendable () -> ListenFileStamp? = { ListenFileStamp(exists: false) },
+         entry: String = "udp_input") {
+        self.entry = entry
+        self.load = load
+        self.stamp = stamp
+        self.loadBlocked = loadBlocked
+        self.blockedStamp = blockedStamp
+    }
+
+    /// Nil while input from `viewerIP` may go on, else why not. Without an
+    /// address only the journal lockdown is asked.
+    func reason(for viewerIP: String? = nil) -> String? {
+        // Taken before the reads: a write after them moves the stamps again.
+        let now = stamp()
+        let nowBlocked = blockedStamp()
+        lock.lock()
+        let journalMoved = now == nil || now != known
+        let blockedMoved = nowBlocked == nil || nowBlocked != knownBlocked
+        lock.unlock()
+        let journal = journalMoved ? Optional(load()) : nil
+        let listed = blockedMoved ? loadBlocked() : nil
+        lock.lock()
+        if let journal {
+            held = journal == nil
+            journalIPs = Set((journal ?? []).map(\.ip))
+            known = now
+        }
+        if let listed {
+            blockedIPs = Set(listed.map(\.ip))
+            knownBlocked = nowBlocked
+        }
+        let verdict: String?
+        if held {
+            verdict = "pending_journal_unreadable"
+        } else if let viewerIP, journalIPs.contains(viewerIP) || blockedIPs.contains(viewerIP) {
+            verdict = "blocked"
+        } else {
+            verdict = nil
+        }
+        let changed = verdict != lastVerdict
+        lastVerdict = verdict
+        lock.unlock()
+        if changed {
+            let what = entry == "udp_input" ? ("UDP 0x24 dropped", "UDP input goes on") : ("nothing sent to the viewer", "the stream goes on")
+            print(verdict.map { "auth.lockdown_hold reason=\($0) entry=\(entry) peer=\(viewerIP ?? "-"); \(what.0) until it clears" }
+                  ?? "auth.lockdown_cleared entry=\(entry) (\(what.1))")
+            fflush(stdout)
+        }
+        return verdict
+    }
+
+    /// What the video service's UDP input asks per 0x24 datagram: no
+    /// password set (`LegacyAuthWatch`), no journal lockdown and (r7) the
+    /// viewer it accepts not on the blacklist.
+    static func udpInputAllowed(legacy: LegacyAuthWatch, hold: PendingJournalHold,
+                                viewerIP: String? = nil) -> @Sendable () -> Bool {
+        { legacy.check() && hold.reason(for: viewerIP) == nil }
     }
 }
 

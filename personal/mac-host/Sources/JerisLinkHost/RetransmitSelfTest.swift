@@ -109,6 +109,8 @@ enum RetransmitSelfTest {
         expect(CaptureClock.elapsedMS(since: 0, now: 5) == 0 && CaptureClock.elapsedMS(since: 9, now: 5) == 0, "latency: unknown or future capture is 0")
 
         loopback(expect)
+        r9StreamBlock(expect)
+        r10ResendBlock(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -184,6 +186,65 @@ enum RetransmitSelfTest {
     }
 }
 
+extension RetransmitSelfTest {
+    /// r9: nothing goes to a blocked viewer over UDP either: video frames,
+    /// NACK resends, audio, pongs. Real sockets on 127.0.0.1; the gates
+    /// the video service wires (PendingJournalHold on a listen.plist and a
+    /// journal in a temp folder), a block added from each.
+    fileprivate static func r9StreamBlock(_ check: (Bool, String) -> Void) {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("jl-r9-udp-\(getpid())", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let plistURL = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("pending-blocks.plist")
+        let me = "127.0.0.1"
+        func writePlist(_ d: [String: Any]) {
+            if let data = try? PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0) {
+                try? data.write(to: plistURL, options: .atomic)
+            }
+        }
+        let ping: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x43, 0, 0, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8]
+        for viaJournal in [true, false] {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let name = "r9 udp: a block from \(source) stops video frames, NACK resends, audio and pongs to the viewer from the next frame"
+            try? fm.removeItem(at: journalURL)
+            writePlist(["mode": "loopback", "clientIP": me])
+            guard let viewer = TestUDPSocket(), let mousePort = TestUDPSocket.freePort(),
+                  let sender = try? UDPFrameSender(bindIP: me, clientIP: me, clientPort: viewer.port,
+                                                   packetBytes: 1200, retransmit: true, videoBitrateMbps: 20) else {
+                check(false, name); continue
+            }
+            defer { viewer.close() }
+            let streamHold = PendingJournalHold(url: journalURL, plistURL: plistURL, entry: "udp_stream")
+            sender.setStreamGate { streamHold.reason(for: me) == nil }
+            let inHold = PendingJournalHold(url: journalURL, plistURL: plistURL)
+            let server = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: mousePort,
+                                            outputAllowed: { inHold.reason(for: me) == nil })
+            guard (try? server.start()) != nil else { check(false, name); continue }
+            defer { server.stop() }
+            let frame = Data((0..<(1180 * 3)).map { UInt8($0 & 0xff) })
+            sender.send(frameID: 1, data: frame, keyFrame: true)
+            let videoBefore = viewer.receiveAll(expect: 3).count == 3
+            viewer.send(ping, toPort: mousePort)
+            let pongBefore = viewer.receiveAll(expect: 1).count == 1
+            let audioBefore = sender.sendAudio(Data([1, 2, 3, 4]), port: viewer.port) && viewer.receiveAll(expect: 1).count == 1
+            if viaJournal {
+                _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: me, at: Date(), reason: "20 wrong passwords")])
+            } else {
+                writePlist(["mode": "loopback", "clientIP": me, "blockedIPs": [me]])
+            }
+            sender.send(frameID: 2, data: frame, keyFrame: true)
+            let resend = sender.retransmit(frameID: 1, ranges: [.wholeFrame])
+            let audioAfter = sender.sendAudio(Data([1, 2, 3, 4]), port: viewer.port)
+            viewer.send(ping, toPort: mousePort)
+            let after = viewer.receiveAll(expect: 8)
+            check(videoBefore && pongBefore && audioBefore && after.isEmpty && resend == .held && !audioAfter
+                  && sender.statsLine().contains("stream_held="), name)
+        }
+    }
+}
+
 private final class NackBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: (UInt64, [UDPFrameSender.NackRange])?
@@ -254,4 +315,144 @@ private final class TestUDPSocket {
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         return addr
     }
+}
+
+extension RetransmitSelfTest {
+    /// r10 (blocker 3): a block that lands part-way through resends (or a
+    /// paced frame) stops them there. Real UDP sockets on 127.0.0.1, the
+    /// video service's gate (PendingJournalHold). The gate lands the block
+    /// once the host has written 5 packets of the batch, and notes the
+    /// host's packet count at that moment; nothing more may leave after it.
+    fileprivate static func r10ResendBlock(_ check: (Bool, String) -> Void) {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("jl-r10-udp-\(getpid())", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let plistURL = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("pending-blocks.plist")
+        let me = "127.0.0.1"
+        func writePlist(_ d: [String: Any]) {
+            if let data = try? PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0) {
+                try? data.write(to: plistURL, options: .atomic)
+            }
+        }
+        enum Kind { case pacedQueue, immediate, pacedFrame }
+        let cases: [(Kind, Bool)] = [(.pacedQueue, true), (.pacedQueue, false), (.immediate, true), (.pacedFrame, true)]
+        let packets = 20, lead = 10
+        for (kind, viaJournal) in cases {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let what: String
+            switch kind {
+            case .pacedQueue: what = "the paced NACK resend queue (20 packets) right after a resend's pacing wait"
+            case .immediate: what = "an unpaced NACK resend batch (20 packets)"
+            case .pacedFrame: what = "a paced video frame (20 packets)"
+            }
+            let name = kind == .pacedQueue
+                ? "r10 udp: a block from \(source) that lands in \(what), mid-queue, stops it there: that resend and the rest are not sent (host sends 0 packets after the block) and the viewer gets only the resends before it"
+                : "r10 udp: a block from \(source) that lands after \(lead) packets of \(what) stops it there: the host sends 0 packets after the block and the viewer gets only those \(lead)"
+            try? fm.removeItem(at: journalURL)
+            writePlist(["mode": "loopback", "clientIP": me])
+            let pacing = kind == .immediate ? UDPPacing.off : UDPPacing(mbps: kind == .pacedQueue ? 1 : 4, burstBytes: kind == .pacedQueue ? 1200 * (packets + lead) : 1200)
+            guard let viewer = TestUDPSocket(),
+                  let sender = try? UDPFrameSender(bindIP: me, clientIP: me, clientPort: viewer.port, packetBytes: 1200,
+                                                   pacing: pacing, retransmit: true, videoBitrateMbps: 20) else {
+                check(false, name); continue
+            }
+            defer { viewer.close() }
+            let hold = PendingJournalHold(url: journalURL, plistURL: plistURL, entry: "udp_stream")
+            let trip = R10Trip()
+            let blockJournal = journalURL, blockPlist = plistURL
+            let blockNow: @Sendable () -> Void = {
+                if viaJournal {
+                    _ = PendingBlockFile(url: blockJournal).save([BlockedEntry(ip: me, at: Date(), reason: "20 wrong passwords")])
+                } else if let data = try? PropertyListSerialization.data(
+                    fromPropertyList: ["mode": "loopback", "clientIP": me, "blockedIPs": [me]], format: .xml, options: 0) {
+                    try? data.write(to: blockPlist, options: .atomic)
+                }
+            }
+            sender.setStreamGate { [weak sender] in
+                if let sender, let at = trip.armedAt, !trip.fired, sender.sentPacketCount() >= at {
+                    let count = sender.sentPacketCount()
+                    blockNow()
+                    trip.fire(count)
+                }
+                return hold.reason(for: me) == nil
+            }
+            let frame = Data((0..<(1180 * packets)).map { UInt8($0 & 0xff) })
+            var result: UDPFrameSender.RetransmitResult?
+            var before = true
+            var got: [Data] = []
+            switch kind {
+            case .pacedFrame:
+                trip.arm(sender.sentPacketCount() + UInt64(lead))
+                sender.send(frameID: 1, data: frame, keyFrame: true)
+            case .pacedQueue:
+                // The bucket holds the frame plus `lead` packets: the frame
+                // leaves in one burst, about `lead` resends follow on what
+                // is left, and the next one waits for tokens (1 Mbps, so
+                // the gaps here refill little). The block lands right after
+                // that first wait, mid-queue, before that resend asks the
+                // gate again.
+                let base = sender.sentPacketCount()
+                sender.setAfterResendPaceWait { [weak sender] in
+                    guard let sender, !trip.fired else { return }
+                    let count = sender.sentPacketCount()
+                    guard count > base + UInt64(packets) else { return }
+                    blockNow()
+                    trip.fire(count)
+                }
+                sender.send(frameID: 1, data: frame, keyFrame: true)
+                // send() is queued: NACK only once the frame is out.
+                let out = Date().addingTimeInterval(1)
+                while sender.sentPacketCount() < base + UInt64(packets) && Date() < out { usleep(200) }
+                result = sender.retransmit(frameID: 1, ranges: [.wholeFrame])
+            case .immediate:
+                sender.send(frameID: 1, data: frame, keyFrame: true)
+                before = viewer.receiveAll(expect: packets).count == packets
+                trip.arm(sender.sentPacketCount() + UInt64(lead))
+                result = sender.retransmit(frameID: 1, ranges: [.wholeFrame])
+            }
+            // Wait for the trip, then long enough for any packet still queued.
+            let waitUntil = Date().addingTimeInterval(8)
+            while !trip.fired && Date() < waitUntil { Thread.sleep(forTimeInterval: 0.02) }
+            Thread.sleep(forTimeInterval: 0.6)
+            got = viewer.receiveAll(expect: 2 * packets)
+            let hostAfter = trip.firedAt.map { sender.sentPacketCount() - $0 }
+            let resent = got.filter { $0.count > 5 && ($0[$0.startIndex + 5] & 0x04) != 0 }.count
+            if kind == .pacedQueue {
+                // Only the resends count below; the frame must be whole.
+                before = got.count - resent == packets
+                got = got.filter { $0.count > 5 && ($0[$0.startIndex + 5] & 0x04) != 0 }
+            }
+            let resultOK: Bool
+            switch kind {
+            case .pacedQueue: resultOK = result == .sent(packets: packets)
+            case .immediate: resultOK = result == .held
+            case .pacedFrame: resultOK = true
+            }
+            print("r10 udp info: case=\(kind) source=\(viaJournal ? "journal" : "listen.plist") fired=\(trip.fired) host_packets_after_block=\(hostAfter.map(String.init) ?? "-") viewer_packets=\(got.count) resent_flag=\(resent) result=\(result.map { "\($0)" } ?? "-") before=\(before) stats=\(sender.statsLine())")
+            let flagged = kind == .pacedFrame ? resent == 0 : resent == got.count
+            let stats = sender.statsLine()
+            let nackWaits = stats.split(separator: " ").first { $0.hasPrefix("nack_pace_waits=") }
+                .flatMap { Int($0.dropFirst("nack_pace_waits=".count)) } ?? -1
+            // Paced queue: the resends that left before the block, 1..19
+            // (a fresh sender: its count starts at 0, the frame is 20).
+            let expected = kind == .pacedQueue ? trip.firedAt.map { Int($0) - packets } ?? -1 : lead
+            let waited = kind != .pacedQueue || (nackWaits >= 1 && expected >= 1 && expected < packets)
+            check(before && resultOK && trip.fired && hostAfter == 0 && got.count == expected && flagged && waited
+                  && stats.contains("stream_held="), name)
+        }
+    }
+}
+
+/// r10 self-test: the point at which a gate lands its block.
+private final class R10Trip: @unchecked Sendable {
+    private let lock = NSLock()
+    private var at: UInt64?
+    private var firedCount: UInt64?
+    func arm(_ count: UInt64) { lock.lock(); at = count; lock.unlock() }
+    var armedAt: UInt64? { lock.lock(); defer { lock.unlock() }; return at }
+    var fired: Bool { lock.lock(); defer { lock.unlock() }; return firedCount != nil }
+    var firedAt: UInt64? { lock.lock(); defer { lock.unlock() }; return firedCount }
+    func fire(_ count: UInt64) { lock.lock(); if firedCount == nil { firedCount = count }; lock.unlock() }
 }
