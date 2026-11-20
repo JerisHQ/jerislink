@@ -2423,14 +2423,7 @@ static void overlayButton(HDC dc, const RECT& r, const wchar_t* text, ov::Item i
     const bool hot = gOverlayHot == item || gOverlayPressed == item;
     jl::ui::roundRect(dc, r, ov::scale(8, dpi), hot ? c::kSecondaryDown : c::kSecondary,
                       c::kBorder, 1);
-    overlayText(dc, text, r, gOverlayTheme.text, textColor, DT_CENTER |    } else {
-        overlayText(dc,
-                    tip ? tip
-                    : gOverlayKeyboard
-                        ? 
-                        : 
-                    toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
-    }
+    overlayText(dc, text, r, gOverlayTheme.text, textColor, DT_CENTER | DT_VCENTER);
 }
 
 static void paintOverlay(HWND hwnd) {
