@@ -169,7 +169,55 @@ void handoffTests() {
 
 }  // namespace
 
+// Pepper's PR-B review r4, item 3: "Retry without password" belongs to the
+// host (ip:port) that sent the NoChallenge.
+void hostBindingTests() {
+    LaunchState s;
+    const auto t0 = Clock::now();
+    const std::string a = "100.64.0.16:38400", b = "100.64.0.17:38400", aOtherPort = "100.64.0.16:47990";
+    s.apply(rep(Outcome::NoChallenge), t0, a);
+    expect(s.view(t0, a).offerNoPassword && s.noPasswordTarget(t0, a) == a,
+           "r5 bound: offered for the host that sent NoChallenge, target is that ip:port");
+    expect(!s.view(t0, b).offerNoPassword && s.noPasswordTarget(t0, b).empty(),
+           "r5 bound: hidden and no target once the address is another Mac");
+    expect(!s.view(t0, aOtherPort).offerNoPassword && s.noPasswordTarget(t0, aOtherPort).empty(),
+           "r5 bound: same IP, other control port: hidden");
+    expect(!s.view(t0, "").offerNoPassword, "r5 bound: address not valid: hidden");
+    expect(s.view(t0, a).offerNoPassword, "r5 bound: back to the first address: shown again (same answer)");
+    s.apply(rep(Outcome::NoChallenge), t0);
+    expect(!s.view(t0, a).offerNoPassword && s.noPasswordTarget(t0, a).empty(),
+           "r5 bound: answer with no known host: never offered");
+    s.apply(rep(Outcome::NoChallenge), t0, a);
+    s.apply(rep(Outcome::Fail, 3), t0, a);
+    expect(s.noPasswordTarget(t0, a).empty(), "r5 bound: a later answer (not NoChallenge) drops the target");
+    s.apply(rep(Outcome::NoChallenge), t0, a);
+    s.clear();
+    expect(s.noPasswordTarget(t0, a).empty() && s.answerHost().empty(), "r5 bound: clear drops the host");
+    // Handed over to a relaunched launch screen with the host.
+    const uint64_t tick0 = 5'000'000;
+    const std::wstring h = encodeHandoff(rep(Outcome::NoChallenge), tick0, a);
+    expect(h.find(L";h=100.64.0.16:38400") != std::wstring::npos, "r5 handoff: carries h=<ip:port>");
+    std::string host;
+    auto back = decodeHandoff(h, tick0, &host);
+    expect(back && back->outcome == Outcome::NoChallenge && host == a, "r5 handoff: host round trip");
+    expect(back && s.apply(*back, t0, host) && s.noPasswordTarget(t0, a) == a && s.noPasswordTarget(t0, b).empty(),
+           "r5 handoff: relaunched screen offers it only for that host");
+    back = decodeHandoff(encodeHandoff(rep(Outcome::NoChallenge), tick0), tick0, &host);
+    expect(back && host.empty(), "r5 handoff: old form (no h) still decodes, host unknown");
+    host = "stale";
+    expect(!decodeHandoff(L"v1;o=3;t=0;k=0;p=0;u=0;h=1.2.3.4:5;h=1.2.3.4:5", tick0, &host) && host.empty(),
+           "r5 handoff: rejects h twice");
+    for (const wchar_t* bad : {L"v1;o=3;t=0;k=0;p=0;u=0;h=", L"v1;o=3;t=0;k=0;p=0;u=0;h=evil.example:1",
+                               L"v1;o=3;t=0;k=0;p=0;u=0;h=100.64.0.16:38400:38400:1",
+                               L"v1;o=3;t=0;k=0;p=0;u=0;h=1.2.3.4 5"}) {
+        expect(!decodeHandoff(bad, tick0, &host), "r5 handoff: rejects bad host #" + std::to_string(wcslen(bad)));
+    }
+    expect(encodeHandoff(rep(Outcome::NoChallenge), tick0, "bad host").find(L";h=") == std::wstring::npos,
+           "r5 handoff: an invalid host is not encoded");
+}
+
 int main() {
+    hostBindingTests();
     probeRaceTests();
     handoffTests();
     carryOnTests();

@@ -26,7 +26,12 @@
 // password, lockout, blocked, mutual check failed, old host, password
 // needed), `Client` halts: no channel connects again until the launch
 // screen starts a new attempt, so background reconnects cannot spend the
-// lockout budget. Channels also take connectSlot() before they connect, so
+// lockout budget. One exception (r5): once a channel of this attempt has
+// authenticated, a host known to want a password that sends no challenge in
+// 2 s (a busy Mac or slow line) does not halt anything. The channel that saw
+// it tries again on its own a few times (NoChallengeRetry), never probing and
+// spending no try, and only that channel pauses when they are used up.
+// Channels also take connectSlot() before they connect, so
 // only one connection at a time can probe or answer a challenge. What a host
 // answered (password / transition) is kept per host address, so a host known
 // to want a password is not probed again by a later attempt.
@@ -98,6 +103,11 @@ constexpr int kProbeWaitMs = 300;
 // The host gives the viewer 5 s after AUTH_CHALLENGE; a RESULT that takes
 // longer than this is a dead connection.
 constexpr int kResultTimeoutMs = 5000;
+// r5: a background NoChallenge (see Client::handshake) is retried this many
+// times by the channel that saw it, waiting kNoChallengeFirstGapMs, then
+// twice as long each time (0.5, 1, 2, 4 s), before that channel pauses.
+constexpr int kNoChallengeRetries = 4;
+constexpr int kNoChallengeFirstGapMs = 500;
 
 enum class Channel : uint8_t { Control = 1, Clipboard = 2, File = 3, Ping = 4 };
 
@@ -562,6 +572,7 @@ enum class Outcome {
     LocalError,    // Windows could not compute the HMAC: nothing was sent
     RaceUnanswered,  // probe crossed a late challenge, the host said nothing: maybe one try spent
     NoChallenge,   // a host known to want a password sent no challenge in 2 s: nothing sent, mode kept
+                   // (ends the attempt only before any channel authenticated; see Client::handshake)
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
     Network,       // connection closed / malformed: an ordinary reconnect
 };
@@ -797,13 +808,42 @@ public:
              (r.outcome == Outcome::Fail ? " tries=" + std::to_string(r.triesLeft) : std::string()) +
              (r.outcome == Outcome::Locked ? " retry_s=" + std::to_string(r.retrySeconds) : std::string()) +
              (r.savedKeyFile ? std::string(" saved_key=") + r.savedKeyFile : std::string()));
+        bool background = false;
         {
             std::lock_guard<std::mutex> g(m_);
             last_ = r.outcome;
+            if (r.outcome == Outcome::Ok || r.outcome == Outcome::Open) authed_ = true;
+            // r5: after the session is up (a channel of this attempt
+            // authenticated), a late challenge is a busy Mac or a slow line,
+            // not an answer for the user. Nothing was sent and the mode
+            // stays Password, so the channel just tries again
+            // (NoChallengeRetry); video, audio and the other channels go on.
+            background = r.outcome == Outcome::NoChallenge && authed_;
         }
-        if (isTerminal(r.outcome)) halt(r);
+        if (background) {
+            note(std::string("auth.no_challenge_background chan=") + channelName(ch) + " session=kept");
+        } else if (isTerminal(r.outcome)) {
+            halt(r);
+        }
         return r;
     }
+
+    // r5: a channel whose background NoChallenge retries ran out (see
+    // NoChallengeRetry). Logged, and kept for the session window to show
+    // once (takePausedChannels). Only that channel stops trying.
+    void channelPaused(Channel ch, int retries) {
+        note(std::string("auth.channel_paused chan=") + channelName(ch) + " reason=no_challenge retries=" +
+             std::to_string(retries));
+        pausedChannels_.fetch_or(1u << unsigned(ch));
+    }
+    void noteNoChallengeRetry(Channel ch, int attempt, int waitMs) {
+        note(std::string("auth.no_challenge_retry chan=") + channelName(ch) + " attempt=" + std::to_string(attempt) +
+             " wait_ms=" + std::to_string(waitMs));
+    }
+    // Bit (1 << Channel) per channel paused since the last call.
+    uint32_t takePausedChannels() { return pausedChannels_.exchange(0); }
+    // A channel of this attempt has authenticated (OK or open_ip_only).
+    bool authenticatedOnce() const { std::lock_guard<std::mutex> g(m_); return authed_; }
 
 private:
     Report exchange(SOCKET s, Channel ch, double connectMs) {
@@ -1152,6 +1192,8 @@ private:
     bool keyFromStore_ = false;
     bool keyVerified_ = false;
     std::atomic<bool> halted_{false};
+    std::atomic<uint32_t> pausedChannels_{0};
+    bool authed_ = false;  // under m_
     Report terminal_;
     Outcome last_ = Outcome::Network;
     std::string hostKey_;
@@ -1178,12 +1220,19 @@ inline void setCurrent(std::shared_ptr<Client> c) {
     currentSlot() = std::move(c);
 }
 
+// The outcome of the last AUTH exchange this thread ran through gate()
+// (Network when the connect failed before one). Reset by connectSlot(),
+// which every channel takes before it connects.
+inline thread_local Outcome tLastGate = Outcome::Network;
+inline Outcome lastGateOutcome() { return tLastGate; }
+
 // See Client::connectSlot. Keeps the client alive while the slot is held.
 struct ConnectSlot {
     std::shared_ptr<Client> client;
     std::unique_lock<std::mutex> lock;
 };
 inline ConnectSlot connectSlot() {
+    tLastGate = Outcome::Network;
     ConnectSlot s;
     s.client = current();
     if (s.client) s.lock = s.client->connectSlot();
@@ -1201,8 +1250,44 @@ inline bool gate(SOCKET s, Channel ch, double connectMs) {
     auto c = current();
     if (!c) return true;
     Report r = c->handshake(s, ch, connectMs);
+    tLastGate = r.outcome;
     return r.outcome == Outcome::Ok || r.outcome == Outcome::Open;
 }
+
+// r5: one per channel (control, clipboard, file). After a connect that did
+// not authenticate, on the thread that ran it, afterFailure() says what to do:
+//   > 0  a background NoChallenge: try again on this channel after that many
+//        ms (0.5, 1, 2, 4 s). The mode stays Password, so no probe goes and
+//        no try is spent.
+//   0    any other failure: the channel's usual path.
+//   -1   kNoChallengeRetries used up: this channel stops trying on its own
+//        (reported once through Client::channelPaused); the budget starts
+//        again for the next attempt.
+// reset() after a connection that authenticated.
+class NoChallengeRetry {
+public:
+    explicit NoChallengeRetry(Channel ch) : ch_(ch) {}
+    int afterFailure() {
+        if (lastGateOutcome() != Outcome::NoChallenge) return 0;
+        auto c = current();
+        if (!c || c->halted() || !c->authenticatedOnce()) return 0;
+        if (failures_ >= kNoChallengeRetries) {
+            failures_ = 0;
+            c->channelPaused(ch_, kNoChallengeRetries);
+            return -1;
+        }
+        const int wait = kNoChallengeFirstGapMs << failures_;
+        ++failures_;
+        c->noteNoChallengeRetry(ch_, failures_, wait);
+        return wait;
+    }
+    void reset() { failures_ = 0; }
+    int failures() const { return failures_; }
+
+private:
+    Channel ch_;
+    int failures_ = 0;
+};
 
 inline double msSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();

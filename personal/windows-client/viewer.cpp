@@ -3607,6 +3607,24 @@ static void fileChipNotice(const std::string& text, bool error, double ms) {
     fileChipShow(ChipMode::Notice, ms);
 }
 
+// r5: background channels (bit per jl::auth::Channel) that stopped after
+// their NoChallenge retries ran out. One notice; the session goes on.
+static void showChannelPaused(uint32_t paused) {
+    using jl::auth::Channel;
+    const auto bit = [](Channel c) { return 1u << unsigned(c); };
+    std::string names;
+    for (Channel c : {Channel::Control, Channel::Clipboard, Channel::File}) {
+        if (!(paused & bit(c))) continue;
+        logLine(std::string("session.channel_paused chan=") + jl::auth::channelName(c) + " reason=no_challenge");
+        if (!names.empty()) names += ", ";
+        names += c == Channel::Control ? "keyboard and mouse" : c == Channel::Clipboard ? "clipboard" : "file transfer";
+    }
+    if (names.empty()) return;
+    std::string text = "The Mac did not answer in time: " + names + " paused. Video keeps going.";
+    if (paused & bit(Channel::Control)) text += " Input tries again on your next key or click.";
+    fileChipNotice(text, true, 8000);
+}
+
 // Cmd+V with new copied files while a transfer runs: the V was eaten, so the
 // Mac pastes nothing. The clipboard stays unclaimed (the next Cmd+V after
 // the transfer pastes it).
@@ -5288,7 +5306,9 @@ struct LaunchContext {
     // channel that ended the session): shown with the same countdown and
     // focus as one the screen got itself.
     std::optional<jl::auth::Report> authAnswer;
+    std::string authAnswerHost;  // r5: ip:port that gave authAnswer (empty: unknown)
     const char* authAnswerSource = "handoff";  // "handoff" (relaunch) or "cli" (command-line preflight)
+    std::string pendingHost;     // r5: ip:port the running check is for
 };
 static LaunchContext* gLaunch = nullptr;
 // The launch screen checked the connection password for this attempt (or
@@ -5514,11 +5534,22 @@ static void launchSetError(HWND dlg, const std::wstring& text) {
     InvalidateRect(GetDlgItem(dlg, IDC_LAUNCH_ERROR), nullptr, TRUE);
 }
 
+static std::string launchHostText(HWND dlg);
+
+// r5: the ip:port the launch screen would connect to now (typed address,
+// control port from the arguments). Empty when the address is not IPv4.
+static std::string launchCurrentHostKey(HWND dlg) {
+    const std::string host = launchHostText(dlg);
+    if (!jl::isIPv4(host) || !gLaunch) return {};
+    return host + ":" + std::to_string(jl::controlPortArg(jl::argsAfterLaunchScreen(gLaunch->args)));
+}
+
 // "Retry without password" follows the last answer (NoChallenge only) on
-// the Host tab.
+// the Host tab, and only while the address on screen is the host that
+// sent it (r5).
 static void launchSyncNoPassword(HWND dlg) {
     const bool show = gLaunch && !gLaunch->codeTab && !gLaunch->checking &&
-        gLaunch->auth.view(std::chrono::steady_clock::now()).offerNoPassword;
+        gLaunch->auth.view(std::chrono::steady_clock::now(), launchCurrentHostKey(dlg)).offerNoPassword;
     ShowWindow(GetDlgItem(dlg, IDC_LAUNCH_NO_PASSWORD), show ? SW_SHOW : SW_HIDE);
 }
 
@@ -5546,7 +5577,9 @@ static std::string launchHostText(HWND dlg) {
     return host.substr(first, last - first + 1);
 }
 
-static void launchConnect(HWND dlg) {
+// `noPasswordFor`: "Retry without password" was clicked for this ip:port
+// (the host that sent the NoChallenge); empty for a normal Connect.
+static void launchConnect(HWND dlg, const std::string& noPasswordFor = {}) {
     if (gLaunch && gLaunch->codeTab) return;
     HWND edit = GetDlgItem(dlg, IDC_HOST_IP);
     const std::string host = launchHostText(dlg);
@@ -5578,13 +5611,20 @@ static void launchConnect(HWND dlg) {
     // Connection password check off the UI thread; the answer comes back as
     // WM_MR_AUTH_PREFLIGHT. Connect stays grey meanwhile; nothing is modal.
     if (!gLaunch) { EndDialog(dlg, IDOK); return; }
+    const std::string hostKey = request.options.sourceIp + ":" + std::to_string(request.options.controlPort);
     if (gLaunch->retryWithoutPassword) {
-        // The user said the Mac dropped its password: probe it again.
+        // The user said the Mac dropped its password: probe it again. Only
+        // the host that sent the NoChallenge, and only if this Connect goes
+        // to it (r5); anything else is a normal Connect.
         gLaunch->retryWithoutPassword = false;
-        const std::string hostKey = request.options.sourceIp + ":" + std::to_string(request.options.controlPort);
-        const bool had = jl::auth::forgetPasswordMode(hostKey);
-        logLine(std::string("auth.known_mode_cleared reason=user had_mark=") + (had ? "1" : "0"));
+        if (noPasswordFor.empty() || hostKey != noPasswordFor) {
+            logLine("auth.known_mode_kept reason=host_changed");
+        } else {
+            const bool had = jl::auth::forgetPasswordMode(noPasswordFor);
+            logLine(std::string("auth.known_mode_cleared reason=user had_mark=") + (had ? "1" : "0"));
+        }
     }
+    gLaunch->pendingHost = hostKey;
     gLaunch->checking = true;
     gLaunch->auth.clear();
     launchSyncNoPassword(dlg);
@@ -5630,10 +5670,11 @@ static void launchApplyAuthView(HWND dlg, bool tick = false) {
 }
 
 // One path for every terminal answer: red line, countdown, Connect, focus.
-static void launchShowAnswer(HWND dlg, const jl::auth::Report& rep) {
+// `host`: the ip:port that gave the answer.
+static void launchShowAnswer(HWND dlg, const jl::auth::Report& rep, const std::string& host) {
     if (!gLaunch) return;
     const auto now = std::chrono::steady_clock::now();
-    gLaunch->auth.apply(rep, now);
+    gLaunch->auth.apply(rep, now, host);
     launchApplyAuthView(dlg);
     KillTimer(dlg, kLaunchAuthTimer);
     if (gLaunch->auth.counting(now)) SetTimer(dlg, kLaunchAuthTimer, 1000, nullptr);
@@ -5654,7 +5695,7 @@ static void launchOnAuthAnswer(HWND dlg, jl::auth::Outcome outcome) {
     auto client = jl::auth::current();
     jl::auth::Report rep = client ? client->lastTerminal() : jl::auth::Report{};
     rep.outcome = outcome;
-    launchShowAnswer(dlg, rep);
+    launchShowAnswer(dlg, rep, gLaunch->pendingHost);
     logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(outcome));
 }
 
@@ -5704,9 +5745,10 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         if (gLaunch && gLaunch->authAnswer) {
             const jl::auth::Report rep = *gLaunch->authAnswer;
             gLaunch->authAnswer.reset();
-            launchShowAnswer(dlg, rep);
+            launchShowAnswer(dlg, rep, gLaunch->authAnswerHost);
             logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(rep.outcome) +
-                    " source=" + gLaunch->authAnswerSource + " retry_s=" + std::to_string(rep.retrySeconds));
+                    " source=" + gLaunch->authAnswerSource + " retry_s=" + std::to_string(rep.retrySeconds) +
+                    " host_bound=" + (gLaunch->authAnswerHost.empty() ? "0" : "1"));
         }
         logLine(std::string("launch.screen shown saved_host=") + (savedHost.empty() ? "no" : "yes") +
                 " note=" + (gLaunch && !gLaunch->note.empty() ? "yes" : "no"));
@@ -5779,9 +5821,18 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             return TRUE;
         case IDC_LAUNCH_NO_PASSWORD:
             if (code == BN_CLICKED && gLaunch && !gLaunch->checking) {
+                // r5: only for the host that sent the NoChallenge, and only
+                // while it is the address on screen.
+                const std::string target =
+                    gLaunch->auth.noPasswordTarget(std::chrono::steady_clock::now(), launchCurrentHostKey(dlg));
+                if (target.empty()) {
+                    logLine("launch.retry_without_password ignored reason=host_changed");
+                    launchSyncNoPassword(dlg);
+                    return TRUE;
+                }
                 logLine("launch.retry_without_password");
                 gLaunch->retryWithoutPassword = true;
-                launchConnect(dlg);
+                launchConnect(dlg, target);
                 gLaunch->retryWithoutPassword = false;  // also when launchConnect stopped early
             }
             return TRUE;
@@ -5894,7 +5945,7 @@ static int appMain(int argc, char** argv) {
         SetEnvironmentVariableA("JERISLINK_PASSWORD_HOSTS", nullptr);
         if (plen > 0 && plen < std::size(pwHosts)) jl::auth::loadPasswordHosts(pwHosts);
         if (hlen > 0 && hlen < std::size(handoff)) {
-            launch.authAnswer = jl::auth::ui::decodeHandoff(handoff, GetTickCount64());
+            launch.authAnswer = jl::auth::ui::decodeHandoff(handoff, GetTickCount64(), &launch.authAnswerHost);
             if (launch.authAnswer) launch.note.clear();  // the answer brings its own line
             launch.authAnswerSource = "handoff";
             logLine(std::string("launch.auth_handoff ") + (launch.authAnswer ? "ok" : "invalid"));
@@ -5923,6 +5974,7 @@ static int appMain(int argc, char** argv) {
             if (!jl::auth::isTerminal(rep.outcome)) break;
             launch.note.clear();
             launch.authAnswer = rep;
+            launch.authAnswerHost = request.options.sourceIp + ":" + std::to_string(request.options.controlPort);
             launch.authAnswerSource = "cli";
             show = true;
             continue;
@@ -5945,11 +5997,13 @@ static int appMain(int argc, char** argv) {
     gConnectionInfo = ConnectionInfoState{};
     if (auto ac = jl::auth::current()) {
         // A channel that gets an answer the user must act on ends the session.
-        ac->setTerminalHandler([](const jl::auth::Report& r) {
+        // A background NoChallenge does not come here (r5): that channel
+        // retries on its own and at most pauses (see the session loop).
+        ac->setTerminalHandler([hostKey = o.sourceIp + ":" + std::to_string(o.controlPort)](const jl::auth::Report& r) {
             {
                 std::lock_guard<std::mutex> g(gAuthHaltMutex);
                 gAuthHaltNote = authNoteFor(r);
-                gAuthHaltHandoff = jl::auth::ui::encodeHandoff(r, GetTickCount64());
+                gAuthHaltHandoff = jl::auth::ui::encodeHandoff(r, GetTickCount64(), hostKey);
             }
             gAuthHalt = true;
         });
@@ -6481,6 +6535,7 @@ static int appMain(int argc, char** argv) {
         overlayCreate(hwnd);
         overlayShow(false, "session-start", 4000);
 
+        double nextPausedCheckMs = 0;
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
         gLoopResponsiveMs = steadyMsNow();
@@ -6497,6 +6552,14 @@ static int appMain(int argc, char** argv) {
                 }
                 logLine("session.end reason=auth");
                 break;
+            }
+            // r5: a background channel whose NoChallenge retries ran out.
+            // Only that channel is affected; video, audio and the session go on.
+            if (steadyMsNow() >= nextPausedCheckMs) {
+                nextPausedCheckMs = steadyMsNow() + 250;
+                const auto pausedAc = jl::auth::current();
+                const uint32_t paused = pausedAc ? pausedAc->takePausedChannels() : 0;
+                if (paused) showChannelPaused(paused);
             }
             phaseMarkMs = steadyMsNow();
             iterPhases.reset();

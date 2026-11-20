@@ -112,6 +112,9 @@ public:
         uint64_t dropped = 0;      // too old, queue full, discarded, or the attempt halted
         uint64_t discarded = 0;    // of those, dropped because the viewer lost focus
         uint64_t positioned = 0;   // queued clicks given their pointer position
+        uint64_t flushWaits = 0;   // r5: flush found the send buffer full and let the lock go
+        uint64_t noChallengeRetries = 0;  // r5: background NoChallenge, tried again on this channel
+        uint64_t paused = 0;       // r5: those retries ran out (input dropped until the next event)
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
         double joinMs = 0.0;
@@ -120,18 +123,23 @@ public:
     // The viewer lost focus: input still waiting for a reconnect is stale
     // (the user is elsewhere) and must not reach the Mac later. That covers
     // the queue and an event the worker already took from it but has not
-    // handed to send() yet: the generation moves on, and the worker checks
-    // it (under the lock) right before each send. Returns how many queued
-    // events were dropped; one cancelled in flight is counted in
+    // put on the wire yet: the generation moves on under the lock, and the
+    // worker checks it and starts the send under the same lock (r5,
+    // flushOneLocked), so there is no moment in between. Returns how many
+    // queued events were dropped; one cancelled in flight is counted in
     // stats.discarded when the worker drops it.
     size_t discardQueuedInput() {
         if (!async_) return 0;
+        // Said before taking the lock, so a worker flushing item after item
+        // (lock held from one send to the next pop) lets this in first.
+        ++async_->discardWaiting;
         std::lock_guard<std::mutex> g(async_->m);
         const size_t n = async_->queue.size();
         async_->queue.clear();
         ++async_->generation;
         async_->stats.dropped += n;
         async_->stats.discarded += n;
+        --async_->discardWaiting;
         return n;
     }
 
@@ -141,6 +149,22 @@ public:
         if (!async_) return;
         std::lock_guard<std::mutex> g(async_->m);
         async_->beforeFlushSend = std::move(fn);
+    }
+    // Tests (r5): runs on the worker under the lock, after the generation
+    // check passed and right before send() (the commit point).
+    void setAtCommitForTest(std::function<void()> fn) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->atCommit = std::move(fn);
+    }
+    // Tests (r5): the next `n` sends of the flush find the send buffer full
+    // (nothing written); `gap` runs each time in the gap, without the lock,
+    // where the worker waits for room before checking again.
+    void setFlushWouldBlockForTest(int n, std::function<void()> gap) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->forceWouldBlock = n;
+        async_->flushGap = std::move(gap);
     }
 
     // The pointer position (MRC1 0x24 units) the viewer last showed the
@@ -161,6 +185,9 @@ public:
     static constexpr size_t kQueueMax = 256;
     static constexpr int kQueueMaxAgeMs = 3000;
     static constexpr int kRetryGapMs = 250;
+    // r5: a queued item that cannot start going out within this long (send
+    // buffer full the whole time) ends the flush as a failed connection.
+    static constexpr int kFlushSendTimeoutMs = 2000;
 
     bool ping(double* rttMs = nullptr) {
         const uint32_t seq = 0x4d523031;
@@ -470,6 +497,10 @@ private:
         std::deque<Queued> queue;
         uint64_t generation = 0;          // moves on when the viewer loses focus
         std::function<void()> beforeFlushSend;  // tests only
+        std::function<void()> atCommit;         // tests only (r5)
+        std::function<void()> flushGap;         // tests only (r5)
+        int forceWouldBlock = 0;                // tests only (r5)
+        std::atomic<int> discardWaiting{0};     // r5: a focus loss wants the lock
         ReconnectStats stats;
     };
 
@@ -481,6 +512,93 @@ private:
             off += static_cast<size_t>(r);
         }
         return true;
+    }
+
+    static bool setNonBlocking(SOCKET s, bool on) {
+        u_long v = on ? 1 : 0;
+        return ioctlsocket(s, FIONBIO, &v) == 0;
+    }
+
+    // Waits up to `ms` for room in the send buffer of a non-blocking socket.
+    static bool waitWritable(SOCKET s, int ms) {
+        fd_set ws; FD_ZERO(&ws); FD_SET(s, &ws);
+        timeval tv{ms / 1000, (ms % 1000) * 1000};
+        return select(0, nullptr, &ws, nullptr, &tv) > 0;
+    }
+
+    // The rest of a frame whose first bytes are already out (non-blocking
+    // socket, no lock held).
+    static bool sendRestNonBlocking(SOCKET s, const std::vector<uint8_t>& b, size_t off,
+                                    std::chrono::steady_clock::time_point deadline, const std::atomic<bool>& cancel) {
+        while (off < b.size()) {
+            const int r = send(s, reinterpret_cast<const char*>(b.data() + off), static_cast<int>(b.size() - off), 0);
+            if (r > 0) { off += static_cast<size_t>(r); continue; }
+            if (r == 0 || WSAGetLastError() != WSAEWOULDBLOCK) return false;
+            if (cancel || std::chrono::steady_clock::now() >= deadline) return false;
+            waitWritable(s, 50);
+        }
+        return true;
+    }
+
+    // r5: the commit point for one queued item (Pepper's r4 review, item
+    // 1). The generation check and the start of the send happen under a.m,
+    // the lock discardQueuedInput() takes: a focus loss either comes first
+    // (the item is dropped here) or waits until the item is on the wire.
+    // The socket is non-blocking while the worker flushes, so the lock is
+    // never held across a network wait: with the send buffer full nothing
+    // is written, the lock is let go while the worker waits for room, and
+    // the check runs again before the next try. Once the first bytes are
+    // out the item is committed and the rest goes without the lock.
+    enum class Flush { Sent, Discarded, Stopped, Failed };
+    static Flush flushOneLocked(Async& a, std::unique_lock<std::mutex>& lk, SOCKET s, const Queued& q) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushSendTimeoutMs);
+        for (;;) {
+            if (a.discardWaiting.load()) {
+                // A focus loss is waiting for the lock: it goes first, so
+                // this item (not committed yet) sees its new generation.
+                lk.unlock();
+                while (a.discardWaiting.load()) std::this_thread::yield();
+                lk.lock();
+                continue;
+            }
+            if (a.stopping) return Flush::Stopped;
+            if (q.generation != a.generation) {
+                // Focus left after it was taken from the queue: stale.
+                ++a.stats.dropped;
+                ++a.stats.discarded;
+                return Flush::Discarded;
+            }
+            if (a.atCommit) a.atCommit();
+            int sent = SOCKET_ERROR;
+            bool full = false;
+            if (a.forceWouldBlock > 0) {
+                --a.forceWouldBlock;
+                full = true;
+            } else {
+                sent = send(s, reinterpret_cast<const char*>(q.bytes.data()), static_cast<int>(q.bytes.size()), 0);
+                if (sent == SOCKET_ERROR) {
+                    if (WSAGetLastError() != WSAEWOULDBLOCK) return Flush::Failed;
+                    full = true;
+                } else if (sent == 0) {
+                    return Flush::Failed;
+                }
+            }
+            if (!full) {
+                if (static_cast<size_t>(sent) == q.bytes.size()) return Flush::Sent;
+                lk.unlock();
+                const bool ok = sendRestNonBlocking(s, q.bytes, static_cast<size_t>(sent), deadline, a.cancel);
+                lk.lock();
+                return ok ? Flush::Sent : Flush::Failed;
+            }
+            // Nothing written: not committed. Wait for room without the lock.
+            ++a.stats.flushWaits;
+            std::function<void()> gap = a.flushGap;
+            lk.unlock();
+            if (gap) gap();
+            waitWritable(s, 50);
+            lk.lock();
+            if (std::chrono::steady_clock::now() >= deadline) return Flush::Failed;
+        }
     }
 
     static bool isMouseMove(const std::vector<uint8_t>& b) {
@@ -526,6 +644,9 @@ private:
             return true;
         };
         jl::auth::tCancel = &a->cancel;
+        // r5: a background NoChallenge is retried here (0.5, 1, 2, 4 s),
+        // with the queue still waiting, before control pauses.
+        jl::auth::NoChallengeRetry noChallenge(ch);
         std::unique_lock<std::mutex> lk(a->m);
         for (;;) {
             a->cv.wait(lk, [&] { return a->stopping || a->wake; });
@@ -537,17 +658,37 @@ private:
             a->pending = INVALID_SOCKET;
             if (a->stopping) { closeSocket(s); break; }
             if (s == INVALID_SOCKET) {
+                const int wait = noChallenge.afterFailure();
+                if (wait > 0) {
+                    // The Mac (known to want a password) sent no challenge
+                    // in 2 s while the session runs: try again on this
+                    // channel. connecting stays set, so input keeps
+                    // queueing (and ages out as usual).
+                    ++a->stats.noChallengeRetries;
+                    a->cv.wait_for(lk, std::chrono::milliseconds(wait), [&] { return a->stopping; });
+                    if (a->stopping) break;
+                    a->wake = true;
+                    continue;
+                }
                 // The queue waits for the next event's attempt (or ages out).
                 a->connecting = false;
                 a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                if (wait < 0) {
+                    // Retries used up (reported through the Client): the
+                    // waiting input is stale; the next event tries again.
+                    ++a->stats.paused;
+                    a->stats.dropped += a->queue.size();
+                    a->queue.clear();
+                }
                 if (!jl::auth::mayConnect()) {
                     a->stats.dropped += a->queue.size();
                     a->queue.clear();
                 }
                 continue;
             }
-            bool alive = true;
-            while (!a->stopping) {
+            noChallenge.reset();
+            bool alive = setNonBlocking(s, true);
+            while (alive && !a->stopping) {
                 dropAgedLocked(*a, std::chrono::steady_clock::now());
                 if (a->queue.empty()) break;
                 Queued q = std::move(a->queue.front());
@@ -558,25 +699,15 @@ private:
                     hook();
                     lk.lock();
                 }
-                if (a->stopping) { ++a->stats.dropped; break; }
-                if (q.generation != a->generation) {
-                    // Focus left after it was taken from the queue: stale.
-                    ++a->stats.dropped;
-                    ++a->stats.discarded;
-                    continue;
-                }
-                // From here the event counts as sent: the check above and
-                // the start of send() are not atomic, but nothing past this
-                // point waits for the user. A focus loss now is like one a
-                // moment after the UI thread sent it directly.
-                lk.unlock();
-                const bool ok = sendAllOn(s, q.bytes);
-                lk.lock();
-                if (ok) { ++a->stats.flushed; continue; }
+                const Flush f = flushOneLocked(*a, lk, s, q);
+                if (f == Flush::Discarded) continue;
+                if (f == Flush::Sent) { ++a->stats.flushed; continue; }
                 ++a->stats.dropped;
-                alive = false;
+                if (f == Flush::Failed) alive = false;
                 break;
             }
+            // The UI thread sends on it blocking (SO_SNDTIMEO), as before.
+            if (alive && !setNonBlocking(s, false)) alive = false;
             if (a->stopping) { closeSocket(s); break; }
             a->connecting = false;
             if (!alive) {

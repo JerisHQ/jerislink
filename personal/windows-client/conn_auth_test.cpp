@@ -1048,6 +1048,77 @@ void r4KnownPasswordTests() {
     }
 }
 
+// Pepper's PR-B review r4, item 2: a background NoChallenge (the session
+// is up) keeps the session; the channel retries with backoff, no probe.
+void r5BackgroundNoChallengeTests() {
+    const std::string hostKey = "127.0.0.9:7005";
+    const Secret sec = makeSecret(kGood);
+    clearKnownModesForTest();
+    Logged log;
+    Client::Options o;
+    o.password = kGood;
+    o.hostKey = hostKey;
+    o.log = log.fn();
+    auto c = std::make_shared<Client>(std::move(o));
+    int terminals = 0;
+    c->setTerminalHandler([&](const Report&) { ++terminals; });
+    FakeHost host;
+    {
+        // Before the session is up, NoChallenge still ends the attempt.
+        loadPasswordHosts(hostKey);
+        Logged log0;
+        Client::Options o0;
+        o0.password = kGood;
+        o0.hostKey = hostKey;
+        o0.log = log0.fn();
+        auto c0 = std::make_shared<Client>(std::move(o0));
+        SilentHost h;
+        Report r = host.run(*c0, Channel::Control, [&](SOCKET s) { h.run(s, 2300, nullptr); });
+        expect(r.outcome == Outcome::NoChallenge && c0->halted() && !c0->authenticatedOnce(),
+               "r5 first connection NoChallenge: still ends the attempt (first-connect timeout may stop)");
+        clearKnownModesForTest();
+    }
+    Seen seen;
+    Report r = host.run(*c, Channel::Ping, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Ping, seen); });
+    expect(r.outcome == Outcome::Ok && c->authenticatedOnce(), "r5 session up (first channel authenticated)");
+    SilentHost h;
+    r = host.run(*c, Channel::Clipboard, [&](SOCKET s) { h.run(s, 2500, &sec); });
+    expect(r.outcome == Outcome::NoChallenge && !c->halted() && terminals == 0,
+           "r5 background NoChallenge (challenge 2.5 s late): session kept, viewer not told to end");
+    expect(!h.gotData && log.count("auth.probe ") == 0, "  no probe, nothing sent: no try spent");
+    expect(c->mode() == Client::Mode::Password && knownMode(hostKey) == HostMode::Password,
+           "  Password mode kept");
+    expect(log.containsText("auth.no_challenge_background chan=clipboard session=kept"), "  logged as background");
+    // The channel's retry budget (thread that ran the gate).
+    setCurrent(c);
+    NoChallengeRetry retry(Channel::Clipboard);
+    tLastGate = Outcome::Network;
+    expect(retry.afterFailure() == 0, "  retry: other failure keeps the channel's usual path");
+    int waits[5];
+    for (int& w : waits) {
+        tLastGate = Outcome::NoChallenge;
+        w = retry.afterFailure();
+    }
+    expect(waits[0] == 500 && waits[1] == 1000 && waits[2] == 2000 && waits[3] == 4000 && waits[4] == -1,
+           "  retry: backoff 500/1000/2000/4000 ms, then paused");
+    expect(c->takePausedChannels() == (1u << unsigned(Channel::Clipboard)) && c->takePausedChannels() == 0,
+           "  paused channel reported once (only the clipboard)");
+    expect(log.count("auth.no_challenge_retry chan=clipboard") == 4 &&
+               log.containsText("auth.channel_paused chan=clipboard reason=no_challenge retries=4"),
+           "  each retry and the pause logged");
+    tLastGate = Outcome::NoChallenge;
+    expect(retry.afterFailure() == 500, "  after a pause the next attempt gets a new budget");
+    retry.reset();
+    expect(retry.failures() == 0 && !c->halted() && terminals == 0, "  reset after a good connection; session never ended");
+    // Then the late Mac answers in time: the same client authenticates.
+    Seen seen2;
+    r = host.run(*c, Channel::Clipboard, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Clipboard, seen2); });
+    expect(r.outcome == Outcome::Ok && seen2.macValid && !seen2.probe, "  next try authenticates with the password, no probe");
+    tLastGate = Outcome::Network;
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
 void r3Tests() {
     const Secret sec = makeSecret(kGood);
 
@@ -1220,6 +1291,7 @@ int main(int argc, char** argv) {
     oldAndTransitionTests();
     reviewFixTests();
     r3Tests();
+    r5BackgroundNoChallengeTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

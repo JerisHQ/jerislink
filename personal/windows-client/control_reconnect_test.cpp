@@ -9,6 +9,10 @@
 // r4: focus loss also cancels an event the worker already took from the
 // queue but has not sent; a click and its position are one queue item
 // (pushed out of a full queue and aged out together).
+// r5: the generation check and the start of the send are one step under the
+// lock focus loss takes (the socket is non-blocking while flushing); a
+// background NoChallenge on control is retried with backoff, never probing,
+// and never ends the session.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -504,6 +508,233 @@ void r4InputTests() {
     setCurrent(nullptr);
 }
 
+// A host connection that sends no challenge for `ms` (then a late one),
+// watching for anything the viewer sends (a probe or an answer).
+bool silentConn(SOCKET s, const Secret& sec, int ms) {
+    uint8_t type = 0;
+    Bytes p;
+    const Io io = recvFrame(s, Clock::now() + std::chrono::milliseconds(ms), type, p);
+    if (io == Io::Ok) return true;
+    std::array<uint8_t, kNonceBytes> hn{};
+    const Bytes ch = challengeFor(sec, hn);
+    sendAllBytes(s, frame(kTypeChallenge, ch.data(), ch.size()));
+    return recvFrame(s, Clock::now() + std::chrono::milliseconds(300), type, p) == Io::Ok;
+}
+
+// Pepper's r4 review: item 1 (focus loss between check and send) and item 2
+// (background NoChallenge on control).
+void r5Tests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    Listener l;
+
+    // (d) The gap between the check and the send: the worker took key A
+    // down, the generation matched, and the send found no room (nothing
+    // written). Focus leaves exactly then, while the worker waits without
+    // the lock. Before the next send the check runs again: nothing goes.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<int> gaps{0};
+        size_t queued = 99;
+        control.setFlushWouldBlockForTest(1, [&] {
+            ++gaps;
+            queued = control.discardQueuedInput();  // WM_KILLFOCUS in the gap
+        });
+        SOCKET hs = INVALID_SOCKET;
+        bool auth = false;
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        std::thread host([&] {
+            hs = l.accept(5000);
+            if (hs == INVALID_SOCKET) return;
+            auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(hs, 1, 1500);
+        });
+        control.sendKey(true, 0x0041);
+        control.sendKey(false, 0x0041);
+        host.join();
+        for (int i = 0; i < 100 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        const auto st = control.reconnectStats();
+        expect(auth && gaps == 1 && queued == 1, "r5 gap: focus left while key A down waited for room (1 more queued)");
+        expect(got.empty(), "  nothing reached the Mac (" + std::to_string(got.size()) + " frames)");
+        expect(st.discarded == 2 && st.flushed == 0 && st.flushWaits == 1,
+               "  stats: discarded=2 (1 rechecked after the gap), flushed=0, flushWaits=1");
+        control.sendKey(true, 0x0042);
+        auto fresh = readFrames(hs, 1, 2000);
+        expect(fresh.size() == 1 && fresh[0].second[2] == 0x42, "  new input after focus returns goes out (blocking again)");
+        control.stop();
+        closesocket(hs);
+    }
+
+    // (e) The commit point: the check passed and send() is next, under the
+    // lock. Focus loss now waits for that send (it cannot slip in between),
+    // then drops what is still queued.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<int> commits{0};
+        std::atomic<bool> discardDone{false};
+        std::atomic<bool> blockedAtCommit{false};
+        std::atomic<size_t> queued{99};
+        std::thread focus;
+        control.setAtCommitForTest([&] {
+            if (commits++ != 0) return;
+            focus = std::thread([&] { queued = control.discardQueuedInput(); discardDone = true; });
+            Sleep(150);
+            blockedAtCommit = !discardDone;  // still waiting for the lock
+        });
+        SOCKET hs = INVALID_SOCKET;
+        bool auth = false;
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        std::thread host([&] {
+            hs = l.accept(5000);
+            if (hs == INVALID_SOCKET) return;
+            auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(hs, 2, 1500);
+        });
+        control.sendKey(true, 0x0041);
+        control.sendKey(false, 0x0041);
+        host.join();
+        if (focus.joinable()) focus.join();
+        for (int i = 0; i < 100 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        const auto st = control.reconnectStats();
+        expect(auth && commits == 1 && blockedAtCommit && queued <= 1,
+               "r5 commit: focus loss waited for the send already committed");
+        expect(got.size() == 1 && got[0].first == 0x10 && got[0].second[0] == 1,
+               "  only the committed key A down reached the Mac; key A up (queued before focus left) did not (" +
+                   std::to_string(got.size()) + " frames)");
+        expect(st.flushed == 1 && st.discarded == 1, "  stats: flushed=1, discarded=1");
+        control.setAtCommitForTest(nullptr);
+        control.stop();
+        closesocket(hs);
+    }
+
+    // (f) Background NoChallenge: the session is up (authenticated), the
+    // control socket drops, and the reconnect's challenge comes 2.5 s late.
+    // The worker tries again on control after 0.5 s; no probe, Password
+    // mode kept, the session is not ended, the queued key goes out.
+    {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, "127.0.0.1:" + std::to_string(l.port));
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> probed{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            closesocket(s);  // the control connection drops
+            s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            if (silentConn(s, sec, 2500)) probed = true;
+            closesocket(s);
+            s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s, 64, 2000);
+            closesocket(s);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        Sleep(200);
+        // Input until the worker sees the dropped socket and reconnects.
+        for (int i = 0; i < 200 && !control.reconnectStats().connecting; ++i) {
+            control.sendKey(true, 0x0043);
+            Sleep(16);
+        }
+        for (int i = 0; i < 500 && control.reconnectStats().noChallengeRetries == 0; ++i) Sleep(10);
+        control.sendKey(true, 0x0046);  // typed while the retry waits: queued for it
+        host.join();
+        const auto st = control.reconnectStats();
+        const bool sawF = !got.empty() && got.back().first == 0x10 && got.back().second[2] == 0x46;
+        expect(auth1 && first.size() == 1, "r5 background: session up, first key delivered");
+        expect(!probed && c->mode() == Client::Mode::Password && knownMode("127.0.0.1:" + std::to_string(l.port)) == HostMode::Password,
+               "  late challenge: no probe, nothing sent, Password mode kept");
+        expect(terms == 0 && !c->halted(), "  session not ended (no terminal answer, client not halted)");
+        expect(st.noChallengeRetries == 1 && auth2 && sawF,
+               "  retried on control after backoff, then the queued key went out (" +
+                   std::to_string(st.noChallengeRetries) + " retries, " + std::to_string(got.size()) + " frames)");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+
+    // (g) The Mac stays silent through every retry: control pauses (queue
+    // dropped, reported once), the session still goes on, and the next
+    // event starts a new attempt that goes through.
+    {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, "127.0.0.1:" + std::to_string(l.port));
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<int> silent{0}, probes{0};
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) readFrames(s, 1, 2000);
+            closesocket(s);
+            for (int i = 0; i < 1 + kNoChallengeRetries; ++i) {
+                s = l.accept(8000);
+                if (s == INVALID_SOCKET) return;
+                ++silent;
+                if (silentConn(s, sec, 2300)) ++probes;
+                closesocket(s);
+            }
+            s = l.accept(15000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s, 64, 2000);
+            closesocket(s);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        Sleep(200);
+        for (int i = 0; i < 200 && !control.reconnectStats().connecting; ++i) {
+            control.sendKey(true, 0x0044);
+            Sleep(16);
+        }
+        for (int i = 0; i < 3000 && control.reconnectStats().paused == 0; ++i) Sleep(10);
+        Sleep(300);  // past the normal retry gap
+        const auto mid = control.reconnectStats();
+        const uint32_t pausedBits = c->takePausedChannels();
+        expect(mid.paused == 1 && mid.noChallengeRetries == uint64_t(kNoChallengeRetries) && silent == 1 + kNoChallengeRetries,
+               "r5 retries spent: control paused after " + std::to_string(mid.noChallengeRetries) + " retries");
+        expect(probes == 0 && pausedBits == (1u << unsigned(Channel::Control)) && terms == 0 && !c->halted(),
+               "  no probe, only control reported paused, session not ended");
+        control.sendKey(true, 0x0045);  // the user's next key: a new attempt
+        host.join();
+        expect(auth2 && got.size() == 1 && got[0].first == 0x10 && got[0].second[2] == 0x45,
+               "  next key after the pause reconnects and goes out; the stale ones were dropped (" +
+                   std::to_string(got.size()) + " frames)");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -513,6 +744,7 @@ int main() {
     stopTests();
     staleInputTests();
     r4InputTests();
+    r5Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -197,6 +197,9 @@ bool FileSession::recvPacket(SOCKET s, uint8_t& type, std::vector<uint8_t>& payl
 
 void FileSession::run() {
     int backoffMs = kBackoffMinMs;
+    // r5: a background NoChallenge is retried on this channel only (0.5, 1,
+    // 2, 4 s); after that file transfer pauses for the session.
+    jl::auth::NoChallengeRetry noChallenge(jl::auth::Channel::File);
     while (!stopRequested_) {
         if (!jl::auth::mayConnect()) {
             // A connection-password answer is waiting for the user.
@@ -218,6 +221,19 @@ void FileSession::run() {
             }
         }
         Outcome outcome = Outcome::ConnectFailed;
+        if (s == INVALID_SOCKET) {
+            const int wait = noChallenge.afterFailure();
+            if (wait < 0) {
+                log("file.paused reason=no_challenge");
+                break;
+            }
+            if (wait > 0) {
+                if (!sleepFor(wait)) break;
+                continue;
+            }
+        } else {
+            noChallenge.reset();
+        }
         if (s != INVALID_SOCKET) {
             using namespace jl::file;
             // r3: the long-lived pull session also shows the Mac's NOTICEs.

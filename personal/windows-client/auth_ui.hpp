@@ -52,20 +52,33 @@ inline std::wstring probeRaceText(uint8_t triesLeft) {
 // shows the same line, countdown and focus as an answer it got itself.
 // "v1;o=<outcome>;t=<tries>;k=<saved key>;p=<probe race>;u=<locked until>"
 // where u is a GetTickCount64 value (shared by every process on the PC).
-inline std::wstring encodeHandoff(const Report& r, uint64_t nowTickMs) {
+// r5: an optional ";h=<ip:port>" says which host gave the answer, so the
+// relaunched screen offers "Retry without password" only for that host.
+inline bool validHostKey(const std::string& h) {
+    if (h.empty() || h.size() > 21) return false;
+    for (char c : h) if (!((c >= '0' && c <= '9') || c == '.' || c == ':')) return false;
+    return true;
+}
+
+inline std::wstring encodeHandoff(const Report& r, uint64_t nowTickMs, const std::string& host = {}) {
     if (!isTerminal(r.outcome)) return {};
     const uint64_t until = r.outcome == Outcome::Locked ? nowTickMs + uint64_t(r.retrySeconds) * 1000 : 0;
     wchar_t buf[128];
     std::swprintf(buf, 128, L"v1;o=%d;t=%u;k=%d;p=%d;u=%llu", int(r.outcome), unsigned(r.triesLeft),
                   r.usedSavedKey ? 1 : 0, r.probeRace ? 1 : 0, static_cast<unsigned long long>(until));
-    return buf;
+    std::wstring out = buf;
+    if (validHostKey(host)) out += L";h=" + std::wstring(host.begin(), host.end());
+    return out;
 }
 
-inline std::optional<Report> decodeHandoff(const std::wstring& text, uint64_t nowTickMs) {
+inline std::optional<Report> decodeHandoff(const std::wstring& text, uint64_t nowTickMs,
+                                           std::string* hostOut = nullptr) {
+    if (hostOut) hostOut->clear();
     if (text.rfind(L"v1;", 0) != 0) return std::nullopt;
     long long o = -1, t = -1, k = -1, p = -1;
     unsigned long long u = 0;
     bool haveU = false;
+    std::string host;
     size_t pos = 3;
     while (pos < text.size()) {
         size_t end = text.find(L';', pos);
@@ -74,6 +87,15 @@ inline std::optional<Report> decodeHandoff(const std::wstring& text, uint64_t no
         pos = end + 1;
         if (field.size() < 3 || field[1] != L'=') return std::nullopt;
         const std::wstring value = field.substr(2);
+        if (field[0] == L'h') {
+            if (!host.empty()) return std::nullopt;
+            for (wchar_t c : value) {
+                if (c > 0x7f) return std::nullopt;
+                host.push_back(static_cast<char>(c));
+            }
+            if (!validHostKey(host)) return std::nullopt;
+            continue;
+        }
         if (value.empty() || value.size() > 20) return std::nullopt;
         for (wchar_t c : value) if (!std::iswdigit(c)) return std::nullopt;
         const unsigned long long n = std::wcstoull(value.c_str(), nullptr, 10);
@@ -100,6 +122,7 @@ inline std::optional<Report> decodeHandoff(const std::wstring& text, uint64_t no
         if (left > 24ull * 3600 * 1000) return std::nullopt;
         r.retrySeconds = static_cast<uint32_t>((left + 999) / 1000);
     }
+    if (hostOut) *hostOut = host;
     return r;
 }
 
@@ -108,10 +131,12 @@ public:
     using Clock = std::chrono::steady_clock;
 
     // A new answer from the host. Returns true when it is one the launch
-    // screen shows (terminal); false means carry on connecting.
-    bool apply(const Report& r, Clock::time_point now) {
+    // screen shows (terminal); false means carry on connecting. `host` is
+    // the ip:port that gave it (r5: "Retry without password" is bound to it).
+    bool apply(const Report& r, Clock::time_point now, const std::string& host = {}) {
         lockedUntil_ = {};
         view_ = View{};
+        host_ = host;
         switch (r.outcome) {
         case Outcome::Ok:
         case Outcome::Open:
@@ -170,6 +195,23 @@ public:
     }
 
     // Once a second while counting down: the text and button follow the clock.
+    // r5: offerNoPassword only while `currentHost` (the address on screen,
+    // ip:port) is the host that sent the NoChallenge.
+    View view(Clock::time_point now, const std::string& currentHost) const {
+        View v = view(now);
+        v.offerNoPassword = v.offerNoPassword && !host_.empty() && currentHost == host_;
+        return v;
+    }
+
+    // The host "Retry without password" may clear Password mode for: the
+    // one that sent the NoChallenge, and only while it is the one on screen.
+    // Empty: nothing to clear (the button does nothing).
+    std::string noPasswordTarget(Clock::time_point now, const std::string& currentHost) const {
+        return view(now, currentHost).offerNoPassword ? host_ : std::string();
+    }
+
+    const std::string& answerHost() const { return host_; }
+
     View view(Clock::time_point now) const {
         View v = view_;
         if (lockedUntil_ != Clock::time_point{}) {
@@ -195,13 +237,15 @@ public:
             lockedUntil_ = {};
             view_ = View{};
             view_.focusPassword = true;
+            host_.clear();
         }
     }
 
-    void clear() { lockedUntil_ = {}; view_ = View{}; }
+    void clear() { lockedUntil_ = {}; view_ = View{}; host_.clear(); }
 
 private:
     View view_;
+    std::string host_;
     Clock::time_point lockedUntil_{};
 };
 

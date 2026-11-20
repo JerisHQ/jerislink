@@ -222,6 +222,19 @@ int main() {
         CHECK(relaunch.openSettings && showLaunchScreen(relaunch, false));
     }
 
+    // r5: the control port in the launch screen's ip:port key follows
+    // --control-port exactly as resolveLaunch does (bad values keep 38400).
+    {
+        CHECK(controlPortArg({}) == 38400);
+        CHECK(controlPortArg({"--control-port", "47990"}) == 47990);
+        CHECK(controlPortArg({"--audio", "off", "--control-port", "47990"}) ==
+              resolveLaunch({"--audio", "off", "--control-port", "47990"}, typicalSaved(), "", tailnet).options.controlPort);
+        CHECK(controlPortArg({"--control-port", "1", "--control-port", "2"}) == 2);
+        CHECK(controlPortArg({"--control-port", "70000"}) == 38400);
+        CHECK(controlPortArg({"--control-port", "x"}) == 38400);
+        CHECK(controlPortArg({"--control-port"}) == 38400);
+    }
+
     std::printf("viewer_options_test: %d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }
