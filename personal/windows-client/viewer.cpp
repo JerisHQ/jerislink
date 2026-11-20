@@ -702,11 +702,18 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
 }
 
 // Focus left the viewer: keys and clicks still waiting for a control
-// reconnect are stale and must not reach the Mac later.
+// reconnect are stale and must not reach the Mac later. r6: a key or button
+// whose down already reached the Mac is released by the channel (now, or
+// first after the reconnect), so nothing stays held there.
 static void discardQueuedInput(const char* reason) {
     if (!gControl) return;
+    const auto before = gControl->reconnectStats();
     const size_t n = gControl->discardQueuedInput();
-    if (n) logLine(std::string("input.queue_discarded reason=") + reason + " events=" + std::to_string(n));
+    const auto after = gControl->reconnectStats();
+    const uint64_t releasedNow = after.released - before.released;
+    if (n || releasedNow)
+        logLine(std::string("input.queue_discarded reason=") + reason + " events=" + std::to_string(n) +
+                " released=" + std::to_string(releasedNow));
 }
 
 static void releaseRemoteModifiers() {
@@ -4003,6 +4010,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         logFirstInput("keyboard");
         const bool repeat = (lParam & (1LL << 30)) != 0;
+        // r6: control paused after its retries ran out: only a fresh press
+        // (not auto-repeat, not the pointer) starts a new round.
+        if (ControlChannel::isFreshKeyDown(static_cast<uint64_t>(lParam)) && gControl->resumeOnUserKey())
+            logLine("control.resume reason=fresh_key");
         // Keyboard preset, Win+Space, Win+C, Ctrl compat shortcuts, Ctrl+Y and
         // plain keys: keymap.hpp.
         const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());

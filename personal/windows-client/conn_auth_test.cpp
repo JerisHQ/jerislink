@@ -1106,10 +1106,20 @@ void r5BackgroundNoChallengeTests() {
     expect(log.count("auth.no_challenge_retry chan=clipboard") == 4 &&
                log.containsText("auth.channel_paused chan=clipboard reason=no_challenge retries=4"),
            "  each retry and the pause logged");
+    // r6 (Pepper's r5 review, item 2): no new round on its own; only
+    // reset() (a good connection, or the user's fresh key press) ends it.
     tLastGate = Outcome::NoChallenge;
-    expect(retry.afterFailure() == 500, "  after a pause the next attempt gets a new budget");
+    const int again1 = retry.afterFailure();
+    const int again2 = retry.afterFailure();
+    expect(again1 == -1 && again2 == -1 && retry.paused() && c->takePausedChannels() == 0 &&
+               log.count("auth.channel_paused chan=clipboard") == 1,
+           "  r6: stays paused after the budget ran out (no new round, not reported again)");
     retry.reset();
-    expect(retry.failures() == 0 && !c->halted() && terminals == 0, "  reset after a good connection; session never ended");
+    expect(retry.failures() == 0 && !retry.paused() && !c->halted() && terminals == 0,
+           "  reset after a good connection; session never ended");
+    tLastGate = Outcome::NoChallenge;
+    expect(retry.afterFailure() == 500, "  r6: after reset() the next attempt gets a new budget");
+    retry.reset();
     // Then the late Mac answers in time: the same client authenticates.
     Seen seen2;
     r = host.run(*c, Channel::Clipboard, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Clipboard, seen2); });

@@ -13,6 +13,10 @@
 // lock focus loss takes (the socket is non-blocking while flushing); a
 // background NoChallenge on control is retried with backoff, never probing,
 // and never ends the session.
+// r6: a key or button whose down reached the Mac is released on focus loss
+// (at once when live, else first after the reconnect), and its later up is
+// not sent twice; once the retries ran out only a fresh key press starts a
+// new round (pointer moves and auto-repeat do not).
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -575,7 +579,8 @@ void r5Tests() {
 
     // (e) The commit point: the check passed and send() is next, under the
     // lock. Focus loss now waits for that send (it cannot slip in between),
-    // then drops what is still queued.
+    // then drops what is still queued. r6: key A down did reach the Mac, so
+    // A is released: the Mac gets a pair, never a held key.
     {
         ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
         control.setIoTimeoutMs(100);
@@ -598,7 +603,7 @@ void r5Tests() {
             hs = l.accept(5000);
             if (hs == INVALID_SOCKET) return;
             auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
-            if (auth) got = readFrames(hs, 2, 1500);
+            if (auth) got = readFrames(hs, 3, 1500);
         });
         control.sendKey(true, 0x0041);
         control.sendKey(false, 0x0041);
@@ -608,10 +613,12 @@ void r5Tests() {
         const auto st = control.reconnectStats();
         expect(auth && commits == 1 && blockedAtCommit && queued <= 1,
                "r5 commit: focus loss waited for the send already committed");
-        expect(got.size() == 1 && got[0].first == 0x10 && got[0].second[0] == 1,
-               "  only the committed key A down reached the Mac; key A up (queued before focus left) did not (" +
+        expect(got.size() == 2 && got[0].first == 0x10 && got[0].second[0] == 1 && got[0].second[2] == 0x41 &&
+                   got[1].first == 0x10 && got[1].second[0] == 0 && got[1].second[2] == 0x41,
+               "  r6: the Mac got key A down and then key A up, a pair, nothing held (" +
                    std::to_string(got.size()) + " frames)");
-        expect(st.flushed == 1 && st.discarded == 1, "  stats: flushed=1, discarded=1");
+        expect(st.flushed == 1 && st.discarded == 1 && st.released == 1,
+               "  stats: flushed=1, discarded=1 (the queued up), released=1 (sent for the down)");
         control.setAtCommitForTest(nullptr);
         control.stop();
         closesocket(hs);
@@ -675,8 +682,9 @@ void r5Tests() {
     }
 
     // (g) The Mac stays silent through every retry: control pauses (queue
-    // dropped, reported once), the session still goes on, and the next
-    // event starts a new attempt that goes through.
+    // dropped, reported once) and the session still goes on. r6: pointer
+    // moves and auto-repeat start no new round (no connection reaches the
+    // host); a fresh key press does, and that attempt goes through.
     {
         clearKnownModesForTest();
         std::atomic<int> terms{0};
@@ -687,7 +695,8 @@ void r5Tests() {
         control.setIoTimeoutMs(100);
         control.setBackgroundReconnect(true);
         bool auth1 = false, auth2 = false;
-        std::atomic<int> silent{0}, probes{0};
+        std::atomic<int> silent{0}, probes{0}, noiseConns{0};
+        std::atomic<bool> noiseDone{false};
         std::vector<std::pair<uint8_t, Bytes>> got;
         std::thread host([&] {
             SOCKET s = l.accept(5000);
@@ -701,6 +710,11 @@ void r5Tests() {
                 ++silent;
                 if (silentConn(s, sec, 2300)) ++probes;
                 closesocket(s);
+            }
+            // Paused: any connection now is a new round nobody asked for.
+            while (!noiseDone) {
+                s = l.accept(50);
+                if (s != INVALID_SOCKET) { ++noiseConns; closesocket(s); }
             }
             s = l.accept(15000);
             if (s == INVALID_SOCKET) return;
@@ -723,14 +737,199 @@ void r5Tests() {
                "r5 retries spent: control paused after " + std::to_string(mid.noChallengeRetries) + " retries");
         expect(probes == 0 && pausedBits == (1u << unsigned(Channel::Control)) && terms == 0 && !c->halted(),
                "  no probe, only control reported paused, session not ended");
-        control.sendKey(true, 0x0045);  // the user's next key: a new attempt
+        // r6: pointer moves and a held key's auto-repeat (the viewer does
+        // not call resumeOnUserKey for those) for 1.5 s, then past the gap.
+        UiClock ui;
+        for (int i = 0; i < 90; ++i) {
+            ui.call([&] { return control.sendMouseMoveAbsolute(uint16_t(100 + i), 200); });
+            ui.call([&] { return control.sendKey(true, 0x0044); });  // auto-repeat
+            Sleep(16);
+        }
+        Sleep(600);
+        noiseDone = true;
+        const auto quiet = control.reconnectStats();
+        expect(noiseConns == 0 && !quiet.connecting && quiet.pausedNow && quiet.pausedDrops >= 180 &&
+                   quiet.noChallengeRetries == uint64_t(kNoChallengeRetries) && quiet.paused == 1,
+               "  r6: moves and auto-repeat after the pause start no new round (" + std::to_string(noiseConns) +
+                   " connections, " + std::to_string(quiet.pausedDrops) + " dropped)");
+        expect(ui.maxMs < kUiBudgetMs && c->takePausedChannels() == 0,
+               "  r6: UI calls return at once while paused, no second paused report");
+        const bool resumed = control.resumeOnUserKey();  // a fresh key press
+        control.sendKey(true, 0x0045);
         host.join();
-        expect(auth2 && got.size() == 1 && got[0].first == 0x10 && got[0].second[2] == 0x45,
-               "  next key after the pause reconnects and goes out; the stale ones were dropped (" +
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects < 2; ++i) Sleep(10);
+        const auto after = control.reconnectStats();
+        expect(resumed && after.resumes == 1 && !after.pausedNow && !control.resumeOnUserKey(),
+               "  r6: a fresh key press ends the pause (once)");
+        expect(auth2 && got.size() == 1 && got[0].first == 0x10 && got[0].second[2] == 0x45 && after.reconnects == 2,
+               "  that key starts a new round, reconnects and goes out; the stale ones were dropped (" +
                    std::to_string(got.size()) + " frames)");
         control.stop();
         setCurrent(nullptr);
         clearKnownModesForTest();
+    }
+    setCurrent(nullptr);
+}
+
+// Pepper's r5 review: item 1 (a key or button down that reached the Mac
+// is released on focus loss) and item 2's helper.
+void r6Tests() {
+    expect(ControlChannel::isFreshKeyDown(0x001E0001) && ControlChannel::isFreshKeyDown(0x20380001),
+           "r6 fresh key: WM_KEYDOWN / WM_SYSKEYDOWN with lParam bit 30 clear counts");
+    expect(!ControlChannel::isFreshKeyDown(0x401E0001) && !ControlChannel::isFreshKeyDown(0x60380001),
+           "  auto-repeat (bit 30 set) does not");
+
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    Listener l;
+    auto isKey = [](const std::pair<uint8_t, Bytes>& f, int down, uint8_t k) {
+        return f.first == 0x10 && f.second.size() == 3 && f.second[0] == down && f.second[2] == k;
+    };
+
+    // (h) Handoff: the worker commits key A down at the moment focus leaves
+    // (the reconnect hands over right after). The up comes from the viewer
+    // only after the focus loss (WM_KEYUP or its own cleanup): the Mac gets
+    // A down, the release for it, and that later up is not sent again.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        std::atomic<int> commits{0};
+        std::atomic<bool> discardDone{false};
+        std::thread focus;
+        control.setAtCommitForTest([&] {
+            if (commits++ != 0) return;
+            focus = std::thread([&] { control.discardQueuedInput(); discardDone = true; });
+            Sleep(50);
+        });
+        SOCKET hs = INVALID_SOCKET;
+        bool auth = false;
+        std::vector<std::pair<uint8_t, Bytes>> got;
+        std::thread host([&] {
+            hs = l.accept(5000);
+            if (hs == INVALID_SOCKET) return;
+            auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) got = readFrames(hs, 4, 2500);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && !discardDone; ++i) Sleep(10);
+        if (focus.joinable()) focus.join();
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        control.sendKey(false, 0x0041);  // after the focus loss
+        control.sendKey(true, 0x0042);   // focus back: new input
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        expect(auth && discardDone && got.size() == 4 && isKey(got[0], 1, 0x41) && isKey(got[1], 0, 0x41) &&
+                   isKey(got[2], 1, 0x42) && isKey(got[3], 0, 0x42),
+               "r6 handoff: A down sent at the handoff, up queued after focus loss: one A pair, then B (" +
+                   std::to_string(got.size()) + " frames)");
+        expect(st.released == 1 && st.swallowed == 1, "  stats: released=1, swallowed=1 (the later A up)");
+        control.setAtCommitForTest(nullptr);
+        control.stop();
+        closesocket(hs);
+    }
+
+    // (i) Live: key A and the right button (0x21) went out on the live
+    // connection; focus leaves: both ups go at once. The viewer's own ups
+    // that follow are not sent again; new input goes after them.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        SOCKET hs = INVALID_SOCKET;
+        bool auth = false;
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::atomic<bool> firstIn{false};
+        std::thread host([&] {
+            hs = l.accept(5000);
+            if (hs == INVALID_SOCKET) return;
+            auth = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+            if (auth) first = readFrames(hs, 1, 2000);
+            firstIn = true;
+            if (auth) got = readFrames(hs, 6, 2500);
+        });
+        control.sendKey(true, 0x0050);  // starts the connection
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.sendKey(false, 0x0050);
+        control.sendKey(true, 0x0041);
+        control.sendMouseButton(1, true);
+        Sleep(100);
+        const size_t n = control.discardQueuedInput();
+        const auto mid = control.reconnectStats();
+        control.sendKey(false, 0x0041);    // viewer: WM_KEYUP after the focus loss
+        control.sendMouseButton(1, false);  // viewer: releaseRemoteButtons
+        control.sendKey(true, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        auto isBtn = [](const std::pair<uint8_t, Bytes>& f, int down) {
+            return f.first == 0x21 && f.second.size() == 2 && f.second[0] == 1 && f.second[1] == down;
+        };
+        expect(auth && first.size() == 1 && n == 0 && mid.released == 2 && got.size() == 6 &&
+                   isKey(got[0], 0, 0x50) && isKey(got[1], 1, 0x41) && isBtn(got[2], 1) && isKey(got[3], 0, 0x41) &&
+                   isBtn(got[4], 0) && isKey(got[5], 1, 0x42),
+               "r6 live: focus left with A and the right button down: both ups sent at once, then new input (" +
+                   std::to_string(got.size()) + " frames)");
+        expect(st.released == 2 && st.swallowed == 2, "  stats: released=2, swallowed=2 (the viewer's later ups)");
+        control.stop();
+        closesocket(hs);
+    }
+
+    // (j) Reconnect: key A and the left button with a click count (0x25)
+    // went out live, then the connection dropped. The viewer's A up waits for
+    // the reconnect, and focus leaves before it is back. The new connection
+    // gets A up and the button up (same frame type and click count) before
+    // anything else; the viewer's later button up is not sent again.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 2, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok);  // 600 ms: focus leaves meanwhile
+            if (auth2) got = readFrames(s2, 4, 2000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+        control.sendMouseButtonExtended(0, true, 2);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        control.close();                 // the connection dropped
+        control.sendKey(false, 0x0041);  // waits for the reconnect
+        for (int i = 0; i < 100 && !control.reconnectStats().connecting; ++i) Sleep(10);
+        const size_t n = control.discardQueuedInput();
+        const auto mid = control.reconnectStats();
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects < 2; ++i) Sleep(10);
+        control.sendMouseButtonExtended(0, false, 2);  // viewer: releaseRemoteButtons
+        control.sendKey(true, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        const bool btnUp = got.size() >= 2 && got[1].first == 0x25 && got[1].second.size() == 3 &&
+                           got[1].second[0] == 0 && got[1].second[1] == 0 && got[1].second[2] == 2;
+        expect(auth1 && first.size() == 2 && mid.connecting && n == 1 && mid.released == 0,
+               "r6 reconnect: A and the left button were down when the connection dropped; focus left during the reconnect");
+        expect(auth2 && got.size() == 3 && isKey(got[0], 0, 0x41) && btnUp && isKey(got[2], 1, 0x42),
+               "  the new connection got A up and the button up (0x25, 2 clicks) first, then B; nothing more (" +
+                   std::to_string(got.size()) + " frames)");
+        expect(st.released == 2 && st.swallowed == 1, "  stats: released=2, swallowed=1 (the viewer's later button up)");
+        control.stop();
     }
     setCurrent(nullptr);
 }
@@ -745,6 +944,7 @@ int main() {
     staleInputTests();
     r4InputTests();
     r5Tests();
+    r6Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -1261,9 +1261,11 @@ inline bool gate(SOCKET s, Channel ch, double connectMs) {
 //        no try is spent.
 //   0    any other failure: the channel's usual path.
 //   -1   kNoChallengeRetries used up: this channel stops trying on its own
-//        (reported once through Client::channelPaused); the budget starts
-//        again for the next attempt.
-// reset() after a connection that authenticated.
+//        (reported once through Client::channelPaused). It stays paused,
+//        and every later call says -1 again without a new report, until
+//        reset() (r6, Pepper's r5 review item 2: no new round on its own).
+// reset() after a connection that authenticated, or when the user asks for
+// a new try (control: a fresh key press, ControlChannel::resumeOnUserKey).
 class NoChallengeRetry {
 public:
     explicit NoChallengeRetry(Channel ch) : ch_(ch) {}
@@ -1272,8 +1274,10 @@ public:
         auto c = current();
         if (!c || c->halted() || !c->authenticatedOnce()) return 0;
         if (failures_ >= kNoChallengeRetries) {
-            failures_ = 0;
-            c->channelPaused(ch_, kNoChallengeRetries);
+            if (!paused_) {
+                paused_ = true;
+                c->channelPaused(ch_, kNoChallengeRetries);
+            }
             return -1;
         }
         const int wait = kNoChallengeFirstGapMs << failures_;
@@ -1281,12 +1285,14 @@ public:
         c->noteNoChallengeRetry(ch_, failures_, wait);
         return wait;
     }
-    void reset() { failures_ = 0; }
+    void reset() { failures_ = 0; paused_ = false; }
     int failures() const { return failures_; }
+    bool paused() const { return paused_; }
 
 private:
     Channel ch_;
     int failures_ = 0;
+    bool paused_ = false;
 };
 
 inline double msSince(Clock::time_point t0) {

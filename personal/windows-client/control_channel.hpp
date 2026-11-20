@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,7 +116,12 @@ public:
         uint64_t positioned = 0;   // queued clicks given their pointer position
         uint64_t flushWaits = 0;   // r5: flush found the send buffer full and let the lock go
         uint64_t noChallengeRetries = 0;  // r5: background NoChallenge, tried again on this channel
-        uint64_t paused = 0;       // r5: those retries ran out (input dropped until the next event)
+        uint64_t paused = 0;       // r5: those retries ran out (input dropped until a fresh key press)
+        uint64_t released = 0;     // r6: key/button ups sent for downs the Mac had when focus left
+        uint64_t swallowed = 0;    // r6: later ups for those, not sent again
+        uint64_t pausedDrops = 0;  // r6: events dropped while paused (moves, auto-repeat...)
+        uint64_t resumes = 0;      // r6: fresh key presses that ended a pause
+        bool pausedNow = false;    // r6: paused right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
         double joinMs = 0.0;
@@ -125,23 +132,65 @@ public:
     // the queue and an event the worker already took from it but has not
     // put on the wire yet: the generation moves on under the lock, and the
     // worker checks it and starts the send under the same lock (r5,
-    // flushOneLocked), so there is no moment in between. Returns how many
-    // queued events were dropped; one cancelled in flight is counted in
-    // stats.discarded when the worker drops it.
+    // flushOneLocked), so there is no moment in between.
+    // r6 (Pepper's r5 review, item 1): a key or mouse button whose down
+    // already reached the Mac is released, never left held. Its up is owed:
+    // sent now when the connection is live, otherwise first thing after the
+    // reconnect, before any other input. A down that never went out is
+    // dropped with its up. A later up for a released key (the viewer's own
+    // focus-loss cleanup, or a WM_KEYUP) is not sent a second time.
+    // Returns how many queued events were dropped; one cancelled in flight
+    // is counted in stats.discarded when the worker drops it.
     size_t discardQueuedInput() {
         if (!async_) return 0;
+        std::shared_ptr<Async> a = async_;
         // Said before taking the lock, so a worker flushing item after item
         // (lock held from one send to the next pop) lets this in first.
-        ++async_->discardWaiting;
-        std::lock_guard<std::mutex> g(async_->m);
-        const size_t n = async_->queue.size();
-        async_->queue.clear();
-        ++async_->generation;
-        async_->stats.dropped += n;
-        async_->stats.discarded += n;
-        --async_->discardWaiting;
+        ++a->discardWaiting;
+        std::unique_lock<std::mutex> g(a->m);
+        const size_t n = a->queue.size();
+        a->queue.clear();
+        ++a->generation;
+        a->stats.dropped += n;
+        a->stats.discarded += n;
+        for (const uint16_t k : a->keysDown) { a->owedKeys.insert(k); a->swallowKeys.insert(k); }
+        a->keysDown.clear();
+        for (const auto& b : a->buttonsDown) { a->owedButtons[b.first] = b.second; a->swallowButtons.insert(b.first); }
+        a->buttonsDown.clear();
+        --a->discardWaiting;
+        // Live and no reconnect running: only this (UI) thread sends on a->s.
+        if (a->connecting || a->s == INVALID_SOCKET || !hasOwedLocked(*a)) return n;
+        const SOCKET live = a->s;
+        const Owed owed = takeOwedLocked(*a);
+        g.unlock();
+        if (sendAllOn(live, owed.bytes)) {
+            g.lock();
+            a->stats.released += owed.count;
+            return n;
+        }
+        g.lock();
+        restoreOwedLocked(*a, owed);
+        if (a->s == live) closeSocket(a->s);  // the next event reconnects and sends them first
         return n;
     }
+
+    // r6 (Pepper's r5 review, item 2): after the background retries ran out
+    // control stays paused: pointer moves, auto-repeat and other events are
+    // dropped and start nothing. Only a fresh key press (WM_KEYDOWN with
+    // lParam bit 30 clear, see isFreshKeyDown) gives a new budget; the
+    // viewer calls this before sending that key. True when it ended a pause.
+    bool resumeOnUserKey() {
+        if (!async_) return false;
+        std::lock_guard<std::mutex> g(async_->m);
+        if (!async_->paused) return false;
+        async_->paused = false;
+        async_->resume = true;  // the worker resets its NoChallengeRetry
+        async_->nextTry = {};
+        ++async_->stats.resumes;
+        return true;
+    }
+    // WM_KEYDOWN / WM_SYSKEYDOWN lParam: bit 30 is set on auto-repeat.
+    static constexpr bool isFreshKeyDown(uint64_t lParam) { return (lParam & (uint64_t(1) << 30)) == 0; }
 
     // Tests: runs on the worker after it took an event from the queue and
     // before the generation check and send (nullptr: none).
@@ -179,6 +228,7 @@ public:
         std::lock_guard<std::mutex> g(async_->m);
         ReconnectStats r = async_->stats;
         r.connecting = async_->connecting;
+        r.pausedNow = async_->paused;
         return r;
     }
 
@@ -476,7 +526,7 @@ private:
     // holding two frames, its pointer position (0x24) then the button: they
     // age out, are pushed out of a full queue, are discarded and are sent
     // together, so a click never lands without its position.
-    enum class Kind : uint8_t { Event, Move, PositionedClick };
+    enum class Kind : uint8_t { Event, Move, PositionedClick, Release };
     struct Queued {
         std::vector<uint8_t> bytes;
         std::chrono::steady_clock::time_point at;
@@ -501,8 +551,97 @@ private:
         std::function<void()> flushGap;         // tests only (r5)
         int forceWouldBlock = 0;                // tests only (r5)
         std::atomic<int> discardWaiting{0};     // r5: a focus loss wants the lock
+        // r6: what the Mac has down from us, as put on the wire: key
+        // semantics, and mouse buttons with the frame type (0x21 / 0x25)
+        // and click count of their down.
+        std::set<uint16_t> keysDown;
+        std::map<uint8_t, std::pair<uint8_t, uint8_t>> buttonsDown;
+        // r6: released on focus loss: ups still to send, and ups the viewer
+        // may send later that must not go out a second time.
+        std::set<uint16_t> owedKeys;
+        std::map<uint8_t, std::pair<uint8_t, uint8_t>> owedButtons;
+        std::set<uint16_t> swallowKeys;
+        std::set<uint8_t> swallowButtons;
+        bool paused = false;  // r6: retries ran out; waits for a fresh key press
+        bool resume = false;  // r6: a fresh key press ended the pause
         ReconnectStats stats;
     };
+
+    static std::vector<uint8_t> frameBytes(uint8_t type, std::initializer_list<uint8_t> payload) {
+        std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, 0, uint8_t(payload.size())};
+        b.insert(b.end(), payload.begin(), payload.end());
+        return b;
+    }
+
+    // Calls f(offset, size, type, payload, payloadSize) for each MRC1 frame
+    // of a queue item (one frame, or a position and a click).
+    template <typename F> static void forEachFrame(const std::vector<uint8_t>& b, F f) {
+        size_t off = 0;
+        while (off + 8 <= b.size()) {
+            const size_t n = (size_t(b[off + 6]) << 8) | b[off + 7];
+            if (off + 8 + n > b.size()) break;
+            f(off, 8 + n, b[off + 5], b.data() + off + 8, n);
+            off += 8 + n;
+        }
+    }
+
+    // r6: the bytes of an item that go on the wire: an up already sent for
+    // a key or button released on focus loss is left out. No state changes.
+    static std::vector<uint8_t> wireBytesLocked(const Async& a, const std::vector<uint8_t>& item) {
+        std::vector<uint8_t> out;
+        forEachFrame(item, [&](size_t off, size_t len, uint8_t type, const uint8_t* p, size_t n) {
+            bool skip = false;
+            if (type == 0x10 && n >= 3 && p[0] == 0) skip = a.swallowKeys.count(uint16_t((p[1] << 8) | p[2])) != 0;
+            if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) skip = p[1] == 0 && a.swallowButtons.count(p[0]) != 0;
+            if (!skip) out.insert(out.end(), item.begin() + off, item.begin() + off + len);
+        });
+        return out;
+    }
+
+    // r6: an item went on the wire (its first bytes are out): what the Mac
+    // now has down.
+    static void noteWireLocked(Async& a, const std::vector<uint8_t>& item) {
+        forEachFrame(item, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
+            if (type == 0x10 && n >= 3) {
+                const uint16_t k = uint16_t((p[1] << 8) | p[2]);
+                if (p[0]) { a.keysDown.insert(k); a.swallowKeys.erase(k); }
+                else if (a.swallowKeys.erase(k)) ++a.stats.swallowed;
+                else a.keysDown.erase(k);
+            } else if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) {
+                if (p[1]) { a.buttonsDown[p[0]] = {type, type == 0x25 ? p[2] : uint8_t(0)}; a.swallowButtons.erase(p[0]); }
+                else if (a.swallowButtons.erase(p[0])) ++a.stats.swallowed;
+                else a.buttonsDown.erase(p[0]);
+            }
+        });
+    }
+
+    struct Owed {
+        std::vector<uint8_t> bytes;
+        std::set<uint16_t> keys;
+        std::map<uint8_t, std::pair<uint8_t, uint8_t>> buttons;
+        uint64_t count = 0;
+    };
+    static bool hasOwedLocked(const Async& a) { return !a.owedKeys.empty() || !a.owedButtons.empty(); }
+    static Owed takeOwedLocked(Async& a) {
+        Owed o;
+        o.keys.swap(a.owedKeys);
+        o.buttons.swap(a.owedButtons);
+        for (const uint16_t k : o.keys) {
+            const auto fr = frameBytes(0x10, {0, uint8_t(k >> 8), uint8_t(k)});
+            o.bytes.insert(o.bytes.end(), fr.begin(), fr.end());
+        }
+        for (const auto& b : o.buttons) {
+            const auto fr = b.second.first == 0x25 ? frameBytes(0x25, {b.first, 0, b.second.second})
+                                                   : frameBytes(0x21, {b.first, 0});
+            o.bytes.insert(o.bytes.end(), fr.begin(), fr.end());
+        }
+        o.count = o.keys.size() + o.buttons.size();
+        return o;
+    }
+    static void restoreOwedLocked(Async& a, const Owed& o) {
+        a.owedKeys.insert(o.keys.begin(), o.keys.end());
+        for (const auto& b : o.buttons) a.owedButtons.insert(b);
+    }
 
     static bool sendAllOn(SOCKET s, const std::vector<uint8_t>& b) {
         size_t off = 0;
@@ -562,20 +701,26 @@ private:
                 continue;
             }
             if (a.stopping) return Flush::Stopped;
-            if (q.generation != a.generation) {
+            if (q.kind != Kind::Release && q.generation != a.generation) {
                 // Focus left after it was taken from the queue: stale.
                 ++a.stats.dropped;
                 ++a.stats.discarded;
                 return Flush::Discarded;
             }
-            if (a.atCommit) a.atCommit();
+            if (a.atCommit && q.kind != Kind::Release) a.atCommit();
+            // r6: an up for a key released on focus loss is not sent again.
+            const std::vector<uint8_t> wire = q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, q.bytes);
+            if (wire.empty()) {
+                noteWireLocked(a, q.bytes);
+                return Flush::Sent;
+            }
             int sent = SOCKET_ERROR;
             bool full = false;
             if (a.forceWouldBlock > 0) {
                 --a.forceWouldBlock;
                 full = true;
             } else {
-                sent = send(s, reinterpret_cast<const char*>(q.bytes.data()), static_cast<int>(q.bytes.size()), 0);
+                sent = send(s, reinterpret_cast<const char*>(wire.data()), static_cast<int>(wire.size()), 0);
                 if (sent == SOCKET_ERROR) {
                     if (WSAGetLastError() != WSAEWOULDBLOCK) return Flush::Failed;
                     full = true;
@@ -584,9 +729,11 @@ private:
                 }
             }
             if (!full) {
-                if (static_cast<size_t>(sent) == q.bytes.size()) return Flush::Sent;
+                // Committed: the Mac has (or will have) these downs and ups.
+                if (q.kind != Kind::Release) noteWireLocked(a, q.bytes);
+                if (static_cast<size_t>(sent) == wire.size()) return Flush::Sent;
                 lk.unlock();
-                const bool ok = sendRestNonBlocking(s, q.bytes, static_cast<size_t>(sent), deadline, a.cancel);
+                const bool ok = sendRestNonBlocking(s, wire, static_cast<size_t>(sent), deadline, a.cancel);
                 lk.lock();
                 return ok ? Flush::Sent : Flush::Failed;
             }
@@ -652,6 +799,11 @@ private:
             a->cv.wait(lk, [&] { return a->stopping || a->wake; });
             if (a->stopping) break;
             a->wake = false;
+            if (a->resume) {
+                // r6: a fresh key press after a pause: a new retry budget.
+                a->resume = false;
+                noChallenge.reset();
+            }
             lk.unlock();
             SOCKET s = openSocket(localIp, remoteIp, port, timeout, ch, onSocket);
             lk.lock();
@@ -675,8 +827,10 @@ private:
                 a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
                 if (wait < 0) {
                     // Retries used up (reported through the Client): the
-                    // waiting input is stale; the next event tries again.
-                    ++a->stats.paused;
+                    // waiting input is stale. r6: control stays paused until
+                    // a fresh key press (resumeOnUserKey), not the next event.
+                    if (!a->paused) ++a->stats.paused;
+                    a->paused = true;
                     a->stats.dropped += a->queue.size();
                     a->queue.clear();
                 }
@@ -689,6 +843,16 @@ private:
             noChallenge.reset();
             bool alive = setNonBlocking(s, true);
             while (alive && !a->stopping) {
+                if (hasOwedLocked(*a)) {
+                    // r6: ups owed since focus left go before any other input.
+                    const Owed owed = takeOwedLocked(*a);
+                    const Queued rel{owed.bytes, std::chrono::steady_clock::now(), Kind::Release, a->generation};
+                    const Flush fl = flushOneLocked(*a, lk, s, rel);
+                    if (fl == Flush::Sent) { a->stats.released += owed.count; continue; }
+                    restoreOwedLocked(*a, owed);
+                    if (fl == Flush::Failed) alive = false;
+                    break;
+                }
                 dropAgedLocked(*a, std::chrono::steady_clock::now());
                 if (a->queue.empty()) break;
                 Queued q = std::move(a->queue.front());
@@ -727,15 +891,33 @@ private:
     bool sendQueued(std::vector<uint8_t> b) {
         std::shared_ptr<Async> a = async_;
         SOCKET live = INVALID_SOCKET;
+        std::vector<uint8_t> wire;
+        Owed owed;
         {
             std::lock_guard<std::mutex> g(a->m);
             if (a->stopping) return false;
             if (!a->connecting && a->queue.empty()) live = a->s;
+            if (live != INVALID_SOCKET) {
+                // Only this thread uses or closes a->s while no reconnect
+                // runs, so what the Mac has down is noted here, before the
+                // send. r6: ups still owed go first.
+                if (hasOwedLocked(*a)) owed = takeOwedLocked(*a);
+                wire = owed.bytes;
+                const auto own = wireBytesLocked(*a, b);
+                wire.insert(wire.end(), own.begin(), own.end());
+                noteWireLocked(*a, b);
+            }
         }
         if (live != INVALID_SOCKET) {
-            // Only this thread uses or closes a->s while no reconnect runs.
-            if (sendAllOn(live, b)) return true;
+            if (wire.empty() || sendAllOn(live, wire)) {
+                if (owed.count) {
+                    std::lock_guard<std::mutex> g(a->m);
+                    a->stats.released += owed.count;
+                }
+                return true;
+            }
             std::lock_guard<std::mutex> g(a->m);
+            restoreOwedLocked(*a, owed);
             if (a->s == live) closeSocket(a->s);
         }
         std::lock_guard<std::mutex> g(a->m);
@@ -744,6 +926,13 @@ private:
             // The attempt ended (wrong password, lockout...): nothing to wait for.
             a->stats.dropped += a->queue.size() + 1;
             a->queue.clear();
+            return false;
+        }
+        if (a->paused) {
+            // r6: retries ran out. Moves, auto-repeat and the rest start no
+            // new round; a fresh key press (resumeOnUserKey) does.
+            ++a->stats.dropped;
+            ++a->stats.pausedDrops;
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
