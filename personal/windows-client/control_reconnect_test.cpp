@@ -933,6 +933,57 @@ void r6Tests() {
         expect(st.released == 2 && st.swallowed == 1, "  stats: released=2, swallowed=1 (the viewer's later button up)");
         control.stop();
     }
+
+    // (k) Found in the win01 hand test: key X and the right button went
+    // down while control was reconnecting, so they waited in the queue, and
+    // focus left before the reconnect was back: both downs are dropped. The
+    // viewer handles X's WM_KEYUP (still in its message queue) and the
+    // button up only after that: their downs never reached the Mac, so they
+    // are not sent either. B goes out as usual.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 2, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok);  // 600 ms: focus leaves meanwhile
+            if (auth2) got = readFrames(s2, 4, 2000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0041);
+        control.sendKey(false, 0x0041);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        control.close();                 // the connection dropped
+        control.sendKey(true, 0x0058);   // starts the reconnect, waits for it
+        control.sendMouseButton(1, true);
+        for (int i = 0; i < 100 && !control.reconnectStats().connecting; ++i) Sleep(10);
+        const size_t n = control.discardQueuedInput();
+        const auto mid = control.reconnectStats();
+        control.sendKey(false, 0x0058);  // the WM_KEYUP handled after the focus change
+        control.sendMouseButton(1, false);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects < 2; ++i) Sleep(10);
+        control.sendKey(true, 0x0042);
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        expect(auth1 && first.size() == 2 && mid.connecting && n == 2 && mid.released == 0,
+               "r6 dropped downs: X and the right button waited for the reconnect when focus left (2 dropped)");
+        expect(auth2 && got.size() == 2 && isKey(got[0], 1, 0x42) && isKey(got[1], 0, 0x42),
+               "  their later ups were not sent: the new connection got only B down and up (" +
+                   std::to_string(got.size()) + " frames)");
+        expect(st.released == 0 && st.swallowed == 2, "  stats: released=0, swallowed=2 (X up, button up)");
+        control.stop();
+    }
     setCurrent(nullptr);
 }
 

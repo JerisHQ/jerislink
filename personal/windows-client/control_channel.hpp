@@ -137,8 +137,10 @@ public:
     // already reached the Mac is released, never left held. Its up is owed:
     // sent now when the connection is live, otherwise first thing after the
     // reconnect, before any other input. A down that never went out is
-    // dropped with its up. A later up for a released key (the viewer's own
-    // focus-loss cleanup, or a WM_KEYUP) is not sent a second time.
+    // dropped with its up: an up that arrives after the focus change (a
+    // WM_KEYUP still in the message queue) is not sent either. A later up
+    // for a released key (the viewer's own focus-loss cleanup, or a
+    // WM_KEYUP) is not sent a second time.
     // Returns how many queued events were dropped; one cancelled in flight
     // is counted in stats.discarded when the worker drops it.
     size_t discardQueuedInput() {
@@ -149,6 +151,7 @@ public:
         ++a->discardWaiting;
         std::unique_lock<std::mutex> g(a->m);
         const size_t n = a->queue.size();
+        for (const auto& q : a->queue) dropDownsLocked(*a, q.bytes);
         a->queue.clear();
         ++a->generation;
         a->stats.dropped += n;
@@ -615,6 +618,16 @@ private:
         });
     }
 
+    // r6: downs dropped on focus loss never reached the Mac, so their ups
+    // are not sent either (wireBytesLocked leaves them out). A new down of
+    // the same key or button clears this (noteWireLocked).
+    static void dropDownsLocked(Async& a, const std::vector<uint8_t>& item) {
+        forEachFrame(item, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
+            if (type == 0x10 && n >= 3 && p[0]) a.swallowKeys.insert(uint16_t((p[1] << 8) | p[2]));
+            else if (((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) && p[1]) a.swallowButtons.insert(p[0]);
+        });
+    }
+
     struct Owed {
         std::vector<uint8_t> bytes;
         std::set<uint16_t> keys;
@@ -703,6 +716,7 @@ private:
             if (a.stopping) return Flush::Stopped;
             if (q.kind != Kind::Release && q.generation != a.generation) {
                 // Focus left after it was taken from the queue: stale.
+                dropDownsLocked(a, q.bytes);
                 ++a.stats.dropped;
                 ++a.stats.discarded;
                 return Flush::Discarded;
