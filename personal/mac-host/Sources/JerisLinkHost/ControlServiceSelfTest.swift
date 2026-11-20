@@ -1370,6 +1370,12 @@ final class MRC1Client {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
     }
 
+    /// Bytes as they are (a PROXY header ahead of the MRC1 stream).
+    func sendRaw(_ bytes: [UInt8]) -> Bool {
+        let sent = bytes.withUnsafeBytes { Darwin.send(fd, $0.baseAddress!, bytes.count, 0) }
+        return sent == bytes.count
+    }
+
     /// Next MRC1 packet from the host, or nil after `timeout` seconds.
     func receive(timeout: Double) -> (type: UInt8, payload: [UInt8])? {
         guard let header = recvExact(8, timeout: timeout), header[0] == 0x4d, header[3] == 0x31 else { return nil }

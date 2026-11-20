@@ -62,7 +62,8 @@ enum ControlService {
                                        port: port, inject: inject,
                                        settingsClientIP: { clientIP }, acceptProxy: false,
                                        inputHelper: helper, allowFileSessions: true, authGate: gate,
-                                       admitConnection: admit, admitMessage: messageOK)
+                                       admitConnection: admit, admitMessage: messageOK,
+                                       admitPeerMessage: peerCheck(gate))
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
@@ -101,6 +102,25 @@ enum ControlService {
                 log("auth.lockdown_hold reason=\(why) entry=\(viewerIP.map { "relay peer=\($0)" } ?? "open_connection"); refused or closed")
             }
             return true
+        }
+    }
+
+    /// r8: for the direct listener's open connections (control, clipboard,
+    /// file and ping alike): false while the guard refuses input from that
+    /// peer (`AuthGuard.inputRefusal`: the journal lockdown, listen.plist
+    /// `blockedIPs`, blocks restored from the pending journal). A block
+    /// added while a connection is open closes it on its next message, not
+    /// on a policy-watch tick; other viewers' connections go on. Logs at
+    /// most once a second; the listener logs each closed connection itself.
+    static func peerCheck(_ gate: AuthGate?) -> (@Sendable (String) -> Bool)? {
+        guard let guardian = gate?.guardian else { return nil }
+        let throttle = OncePerInterval(1)
+        return { ip in
+            guard let why = guardian.inputRefusal(ip) else { return true }
+            if throttle.due() {
+                log("auth.peer_refused peer=\(ip) reason=\(why) entry=open_connection; closed")
+            }
+            return false
         }
     }
 

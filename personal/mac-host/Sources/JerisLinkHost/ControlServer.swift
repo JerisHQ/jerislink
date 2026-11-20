@@ -117,6 +117,13 @@ final class ControlServer: @unchecked Sendable {
     /// the next periodic check. Callers make it one stat while listen.plist
     /// is unchanged (PolicyWatch.stillCurrent, LegacyAuthWatch.check).
     private let admitMessage: (@Sendable () -> Bool)?
+    /// r8: asked with the connection's peer address next to `admitMessage`,
+    /// on every message and every file or clipboard session loop turn:
+    /// false closes that connection only. The control service asks the
+    /// guard's blacklist (AuthGuard.inputRefusal), so a block added while
+    /// the connection is open (pending journal or listen.plist) stops that
+    /// viewer's sessions on their next message; other viewers go on.
+    private let admitPeerMessage: (@Sendable (String) -> Bool)?
     private(set) var authFailures: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
@@ -136,6 +143,7 @@ final class ControlServer: @unchecked Sendable {
          authGate: AuthGate? = nil,
          admitConnection: (@Sendable () -> Bool)? = nil,
          admitMessage: (@Sendable () -> Bool)? = nil,
+         admitPeerMessage: (@Sendable (String) -> Bool)? = nil,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
@@ -144,6 +152,7 @@ final class ControlServer: @unchecked Sendable {
         self.authGate = authGate
         self.admitConnection = admitConnection
         self.admitMessage = admitMessage
+        self.admitPeerMessage = admitPeerMessage
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -426,6 +435,11 @@ final class ControlServer: @unchecked Sendable {
                 print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
                 return
             }
+            if let admitPeerMessage, !admitPeerMessage(peer.ip) {
+                rejectedClients += 1
+                print("Control reject peer=\(peer.ip) reason=peer_refused type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
+                return
+            }
             // Transition mode: a v0.4 viewer's probe learns that this host
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {
@@ -462,13 +476,13 @@ final class ControlServer: @unchecked Sendable {
                     print("file.session=refused")
                     return
                 }
-                handleFileSession(fd, peerCaps: peerCaps)
+                handleFileSession(fd, peerCaps: peerCaps, peerIP: peer.ip)
                 return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
                 guard sensitiveAllowed(type: type, peer: peer, authenticated: authenticated) else { return }
                 print("Clipboard session connected")
-                handleClipboardSession(fd)
+                handleClipboardSession(fd, peerIP: peer.ip)
                 print("Clipboard session ended")
                 return
             case 0x01: // PING
@@ -649,7 +663,7 @@ final class ControlServer: @unchecked Sendable {
     /// an upload running removes its partial files. Runs on this client's own
     /// thread; only the final pasteboard write hops to the main thread. Logs
     /// carry no file names (D15): only open/closed and counts.
-    private func handleFileSession(_ fd: Int32, peerCaps: UInt16) {
+    private func handleFileSession(_ fd: Int32, peerCaps: UInt16, peerIP: String) {
         fileSessions += 1
         let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard, sendFolder: fileSendFolder)
         let announcer: FileAnnouncer? = (peerCaps & FileProto.Caps.announce) != 0 ? FileAnnouncer() : nil
@@ -715,7 +729,7 @@ final class ControlServer: @unchecked Sendable {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { reason = "stopping"; return }
             // r5 (B3): nothing more is sent or served once the policy moved.
-            if sessionRevoked("file") { reason = "policy_changed"; return }
+            if sessionRevoked("file", peerIP: peerIP) { reason = "policy_changed"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
             if showsNotice {
                 let seq = currentNoticeSeq()
@@ -764,7 +778,7 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= FileProto.maxPayload else { reason = "too_long"; return }
             guard let payload = recvExact(fd, count: length) else { return }
-            if sessionRevoked("file") { reason = "policy_changed"; return }
+            if sessionRevoked("file", peerIP: peerIP) { reason = "policy_changed"; return }
             received += 1
             lastMessage = Date()
             pushBroker.heard(pushSession)
@@ -836,14 +850,22 @@ final class ControlServer: @unchecked Sendable {
     /// turn (nothing is sent or written after a policy change) and again
     /// before an inbound message is handled. One stat while listen.plist is
     /// unchanged.
-    private func sessionRevoked(_ kind: String) -> Bool {
-        guard let admitMessage, !admitMessage() else { return false }
-        rejectedClients += 1
-        print("Control reject reason=policy_changed session=\(kind) on \(bindIP):\(port); open connection closed")
-        return true
+    /// r8: and `admitPeerMessage` for this session's peer.
+    private func sessionRevoked(_ kind: String, peerIP: String) -> Bool {
+        if let admitMessage, !admitMessage() {
+            rejectedClients += 1
+            print("Control reject reason=policy_changed session=\(kind) on \(bindIP):\(port); open connection closed")
+            return true
+        }
+        if let admitPeerMessage, !admitPeerMessage(peerIP) {
+            rejectedClients += 1
+            print("Control reject peer=\(peerIP) reason=peer_refused session=\(kind) on \(bindIP):\(port); open connection closed")
+            return true
+        }
+        return false
     }
 
-    private func handleClipboardSession(_ fd: Int32) {
+    private func handleClipboardSession(_ fd: Int32, peerIP: String) {
         // Each 100 ms poll reads only the change count, on this thread. The
         // contents are read (on the main thread) only when the count moved.
         var lastChangeCount = clipboard.changeCount()
@@ -854,7 +876,7 @@ final class ControlServer: @unchecked Sendable {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { return }
             // r5 (B3): no clipboard read or write once the policy moved.
-            if sessionRevoked("clipboard") { return }
+            if sessionRevoked("clipboard", peerIP: peerIP) { return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -872,7 +894,7 @@ final class ControlServer: @unchecked Sendable {
                     let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
                     guard length <= Self.maxClipboardBytes,
                           let payload = recvExact(fd, count: length) else { return }
-                    if sessionRevoked("clipboard") { return }
+                    if sessionRevoked("clipboard", peerIP: peerIP) { return }
 
                     if type == 0x31 {
                         guard let text = String(data: Data(payload), encoding: .utf8) else {
@@ -926,7 +948,7 @@ final class ControlServer: @unchecked Sendable {
             }
             if text == lastSentText { continue }
             // r5 (B3): the policy may have moved during the 100 ms poll.
-            if sessionRevoked("clipboard") { return }
+            if sessionRevoked("clipboard", peerIP: peerIP) { return }
             guard sendPacket(fd, type: 0x31, payload: payload) else { return }
             lastSentText = text
             clipboardSent += 1

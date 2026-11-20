@@ -17,9 +17,16 @@ protocol BlocklistStore: AnyObject {
     func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]?
     /// Whether `update` can write at all (checked at start in password mode).
     func writable() -> Bool
+    /// r8: a cheap stamp of the store (one stat). The guard reads the store
+    /// again whenever it moves, so a block added by hand while the service
+    /// runs applies on the next check; nil (stat failed) reads it too.
+    func probeStamp() -> ListenFileStamp?
 }
 
 extension BlocklistStore {
+    /// Stores without a file never move.
+    func probeStamp() -> ListenFileStamp? { ListenFileStamp(exists: false) }
+
     static func merged(_ current: [BlockedEntry], adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry] {
         var out = current.filter { !removing.contains($0.ip) }
         for e in adding where !removing.contains(e.ip) && !out.contains(where: { $0.ip == e.ip }) { out.append(e) }
@@ -40,6 +47,8 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return readDict().map(Self.entries(in:)) ?? []
     }
+
+    func probeStamp() -> ListenFileStamp? { ListenFileStamp.of(url) }
 
     /// The `blockedIPs` of a listen.plist already read (the policy watcher
     /// reads the file once per check).
@@ -301,6 +310,8 @@ final class AuthGuard: @unchecked Sendable {
     private var journalUnreadable = false
     /// r7: the journal's stamp when this guard last read it.
     private var journalKnown: ListenFileStamp?
+    /// r8: the blocklist store's (listen.plist) stamp when last read.
+    private var storeKnown: ListenFileStamp?
     private var lastJournalRetry: TimeInterval = -.infinity
     private var lastPendingRetry: TimeInterval = -.infinity
     static let pendingRetryInterval: TimeInterval = 1
@@ -317,6 +328,8 @@ final class AuthGuard: @unchecked Sendable {
         self.now = now
         self.wallNow = wallNow
         self.pause = pause
+        // r8: taken before the read, as for the journal.
+        self.storeKnown = blocklist.probeStamp()
         let loaded = blocklist.load()
         self.persisted = Set(loaded.map(\.ip))
         // B5 r4: a block that never reached listen.plist before the last
@@ -356,20 +369,49 @@ final class AuthGuard: @unchecked Sendable {
     /// can go on to the per-address checks.
     func lockdownReason() -> String? {
         lock.lock(); defer { lock.unlock() }
-        refreshJournalLocked(force: false)
+        refreshLocked(force: false)
         return journalHoldLocked() ? "pending_journal_unreadable" : nil
     }
 
-    /// r7 (B5): what input that does not pass the direct listener's gate
-    /// asks for its viewer `ip` (the mouse relay on every connection and
-    /// every message): nil to go on, else why not. The journal lockdown,
-    /// then the same blacklist direct admission uses: listen.plist
-    /// `blockedIPs` plus the blocks restored from the pending journal.
+    /// r7 (B5): what input from viewer `ip` asks on every message once
+    /// its connection is open (r8: every direct connection, control,
+    /// clipboard, file and ping alike, by its peer address; r7: the mouse
+    /// relay on every connection and message): nil to go on, else why not.
+    /// The journal lockdown, then the same blacklist direct admission uses:
+    /// listen.plist `blockedIPs` (re-read when it moved, r8) plus the blocks
+    /// restored from the pending journal.
     func inputRefusal(_ ip: String) -> String? {
         lock.lock(); defer { lock.unlock() }
-        refreshJournalLocked(force: false)
+        refreshLocked(force: false)
         if journalHoldLocked() { return "pending_journal_unreadable" }
         return blocked.contains(where: { $0.ip == ip }) ? "blocked" : nil
+    }
+
+    /// r8: the journal, then listen.plist, each read again only when its
+    /// stamp moved (one stat each otherwise).
+    private func refreshLocked(force: Bool) {
+        refreshStoreLocked()
+        refreshJournalLocked(force: force)
+    }
+
+    /// r8: a block added to listen.plist from outside while the service
+    /// runs (by hand, the host app) applies at once: it joins the blacklist
+    /// and counts as persisted, so the policy watch does not restart the
+    /// service for it and open sessions of other viewers go on; the
+    /// blocked viewer's open sessions stop on their next message
+    /// (`inputRefusal`). Only additions are taken here; a block removed
+    /// from outside is still a change that restarts the service.
+    private func refreshStoreLocked() {
+        let stamp = blocklist.probeStamp()
+        if let stamp, stamp == storeKnown { return }
+        let entries = blocklist.load()
+        storeKnown = stamp
+        let added = entries.filter { !persisted.contains($0.ip) }
+        guard !added.isEmpty else { return }
+        persisted.formUnion(added.map(\.ip))
+        for e in added where !blocked.contains(where: { $0.ip == e.ip }) { blocked.append(e) }
+        print("auth.block_added peers=\(added.count) source=listen.plist found=running")
+        fflush(stdout)
     }
 
     /// r6 (B5): a journal that stops reading while the service runs holds
@@ -379,7 +421,7 @@ final class AuthGuard: @unchecked Sendable {
     /// relay message also looks (one stat), so this is only the fallback.
     func probeJournal() {
         lock.lock(); defer { lock.unlock() }
-        refreshJournalLocked(force: true)
+        refreshLocked(force: true)
     }
 
     /// r7 (B5): reads the journal when it moved since this guard last read
@@ -416,7 +458,7 @@ final class AuthGuard: @unchecked Sendable {
     /// Blacklist only (transition mode: no challenge, so no counting).
     func isBlocked(_ ip: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        refreshJournalLocked(force: false)
+        refreshLocked(force: false)
         return blocked.contains { $0.ip == ip }
     }
 
@@ -485,11 +527,12 @@ final class AuthGuard: @unchecked Sendable {
     /// service compares it with the file to notice outside edits.
     var persistedIPs: Set<String> {
         lock.lock(); defer { lock.unlock() }
+        refreshStoreLocked()
         return persisted
     }
 
     private func admitLocked(_ ip: String) -> Admission {
-        refreshJournalLocked(force: false)
+        refreshLocked(force: false)
         if blocked.contains(where: { $0.ip == ip }) { return .blocked }
         if !whitelist.isEmpty && !whitelist.contains(ip) { return .notAllowed }
         let t = now()

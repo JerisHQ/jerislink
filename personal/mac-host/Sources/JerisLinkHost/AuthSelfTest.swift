@@ -39,6 +39,7 @@ enum AuthSelfTest {
         r5Journal(expect)
         r6RelayLockdown(expect)
         r7RelayBlacklist(expect)
+        r8DirectBlacklist(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -654,6 +655,11 @@ enum AuthSelfTest {
         writePlist(base, url)
         for _ in 0..<20 { _ = guardian.recordFailure("100.64.0.7") }
         expect(check() == nil, "watch: the service's own blacklist write does not restart it")
+        var added = readPlist(url) ?? base
+        added["blockedIPs"] = ((added["blockedIPs"] as? [Any]) ?? []) + ["100.64.0.9"]
+        writePlist(added, url)
+        expect(check() == nil && guardian.isBlocked("100.64.0.9"),
+               "watch: r8: a block added to listen.plist from outside applies at once and does not restart")
         var outside = readPlist(url) ?? base
         outside["blockedIPs"] = ["100.64.0.8"]
         writePlist(outside, url)
@@ -820,8 +826,8 @@ enum AuthSelfTest {
         let inFile = { Set(ListenPlistBlocklist(url: url).load().map(\.ip)) }
         expect(inFile() == ["100.64.0.5", "100.64.0.9", "100.64.0.7"],
                "b5: automatic block merges into listen.plist; a manual block written after start is kept")
-        expect(g.admit("100.64.0.9") == .blocked && !g.persistedIPs.contains("100.64.0.9"),
-               "b5: that manual block applies at once and still counts as an outside edit")
+        expect(g.admit("100.64.0.9") == .blocked && g.persistedIPs.contains("100.64.0.9"),
+               "b5: that manual block applies at once (r8: and counts as persisted, so adding it does not restart the service)")
         expect(g.release("100.64.0.7") == .released && inFile() == ["100.64.0.5", "100.64.0.9"],
                "b5: release removes only its own IP")
 
@@ -1491,5 +1497,133 @@ enum AuthSelfTest {
         Thread.sleep(forTimeInterval: 0.3)
         expect(udp.forwarded == 1 && udp.inputDropped == 1 && relay.mouseEvents == held,
                "r7 b5 udp: block gained from the journal while running: the next UDP 0x24 is dropped")
+    }
+
+    // MARK: r8
+
+    /// B5 r8: a block that arrives while a direct connection is open (the
+    /// pending journal gains it, or listen.plist is edited) closes that
+    /// viewer's open direct sessions (control and ping, file, clipboard) on
+    /// their next message, with no policy-watch tick and no restart; other
+    /// viewers' sessions go on. Real sockets, real files.
+    private static func r8DirectBlacklist(_ expect: Expect) {
+        let fm = FileManager.default
+        let dir = tempDir()
+        defer { try? fm.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+        try? fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let me = ListenConfig.loopbackIP
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        let filePing = FileProto.Message.ping(token: [1, 2, 3, 4])
+        func pong(_ c: MRC1Client, timeout: Double = 2) -> Bool {
+            _ = c.send(type: 0x01, payload: [9, 8, 7, 6])
+            return c.receive(timeout: timeout)?.type == 0x02
+        }
+        func fileEcho(_ c: MRC1Client, timeout: Double = 2) -> Bool {
+            _ = c.send(type: filePing.type, payload: filePing.encode() ?? [])
+            return c.receive(timeout: timeout)?.type == filePing.type
+        }
+        func openFile(_ c: MRC1Client) -> Bool {
+            _ = c.send(type: 0x50, payload: [1, 0, 0])
+            return c.receive(timeout: 3)?.type == 0x51
+        }
+        func journalBlock(_ ip: String) {
+            _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: ip, at: Date(), reason: "20 wrong passwords")])
+        }
+        func plistBlock(_ ip: String) {
+            var d = readPlist(url) ?? [:]
+            d["blockedIPs"] = ((d["blockedIPs"] as? [Any]) ?? []) + [ip]
+            writePlist(d, url)
+        }
+
+        // a. The service as ControlService.run starts it, one viewer.
+        let cases: [(String, (String) -> Void)] = [
+            ("r8 b5 direct: block gained from the journal while running: the open control connection and file session are closed on their next message, no policy-watch tick, no restart", journalBlock),
+            ("r8 b5 direct: block added to listen.plist while running: the open control connection and file session are closed on their next message, no restart", plistBlock),
+        ]
+        for (name, add) in cases {
+            writePlist(loopbackBase(me), url)
+            try? fm.removeItem(at: journalURL)
+            guard let s = bootService(read: read, url: url, gate: { ep, plist in
+                ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil, blocklist: ListenPlistBlocklist(url: url),
+                                        journal: PendingBlockFile(url: journalURL))
+            }), let ctl = MRC1Client(port: s.port), let file = MRC1Client(port: s.port) else {
+                expect(false, name); continue
+            }
+            let direct = s.servers[0]
+            let works = pong(ctl) && openFile(file) && fileEcho(file)
+            add(me)
+            let ctlAfter = pong(ctl, timeout: 0.5)
+            let fileAfter = fileEcho(file, timeout: 0.5)
+            expect(works && !ctlAfter && !fileAfter && direct.rejectedClients >= 2 && s.watch.appliedChange == nil
+                   && !s.gate.isRevoked && s.gate.guardian.inputRefusal(me) == "blocked"
+                   && ListenPlistBlocklist(url: url).load().map(\.ip) == [me],
+                   name)
+            ctl.close(); file.close()
+            s.servers.forEach { $0.stop() }
+        }
+
+        // b. Three viewers on one direct listener, handed over by a local
+        // PROXY forwarder (tailscale serve): a block for one and then for
+        // another closes only theirs.
+        let va = "100.64.0.21", vb = "100.64.0.22", vc = "100.64.0.23"
+        writePlist(["mode": "loopback", "clientIP": me, "allowedIPs": [va, vb, vc], "passwordSet": false], url)
+        try? fm.removeItem(at: journalURL)
+        let (resolution, plist) = read()
+        guard case .ready(let ep) = resolution, let port = ControlServiceSelfTest.freeLoopbackPort() else {
+            expect(false, "r8 b5 direct: per peer: endpoint resolves"); return
+        }
+        let (made, snapshot) = ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil,
+                                                       blocklist: ListenPlistBlocklist(url: url),
+                                                       journal: PendingBlockFile(url: journalURL))
+        guard let gate = made else { expect(false, "r8 b5 direct: per peer: gate"); return }
+        let watch = PolicyWatch(started: ep, snapshot: snapshot, gate: gate, read: read, loadSecret: { nil },
+                                stamp: { ListenFileStamp.of(url) })
+        let board = FakeClipboard(text: "mac-before")
+        let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                    fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                    openFolder: { _ in })
+        // The direct listener's wiring in ControlService.startServers, with
+        // PROXY on so one loopback socket can stand for each viewer.
+        let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
+                                   settingsClientIP: { va }, acceptProxy: true, allowFileSessions: true,
+                                   fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
+                                   fileSendFolder: folder, clipboard: board, authGate: gate,
+                                   admitConnection: { watch.admitNew() }, admitMessage: { watch.stillCurrent() },
+                                   admitPeerMessage: ControlService.peerCheck(gate))
+        func viewer(_ ip: String) -> MRC1Client? {
+            guard let cl = MRC1Client(port: port), cl.sendRaw(Array("PROXY TCP4 \(ip) \(me) 40000 \(port)\r\n".utf8)) else { return nil }
+            return cl
+        }
+        guard (try? server.start()) != nil, let aCtl = viewer(va), let aClip = viewer(va), let bCtl = viewer(vb),
+              let bFile = viewer(vb), let cCtl = viewer(vc), let cFile = viewer(vc) else {
+            expect(false, "r8 b5 direct: per peer: server and viewers start"); return
+        }
+        defer { [aCtl, aClip, bCtl, bFile, cCtl, cFile].forEach { $0.close() }; server.stop() }
+        _ = aClip.send(type: 0x30, payload: [])                        // CLIPBOARD_HELLO
+        _ = aClip.send(type: 0x31, payload: Array("a-before".utf8))
+        let before = pong(aCtl) && pong(bCtl) && pong(cCtl) && openFile(bFile) && fileEcho(bFile)
+            && openFile(cFile) && fileEcho(cFile) && settle { board.writes == ["a-before"] }
+        expect(before, "r8 b5 direct: per peer: three viewers through a PROXY forwarder: control, clipboard and file sessions work")
+
+        journalBlock(va)
+        _ = aClip.send(type: 0x31, payload: Array("a-after".utf8))
+        let aAfter = pong(aCtl, timeout: 0.5)
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(!aAfter && board.writes == ["a-before"] && pong(bCtl) && pong(cCtl) && fileEcho(bFile) && fileEcho(cFile)
+               && watch.appliedChange == nil && !gate.isRevoked,
+               "r8 b5 direct: per peer: a journal block for one viewer closes its control connection and clipboard session on the next message; the other viewers go on")
+
+        plistBlock(vb)
+        let bCtlAfter = pong(bCtl, timeout: 0.5)
+        let bFileAfter = fileEcho(bFile, timeout: 0.5)
+        expect(!bCtlAfter && !bFileAfter && pong(cCtl) && fileEcho(cFile) && watch.appliedChange == nil
+               && gate.guardian.isBlocked(vb) && !gate.guardian.isBlocked(vc),
+               "r8 b5 direct: per peer: a listen.plist block for a second viewer closes its control connection and file session on the next message; the third viewer goes on, no restart")
     }
 }
