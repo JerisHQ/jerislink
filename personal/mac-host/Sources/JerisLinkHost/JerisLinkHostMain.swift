@@ -368,6 +368,8 @@ struct JerisLinkHostMain {
                 // connection, per UDP 0x24 datagram and every 0.5 s
                 // (LegacyAuthWatch); closing revokes the UDP input and its
                 // relay connection before anything else is handled.
+                // r6 (B5): and nothing while the pending journal does not read.
+                let journalHold = PendingJournalHold()
                 let legacy = LegacyAuthWatch()
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
@@ -375,7 +377,7 @@ struct JerisLinkHostMain {
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
                                                     port: mouseUDPPort, presence: viewer,
-                                                    inputAllowed: { legacy.check() })
+                                                    inputAllowed: PendingJournalHold.udpInputAllowed(legacy: legacy, hold: journalHold))
                     legacy.onClose { reason in server.revokeInput(reason: reason) }
                     try server.start()
                     mouseUDP = server

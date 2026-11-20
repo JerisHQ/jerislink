@@ -459,6 +459,64 @@ final class LegacyAuthWatch: @unchecked Sendable {
     }
 }
 
+/// r6 (B5): the video service's side of the control service's journal
+/// lockdown. UDP mouse input has no AuthGuard in this process, so it reads
+/// the pending journal itself: while the file exists but does not read
+/// (corrupt, unreadable, its folder unreadable) every 0x24 is dropped. One
+/// stat per datagram while the file is unchanged (`ListenFileStamp`); read
+/// again whenever the stamp moves or stat fails. Not a latch: input comes
+/// back once the journal reads or is removed, as admission does in the
+/// control service.
+final class PendingJournalHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let load: @Sendable () -> [BlockedEntry]?
+    private let stamp: @Sendable () -> ListenFileStamp?
+    private var known: ListenFileStamp?
+    private var held = false
+
+    /// The live journal next to listen.plist.
+    convenience init(url: URL = ListenConfig.pendingBlocksURL) {
+        let file = PendingBlockFile(url: url)
+        self.init(load: { file.load() }, stamp: { ListenFileStamp.of(url) })
+    }
+
+    init(load: @escaping @Sendable () -> [BlockedEntry]?, stamp: @escaping @Sendable () -> ListenFileStamp?) {
+        self.load = load
+        self.stamp = stamp
+    }
+
+    /// Nil while input may go on, else why not.
+    func reason() -> String? {
+        // Taken before the read: a write after it moves the stamp again.
+        let now = stamp()
+        lock.lock()
+        if let now, let known, now == known {
+            let h = held
+            lock.unlock()
+            return h ? "pending_journal_unreadable" : nil
+        }
+        lock.unlock()
+        let readable = load() != nil
+        lock.lock()
+        let was = held
+        held = !readable
+        known = now
+        lock.unlock()
+        if was != held {
+            print(readable ? "auth.lockdown_journal_readable entry=udp_input (UDP input goes on)"
+                           : "auth.lockdown_hold reason=pending_journal_unreadable entry=udp_input; UDP 0x24 dropped until it reads or is removed")
+            fflush(stdout)
+        }
+        return readable ? nil : "pending_journal_unreadable"
+    }
+
+    /// What the video service's UDP input asks per 0x24 datagram: no
+    /// password set (`LegacyAuthWatch`) and no journal lockdown.
+    static func udpInputAllowed(legacy: LegacyAuthWatch, hold: PendingJournalHold) -> @Sendable () -> Bool {
+        { legacy.check() && hold.reason() == nil }
+    }
+}
+
 /// `JerisLinkHost --self-test` part for the resolver. Pure; touches no files.
 enum ListenConfigSelfTest {
     static func run() -> Int32 {

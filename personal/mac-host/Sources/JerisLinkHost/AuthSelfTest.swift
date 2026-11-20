@@ -37,6 +37,7 @@ enum AuthSelfTest {
         r5Sessions(expect)
         r5Lock(expect)
         r5Journal(expect)
+        r6RelayLockdown(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -1298,5 +1299,92 @@ enum AuthSelfTest {
         expect(back && a.gate.guardian.isBlocked("100.64.0.9") && ListenPlistBlocklist(url: url).load().map(\.ip) == ["100.64.0.9"]
                && PendingBlockFile(url: journalURL).load()?.isEmpty == true,
                "r5 b5 service: once the journal reads again its block is carried into listen.plist and the viewer is admitted")
+    }
+
+    // MARK: r6
+
+    /// B5 r6: a pending journal that does not read holds the mouse relay and
+    /// the UDP input too, at start and when it turns unreadable while
+    /// running: new relay connections are refused, an open one is refused
+    /// on its next move, and the video side drops UDP 0x24. Real sockets.
+    private static func r6RelayLockdown(_ expect: Expect) {
+        let fm = FileManager.default
+        let dir = tempDir()
+        defer { try? fm.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+        let me = ListenConfig.loopbackIP
+        writePlist(loopbackBase(me), url)
+        try? fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let garbage = Data("not a plist".utf8)
+        try? garbage.write(to: journalURL)
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        guard let svc = bootService(read: read, url: url, gate: { ep, plist in
+            ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil, blocklist: ListenPlistBlocklist(url: url),
+                                    journal: PendingBlockFile(url: journalURL))
+        }), let udpPort = ControlServiceSelfTest.freeLoopbackPort() else {
+            expect(false, "r6 b5: service starts with the mouse relay"); return
+        }
+        defer { svc.servers.forEach { $0.stop() } }
+        let relay = svc.servers[1]
+        // The video side as JerisLinkHostMain wires it.
+        let legacy = LegacyAuthWatch(url: url)
+        let hold = PendingJournalHold(url: journalURL)
+        let udp = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: udpPort, relayPort: svc.relayPort,
+                                     inputAllowed: PendingJournalHold.udpInputAllowed(legacy: legacy, hold: hold))
+        guard (try? udp.start()) != nil else { expect(false, "r6 b5: UDP input starts"); return }
+        defer { udp.stop() }
+        let s = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        defer { Darwin.close(s) }
+        var addr = ControlServiceSelfTest.loopbackAddress(port: udpPort)
+        var seq: UInt8 = 0
+        func move() {
+            seq &+= 1
+            let bytes: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x24, 0, 0, 0, seq, 0x80, 0, 0x80, 0]
+            _ = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bytes.withUnsafeBytes { Darwin.sendto(s, $0.baseAddress!, bytes.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+            }
+        }
+
+        let early = LocalControlMouseClient(port: svc.relayPort)
+        _ = early.sendMouseMoveNormalized(nx: 1, ny: 1)
+        move()
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(relay.mouseEvents == 0 && udp.forwarded == 0 && udp.inputDropped == 1
+               && svc.gate.guardian.lockdownReason() == "pending_journal_unreadable",
+               "r6 b5 relay: corrupt journal at start: a new relay connection is refused and UDP 0x24 is dropped")
+
+        try? fm.removeItem(at: journalURL)
+        let open = LocalControlMouseClient(port: svc.relayPort)
+        let viaRelay = settle { _ = open.sendMouseMoveNormalized(nx: 2, ny: 2); return relay.mouseEvents >= 1 }
+        Thread.sleep(forTimeInterval: 0.3) // let the retries still in flight land first
+        let before = relay.mouseEvents
+        move()
+        let viaUDP = settle { udp.forwarded == 1 && relay.mouseEvents == before + 1 }
+        if !(viaRelay && viaUDP) {
+            print("r6 b5 relay detail: viaRelay=\(viaRelay) viaUDP=\(viaUDP) forwarded=\(udp.forwarded) dropped=\(udp.inputDropped) events=\(relay.mouseEvents) before=\(before)")
+        }
+        expect(viaRelay && viaUDP && svc.gate.guardian.lockdownReason() == nil,
+               "r6 b5 relay: once the journal is removed the relay and UDP input go on")
+
+        try? garbage.write(to: journalURL)
+        svc.watch.tick() // the once-a-second policy watch
+        let held = relay.mouseEvents
+        _ = open.sendMouseMoveNormalized(nx: 3, ny: 3)
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(relay.mouseEvents == held && svc.gate.guardian.lockdownReason() == "pending_journal_unreadable"
+               && svc.watch.appliedChange == nil,
+               "r6 b5 relay: journal unreadable while running: the open relay connection's next move is refused, no policy change applied")
+        move()
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(udp.forwarded == 1 && udp.inputDropped == 2 && relay.mouseEvents == held
+               && (try? Data(contentsOf: journalURL)) == garbage,
+               "r6 b5 udp: journal unreadable while running: the next UDP 0x24 is dropped, journal kept as is")
     }
 }

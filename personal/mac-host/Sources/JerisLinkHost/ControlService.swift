@@ -41,6 +41,14 @@ enum ControlService {
                              admit: (@Sendable () -> Bool)? = nil,
                              admitMessage: (@Sendable () -> Bool)? = nil) throws -> [ControlServer] {
         var servers: [ControlServer] = []
+        // r6 (B5): while the pending journal does not read nobody gets in and
+        // nothing already open goes on. Every message on both listeners
+        // (file and clipboard sessions included) and every relay connection
+        // asks the guard first; the direct listener's new connections ask
+        // it in the gate already.
+        let held = lockdownCheck(gate)
+        let messageOK: @Sendable () -> Bool = { !held() && (admitMessage?() ?? true) }
+        let relayAdmit: @Sendable () -> Bool = { !held() && (admit?() ?? true) }
         do {
             // With a gate the whitelist, blacklist and password live in the
             // gate; without one (legacy callers) the 0.3 single-IP check.
@@ -48,7 +56,7 @@ enum ControlService {
                                        port: port, inject: inject,
                                        settingsClientIP: { clientIP }, acceptProxy: false,
                                        inputHelper: helper, allowFileSessions: true, authGate: gate,
-                                       admitConnection: admit, admitMessage: admitMessage)
+                                       admitConnection: admit, admitMessage: messageOK)
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
@@ -62,7 +70,7 @@ enum ControlService {
                                           settingsClientIP: { clientIP }, acceptProxy: false,
                                           inputHelper: helper, announceInputSessions: false,
                                           allowSensitiveControl: false, relayMouseOnly: true,
-                                          admitConnection: admit, admitMessage: admitMessage)
+                                          admitConnection: relayAdmit, admitMessage: messageOK)
                 try relay.start()
                 servers.append(relay)
             }
@@ -71,6 +79,19 @@ enum ControlService {
             throw error
         }
         return servers
+    }
+
+    /// True while the guard holds every admission (B5: the pending journal
+    /// does not read). Logs at most once a second; the listeners log each
+    /// refused connection or message themselves.
+    static func lockdownCheck(_ gate: AuthGate?) -> @Sendable () -> Bool {
+        guard let guardian = gate?.guardian else { return { false } }
+        let throttle = OncePerInterval(1)
+        return {
+            guard let why = guardian.lockdownReason() else { return false }
+            if throttle.due() { log("auth.lockdown_hold reason=\(why) entry=relay_or_open_connection; refused or closed") }
+            return true
+        }
     }
 
     static func raiseOpenFileLimit(to want: rlim_t) {
@@ -295,6 +316,7 @@ final class PolicyWatch: @unchecked Sendable {
 
     /// One periodic check; returns the transient count to carry.
     @discardableResult func tick(transientMisses: Int = 0) -> Int {
+        gate?.guardian.probeJournal()
         _ = gate?.guardian.retryPending(force: false)
         switch evaluate() {
         case .current: return 0
@@ -350,5 +372,20 @@ final class PolicyWatch: @unchecked Sendable {
             Thread.sleep(forTimeInterval: interval)
             _ = guardian.saveJournal()
         }
+    }
+}
+
+/// True at most once per `interval` (log throttling).
+final class OncePerInterval: @unchecked Sendable {
+    private let lock = NSLock()
+    private let interval: TimeInterval
+    private var last: TimeInterval = -.infinity
+    init(_ interval: TimeInterval) { self.interval = interval }
+    func due() -> Bool {
+        let t = ProcessInfo.processInfo.systemUptime
+        lock.lock(); defer { lock.unlock() }
+        guard t - last >= interval else { return false }
+        last = t
+        return true
     }
 }

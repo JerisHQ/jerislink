@@ -344,6 +344,19 @@ final class AuthGuard: @unchecked Sendable {
         return journalHoldLocked() ? "pending_journal_unreadable" : nil
     }
 
+    /// r6 (B5): a journal that stops reading while the service runs holds
+    /// everything as one found at start does (the UDP input in the video
+    /// service reads the same file). The policy watch calls this every
+    /// second; the file is kept as it is.
+    func probeJournal() {
+        lock.lock(); defer { lock.unlock() }
+        guard !journalUnreadable, let journal, journal.load() == nil else { return }
+        journalUnreadable = true
+        lastJournalRetry = now()
+        print("auth.lockdown reason=pending_journal_unreadable found=running (file kept as is; nobody is admitted and open connections stop until it reads or is removed)")
+        fflush(stdout)
+    }
+
     /// Blacklist only (transition mode: no challenge, so no counting).
     func isBlocked(_ ip: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
