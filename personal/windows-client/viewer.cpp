@@ -6207,6 +6207,21 @@ static int appMain(int argc, char** argv) {
         // From here a lost control connection (and its AUTH) is re-made off
         // the UI thread, so input never stalls video presentation.
         if (control) control->setBackgroundReconnect(true);
+        // Hand tests only: JERISLINK_TEST_FLUSH_HOLD_MS (1-5000) holds each
+        // event the reconnect worker took from the queue for that long
+        // before its focus check and send, so a focus loss can be made to
+        // land on an event in flight. Unset in normal use.
+        if (control) {
+            char hold[16]{};
+            const DWORD hl = GetEnvironmentVariableA("JERISLINK_TEST_FLUSH_HOLD_MS", hold, DWORD(std::size(hold)));
+            const int holdMs = (hl > 0 && hl < std::size(hold)) ? std::atoi(hold) : 0;
+            if (holdMs > 0 && holdMs <= 5000) {
+                control->setBeforeFlushSendForTest([holdMs] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+                });
+                logLine("control.test_flush_hold_ms=" + std::to_string(holdMs));
+            }
+        }
 
         gConnectionInfo.effectiveCodec = effectiveCodec;
         gConnectionInfo.effectiveBitrateMbps = effectiveBitrateMbps;
