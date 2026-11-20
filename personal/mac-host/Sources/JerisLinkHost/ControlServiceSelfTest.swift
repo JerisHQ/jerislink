@@ -1393,6 +1393,17 @@ final class MRC1Client {
         return sent == bytes.count
     }
 
+    /// r11: the bytes the host sent, up to 64 KiB, after waiting up to
+    /// `timeout` s: 0 when none came, -1 once the host closed.
+    func readAny(timeout: Double) -> Int {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard Darwin.poll(&pfd, 1, Int32(timeout * 1000)) > 0 else { return 0 }
+        var buf = [UInt8](repeating: 0, count: 65536)
+        let n = buf.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!, 65536, 0) }
+        if n == 0 || (n < 0 && errno == ECONNRESET) { sawEOF = true; return -1 }
+        return max(0, n)
+    }
+
     /// Next MRC1 packet from the host, or nil after `timeout` seconds.
     func receive(timeout: Double) -> (type: UInt8, payload: [UInt8])? {
         guard let header = recvExact(8, timeout: timeout), header[0] == 0x4d, header[3] == 0x31 else { return nil }

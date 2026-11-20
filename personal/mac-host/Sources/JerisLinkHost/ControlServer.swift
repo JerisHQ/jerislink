@@ -315,9 +315,16 @@ final class ControlServer: @unchecked Sendable {
             var noSigPipe: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
             let keepAlive = Self.enableKeepAlive(c)
-            Self.setSendSlice(c)
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
+            // r11: fail closed. Without the send timeout a send() that finds
+            // the buffer short of room could wait on a stalled viewer for good.
+            if !sendSliceSetter(c) {
+                rejectedClients += 1
+                print("Control reject peer=\(peerIP) reason=send_timeout_unset on \(bindIP):\(port); connection closed")
+                Darwin.close(c)
+                continue
+            }
             if let allowedClientIP, peerIP != allowedClientIP {
                 rejectedClients += 1
                 print("Control reject peer=\(peerIP) expected=\(allowedClientIP) on \(bindIP):\(port); connection closed")
@@ -1433,28 +1440,59 @@ final class ControlServer: @unchecked Sendable {
     /// honoured by a blocking TCP socket on macOS: send still waits).
     static let sendSliceMillis: Int32 = 100
 
-    /// SO_SNDTIMEO = `sendSliceMillis` on a viewer socket (r10).
-    static func setSendSlice(_ fd: Int32) {
+    /// SO_SNDTIMEO = `sendSliceMillis` on a viewer socket (r10). r11: false
+    /// when the kernel refuses it; the accept loop then closes the
+    /// connection instead of serving it without the timeout.
+    static func setSendSlice(_ fd: Int32) -> Bool {
         var tv = timeval(tv_sec: 0, tv_usec: __darwin_suseconds_t(sendSliceMillis * 1000))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        return setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size)) == 0
     }
 
-    /// One MRC1 frame (r10). The socket's send timeout (`setSendSlice`)
-    /// cuts a wait on a viewer's full window into 100 ms slices. `revoked`
-    /// (an admitted viewer, via sendChecked) is asked before the first write
-    /// and after every slice that left the frame unfinished; true ends the
-    /// frame there. Without it (handshake frames) the wait ends after
-    /// `handshakeSendSeconds`.
+    /// Sets the send timeout on an accepted socket (r11). The self-test
+    /// swaps it for one that fails, to see the connection refused.
+    var sendSliceSetter: (Int32) -> Bool = ControlServer.setSendSlice
+
+    /// Free room in `fd`'s send buffer (r11): SO_SNDBUF less the bytes it
+    /// still holds, sent or not (SO_NWRITE). nil when either read fails.
+    static func sendRoom(_ fd: Int32) -> Int? {
+        var size: Int32 = 0, held: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, &len) == 0 else { return nil }
+        len = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_NWRITE, &held, &len) == 0 else { return nil }
+        return Int(size) - Int(held)
+    }
+
+    /// One MRC1 frame. r11: the wait for room is poll(POLLOUT) in
+    /// `sendSliceMillis` slices, never send(). After every wake (room, a
+    /// slice with none, a signal) `revoked` is asked first (an admitted
+    /// viewer, via sendChecked), and only then is one write made, no larger
+    /// than the room the buffer has, so the write does not wait: a window
+    /// that reopens after a block cannot carry bytes written after it.
+    /// Without `revoked` (handshake frames) the wait ends after
+    /// `handshakeSendSeconds`. SO_SNDTIMEO stays as the bound should a
+    /// write still find less room than measured.
     private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8], peerIP: String? = nil,
                             revoked: (() -> Bool)? = nil) -> Bool {
-        if let revoked, revoked() { return false }
         let length = UInt16(payload.count)
         let bytes: [UInt8] = [0x4d, 0x52, 0x43, 0x31, 1, type, UInt8(length >> 8), UInt8(length & 0xff)] + payload
         let deadline = revoked == nil ? ProcessInfo.processInfo.systemUptime + Self.handshakeSendSeconds : .infinity
         var offset = 0
         while offset < bytes.count {
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let ready = Darwin.poll(&pfd, 1, Self.sendSliceMillis)
+            if ready < 0 && errno != EINTR { return false }
+            if let revoked, revoked() { return false }
+            if ProcessInfo.processInfo.systemUptime > deadline { return false }
+            lock.lock(); let shouldStop = stopping; lock.unlock()
+            if shouldStop { return false }
+            guard ready > 0 else { continue }
+            guard pfd.revents & Int16(POLLOUT) != 0 else { return false }
+            guard let room = Self.sendRoom(fd) else { return false }
+            guard room > 0 else { usleep(1000); continue }
+            let chunk = min(bytes.count - offset, room)
             let n = bytes.withUnsafeBytes { raw -> Int in
-                Darwin.send(fd, raw.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
+                Darwin.send(fd, raw.baseAddress!.advanced(by: offset), chunk, 0)
             }
             if n > 0 {
                 offset += n
@@ -1465,16 +1503,10 @@ final class ControlServer: @unchecked Sendable {
                     txByPeer[peerIP] = t
                     txLock.unlock()
                 }
-                if offset == bytes.count { break }
-                // A short write: the slice ran out with the window full.
             } else {
                 let e = errno
                 guard n < 0, e == EAGAIN || e == EINTR else { return false }
             }
-            if let revoked, revoked() { return false }
-            if ProcessInfo.processInfo.systemUptime > deadline { return false }
-            lock.lock(); let shouldStop = stopping; lock.unlock()
-            if shouldStop { return false }
         }
         return true
     }

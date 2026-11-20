@@ -43,6 +43,8 @@ enum AuthSelfTest {
         r9InFlightBlock(expect)
         r10StalledBlock(expect)
         r10ReplyBlock(expect)
+        r10StalledBlock(expect, reopen: true)
+        r11SendSliceFailClosed(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -1830,13 +1832,20 @@ extension AuthSelfTest {
     /// The viewer never reads again; its connection is still closed within
     /// 2 s, and the host writes nothing to it after the block (host count).
     /// The other viewer's pull finishes with every byte and FILE_END.
-    fileprivate static func r10StalledBlock(_ expect: Expect) {
+    ///
+    /// r11 (`reopen`): the same, but the viewer starts reading again right
+    /// after the block, so its window reopens while the host waits. The host
+    /// still writes 0 bytes after the block (its own write count; what the
+    /// viewer reads is what the kernel already held) and the socket closes.
+    fileprivate static func r10StalledBlock(_ expect: Expect, reopen: Bool = false) {
         typealias M = FileProto.Message
         let vx = "100.64.0.41", vy = "100.64.0.42"
         let body = FileAnnounceSelfTest.body(Int(FileAnnouncer.maxRequest))
         for viaJournal in [true, false] {
             let source = viaJournal ? "the journal" : "listen.plist"
-            let name = "r10 stalled send: a block from \(source) lands while the host waits on a viewer that stopped reading mid-pull: its socket closes within 2 s without the viewer reading again, the host writes 0 bytes to it after the block, no FILE_END; the other viewer's pull finishes with every byte and FILE_END"
+            let name = reopen
+                ? "r11 reopened window: a block from \(source) lands while the host waits on a viewer that stopped reading mid-pull, and the viewer then reads again so its window reopens: the host writes 0 bytes to it after the block (host write count), its socket closes within 2 s, no FILE_END; the other viewer's pull finishes with every byte and FILE_END"
+                : "r10 stalled send: a block from \(source) lands while the host waits on a viewer that stopped reading mid-pull: its socket closes within 2 s without the viewer reading again, the host writes 0 bytes to it after the block, no FILE_END; the other viewer's pull finishes with every byte and FILE_END"
             guard let rig = R10Rig(allowed: [vx, vy], settingsIP: vy, srcBody: body), rig.start(),
                   let x = rig.viewer(vx, receiveBuffer: 8 * 1024), let y = rig.viewer(vy) else {
                 expect(false, name); continue
@@ -1872,6 +1881,7 @@ extension AuthSelfTest {
             let atBlock = rig.server.txCount(peer: vx)
             let blockedAt = Date()
             rig.block(vx, viaJournal: viaJournal)
+            let drain = reopen ? R11Drain(x) : nil
             var closed = false
             while !closed && Date().timeIntervalSince(blockedAt) < 2 {
                 Thread.sleep(forTimeInterval: 0.02)
@@ -1880,6 +1890,7 @@ extension AuthSelfTest {
             let closeMs = Int(Date().timeIntervalSince(blockedAt) * 1000)
             Thread.sleep(forTimeInterval: 0.3)
             let after = rig.server.txCount(peer: vx)
+            let viewerRead = drain?.finish() ?? 0
             var yBody: [UInt8] = []
             var yEnd: M?
             while let m = next(y) {
@@ -1887,13 +1898,67 @@ extension AuthSelfTest {
                 if case .fileEnd = m { yEnd = m; break }
                 if case .reply = m { break }
             }
-            print("r10 stalled info: source=\(viaJournal ? "journal" : "listen.plist") stalled=\(stalled) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) viewer_read_after_block=0; other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
+            print("\(reopen ? "r11 reopened" : "r10 stalled") info: source=\(viaJournal ? "journal" : "listen.plist") stalled=\(stalled) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) viewer_read_after_block=\(viewerRead); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
             expect(stalled && closed && after.sends == atBlock.sends && after.bytes == atBlock.bytes
                    && yBody == body && yEnd == .fileEnd(transfer: ty, index: 0, sha256: FileUploadSelfTest.sha(body))
                    && rig.server.rejectedClients >= 1 && rig.watch.appliedChange == nil && !rig.gate.isRevoked
                    && rig.gate.guardian.isBlocked(vx) && !rig.gate.guardian.isBlocked(vy),
                    name)
         }
+    }
+
+    /// r11: reads whatever the host sends to `client`, on its own thread,
+    /// until `finish` or the host closes: the viewer's window reopens.
+    fileprivate final class R11Drain: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stop = false
+        private var bytes = 0
+        private let done = DispatchSemaphore(value: 0)
+
+        init(_ client: MRC1Client) {
+            Thread.detachNewThread { [self] in
+                while true {
+                    lock.lock(); let s = stop; lock.unlock()
+                    if s { break }
+                    let n = client.readAny(timeout: 0.05)
+                    if n < 0 { break }
+                    lock.lock(); bytes += n; lock.unlock()
+                }
+                done.signal()
+            }
+        }
+
+        /// Stops reading; the bytes the viewer read.
+        func finish() -> Int {
+            lock.lock(); stop = true; lock.unlock()
+            done.wait()
+            lock.lock(); defer { lock.unlock() }
+            return bytes
+        }
+    }
+
+    /// r11: a viewer socket whose send timeout cannot be set is not served
+    /// (fail closed): the accept loop closes it before any frame.
+    fileprivate static func r11SendSliceFailClosed(_ expect: Expect) {
+        let v = "100.64.0.44"
+        let name = "r11 send timeout unset: when SO_SNDTIMEO cannot be set on an accepted viewer socket the host closes that connection at once (fail closed): no reply, rejected count +1; on a real socket the setter succeeds"
+        guard let rig = R10Rig(allowed: [v], settingsIP: v) else { expect(false, name); return }
+        rig.server.sendSliceSetter = { _ in false }
+        guard rig.start(), let c = rig.viewer(v) else { rig.close(); expect(false, name); return }
+        defer { c.close(); rig.close() }
+        _ = c.send(type: 0x01, payload: [])
+        var closed = false
+        let t0 = Date()
+        while !closed && Date().timeIntervalSince(t0) < 1 {
+            Thread.sleep(forTimeInterval: 0.02)
+            closed = c.hostClosed()
+        }
+        let reply = c.receive(timeout: 0.3)
+        let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        defer { Darwin.close(s) }
+        let realOK = ControlServer.setSendSlice(s)
+        print("r11 send timeout info: closed=\(closed) reply=\(reply != nil) rejected=\(rig.server.rejectedClients) real_setter_ok=\(realOK)")
+        expect(closed && reply == nil && rig.server.rejectedClients >= 1 && realOK, name)
     }
 
     /// r10 (blocker 2): a block that lands while a request is handled (after
