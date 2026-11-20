@@ -27,6 +27,9 @@ enum AuthSelfTest {
         concurrentEndToEnd(expect)
         failClosed(expect)
         configWatch(expect)
+        legacyRuntime(expect)
+        serviceLevel(expect)
+        blocklistMerge(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -188,7 +191,7 @@ enum AuthSelfTest {
         expect(reloaded.release("100.64.0.7") == .released && AuthGuard(whitelist: [], blocklist: ListenPlistBlocklist(url: url)).admit("100.64.0.7") == .challenge,
                "release removes the IP and is saved")
         let missing = dir.appendingPathComponent("absent.plist")
-        expect(!ListenPlistBlocklist(url: missing).save([BlockedEntry(ip: "100.64.0.7", at: Date(), reason: "t")])
+        expect(ListenPlistBlocklist(url: missing).update(adding: [BlockedEntry(ip: "100.64.0.7", at: Date(), reason: "t")], removing: []) == nil
                && !FileManager.default.fileExists(atPath: missing.path), "no listen.plist: the blacklist never creates one")
     }
 
@@ -581,7 +584,7 @@ enum AuthSelfTest {
 
         // MouseMoveUDPServer with input off drops 0x24 but still answers ping.
         guard let up = ControlServiceSelfTest.freeLoopbackPort() else { return }
-        let udp = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: up, inputEnabled: false)
+        let udp = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: up, inputAllowed: { false })
         guard (try? udp.start()) != nil else { expect(false, "fail closed: UDP server starts"); return }
         defer { udp.stop() }
         let s = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
@@ -605,28 +608,33 @@ enum AuthSelfTest {
 
         // Legacy entries read passwordSet from listen.plist.
         let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir); unsetenv("JERISLINK_LISTEN_PLIST") }
+        defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("listen.plist")
-        setenv("JERISLINK_LISTEN_PLIST", url.path, 1)
         writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "passwordSet": true], url)
-        let on = ListenConfig.passwordModeRequested()
+        let on = ListenConfig.passwordState(url: url)
         writePlist(["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "passwordSet": false], url)
-        expect(on && !ListenConfig.passwordModeRequested(), "fail closed: legacy entries see passwordSet")
+        expect(on == .on && ListenConfig.passwordState(url: url) == .off, "fail closed: legacy entries see passwordSet")
     }
 
     // MARK: r2: auth config changes restart the service
 
     private static func configWatch(_ expect: Expect) {
         let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir); unsetenv("JERISLINK_LISTEN_PLIST") }
+        defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("listen.plist")
-        setenv("JERISLINK_LISTEN_PLIST", url.path, 1)
         let base: [String: Any] = ["bindIP": "100.64.0.1", "clientIP": "100.64.0.2", "allowedIPs": ["100.64.0.2"],
                                    "allowedIPsSource": "clientIP", "passwordSet": false]
         writePlist(base, url)
         let guardian = AuthGuard(whitelist: ["100.64.0.2"], blocklist: ListenPlistBlocklist(url: url), pause: { _ in })
-        let started = AuthConfigSnapshot.read(plist: ListenConfig.readPlist(), secret: nil)
-        let check = ControlService.authChanged(from: started, guardian: guardian, loadSecret: { nil })
+        let started = AuthConfigSnapshot.read(plist: ListenConfig.readPlist(url: url), secret: nil)
+        let ep = ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.1", clientIP: "100.64.0.2", source: "listen.plist")
+        let gate = AuthGate(policy: .transition(whitelist: ["100.64.0.2"]), guardian: guardian, secret: nil)
+        let watch = PolicyWatch(started: ep, snapshot: started, gate: gate,
+                                read: { (.ready(ep), ListenConfig.readPlist(url: url)) }, loadSecret: { nil })
+        func check() -> String? {
+            if case .changed(let what) = watch.evaluate() { return what }
+            return nil
+        }
         expect(check() == nil, "watch: unchanged config, no restart")
         var edited = base; edited["allowedIPs"] = ["100.64.0.2", "100.64.0.3"]; edited["allowedIPsSource"] = nil
         writePlist(edited, url)
@@ -644,5 +652,192 @@ enum AuthSelfTest {
         let a = AuthConfigSnapshot.read(plist: ["passwordSet": true], secret: ConnSecret(key: [1], salt: [2], iterations: 1, hostID: [3]))
         let b = AuthConfigSnapshot.read(plist: ["passwordSet": true], secret: ConnSecret(key: [1], salt: [4], iterations: 1, hostID: [3]))
         expect(b.changes(from: a) == "password", "watch: a new password (new salt) restarts")
+    }
+
+    // MARK: r3: legacy entries, service-level policy changes, blacklist merge
+
+    private final class SecretSlot: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: ConnSecret?
+        var value: ConnSecret? {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
+    }
+
+    private static func pong(_ c: MRC1Client?) -> Bool {
+        guard let c, c.send(type: 0x01, payload: [9, 8, 7, 6]), let r = c.receive(timeout: 2) else { return false }
+        return r.type == 0x02 && r.payload == [9, 8, 7, 6]
+    }
+
+    /// Connects and answers the challenge for the control channel.
+    private static func login(_ port: UInt16, password: String) -> (MRC1Client?, ConnAuth.Result?) {
+        guard let c = MRC1Client(port: port), let ch = c.receive(timeout: 2),
+              ch.type == ConnAuth.MsgType.challenge, let challenge = ConnAuth.Challenge.decode(ch.payload),
+              let key = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations) else { return (nil, nil) }
+        let cn = ConnAuth.random(ConnAuth.nonceBytes)
+        let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: .control, hostID: challenge.hostID)
+        _ = c.send(type: ConnAuth.MsgType.response, payload: ConnAuth.Response(clientNonce: cn, mac: mac).payload)
+        guard let r = c.receive(timeout: 3), r.type == ConnAuth.MsgType.result else { return (c, nil) }
+        return (c, ConnAuth.Result.decode(r.payload))
+    }
+
+    /// B2: legacy entries fail closed on an unknown password state and close
+    /// at runtime when a password is set.
+    private static func legacyRuntime(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        expect(ListenConfig.passwordState(url: url) == .off, "b2: no listen.plist is password off (network.conf setups)")
+        writePlist(["mode": "loopback", "passwordSet": "yes"], url)
+        expect(ListenConfig.passwordState(url: url) == .unknown("password_set_invalid"), "b2: a non-bool passwordSet is unknown, not off")
+        try? Data("not a plist".utf8).write(to: url)
+        expect(ListenConfig.passwordState(url: url) == .unknown("listen_plist_invalid"), "b2: an unparseable listen.plist is unknown, not off")
+        writePlist(["mode": "loopback", "passwordSet": false], url)
+        chmod(url.path, 0)
+        let unreadable = ListenConfig.passwordState(url: url)
+        chmod(url.path, 0o644)
+        expect(unreadable == .unknown("listen_plist_unreadable"), "b2: an unreadable listen.plist is unknown, not off")
+        expect(AuthPolicy.resolve(plist: ["passwordSet": "yes", "clientIP": "100.64.0.2"], clientIP: "100.64.0.2", secretLoaded: false)
+               == .refused(reason: "password_set_invalid"), "b2: the control service refuses a non-bool passwordSet")
+        expect(!LegacyAuthWatch(read: { .unknown("listen_plist_unreadable") }).isOpen, "b2: legacy entries start closed on an unknown state")
+
+        writePlist(["mode": "loopback", "passwordSet": false], url)
+        let me = ListenConfig.loopbackIP
+        let watch = LegacyAuthWatch(read: { ListenConfig.passwordState(url: url) })
+        guard let port = ControlServiceSelfTest.freeLoopbackPort() else { return }
+        let legacy = ControlServer.legacyListener(bindIP: me, allowedClientIP: me, port: port, inject: false,
+                                                  globalClientIP: { me }, clipboard: FakeClipboard(text: nil),
+                                                  admit: { watch.check() })
+        watch.onClose { _ in legacy.stop() }
+        guard (try? legacy.start()) != nil else { expect(false, "b2: legacy listener starts"); return }
+        defer { legacy.stop() }
+        let old = MRC1Client(port: port)
+        expect(pong(old), "b2: legacy listener serves while passwordSet is false")
+        writePlist(["mode": "loopback", "passwordSet": true], url)
+        // No poll has run: the accept-time check alone must refuse it.
+        expect(!pong(MRC1Client(port: port)), "b2: password set at runtime: the next legacy connection is refused at once")
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(!watch.isOpen && !pong(old), "b2: legacy listener stops and the connection opened before the change is closed")
+        writePlist(["mode": "loopback", "passwordSet": false], url)
+        expect(!watch.check() && MRC1Client(port: port).map { pong($0) } != true, "b2: clearing the password does not reopen legacy entries")
+    }
+
+    /// Should-fix: the control service as it runs (startServers + PolicyWatch
+    /// on a temporary listen.plist): password turned on while running, old
+    /// connections closed, admission after the restart.
+    private static func serviceLevel(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let me = ListenConfig.loopbackIP
+        let password = "Service-\(UUID().uuidString.prefix(8))!"
+        guard let secret = ConnSecret.make(password: password, iterations: 1000) else { return }
+        let slot = SecretSlot()
+        let base: [String: Any] = ["mode": "loopback", "clientIP": me, "allowedIPs": [me],
+                                   "allowedIPsSource": "clientIP", "passwordSet": false]
+        writePlist(base, url)
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        struct Running { var watch: PolicyWatch; var servers: [ControlServer]; var port: UInt16; var changes: Box<String> }
+        /// One service start, as ControlService.run does it.
+        func boot() -> Running? {
+            let (resolution, plist) = read()
+            guard case .ready(let ep) = resolution, let port = ControlServiceSelfTest.freeLoopbackPort() else { return nil }
+            let (gate, snapshot) = ControlService.authGate(clientIP: ep.clientIP, plist: plist,
+                                                           secret: ControlService.wantsPassword(plist) ? slot.value : nil,
+                                                           blocklist: ListenPlistBlocklist(url: url))
+            let watch = PolicyWatch(started: ep, snapshot: snapshot, gate: gate, read: read, loadSecret: { slot.value })
+            guard let servers = try? ControlService.startServers(bindIP: me, clientIP: me, port: port, relayPort: 0, inject: false,
+                                                                 helper: InputHelperClient(port: 9), gate: gate,
+                                                                 admit: { watch.admitNew() }) else { return nil }
+            let changes = Box<String>()
+            watch.setOnChange { what in changes.add(what); servers.forEach { $0.stop() } }
+            return Running(watch: watch, servers: servers, port: port, changes: changes)
+        }
+
+        guard let a = boot() else { expect(false, "service: starts in transition mode"); return }
+        let old = MRC1Client(port: a.port)
+        expect(pong(old), "service: transition mode admits a 0.3 viewer without AUTH")
+        slot.value = secret
+        var pw = base; pw["passwordSet"] = true
+        writePlist(pw, url)
+        // No periodic check has run: the accept-time check alone applies it.
+        expect(!pong(MRC1Client(port: a.port)), "service: password set while running: the next connection is refused at once")
+        expect(a.watch.appliedChange?.contains("passwordSet") == true && a.watch.gate?.isRevoked == true && a.changes.all.count == 1,
+               "service: one check is enough: old gate revoked, change applied once")
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(!pong(old), "service: a connection admitted before the change is closed")
+        a.servers.forEach { $0.stop() }
+
+        // Restart (launchd): the same listen.plist now means password mode.
+        guard let b = boot() else { expect(false, "service: restarts in password mode"); return }
+        defer { b.servers.forEach { $0.stop() } }
+        expect(b.watch.gate?.requiresPassword == true, "service restart: password policy in force")
+        let plain = MRC1Client(port: b.port)
+        expect(plain?.receive(timeout: 2)?.type == ConnAuth.MsgType.challenge, "service restart: a viewer without a password gets a challenge, nothing else")
+        plain?.close()
+        let (wrongClient, wrong) = login(b.port, password: "Wrong-\(UUID().uuidString.prefix(6))!")
+        if case .fail? = wrong { expect(!pong(wrongClient), "service restart: wrong password refused") }
+        else { expect(false, "service restart: wrong password refused") }
+        let (goodClient, good) = login(b.port, password: password)
+        if case .ok? = good { expect(pong(goodClient), "service restart: right password admitted") }
+        else { expect(false, "service restart: right password admitted") }
+
+        // An open authenticated connection is closed by the periodic check.
+        var narrowed = pw; narrowed["allowedIPs"] = ["100.64.0.9"]; narrowed["allowedIPsSource"] = nil
+        writePlist(narrowed, url)
+        b.watch.tick()
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(b.watch.appliedChange?.contains("allowedIPs") == true && !pong(goodClient),
+               "service: allowedIPs edit closes an authenticated connection on the first periodic check")
+    }
+
+    /// B5: automatic writes merge with listen.plist; a block that could not
+    /// be written keeps the host shut until it is.
+    private static func blocklistMerge(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        writePlist(["mode": "loopback", "blockedIPs": ["100.64.0.5"]], url)
+        let g = AuthGuard(whitelist: [], blocklist: ListenPlistBlocklist(url: url), pause: { _ in })
+        var outside = readPlist(url) ?? [:]
+        outside["blockedIPs"] = ["100.64.0.5", "100.64.0.9"]
+        writePlist(outside, url)
+        for _ in 0..<20 { _ = g.recordFailure("100.64.0.7") }
+        let inFile = { Set(ListenPlistBlocklist(url: url).load().map(\.ip)) }
+        expect(inFile() == ["100.64.0.5", "100.64.0.9", "100.64.0.7"],
+               "b5: automatic block merges into listen.plist; a manual block written after start is kept")
+        expect(g.admit("100.64.0.9") == .blocked && !g.persistedIPs.contains("100.64.0.9"),
+               "b5: that manual block applies at once and still counts as an outside edit")
+        expect(g.release("100.64.0.7") == .released && inFile() == ["100.64.0.5", "100.64.0.9"],
+               "b5: release removes only its own IP")
+
+        let clock = Clock()
+        let store = MemoryBlocklist()
+        store.failNextSaves = 99
+        let lg = AuthGuard(whitelist: [], blocklist: store, now: { clock.t }, pause: { _ in })
+        var last: AuthGuard.FailureOutcome?
+        for _ in 0..<20 { last = lg.recordFailure("100.64.0.7").outcome; clock.t += 61 }
+        clock.t -= 61
+        expect(last == .blacklisted(persisted: false) && lg.admit("100.64.0.8") == .globalLocked(retrySeconds: AuthGuard.pendingRetrySeconds),
+               "b5: a block that could not be written stops every challenge (fail closed)")
+        clock.t += 2
+        expect(lg.admit("100.64.0.8") != .challenge && lg.pendingIPs == ["100.64.0.7"], "b5: still shut while writes keep failing")
+        store.failNextSaves = 0
+        clock.t += 2
+        expect(lg.admit("100.64.0.8") == .challenge && store.entries.map(\.ip) == ["100.64.0.7"] && lg.pendingIPs.isEmpty,
+               "b5: the retry writes the block, then challenges resume")
+
+        guard let secret = ConnSecret.make(password: "Unwritable-\(UUID().uuidString.prefix(6))!", iterations: 1000) else { return }
+        let ro = MemoryBlocklist(); ro.canWrite = false
+        let plist: [String: Any] = ["mode": "loopback", "allowedIPs": ["127.0.0.1"], "passwordSet": true]
+        expect(ControlService.authGate(clientIP: "127.0.0.1", plist: plist, secret: secret, blocklist: ro).0 == nil,
+               "b5: password mode refuses to start while the blacklist cannot be written")
+        expect(ControlService.authGate(clientIP: "127.0.0.1", plist: plist, secret: secret, blocklist: MemoryBlocklist()).0?.requiresPassword == true,
+               "b5: and starts when it can")
     }
 }

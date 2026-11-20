@@ -9,7 +9,22 @@ struct BlockedEntry: Equatable {
 
 protocol BlocklistStore: AnyObject {
     func load() -> [BlockedEntry]
-    @discardableResult func save(_ entries: [BlockedEntry]) -> Bool
+    /// Read-modify-write against what the store holds now: entries in
+    /// `adding` that are not there yet are appended, IPs in `removing` are
+    /// dropped, and every other entry (a manual block written after this
+    /// process loaded the list, say) stays. Returns the list as written, or
+    /// nil when it could not be written.
+    func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]?
+    /// Whether `update` can write at all (checked at start in password mode).
+    func writable() -> Bool
+}
+
+extension BlocklistStore {
+    static func merged(_ current: [BlockedEntry], adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry] {
+        var out = current.filter { !removing.contains($0.ip) }
+        for e in adding where !removing.contains(e.ip) && !out.contains(where: { $0.ip == e.ip }) { out.append(e) }
+        return out
+    }
 }
 
 /// `blockedIPs` in listen.plist: read-modify-write, other keys untouched.
@@ -23,7 +38,13 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
 
     func load() -> [BlockedEntry] {
         lock.lock(); defer { lock.unlock() }
-        guard let dict = readDict(), let raw = dict["blockedIPs"] as? [Any] else { return [] }
+        return readDict().map(Self.entries(in:)) ?? []
+    }
+
+    /// The `blockedIPs` of a listen.plist already read (the policy watcher
+    /// reads the file once per check).
+    static func entries(in dict: [String: Any]) -> [BlockedEntry] {
+        guard let raw = dict["blockedIPs"] as? [Any] else { return [] }
         return raw.compactMap { item in
             if let ip = item as? String, ListenConfig.isIPv4(ip) {
                 return BlockedEntry(ip: ip, at: Date(timeIntervalSince1970: 0), reason: "manual")
@@ -34,19 +55,27 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
         }
     }
 
-    @discardableResult func save(_ entries: [BlockedEntry]) -> Bool {
+    func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]? {
         lock.lock(); defer { lock.unlock() }
         guard var dict = readDict() else {
             print("auth.blocklist_not_saved reason=no_listen_plist")
-            return false
+            return nil
         }
-        dict["blockedIPs"] = entries.map { ["ip": $0.ip, "at": $0.at, "reason": $0.reason] as [String: Any] }
+        let out = Self.merged(Self.entries(in: dict), adding: adding, removing: removing)
+        dict["blockedIPs"] = out.map { ["ip": $0.ip, "at": $0.at, "reason": $0.reason] as [String: Any] }
         guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0),
               (try? data.write(to: url, options: .atomic)) != nil else {
             print("auth.blocklist_not_saved reason=write_failed")
-            return false
+            return nil
         }
-        return true
+        return out
+    }
+
+    /// An atomic write replaces the file, so the folder must be writable too.
+    func writable() -> Bool {
+        let fm = FileManager.default
+        return readDict() != nil && fm.isWritableFile(atPath: url.path)
+            && fm.isWritableFile(atPath: url.deletingLastPathComponent().path)
     }
 
     private func readDict() -> [String: Any]? {
@@ -57,17 +86,19 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
 
 final class MemoryBlocklist: BlocklistStore, @unchecked Sendable {
     var entries: [BlockedEntry]
-    /// Self-test: this many saves fail before one succeeds.
+    /// Self-test: this many writes fail before one succeeds.
     var failNextSaves = 0
+    var canWrite = true
     private(set) var saveCalls = 0
     init(_ entries: [BlockedEntry] = []) { self.entries = entries }
     func load() -> [BlockedEntry] { entries }
-    @discardableResult func save(_ entries: [BlockedEntry]) -> Bool {
+    func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]? {
         saveCalls += 1
-        if failNextSaves > 0 { failNextSaves -= 1; return false }
-        self.entries = entries
-        return true
+        if failNextSaves > 0 { failNextSaves -= 1; return nil }
+        entries = Self.merged(entries, adding: adding, removing: removing)
+        return entries
     }
+    func writable() -> Bool { canWrite }
 }
 
 /// Wrong-password limits (design §4).
@@ -107,7 +138,8 @@ final class AuthGuard: @unchecked Sendable {
         case retry(triesLeft: UInt8)
         case locked(retrySeconds: UInt32, stage: Int)
         /// `persisted`: listen.plist now holds the entry. When false the IP
-        /// is still blocked in memory until the service restarts.
+        /// is blocked in memory and the host issues no challenge to anyone
+        /// until the write succeeds (AuthGuard `pending`).
         case blacklisted(persisted: Bool)
     }
 
@@ -151,6 +183,14 @@ final class AuthGuard: @unchecked Sendable {
     private var persisted: Set<String>
     private var globalFailures: [TimeInterval] = []
     private var globalLockedUntil: TimeInterval = 0
+    /// Blocked in memory but not yet in the store (every write attempt
+    /// failed). While any is pending, no challenge is issued to anyone, and
+    /// the write is retried (`retryPending`): a restart must not be able to
+    /// drop a block that was never written, so the host stays shut instead.
+    private var pending: [BlockedEntry] = []
+    private var lastPendingRetry: TimeInterval = -.infinity
+    static let pendingRetryInterval: TimeInterval = 1
+    static let pendingRetrySeconds: UInt32 = 5
 
     init(whitelist: [String], blocklist: BlocklistStore,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -212,12 +252,12 @@ final class AuthGuard: @unchecked Sendable {
     @discardableResult func release(_ ip: String) -> ReleaseResult {
         lock.lock(); defer { lock.unlock() }
         guard blocked.contains(where: { $0.ip == ip }) else { return .notBlocked }
-        let remaining = blocked.filter { $0.ip != ip }
-        guard saveLocked(remaining) else {
+        guard writeLocked(adding: [], removing: [ip]) else {
             print("auth.release_failed peer=\(ip) reason=write_failed attempts=\(Self.saveAttempts)")
             return .saveFailed
         }
-        blocked = remaining
+        blocked.removeAll { $0.ip == ip }
+        pending.removeAll { $0.ip == ip }
         peers[ip] = nil
         print("auth.released peer=\(ip) persisted=listen.plist")
         return .released
@@ -248,6 +288,10 @@ final class AuthGuard: @unchecked Sendable {
             return .locked(retrySeconds: Self.seconds(p.lockedUntil - t), stage: p.stage)
         }
         if globalLockedUntil > t { return .globalLocked(retrySeconds: Self.seconds(globalLockedUntil - t)) }
+        if !pending.isEmpty {
+            retryPendingLocked(force: false)
+            if !pending.isEmpty { return .globalLocked(retrySeconds: Self.pendingRetrySeconds) }
+        }
         return .challenge
     }
 
@@ -275,7 +319,13 @@ final class AuthGuard: @unchecked Sendable {
             if !blocked.contains(where: { $0.ip == ip }) {
                 blocked.append(BlockedEntry(ip: ip, at: wallNow(), reason: "\(failures) wrong passwords"))
             }
-            let persisted = saveLocked(blocked)
+            let entry = blocked.first { $0.ip == ip }!
+            let persisted = writeLocked(adding: [entry], removing: [])
+            if !persisted && !pending.contains(where: { $0.ip == ip }) {
+                pending.append(entry)
+                lastPendingRetry = t
+                print("auth.lockdown reason=blocklist_unpersisted peer=\(ip) (no challenges until listen.plist is written)")
+            }
             return Failure(outcome: .blacklisted(persisted: persisted), failures: failures, globalTriggered: globalTriggered)
         }
         let wait = Self.stageWait * Double(p.stage)
@@ -285,17 +335,51 @@ final class AuthGuard: @unchecked Sendable {
                        failures: failures, globalTriggered: globalTriggered)
     }
 
-    /// Bounded retry; the whole list is written each time, so an entry whose
-    /// earlier write failed is saved by the next successful one.
-    private func saveLocked(_ entries: [BlockedEntry]) -> Bool {
+    /// Bounded retry of one merge write (BlocklistStore.update). On success
+    /// the guard also adopts entries someone else wrote meanwhile, so a
+    /// manual block applies at once; `persisted` tracks only what this guard
+    /// wrote or loaded, so the policy watcher still sees the outside edit.
+    private func writeLocked(adding: [BlockedEntry], removing: Set<String>) -> Bool {
         for attempt in 1...Self.saveAttempts {
-            if blocklist.save(entries) {
-                persisted = Set(entries.map(\.ip))
+            if let stored = blocklist.update(adding: adding, removing: removing) {
+                persisted.formUnion(adding.map(\.ip))
+                persisted.subtract(removing)
+                for e in stored where !blocked.contains(where: { $0.ip == e.ip }) && !persisted.contains(e.ip) {
+                    blocked.append(e)
+                }
                 return true
             }
             if attempt < Self.saveAttempts { pause(Self.saveRetryPause * Double(attempt)) }
         }
         return false
+    }
+
+    /// Writes blocks that are still only in memory. Called on every
+    /// admission (at most once per `pendingRetryInterval`) and by the
+    /// control service's policy watcher; `force` skips the interval (the
+    /// service calls it before exiting). True when nothing is pending.
+    @discardableResult func retryPending(force: Bool = true) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        retryPendingLocked(force: force)
+        return pending.isEmpty
+    }
+
+    var pendingIPs: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return pending.map(\.ip)
+    }
+
+    private func retryPendingLocked(force: Bool) {
+        guard !pending.isEmpty else { return }
+        let t = now()
+        guard force || t - lastPendingRetry >= Self.pendingRetryInterval else { return }
+        lastPendingRetry = t
+        let waiting = pending
+        if blocklist.update(adding: waiting, removing: []) != nil {
+            persisted.formUnion(waiting.map(\.ip))
+            pending = []
+            print("auth.lockdown_cleared persisted=listen.plist peers=\(waiting.count)")
+        }
     }
 
     private static func seconds(_ interval: TimeInterval) -> UInt32 {
@@ -334,6 +418,10 @@ enum AuthPolicy: Equatable {
     /// Password mode refuses an `allowedIPs` with any entry that is not an
     /// IPv4 address: dropping it could leave an empty list, which means any.
     static func resolve(plist: [String: Any]?, clientIP: String?, secretLoaded: Bool) -> AuthPolicy {
+        // A passwordSet that is not a bool is not "no password".
+        if let plist, case .unknown(let why) = ListenConfig.passwordState(plist: plist) {
+            return .refused(reason: why)
+        }
         let passwordSet = plist?["passwordSet"] as? Bool == true
         let client = clientIP.flatMap { ListenConfig.isIPv4($0) ? [$0] : nil } ?? []
         let whitelist: [String]
@@ -359,7 +447,8 @@ enum AuthPolicy: Equatable {
 /// restarts when they change, so the new policy applies and connections
 /// admitted under the old one are closed. Never logged as a whole.
 struct AuthConfigSnapshot: Equatable, Sendable {
-    var passwordSet: Bool
+    /// Raw description: an edit to a non-bool value is a change too.
+    var passwordSet: String
     /// Raw description, so an invalid edit is noticed too.
     var allowedIPs: String
     var allowedIPsSource: String
@@ -367,7 +456,7 @@ struct AuthConfigSnapshot: Equatable, Sendable {
     var secretTag: String
 
     static func read(plist: [String: Any]?, secret: ConnSecret?) -> AuthConfigSnapshot {
-        AuthConfigSnapshot(passwordSet: plist?["passwordSet"] as? Bool == true,
+        AuthConfigSnapshot(passwordSet: plist?["passwordSet"].map { String(describing: $0) } ?? "-",
                            allowedIPs: plist?["allowedIPs"].map { String(describing: $0) } ?? "-",
                            allowedIPsSource: plist?[ListenMigration.sourceKey] as? String ?? "-",
                            secretTag: secret.map { ConnAuth.hex($0.salt) + ":" + ConnAuth.hex($0.hostID) } ?? "-")
@@ -445,6 +534,14 @@ final class AuthGate: @unchecked Sendable {
         if case .password = policy, secret != nil { return true }
         return false
     }
+
+    private let revokeLock = NSLock()
+    private var revoked = false
+
+    /// The policy changed (ControlService.PolicyWatch): from now on this gate
+    /// admits nobody, before the service stops or restarts.
+    func revoke() { revokeLock.lock(); revoked = true; revokeLock.unlock() }
+    var isRevoked: Bool { revokeLock.lock(); defer { revokeLock.unlock() }; return revoked }
 
     static func make(policy: AuthPolicy, secret: ConnSecret?, blocklist: BlocklistStore) -> AuthGate {
         let whitelist: [String]

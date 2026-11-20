@@ -215,7 +215,9 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// False in password mode: UDP input is only IP-checked, so it stays off
     /// until it is bound to an authenticated session (PR-C). Presence,
     /// keyframe, NACK, receiver report, ping and audio still work.
-    let inputEnabled: Bool
+    /// Read per datagram (LegacyAuthWatch.isOpen in the video host).
+    private let inputAllowed: @Sendable () -> Bool
+    var inputEnabled: Bool { inputAllowed() }
 
     /// Told about every valid datagram from the allowed client (video
     /// service: capture runs only while a viewer is heard).
@@ -224,9 +226,9 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var presenceNewSession = false
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil,
-         inputEnabled: Bool = true) {
+         inputAllowed: @escaping @Sendable () -> Bool = { true }) {
         self.presence = presence
-        self.inputEnabled = inputEnabled
+        self.inputAllowed = inputAllowed
         self.bindIP = bindIP
         self.allowedClientIP = allowedClientIP
         self.port = port
@@ -508,7 +510,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 guard inputEnabled else {
                     inputDropped &+= 1
                     if inputDropped == 1 {
-                        print("MouseMove UDP input.dropped reason=password_mode peer=\(peerIP) (logged once)")
+                        print("MouseMove UDP input.dropped reason=password_mode_or_unknown peer=\(peerIP) (logged once)")
                         fflush(stdout)
                     }
                     continue

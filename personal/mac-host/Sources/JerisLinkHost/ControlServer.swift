@@ -107,6 +107,10 @@ final class ControlServer: @unchecked Sendable {
     /// Connection password gate (v0.4.0). nil: the listener checks only
     /// `allowedClientIP`, as in 0.3 (legacy listeners, loopback relay).
     private let authGate: AuthGate?
+    /// Asked for every accepted connection before anything is read: false
+    /// closes it. The control service re-reads its policy here, the legacy
+    /// listeners whether a password is set (LegacyAuthWatch).
+    private let admitConnection: (@Sendable () -> Bool)?
     private(set) var authFailures: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
@@ -124,12 +128,14 @@ final class ControlServer: @unchecked Sendable {
          inputSources: InputSourceCache = .shared,
          pushBroker: PushBroker = .shared,
          authGate: AuthGate? = nil,
+         admitConnection: (@Sendable () -> Bool)? = nil,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
         self.inputSources = inputSources
         self.pushBroker = pushBroker
         self.authGate = authGate
+        self.admitConnection = admitConnection
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -151,10 +157,12 @@ final class ControlServer: @unchecked Sendable {
     /// viewer (a fixed value in the self-test).
     static func legacyListener(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
                                globalClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
-                               clipboard: ClipboardBackend = SystemClipboard.shared) -> ControlServer {
+                               clipboard: ClipboardBackend = SystemClipboard.shared,
+                               admit: (@Sendable () -> Bool)? = nil) -> ControlServer {
         // The listener's own --control-client-ip wins; network.conf only decides when it is not set.
         ControlServer(bindIP: bindIP, allowedClientIP: allowedClientIP, port: port, inject: inject,
-                      settingsClientIP: { allowedClientIP ?? globalClientIP() }, clipboard: clipboard)
+                      settingsClientIP: { allowedClientIP ?? globalClientIP() }, clipboard: clipboard,
+                      admitConnection: admit)
     }
 
     func start() throws {
@@ -284,6 +292,12 @@ final class ControlServer: @unchecked Sendable {
                 Darwin.close(c)
                 continue
             }
+            if let admitConnection, !admitConnection() {
+                rejectedClients += 1
+                print("Control reject peer=\(peerIP) reason=policy_changed on \(bindIP):\(port); connection closed")
+                Darwin.close(c)
+                continue
+            }
 
             lock.lock(); clientFDs.insert(c); lock.unlock()
             let peerPort = UInt16(bigEndian: peer.sin_port)
@@ -360,6 +374,12 @@ final class ControlServer: @unchecked Sendable {
         // for; the connection is held to it.
         var authChannel: ConnAuth.Channel?
         if let authGate {
+            // The policy this gate holds was replaced (ControlService.PolicyWatch):
+            // nothing more is admitted under it.
+            if authGate.isRevoked {
+                print("Control reject peer=\(peer.ip) reason=policy_revoked; connection closed")
+                return
+            }
             if authGate.requiresPassword {
                 guard pending == nil, let channel = authenticate(fd, peer: peer, gate: authGate) else { return }
                 authChannel = channel

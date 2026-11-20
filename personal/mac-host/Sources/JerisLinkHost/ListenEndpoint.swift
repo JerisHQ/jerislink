@@ -110,17 +110,66 @@ enum ListenConfig {
         }
     }
 
-    /// listen.plist says a connection password is set (v0.4.0). Listeners
-    /// that cannot check it (the legacy entries, UDP input) stay off then.
-    static func passwordModeRequested() -> Bool {
-        (readPlist()?["passwordSet"] as? Bool) == true
+    /// What listen.plist says about the connection password (v0.4.0), for
+    /// the entries that cannot check one (`--control-only`, video-control,
+    /// UDP mouse input). Only `off` lets them run: a file that exists but
+    /// cannot be read or parsed, or a `passwordSet` that is not a bool, is
+    /// `unknown` and closes them like `on`. No listen.plist (network.conf
+    /// setups) is `off`.
+    enum PasswordState: Equatable, Sendable {
+        case off
+        case on
+        case unknown(String)
+
+        var reason: String {
+            switch self {
+            case .off: return "password_off"
+            case .on: return "password_set"
+            case .unknown(let why): return why
+            }
+        }
     }
 
-    static func readPlist() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: plistURL) else { return nil }
-        let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+    static func passwordState(url: URL = plistURL) -> PasswordState {
+        switch readPlistResult(url: url) {
+        case .missing: return .off
+        case .unreadable: return .unknown("listen_plist_unreadable")
+        case .invalid: return .unknown("listen_plist_invalid")
+        case .ok(let dict): return passwordState(plist: dict)
+        }
+    }
+
+    static func passwordState(plist: [String: Any]) -> PasswordState {
+        guard let raw = plist["passwordSet"] else { return .off }
+        guard let set = raw as? Bool else { return .unknown("password_set_invalid") }
+        return set ? .on : .off
+    }
+
+    enum PlistRead {
+        case missing
+        case unreadable
+        case invalid
+        case ok([String: Any])
+    }
+
+    /// Only a file that does not exist counts as missing; any other read
+    /// error is not "no settings".
+    static func readPlistResult(url: URL = plistURL) -> PlistRead {
+        if access(url.path, F_OK) != 0 && errno == ENOENT { return .missing }
+        guard let data = try? Data(contentsOf: url) else { return .unreadable }
+        guard let dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any] else {
+            return .invalid
+        }
+        return .ok(dict)
+    }
+
+    static func readPlist(url: URL = plistURL) -> [String: Any]? {
+        switch readPlistResult(url: url) {
+        case .missing: return nil
         // An unreadable file must not fall back to network.conf.
-        return parsed as? [String: Any] ?? ["mode": "invalid"]
+        case .unreadable, .invalid: return ["mode": "invalid"]
+        case .ok(let dict): return dict
+        }
     }
 
     static func localAddresses() -> [LocalAddress] {
@@ -144,8 +193,14 @@ enum ListenConfig {
         return result
     }
 
-    static func current() -> ListenResolution {
-        resolve(plist: readPlist(), conf: VideoService.loadAddresses(), local: localAddresses())
+    static func current() -> ListenResolution { currentWithPlist().0 }
+
+    /// The resolution and the listen.plist it came from, read once, so the
+    /// control service builds its endpoint and its auth policy from the same
+    /// file contents.
+    static func currentWithPlist(url: URL = plistURL) -> (ListenResolution, [String: Any]?) {
+        let plist = readPlist(url: url)
+        return (resolve(plist: plist, conf: VideoService.loadAddresses(), local: localAddresses()), plist)
     }
 
     /// The configured viewer, even while its interface is down.
@@ -166,11 +221,18 @@ enum ListenConfig {
 
     /// Blocks until the endpoint is ready. Logs each new reason once.
     static func waitForEndpoint(log: (String) -> Void) async -> ListenEndpoint {
+        await waitForEndpointWithPlist(log: log).0
+    }
+
+    /// As `waitForEndpoint`, plus the listen.plist contents the endpoint was
+    /// resolved from.
+    static func waitForEndpointWithPlist(log: (String) -> Void) async -> (ListenEndpoint, [String: Any]?) {
         var lastReason: String?
         while true {
-            switch current() {
+            let (resolution, plist) = currentWithPlist()
+            switch resolution {
             case .ready(let ep):
-                return ep
+                return (ep, plist)
             case .notConfigured(let reason):
                 if reason != lastReason { log("not configured: \(reason) (\(plistURL.path))"); lastReason = reason }
                 try? await Task.sleep(for: endpointWaitInterval)
@@ -212,6 +274,78 @@ enum ListenConfig {
                 }
             }
         }
+    }
+}
+
+/// The legacy entries (`--control-only`, control inside the video host,
+/// UDP mouse input) have no AUTH step. They stay open only while listen.plist
+/// says `passwordSet` is off (`ListenConfig.PasswordState.off`). The state is
+/// read again for every legacy TCP connection (`check`) and polled for the
+/// UDP input; the first time it is not `off` the entries close for the life
+/// of the process, and handlers registered with `onClose` stop the
+/// listeners, which also closes their connections. Clearing the password
+/// does not reopen them: that needs a restart.
+final class LegacyAuthWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private let read: @Sendable () -> ListenConfig.PasswordState
+    private var open: Bool
+    private var closedReason: String?
+    private var handlers: [@Sendable (String) -> Void] = []
+
+    init(read: @escaping @Sendable () -> ListenConfig.PasswordState = { ListenConfig.passwordState() }) {
+        self.read = read
+        let state = read()
+        open = state == .off
+        closedReason = state == .off ? nil : state.reason
+    }
+
+    var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return open }
+
+    /// Why the entries are closed (nil while open).
+    var reason: String? { lock.lock(); defer { lock.unlock() }; return closedReason }
+
+    /// Reads listen.plist now. False, and closed from then on, unless it
+    /// still says no password.
+    @discardableResult func check() -> Bool {
+        guard isOpen else { return false }
+        let state = read()
+        if state == .off { return true }
+        close(reason: state.reason)
+        return false
+    }
+
+    /// Runs `handler` once when the entries close (at once if already closed).
+    func onClose(_ handler: @escaping @Sendable (String) -> Void) {
+        lock.lock()
+        if open { handlers.append(handler); lock.unlock(); return }
+        let why = closedReason ?? "closed"
+        lock.unlock()
+        handler(why)
+    }
+
+    /// Polls for the UDP input, which is not re-read per packet.
+    func startPolling(interval: TimeInterval = 0.5) {
+        let t = Thread { [self] in
+            while isOpen {
+                Thread.sleep(forTimeInterval: interval)
+                check()
+            }
+        }
+        t.name = "legacy-auth-watch"
+        t.start()
+    }
+
+    private func close(reason: String) {
+        lock.lock()
+        guard open else { lock.unlock(); return }
+        open = false
+        closedReason = reason
+        let run = handlers
+        handlers = []
+        lock.unlock()
+        print("config.legacy_closed reason=\(reason) (entries without AUTH stop; a restart is needed to reopen them)")
+        fflush(stdout)
+        run.forEach { $0(reason) }
     }
 }
 
