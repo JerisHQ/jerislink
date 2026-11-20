@@ -127,8 +127,10 @@ struct UiClock {
     }
 };
 
-std::shared_ptr<Client> makeClient(std::atomic<int>& terminals, std::atomic<int>& lastOutcome) {
+std::shared_ptr<Client> makeClient(std::atomic<int>& terminals, std::atomic<int>& lastOutcome,
+                                   const std::string& hostKey = "") {
     Client::Options o;
+    o.hostKey = hostKey;
     o.password = kPw;
     o.remember = false;
     o.storeDir = L"";
@@ -260,11 +262,14 @@ void reconnectTests() {
 void stopTests() {
     std::atomic<int> terminals{0};
     std::atomic<int> lastOutcome{-1};
-    auto client = makeClient(terminals, lastOutcome);
+    // A host known to need a password: the worker waits the full 2 s for a
+    // challenge, so only the cancel flag can end that wait early.
+    jl::auth::rememberMode("127.0.0.1:stop", jl::auth::HostMode::Password);
+    auto client = makeClient(terminals, lastOutcome, "127.0.0.1:stop");
     setCurrent(client);
     Listener l;
     auto control = std::make_unique<ControlChannel>("127.0.0.1", "127.0.0.1", l.port);
-    control->setIoTimeoutMs(100);
+    control->setIoTimeoutMs(3000);
     control->setBackgroundReconnect(true);
     std::atomic<bool> accepted{false};
     std::thread host([&] {
@@ -282,7 +287,7 @@ void stopTests() {
     const double joinMs = control->stop();
     const auto st = control->reconnectStats();
     expect(joinMs >= 0.0 && st.joined, "stop: worker joined (" + std::to_string(int(joinMs)) + " ms)");
-    expect(joinMs < 2500.0, "  join did not wait for the whole AUTH timeout");
+    expect(joinMs < 1000.0, "  join did not wait for the challenge timeout (host known to need a password)");
     expect(st.reconnects == 0 && !st.connecting, "  attempt cancelled, nothing connected");
     const bool sent = ui.call([&] { return control->sendKey(false, 0x0041); });
     expect(!sent && ui.maxMs < kUiBudgetMs, "  after stop: calls fail fast");
@@ -291,7 +296,7 @@ void stopTests() {
     host.join();
     // Destroyed without stop() while a reconnect runs: the destructor joins.
     auto c2 = std::make_unique<ControlChannel>("127.0.0.1", "127.0.0.1", l.port);
-    c2->setIoTimeoutMs(100);
+    c2->setIoTimeoutMs(3000);
     c2->setBackgroundReconnect(true);
     std::thread host2([&] {
         SOCKET s = l.accept(3000);
@@ -303,9 +308,10 @@ void stopTests() {
     Sleep(150);
     const auto t0 = Clock::now();
     c2.reset();
-    expect(msSince(t0) < 2500.0, "destructor during a reconnect: joined (" + std::to_string(int(msSince(t0))) + " ms)");
+    expect(msSince(t0) < 1000.0, "destructor during a reconnect: joined (" + std::to_string(int(msSince(t0))) + " ms)");
     host2.join();
     setCurrent(nullptr);
+    jl::auth::clearKnownModesForTest();
 }
 
 // Blocker 3: stale input. Keys and clicks queued before the viewer lost

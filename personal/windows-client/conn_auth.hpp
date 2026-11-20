@@ -311,11 +311,20 @@ inline int msUntil(Clock::time_point deadline) {
 
 enum class Io { Ok, Timeout, Closed };
 
+// A thread that may be told to give up (the control channel's reconnect
+// worker, see ControlChannel::stop()) points this at its flag. Waits then
+// end within kCancelSliceMs: shutdown() does not wake select() on Windows.
+inline thread_local const std::atomic<bool>* tCancel = nullptr;
+constexpr int kCancelSliceMs = 50;
+inline bool cancelled() { return tCancel && tCancel->load(); }
+
 inline Io waitReadable(SOCKET s, Clock::time_point deadline) {
     for (;;) {
+        if (cancelled()) return Io::Closed;
         int ms = msUntil(deadline);
+        const int slice = tCancel ? std::min(ms, kCancelSliceMs) : ms;
         fd_set rs; FD_ZERO(&rs); FD_SET(s, &rs);
-        timeval tv{ms / 1000, (ms % 1000) * 1000};
+        timeval tv{slice / 1000, (slice % 1000) * 1000};
         int rc = select(0, &rs, nullptr, nullptr, &tv);
         if (rc > 0) return Io::Ok;
         if (rc == SOCKET_ERROR) return Io::Closed;

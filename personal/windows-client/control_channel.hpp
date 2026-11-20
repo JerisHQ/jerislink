@@ -59,6 +59,7 @@ public:
         {
             std::lock_guard<std::mutex> g(a->m);
             a->stopping = true;
+            a->cancel = true;  // ends the worker's connect / AUTH waits within 50 ms
             a->stats.dropped += a->queue.size();
             a->queue.clear();
             if (a->pending != INVALID_SOCKET) shutdown(a->pending, SD_BOTH);
@@ -397,13 +398,19 @@ private:
             if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEINVAL) {
                 closesocket(s); return INVALID_SOCKET;
             }
+            // In slices, so stop() can cut a slow connect short (jl::auth::tCancel).
+            const auto connectDeadline = connectStart + std::chrono::milliseconds(ioTimeoutMs);
             fd_set writeSet, errorSet;
-            FD_ZERO(&writeSet); FD_ZERO(&errorSet);
-            FD_SET(s, &writeSet); FD_SET(s, &errorSet);
-            timeval tv{};
-            tv.tv_sec = static_cast<long>(ioTimeoutMs / 1000);
-            tv.tv_usec = static_cast<long>((ioTimeoutMs % 1000) * 1000);
-            rc = select(0, nullptr, &writeSet, &errorSet, &tv);
+            for (;;) {
+                if (jl::auth::cancelled()) { rc = 0; break; }
+                const int ms = jl::auth::msUntil(connectDeadline);
+                const int slice = std::min(ms, jl::auth::kCancelSliceMs);
+                FD_ZERO(&writeSet); FD_ZERO(&errorSet);
+                FD_SET(s, &writeSet); FD_SET(s, &errorSet);
+                timeval tv{slice / 1000, (slice % 1000) * 1000};
+                rc = select(0, nullptr, &writeSet, &errorSet, &tv);
+                if (rc != 0 || ms == 0) break;
+            }
             if (rc <= 0 || FD_ISSET(s, &errorSet)) {
                 closesocket(s); return INVALID_SOCKET;
             }
@@ -438,6 +445,7 @@ private:
         bool connecting = false;          // a reconnect is asked for or running
         bool wake = false;                // the worker should start one
         bool stopping = false;
+        std::atomic<bool> cancel{false};  // read by the worker's socket waits (jl::auth::tCancel)
         std::chrono::steady_clock::time_point nextTry{};
         std::deque<Queued> queue;
         ReconnectStats stats;
@@ -494,6 +502,7 @@ private:
             a->pending = x;
             return true;
         };
+        jl::auth::tCancel = &a->cancel;
         std::unique_lock<std::mutex> lk(a->m);
         for (;;) {
             a->cv.wait(lk, [&] { return a->stopping || a->wake; });
