@@ -628,6 +628,24 @@ private:
         });
     }
 
+    // r6: what noteWireLocked changes, so a send that failed can undo it.
+    struct Held {
+        std::set<uint16_t> keys, swallowKeys;
+        std::map<uint8_t, std::pair<uint8_t, uint8_t>> buttons;
+        std::set<uint8_t> swallowButtons;
+        uint64_t swallowed = 0;
+    };
+    static Held heldLocked(const Async& a) {
+        return Held{a.keysDown, a.swallowKeys, a.buttonsDown, a.swallowButtons, a.stats.swallowed};
+    }
+    static void restoreHeldLocked(Async& a, const Held& h) {
+        a.keysDown = h.keys;
+        a.swallowKeys = h.swallowKeys;
+        a.buttonsDown = h.buttons;
+        a.swallowButtons = h.swallowButtons;
+        a.stats.swallowed = h.swallowed;
+    }
+
     struct Owed {
         std::vector<uint8_t> bytes;
         std::set<uint16_t> keys;
@@ -907,6 +925,7 @@ private:
         SOCKET live = INVALID_SOCKET;
         std::vector<uint8_t> wire;
         Owed owed;
+        Held held;
         {
             std::lock_guard<std::mutex> g(a->m);
             if (a->stopping) return false;
@@ -919,6 +938,7 @@ private:
                 wire = owed.bytes;
                 const auto own = wireBytesLocked(*a, b);
                 wire.insert(wire.end(), own.begin(), own.end());
+                held = heldLocked(*a);
                 noteWireLocked(*a, b);
             }
         }
@@ -932,6 +952,10 @@ private:
             }
             std::lock_guard<std::mutex> g(a->m);
             restoreOwedLocked(*a, owed);
+            // r6 (win01 hand test): the send failed (the Mac had already
+            // reset the connection), so the Mac did not get these downs:
+            // undo the note. The item waits for the reconnect below.
+            restoreHeldLocked(*a, held);
             if (a->s == live) closeSocket(a->s);
         }
         std::lock_guard<std::mutex> g(a->m);

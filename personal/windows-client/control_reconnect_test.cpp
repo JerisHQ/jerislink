@@ -15,8 +15,9 @@
 // and never ends the session.
 // r6: a key or button whose down reached the Mac is released on focus loss
 // (at once when live, else first after the reconnect), and its later up is
-// not sent twice; once the retries ran out only a fresh key press starts a
-// new round (pointer moves and auto-repeat do not).
+// not sent twice; a down that never went out (dropped from the queue, or
+// its send failed) is dropped with its up. Once the retries ran out only a
+// fresh key press starts a new round (pointer moves and auto-repeat do not).
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -982,6 +983,54 @@ void r6Tests() {
                "  their later ups were not sent: the new connection got only B down and up (" +
                    std::to_string(got.size()) + " frames)");
         expect(st.released == 0 && st.swallowed == 2, "  stats: released=0, swallowed=2 (X up, button up)");
+        control.stop();
+    }
+
+    // (l) Found in the win01 hand test: key A is held on the live
+    // connection, the Mac resets it, and the viewer's next key X still sees
+    // it as live. Its send fails, so X down waits for the reconnect; focus
+    // leaves before that. The Mac must get A up (A was down) but no X up:
+    // X down never reached it.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> reset{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { reset = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            linger lg{1, 0};  // closesocket sends RST
+            setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lg), sizeof(lg));
+            closesocket(s);
+            reset = true;
+            SOCKET s2 = l.accept(5000);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok);  // 600 ms: focus leaves meanwhile
+            if (auth2) got = readFrames(s2, 4, 2000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0041);
+        for (int i = 0; i < 300 && !reset; ++i) Sleep(10);
+        Sleep(200);                      // the RST has arrived
+        control.sendKey(true, 0x0058);   // the send fails: waits for the reconnect
+        for (int i = 0; i < 100 && !control.reconnectStats().connecting; ++i) Sleep(10);
+        const size_t n = control.discardQueuedInput();
+        const auto mid = control.reconnectStats();
+        control.sendKey(false, 0x0058);
+        for (int i = 0; i < 300 && control.reconnectStats().reconnects < 2; ++i) Sleep(10);
+        control.sendKey(true, 0x0042);
+        control.sendKey(false, 0x0042);
+        host.join();
+        const auto st = control.reconnectStats();
+        expect(auth1 && first.size() == 1 && isKey(first[0], 1, 0x41) && mid.connecting && n == 1,
+               "r6 failed send: A held, the Mac reset the connection, X's send failed and X waited; focus left");
+        expect(auth2 && got.size() == 3 && isKey(got[0], 0, 0x41) && isKey(got[1], 1, 0x42) && isKey(got[2], 0, 0x42),
+               "  the new connection got A up, then B; no X up (" + std::to_string(got.size()) + " frames)");
+        expect(st.released == 1 && st.swallowed == 1, "  stats: released=1 (A), swallowed=1 (X up)");
         control.stop();
     }
     setCurrent(nullptr);
