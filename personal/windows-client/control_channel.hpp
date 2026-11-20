@@ -1,6 +1,7 @@
 #pragma once
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "conn_auth.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -196,6 +197,10 @@ public:
         return result;
     }
 
+    // The AUTH channel this connection proves (design §5). Control by
+    // default; the launch screen check uses Ping.
+    void setAuthChannel(jl::auth::Channel c) { authChannel_ = c; }
+
     bool connected() const { return s_ != INVALID_SOCKET; }
     uint64_t sentEvents() const { return sentEvents_; }
     uint64_t failures() const { return failures_; }
@@ -212,6 +217,7 @@ private:
 
     bool ensureConnected() {
         if (s_ != INVALID_SOCKET) return true;
+        if (!jl::auth::mayConnect()) return false;
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) return false;
         BOOL noDelay = TRUE;
@@ -236,6 +242,7 @@ private:
         if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
             closesocket(s); return false;
         }
+        const auto connectStart = jl::auth::Clock::now();
         int rc = connect(s, reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
         if (rc == SOCKET_ERROR) {
             int e = WSAGetLastError();
@@ -260,6 +267,10 @@ private:
         }
         nonBlocking = 0;
         if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+            closesocket(s); return false;
+        }
+        // v0.4.0: prove the connection password before the first message.
+        if (!jl::auth::gate(s, authChannel_, jl::auth::msSince(connectStart))) {
             closesocket(s); return false;
         }
         s_ = s;
@@ -313,6 +324,7 @@ private:
     uint16_t port_;
     SOCKET s_ = INVALID_SOCKET;
     DWORD ioTimeoutMs_ = 100;
+    jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

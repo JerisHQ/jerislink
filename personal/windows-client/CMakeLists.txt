@@ -52,7 +52,7 @@ if(MSVC)
     target_compile_options(opus PRIVATE /w)
 endif()
 
-set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt normaliz shell32 oleaut32 shlwapi uuid)
+set(JERISLINK_LIBS ws2_32 ole32 mfplat mf mfuuid wmcodecdspuuid user32 gdi32 iphlpapi dwmapi d3d11 dxgi advapi32 avrt bcrypt crypt32 normaliz shell32 oleaut32 shlwapi uuid)
 
 add_executable(Jerislink WIN32 viewer.cpp clipboard_channel.cpp file_session.cpp file_pull.cpp file_push_win.cpp send_to_win.cpp hardware_video_pipeline.cpp video_decoder_factory.cpp jerislink.rc)
 target_compile_definitions(Jerislink PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -156,3 +156,14 @@ add_executable(JerislinkSendToTest send_to_test.cpp)
 add_executable(JerislinkSendToPipeTest send_to_pipe_test.cpp send_to_win.cpp)
 target_compile_definitions(JerislinkSendToPipeTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(JerislinkSendToPipeTest PRIVATE advapi32 user32)
+
+# Console test for the connection password: shared vectors, DPAPI copy and the
+# AUTH exchange against a loopback fake host (conn_auth.hpp).
+add_executable(JerislinkConnAuthTest conn_auth_test.cpp)
+target_compile_definitions(JerislinkConnAuthTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkConnAuthTest PRIVATE ws2_32 bcrypt crypt32 normaliz)
+
+# Console test for the launch screen password answers (auth_ui.hpp).
+add_executable(JerislinkAuthUiTest auth_ui_test.cpp)
+target_compile_definitions(JerislinkAuthUiTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkAuthUiTest PRIVATE ws2_32 bcrypt crypt32 normaliz)

@@ -61,3 +61,9 @@
 #define IDC_INFO_BUILD 1067
 #define IDC_INFO_SECTION_ADDRESS 1068
 #define IDC_INFO_ADDRESS 1069
+
+// Launch screen: connection password (v0.4.0).
+#define IDC_UI_LABEL_PASSWORD 1070
+#define IDC_LAUNCH_PASSWORD 1071
+#define IDC_LAUNCH_SHOW_PW 1072
+#define IDC_LAUNCH_REMEMBER 1073

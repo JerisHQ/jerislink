@@ -46,6 +46,7 @@ constexpr COLORREF kDisabled = RGB(0x5D, 0x6B, 0x80);      // disabled slider an
 constexpr COLORREF kSecondary = RGB(0x18, 0x24, 0x3A);     // Cancel / Close button
 constexpr COLORREF kSecondaryDown = RGB(0x22, 0x31, 0x4C);
 constexpr COLORREF kError = RGB(0xFF, 0x8A, 0x8A);         // inline errors, Disconnect
+constexpr COLORREF kWarning = RGB(0xFF, 0xD1, 0x66);       // "no connection password" notice
 }  // namespace color
 
 // The colours that change with the accent choice.

@@ -1,4 +1,5 @@
 #include "clipboard_channel.hpp"
+#include "conn_auth.hpp"
 
 #include <windows.h>
 #include <algorithm>
@@ -231,8 +232,19 @@ void ClipboardChannel::run() {
 
     while (!stopRequested_) {
         if (s == INVALID_SOCKET) {
+            if (!jl::auth::mayConnect()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            const auto connectStart = jl::auth::Clock::now();
             s = connectSocket();
             if (s == INVALID_SOCKET) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            // v0.4.0: AUTH for the clipboard channel before CLIPBOARD_HELLO.
+            if (!jl::auth::gate(s, jl::auth::Channel::Clipboard, jl::auth::msSince(connectStart))) {
+                closeSocket(s);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
             }

@@ -19,6 +19,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include "control_channel.hpp"
+#include "auth_ui.hpp"
 #include <cstdlib>
 #include <utility>
 #include "clipboard_channel.hpp"
@@ -382,6 +383,7 @@ static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
 static constexpr UINT WM_MR_FILE_PULL_NOTICE = WM_APP + 47;  // F3 r2, wParam = FileSession::PullNotice
 static constexpr UINT WM_MR_SEND_TO = WM_APP + 48;           // F5a, lParam = new std::shared_ptr<SendToRequest>
+static constexpr UINT WM_MR_AUTH_PREFLIGHT = WM_APP + 49;   // launch screen, wParam = jl::auth::Outcome
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -1061,7 +1063,7 @@ static void commitAudioVolume(const char* source) {
 static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
 static constexpr int kSettingsFooterTop = 201;  // dialog units, see jerislink.rc
 static constexpr int kVolumeFooterTop = 70;
-static constexpr int kLaunchFooterTop = 238;
+static constexpr int kLaunchFooterTop = 288;
 static constexpr int kInfoFooterTop = 205;
 
 struct ThemedDialog;
@@ -1101,6 +1103,7 @@ static TextRole textRole(int id) {
     case IDC_UI_SECTION_AUDIO:
     case IDC_UI_SECTION_KEYBOARD: return TextRole::Section;
     case IDC_UI_LABEL_HOST:
+    case IDC_UI_LABEL_PASSWORD:
     case IDC_UI_LABEL_CODEC:
     case IDC_UI_LABEL_BITRATE:
     case IDC_UI_LABEL_VOLUME:
@@ -1330,9 +1333,10 @@ static void paintThemedDialog(HWND dlg, const ThemedDialog& td) {
     jl::ui::fillRect(dc, divider, jl::ui::color::kBorder);
     RECT pad{0, 0, 4, 3};
     MapDialogRect(dlg, &pad);
-    HWND edit = GetDlgItem(dlg, IDC_HOST_IP);
-    if (edit && IsWindowVisible(edit)) {
-        RECT r = jl::ui::childRect(dlg, IDC_HOST_IP);
+    for (int fieldId : {IDC_HOST_IP, IDC_LAUNCH_PASSWORD}) {
+        HWND edit = GetDlgItem(dlg, fieldId);
+        if (!edit || !IsWindowVisible(edit)) continue;
+        RECT r = jl::ui::childRect(dlg, fieldId);
         InflateRect(&r, pad.right, pad.bottom);
         jl::ui::roundRect(dc, r, jl::ui::px(t.dpi, 8), jl::ui::color::kField,
                           GetFocus() == edit ? jl::ui::accent().accent : jl::ui::color::kBorder,
@@ -2419,7 +2423,14 @@ static void overlayButton(HDC dc, const RECT& r, const wchar_t* text, ov::Item i
     const bool hot = gOverlayHot == item || gOverlayPressed == item;
     jl::ui::roundRect(dc, r, ov::scale(8, dpi), hot ? c::kSecondaryDown : c::kSecondary,
                       c::kBorder, 1);
-    overlayText(dc, text, r, gOverlayTheme.text, textColor, DT_CENTER | DT_VCENTER);
+    overlayText(dc, text, r, gOverlayTheme.text, textColor, DT_CENTER |    } else {
+        overlayText(dc,
+                    tip ? tip
+                    : gOverlayKeyboard
+                        ? 
+                        : 
+                    toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
+    }
 }
 
 static void paintOverlay(HWND hwnd) {
@@ -2522,12 +2533,20 @@ static void paintOverlay(HWND hwnd) {
     // The hovered (or keyboard-focused) item's tooltip replaces the hint.
     const wchar_t* tip = ov::tooltipFor(gOverlayHot);
     if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus);
-    overlayText(dc,
-                tip ? tip
-                : gOverlayKeyboard
-                    ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
-                    : L"Ctrl+Alt+O, or hold the pointer bottom-left for 2 s",
-                toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
+    // Host in transition mode (design §8): the idle hint becomes a yellow
+    // warning that anyone on the allowed IP can connect without a password.
+    const auto authNow = jl::auth::current();
+    if (!tip && authNow && authNow->transition()) {
+        overlayText(dc, L"No connection password set on this Mac (IP check only)",
+                    toRECT(l.hint), t.smallText, c::kWarning, DT_LEFT | DT_VCENTER);
+    } else {
+        overlayText(dc,
+                    tip ? tip
+                    : gOverlayKeyboard
+                        ? L"Tab or arrows to move \u00b7 Enter to choose \u00b7 Esc to close"
+                        : L"Ctrl+Alt+O, or hold the pointer bottom-left for 2 s",
+                    toRECT(l.hint), t.smallText, c::kMuted, DT_LEFT | DT_VCENTER);
+    }
 
     BitBlt(wdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, oldBmp);
@@ -5247,8 +5266,68 @@ struct LaunchContext {
     std::wstring note;              // why we are here (shown in the error line)
     std::vector<std::string> args;  // command-line arguments after argv[0]
     bool codeTab = false;
+    bool checking = false;          // connection password check running
+    bool quietEdit = false;         // the dialog itself is changing a field
+    bool showPassword = false;
+    wchar_t passwordChar = 0x25CF;
+    jl::auth::ui::LaunchState auth;
 };
 static LaunchContext* gLaunch = nullptr;
+// The launch screen checked the connection password for this attempt (or
+// found the Mac unreachable and left that to the session as before).
+static bool gLaunchPreflightDone = false;
+static constexpr UINT_PTR kLaunchAuthTimer = 0x4A41;
+
+// ---- Connection password (v0.4.0) ------------------------------------------
+// Before a session: AUTH on the ping channel, then one PING (design §7). The
+// Client stays current for the session, so every channel reuses K without
+// running PBKDF2 again. A typed password is wiped once K is derived.
+static jl::auth::Report authPreflight(const Options& o, std::wstring password, bool remember) {
+    jl::auth::Client::Options co;
+    co.password = std::move(password);
+    co.remember = remember;
+    co.log = [](const std::string& m) { logLine(m); };
+    auto client = std::make_shared<jl::auth::Client>(std::move(co));
+    jl::auth::wipe(password);
+    jl::auth::setCurrent(client);
+    jl::auth::Report rep;
+    rep.outcome = jl::auth::Outcome::Network;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+        // Twice at most: the second covers a transition probe that crossed
+        // a late challenge (the host is then known to want a password).
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            ControlChannel ch(o.bindIp, o.sourceIp, o.controlPort);
+            ch.setAuthChannel(jl::auth::Channel::Ping);
+            ch.setIoTimeoutMs(4000);
+            double rtt = 0.0;
+            const bool ok = ch.ping(&rtt);
+            if (client->halted()) { rep = client->lastTerminal(); break; }
+            if (ok) {
+                rep.outcome = client->transition() ? jl::auth::Outcome::Open : jl::auth::Outcome::Ok;
+                break;
+            }
+        }
+        WSACleanup();
+    }
+    logLine(std::string("auth.preflight outcome=") + jl::auth::outcomeName(rep.outcome) +
+            " remember=" + (remember ? "on" : "off"));
+    return rep;
+}
+
+// The launch-screen text for an answer that ended a session or a
+// command-line start.
+static std::wstring authNoteFor(const jl::auth::Report& r) {
+    jl::auth::ui::LaunchState st;
+    st.apply(r, std::chrono::steady_clock::now());
+    return st.view(std::chrono::steady_clock::now()).text;
+}
+
+// A channel got such an answer mid-session (any thread): the main loop
+// ends the session and JerisLink returns to the launch screen with it.
+static std::atomic<bool> gAuthHalt{false};
+static std::mutex gAuthHaltMutex;
+static std::wstring gAuthHaltNote;
 
 static RECT dluRect(HWND dlg, int x, int y, int w, int h) {
     RECT r{x, y, x + w, y + h};
@@ -5372,6 +5451,15 @@ static bool drawLaunchButton(HWND dlg, const DRAWITEMSTRUCT& di) {
                    DT_CENTER | DT_VCENTER);
         return true;
     }
+    case IDC_LAUNCH_SHOW_PW: {
+        // Show / Hide for the password field: a small secondary button.
+        jl::ui::fillRect(dc, r, jl::ui::color::kBody);
+        jl::ui::roundRect(dc, r, s(8),
+                          down ? jl::ui::color::kSecondaryDown : jl::ui::color::kSecondary,
+                          focus ? a.focusRing : jl::ui::color::kBorder, focus ? s(2) : s(1));
+        launchText(dc, text, r, t.label, jl::ui::color::kText, DT_CENTER | DT_VCENTER);
+        return true;
+    }
     case IDOK:
         if (IsWindowEnabled(di.hwndItem)) {
             jl::ui::drawButton(di, t, true, jl::ui::color::kBody);
@@ -5396,11 +5484,14 @@ static void launchSetError(HWND dlg, const std::wstring& text) {
 // (pairing codes are reserved for jerispair, not built yet).
 static void launchSetTab(HWND dlg, bool code) {
     if (gLaunch) gLaunch->codeTab = code;
-    for (int id : {IDC_UI_LABEL_HOST, IDC_HOST_IP, IDC_UI_HINT_HOST, IDC_LAUNCH_ERROR}) {
+    for (int id : {IDC_UI_LABEL_HOST, IDC_HOST_IP, IDC_UI_HINT_HOST, IDC_UI_LABEL_PASSWORD,
+                   IDC_LAUNCH_PASSWORD, IDC_LAUNCH_SHOW_PW, IDC_LAUNCH_REMEMBER, IDC_LAUNCH_ERROR}) {
         ShowWindow(GetDlgItem(dlg, id), code ? SW_HIDE : SW_SHOW);
     }
     ShowWindow(GetDlgItem(dlg, IDC_LAUNCH_CODE_NOTE), code ? SW_SHOW : SW_HIDE);
-    EnableWindow(GetDlgItem(dlg, IDOK), code ? FALSE : TRUE);
+    const bool authAllows = !gLaunch ||
+        (!gLaunch->checking && gLaunch->auth.view(std::chrono::steady_clock::now()).connectEnabled);
+    EnableWindow(GetDlgItem(dlg, IDOK), code || !authAllows ? FALSE : TRUE);
     InvalidateRect(dlg, nullptr, TRUE);
 }
 
@@ -5441,7 +5532,64 @@ static void launchConnect(HWND dlg) {
     }
     logLine("launch.connect host_source=" + request.hostSource +
             " bind_source=" + request.bindSource);
-    EndDialog(dlg, IDOK);
+    // Connection password check off the UI thread; the answer comes back as
+    // WM_MR_AUTH_PREFLIGHT. Connect stays grey meanwhile; nothing is modal.
+    if (!gLaunch) { EndDialog(dlg, IDOK); return; }
+    gLaunch->checking = true;
+    gLaunch->auth.clear();
+    KillTimer(dlg, kLaunchAuthTimer);
+    launchSetError(dlg, L"");
+    SetDlgItemTextW(dlg, IDOK, L"Connecting…");
+    EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
+    std::wstring password = windowText(GetDlgItem(dlg, IDC_LAUNCH_PASSWORD));
+    const bool remember = jl::ui::ownerChecked(dlg, IDC_LAUNCH_REMEMBER);
+    logLine(std::string("launch.auth_check password=") + (password.empty() ? "empty" : "typed") +
+            " remember=" + (remember ? "on" : "off"));
+    std::thread([dlg, opts = request.options, password = std::move(password), remember]() mutable {
+        const auto rep = authPreflight(opts, std::move(password), remember);
+        jl::auth::wipe(password);
+        PostMessageW(dlg, WM_MR_AUTH_PREFLIGHT, static_cast<WPARAM>(rep.outcome), 0);
+    }).detach();
+}
+
+// Shows the launch-screen state for the last connection password answer.
+static void launchApplyAuthView(HWND dlg, bool tick = false) {
+    if (!gLaunch) return;
+    const auto v = gLaunch->auth.view(std::chrono::steady_clock::now());
+    launchSetError(dlg, v.text);
+    HWND ok = GetDlgItem(dlg, IDOK);
+    EnableWindow(ok, v.connectEnabled && !gLaunch->codeTab ? TRUE : FALSE);
+    InvalidateRect(ok, nullptr, TRUE);
+    HWND pw = GetDlgItem(dlg, IDC_LAUNCH_PASSWORD);
+    if (tick) return;  // the countdown only changes the text and the button
+    if (v.clearPassword) {
+        gLaunch->quietEdit = true;
+        SetWindowTextW(pw, L"");
+        gLaunch->quietEdit = false;
+    }
+    if (v.focusPassword) SetFocus(pw);
+}
+
+static void launchOnAuthAnswer(HWND dlg, jl::auth::Outcome outcome) {
+    if (!gLaunch) return;
+    gLaunch->checking = false;
+    SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  →");
+    EnableWindow(GetDlgItem(dlg, IDOK), TRUE);
+    if (!jl::auth::isTerminal(outcome)) {
+        // OK, open_ip_only, or the Mac did not answer at all: start the
+        // session (an unreachable Mac is reported there, as before).
+        gLaunchPreflightDone = true;
+        EndDialog(dlg, IDOK);
+        return;
+    }
+    auto client = jl::auth::current();
+    jl::auth::Report rep = client ? client->lastTerminal() : jl::auth::Report{};
+    rep.outcome = outcome;
+    const auto now = std::chrono::steady_clock::now();
+    gLaunch->auth.apply(rep, now);
+    launchApplyAuthView(dlg);
+    if (gLaunch->auth.counting(now)) SetTimer(dlg, kLaunchAuthTimer, 1000, nullptr);
+    logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(outcome));
 }
 
 static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5470,6 +5618,19 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         SendMessageW(edit, EM_LIMITTEXT, 15, 0);
         const std::string savedHost = loadSavedSettings().hostIp;
         SetWindowTextW(edit, wideFromAscii(savedHost).c_str());
+        // Connection password: masked, empty, never prefilled. "Remember"
+        // starts unticked on every launch (design §7).
+        HWND pw = GetDlgItem(dlg, IDC_LAUNCH_PASSWORD);
+        SendMessageW(pw, EM_LIMITTEXT, 256, 0);
+        if (gLaunch) {
+            const LRESULT ch = SendMessageW(pw, EM_GETPASSWORDCHAR, 0, 0);
+            if (ch) gLaunch->passwordChar = static_cast<wchar_t>(ch);
+            gLaunch->showPassword = false;
+            gLaunch->checking = false;
+            gLaunch->auth.clear();
+        }
+        SetDlgItemTextW(dlg, IDC_LAUNCH_SHOW_PW, L"Show");
+        jl::ui::setOwnerChecked(dlg, IDC_LAUNCH_REMEMBER, false);
         launchSetError(dlg, gLaunch ? gLaunch->note : std::wstring());
         launchSetTab(dlg, gLaunch && gLaunch->codeTab);
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
@@ -5506,9 +5667,46 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             }
             return TRUE;
         case IDC_HOST_IP:
-            if (code == EN_CHANGE) launchSetError(dlg, L"");
+            if (code == EN_CHANGE) {
+                launchSetError(dlg, L"");
+                // Another Mac: the last answer (and any countdown) was not about it.
+                if (gLaunch && !gLaunch->checking) {
+                    gLaunch->auth.clear();
+                    KillTimer(dlg, kLaunchAuthTimer);
+                    EnableWindow(GetDlgItem(dlg, IDOK), gLaunch->codeTab ? FALSE : TRUE);
+                }
+            }
             return FALSE;
+        case IDC_LAUNCH_PASSWORD:
+            if (code == EN_CHANGE && gLaunch && !gLaunch->quietEdit && !gLaunch->checking &&
+                !gLaunch->auth.counting(std::chrono::steady_clock::now())) {
+                gLaunch->auth.clear();
+                launchSetError(dlg, L"");
+            }
+            return FALSE;
+        case IDC_LAUNCH_SHOW_PW:
+            if (code == BN_CLICKED && gLaunch) {
+                gLaunch->showPassword = !gLaunch->showPassword;
+                HWND pw = GetDlgItem(dlg, IDC_LAUNCH_PASSWORD);
+                SendMessageW(pw, EM_SETPASSWORDCHAR,
+                             gLaunch->showPassword ? 0 : gLaunch->passwordChar, 0);
+                InvalidateRect(pw, nullptr, TRUE);
+                SetDlgItemTextW(dlg, IDC_LAUNCH_SHOW_PW, gLaunch->showPassword ? L"Hide" : L"Show");
+                SetFocus(pw);
+            }
+            return TRUE;
+        case IDC_LAUNCH_REMEMBER:
+            if (code == BN_CLICKED) {
+                const bool on = !jl::ui::ownerChecked(dlg, IDC_LAUNCH_REMEMBER);
+                jl::ui::setOwnerChecked(dlg, IDC_LAUNCH_REMEMBER, on);
+                logLine(std::string("launch.remember=") + (on ? "on" : "off"));
+            }
+            return TRUE;
         case IDOK:
+            if (gLaunch && (gLaunch->checking ||
+                            !gLaunch->auth.view(std::chrono::steady_clock::now()).connectEnabled)) {
+                return TRUE;  // checking, or counting down a lockout
+            }
             launchConnect(dlg);
             return TRUE;
         case IDCANCEL:
@@ -5519,6 +5717,26 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
     }
+    case WM_MR_AUTH_PREFLIGHT:
+        launchOnAuthAnswer(dlg, static_cast<jl::auth::Outcome>(wParam));
+        return TRUE;
+    case WM_TIMER:
+        if (wParam == kLaunchAuthTimer && gLaunch) {
+            const auto now = std::chrono::steady_clock::now();
+            if (gLaunch->auth.counting(now)) {
+                launchApplyAuthView(dlg, true);
+            } else {
+                KillTimer(dlg, kLaunchAuthTimer);
+                gLaunch->auth.expireIfDone(now);
+                launchApplyAuthView(dlg);
+                logLine("launch.auth_wait_over");
+            }
+            return TRUE;
+        }
+        break;
+    case WM_DESTROY:
+        KillTimer(dlg, kLaunchAuthTimer);
+        break;
     case WM_CLOSE:
         EndDialog(dlg, IDCANCEL);
         return TRUE;
@@ -5584,6 +5802,7 @@ static int appMain(int argc, char** argv) {
                 (request.openSettings ? "flag" : shiftHeld ? "shift" : "default"));
     }
     for (;;) {
+        gLaunchPreflightDone = false;
         if (show) {
             if (runLaunchScreen(launch) != IDOK) {
                 logLine("launch.screen closed");
@@ -5591,7 +5810,16 @@ static int appMain(int argc, char** argv) {
             }
             request = resolveLaunchArgs(jl::argsAfterLaunchScreen(args));
         }
-        if (request.status == jl::LaunchStatus::Ok) break;
+        if (request.status == jl::LaunchStatus::Ok) {
+            if (gLaunchPreflightDone) break;
+            // Address from the command line: no password typed, so only a
+            // remembered one can answer a Mac that wants it.
+            const auto rep = authPreflight(request.options, std::wstring(), false);
+            if (!jl::auth::isTerminal(rep.outcome)) break;
+            launch.note = authNoteFor(rep);
+            show = true;
+            continue;
+        }
         if (request.status == jl::LaunchStatus::NoTailnet) {
             logLine("launch.blocked reason=no-tailnet bind_reason=" + request.bindReason);
             launch.note = kNoTailnetNote;
@@ -5608,6 +5836,17 @@ static int appMain(int argc, char** argv) {
             " bind_reason=" + request.bindReason);
     Options o = request.options;
     gConnectionInfo = ConnectionInfoState{};
+    if (auto ac = jl::auth::current()) {
+        // A channel that gets an answer the user must act on ends the session.
+        ac->setTerminalHandler([](const jl::auth::Report& r) {
+            {
+                std::lock_guard<std::mutex> g(gAuthHaltMutex);
+                gAuthHaltNote = authNoteFor(r);
+            }
+            gAuthHalt = true;
+        });
+        logLine(std::string("auth.session mode=") + (ac->transition() ? "open_ip_only" : "password"));
+    }
     gConnectionInfo.configuredCodec = o.codec;
     gConnectionInfo.configuredBitrateMbps = o.bitrateMbps;
     gConnectionInfo.remoteWidth = o.width;
@@ -6122,6 +6361,15 @@ static int appMain(int argc, char** argv) {
         gModal.takeWindowMs();
         while (!gWindowClosed) {
             iterStart = std::chrono::steady_clock::now();
+            if (gAuthHalt.exchange(false)) {
+                gRelaunch = true;
+                {
+                    std::lock_guard<std::mutex> g(gAuthHaltMutex);
+                    gRelaunchNote = gAuthHaltNote;
+                }
+                logLine("session.end reason=auth");
+                break;
+            }
             phaseMarkMs = steadyMsNow();
             iterPhases.reset();
             gIterPump.reset();
