@@ -123,6 +123,7 @@ public:
         uint64_t resumes = 0;      // r6: fresh key presses that ended a pause
         uint64_t owedOnDrop = 0;   // r7: ups dropped unsent while the Mac had their down: sent later instead
         uint64_t positionsSkipped = 0;  // r7: click positions left out with a button up not sent again
+        uint64_t cancelledInFlight = 0;  // r8: downs taken by the worker, not sent yet, whose up was dropped
         bool pausedNow = false;    // r6: paused right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
@@ -567,6 +568,12 @@ private:
         std::map<uint8_t, std::pair<uint8_t, uint8_t>> owedButtons;
         std::set<uint16_t> swallowKeys;
         std::set<uint8_t> swallowButtons;
+        // r8 (Pepper's r7 review, item 2): the item the worker took from the
+        // queue and has not committed yet (nullptr: none). It counts for the
+        // drop rule like a queued item: when the up of a down in it is
+        // dropped, the item is cancelled instead of sent.
+        const std::vector<uint8_t>* inflight = nullptr;
+        bool inflightCancelled = false;
         bool paused = false;  // r6: retries ran out; waits for a fresh key press
         bool resume = false;  // r6: a fresh key press ended the pause
         ReconnectStats stats;
@@ -649,10 +656,27 @@ private:
     // - An up whose down was dropped too: nothing to send.
     // A new down of the same key or button clears a pending skip
     // (noteWireLocked).
+    // r8 (Pepper's r7 review, item 2): the item the worker took from the
+    // queue but has not put on the wire (waiting for room in the send
+    // buffer, without the lock) is held to the same rule. When the up of a
+    // down in it is dropped, the item is cancelled and never sent
+    // (flushOneLocked), so the Mac gets neither. Once its first bytes are
+    // out it is no longer in flight: its down is in keysDown and the
+    // dropped up is owed, as above.
+    static bool inflightDownLocked(const Async& a, bool key, uint16_t id) {
+        if (!a.inflight || a.inflightCancelled) return false;
+        bool found = false;
+        forEachFrame(*a.inflight, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
+            if (key && type == 0x10 && n >= 3 && p[0] && uint16_t((p[1] << 8) | p[2]) == id) found = true;
+            if (!key && ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) && p[1] && p[0] == id) found = true;
+        });
+        return found;
+    }
     static void dropItemLocked(Async& a, const std::vector<uint8_t>& item) {
         forEachFrame(item, [&](size_t, size_t, uint8_t type, const uint8_t* p, size_t n) {
             if (type == 0x10 && n >= 3) {
                 const uint16_t k = uint16_t((p[1] << 8) | p[2]);
+                if (!p[0] && inflightDownLocked(a, true, k)) a.inflightCancelled = true;  // r8
                 if (p[0]) {
                     if (!a.keysDown.count(k)) a.swallowKeys.insert(k);
                 } else if (a.keysDown.erase(k)) {
@@ -661,6 +685,7 @@ private:
                     ++a.stats.owedOnDrop;
                 }
             } else if ((type == 0x21 && n >= 2) || (type == 0x25 && n >= 3)) {
+                if (!p[1] && inflightDownLocked(a, false, p[0])) a.inflightCancelled = true;  // r8
                 if (p[1]) {
                     if (!a.buttonsDown.count(p[0])) a.swallowButtons.insert(p[0]);
                 } else {
@@ -777,8 +802,9 @@ private:
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushSendTimeoutMs);
         // r7: nothing of the item went out; the caller drops it (an owed
         // Release is restored by the caller instead).
+        // r8: one cancelled in flight already lost its up: nothing to skip.
         const auto failedUnsent = [&] {
-            if (q.kind != Kind::Release) dropItemLocked(a, q.bytes);
+            if (q.kind != Kind::Release && !(a.inflight == &q.bytes && a.inflightCancelled)) dropItemLocked(a, q.bytes);
             return Flush::Failed;
         };
         for (;;) {
@@ -796,6 +822,14 @@ private:
                 dropItemLocked(a, q.bytes);
                 ++a.stats.dropped;
                 ++a.stats.discarded;
+                return Flush::Discarded;
+            }
+            if (q.kind != Kind::Release && a.inflight == &q.bytes && a.inflightCancelled) {
+                // r8: the up of its down was dropped while this waited
+                // (aged out, full queue, the attempt ended): neither goes.
+                // Its up is already gone, so no skip is set for it.
+                ++a.stats.dropped;
+                ++a.stats.cancelledInFlight;
                 return Flush::Discarded;
             }
             if (a.atCommit && q.kind != Kind::Release) a.atCommit();
@@ -825,6 +859,8 @@ private:
             }
             if (!full) {
                 // Committed: the Mac has (or will have) these downs and ups.
+                // r8: no longer in flight; a later dropped up is owed.
+                if (a.inflight == &q.bytes) a.inflight = nullptr;
                 if (q.kind != Kind::Release) noteWireLocked(a, q.bytes);
                 a.stats.positionsSkipped += positionsSkipped;
                 if (static_cast<size_t>(sent) == wire.size()) return Flush::Sent;
@@ -936,7 +972,14 @@ private:
             }
             noChallenge.reset();
             bool alive = setNonBlocking(s, true);
+            // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
+            // out, (2) sends the releases owed (including those that aging
+            // just made owed), (3) only then sends the next input, or hands
+            // the socket over when the queue is empty. An up that ages out
+            // after the reconnect so reaches the Mac before the next key,
+            // and at once when nothing else waits.
             while (alive && !a->stopping) {
+                dropAgedLocked(*a, std::chrono::steady_clock::now());
                 if (hasOwedLocked(*a)) {
                     // r6: ups owed since focus left go before any other input.
                     const Owed owed = takeOwedLocked(*a);
@@ -947,10 +990,12 @@ private:
                     if (fl == Flush::Failed) alive = false;
                     break;
                 }
-                dropAgedLocked(*a, std::chrono::steady_clock::now());
                 if (a->queue.empty()) break;
                 Queued q = std::move(a->queue.front());
                 a->queue.pop_front();
+                // r8: in flight from here until its first bytes are out.
+                a->inflight = &q.bytes;
+                a->inflightCancelled = false;
                 if (a->beforeFlushSend) {
                     auto hook = a->beforeFlushSend;
                     lk.unlock();
@@ -958,6 +1003,8 @@ private:
                     lk.lock();
                 }
                 const Flush f = flushOneLocked(*a, lk, s, q);
+                a->inflight = nullptr;
+                a->inflightCancelled = false;
                 if (f == Flush::Discarded) continue;
                 if (f == Flush::Sent) { ++a->stats.flushed; continue; }
                 ++a->stats.dropped;

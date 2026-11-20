@@ -21,6 +21,9 @@
 // r7: input dropped unsent on any path (aged out, full queue, paused, a
 // flush that failed before any byte went out) keeps downs and ups paired on
 // the Mac; a button up not sent again takes its queued position along.
+// r8: an up that ages out after the reconnect still goes before the next
+// key (at once when nothing else waits); a down the worker took but has not
+// sent is cancelled when its up is dropped.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -1376,6 +1379,229 @@ void r7Tests() {
     }
 }
 
+// Pepper's r7 review. Item 1: the worker drops what aged out before it
+// sends owed releases, and both before the next input or the socket
+// handover, so an up that ages out only after the reconnect still reaches
+// the Mac before the next key, and at once when nothing else waits.
+// Item 2: an item the worker took from the queue but has not sent (send
+// buffer full) follows the drop rule too: when its up is dropped, it is
+// cancelled, and the Mac gets neither.
+void r8Tests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    auto isKey = [](const std::pair<uint8_t, Bytes>& f, int down, uint8_t k) {
+        return f.first == 0x10 && f.second.size() == 3 && f.second[0] == down && f.second[2] == k;
+    };
+    auto count = [](const std::vector<std::pair<uint8_t, Bytes>>& got, uint8_t k) {
+        size_t n = 0;
+        for (const auto& f : got) if (f.first == 0x10 && f.second.size() == 3 && f.second[2] == k) ++n;
+        return n;
+    };
+    const std::string hostKey = "127.0.0.1:" + std::to_string(l.port);
+    constexpr uint16_t kShift = 0x0038;
+
+    // (r) Shift went down live, then the connection dropped. Shift up waits
+    // for the reconnect, K (a whole press) 2 s later. Nothing else is
+    // queued, so Shift up is found aged only by the worker, after the new
+    // connection is up (the Mac's challenge is late once: about 3.5 s).
+    // The Mac gets Shift up before K, never K with Shift held.
+    for (int empty = 0; empty < 2; ++empty) {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, hostKey);
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false}, upIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got1, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; upIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            firstIn = true;
+            SOCKET q = l.accept(5000);
+            closesocket(s);
+            if (q == INVALID_SOCKET) { upIn = true; return; }
+            silentConn(q, sec, 2300);
+            closesocket(q);
+            s = l.accept(8000);
+            if (s == INVALID_SOCKET) { upIn = true; return; }
+            auth2 = hostAuth(s, sec, Answer::Ok, 1000);
+            if (auth2 && empty) got1 = readFrames(s, 1, 1000);  // with no other input
+            upIn = true;
+            if (auth2) got = readFrames(s, empty ? 2 : 3, 3000);
+            closesocket(s);
+        });
+        control.sendKey(true, kShift);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.close();                    // the connection dropped
+        control.sendKey(false, kShift);     // waits for the reconnect
+        if (!empty) {
+            Sleep(2000);
+            const auto mid = control.reconnectStats();
+            control.sendKey(true, 0x004B);  // K: queued before Shift up ages
+            control.sendKey(false, 0x004B);
+            host.join();
+            const auto st = control.reconnectStats();
+            std::string why;
+            const bool paired = pairedOnly(got, {kShift}, why);
+            expect(auth1 && first.size() == 1 && isKey(first[0], 1, 0x38) && mid.connecting && mid.reconnects == 1,
+                   "r8 aged after reconnect: Shift down reached the Mac; Shift up and K waited for the reconnect");
+            expect(auth2 && got.size() == 3 && isKey(got[0], 0, 0x38) && isKey(got[1], 1, 0x4B) && isKey(got[2], 0, 0x4B) &&
+                       paired,
+                   "  Shift up aged out after the reconnect: the Mac got Shift up before K (" + std::to_string(got.size()) +
+                       " frames, " + why + ")");
+            expect(st.owedOnDrop == 1 && st.released == 1 && st.swallowed == 0,
+                   "  stats: owedOnDrop=1 (found by the worker), released=1");
+        } else {
+            for (int i = 0; i < 1000 && !upIn; ++i) Sleep(10);
+            const auto mid = control.reconnectStats();
+            control.sendKey(true, 0x004B);  // only after the Mac got Shift up (or gave up waiting)
+            control.sendKey(false, 0x004B);
+            host.join();
+            const auto st = control.reconnectStats();
+            std::string why;
+            std::vector<std::pair<uint8_t, Bytes>> all = got1;
+            all.insert(all.end(), got.begin(), got.end());
+            const bool paired = pairedOnly(all, {kShift}, why);
+            expect(auth1 && auth2 && got1.size() == 1 && isKey(got1[0], 0, 0x38) && mid.owedOnDrop == 1 && mid.released == 1,
+                   "r8 aged after reconnect, queue empty: Shift up went at once, with no other input (" +
+                       std::to_string(got1.size()) + " frames)");
+            expect(got.size() == 2 && isKey(got[0], 1, 0x4B) && isKey(got[1], 0, 0x4B) && paired && st.reconnects == 2,
+                   "  then K live on the same connection (" + std::to_string(got.size()) + " frames, " + why + ")");
+        }
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+
+    // (s) Full queue, item 2: D down is taken by the worker after the
+    // reconnect and waits with the send buffer full. D up is queued behind
+    // it and pushed out of the full queue by 256 C events. D down is
+    // cancelled: the Mac gets the whole C presses and no D at all.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 2, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s2, ControlChannel::kQueueMax + 4, 3000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0050);
+        control.sendKey(false, 0x0050);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.setFlushWouldBlockForTest(1000000, [] { Sleep(20); });
+        control.close();
+        const auto before = control.reconnectStats();
+        control.sendKey(true, 0x0044);  // D down: taken by the worker, cannot go out
+        for (int i = 0; i < 300 && control.reconnectStats().flushWaits == before.flushWaits; ++i) Sleep(10);
+        const auto inFlight = control.reconnectStats();
+        control.sendKey(false, 0x0044);  // D up: queued behind it
+        for (size_t i = 0; i < ControlChannel::kQueueMax; ++i) control.sendKey(i % 2 == 0, 0x0043);  // pushes D up out
+        const auto mid = control.reconnectStats();
+        control.setFlushWouldBlockForTest(0, nullptr);
+        host.join();
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {}, why);
+        size_t cDown = 0;
+        for (const auto& f : got) if (isKey(f, 1, 0x43)) ++cDown;
+        expect(auth1 && first.size() == 2 && inFlight.flushWaits > before.flushWaits && inFlight.connecting &&
+                   mid.dropped == before.dropped + 1,
+               "r8 in flight, full queue: D down waited with the send buffer full; D up was pushed out of the queue");
+        expect(auth2 && count(got, 0x44) == 0 && cDown == ControlChannel::kQueueMax / 2 &&
+                   got.size() == ControlChannel::kQueueMax && paired,
+               "  D down was cancelled: the Mac got " + std::to_string(cDown) + " whole C presses and no D (" +
+                   std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.cancelledInFlight == 1 && st.owedOnDrop == 0, "  stats: cancelledInFlight=1, owedOnDrop=0");
+        control.stop();
+    }
+
+    // (t) Aged out, item 2: D down and D up wait for the reconnect. The
+    // worker takes D down and is slow to send it (3.3 s, then the send
+    // buffer is full); B down comes meanwhile and D up is found aged out.
+    // D down is cancelled: the Mac gets B and no D.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 2, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s2, 3, 7000);
+            closesocket(s2);
+        });
+        control.sendKey(true, 0x0050);
+        control.sendKey(false, 0x0050);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        std::atomic<bool> slow{false};
+        control.setBeforeFlushSendForTest([&] {
+            if (!slow.exchange(true)) Sleep(DWORD(ControlChannel::kQueueMaxAgeMs + 300));
+        });
+        control.setFlushWouldBlockForTest(1000000, [] { Sleep(20); });
+        control.close();
+        const auto before = control.reconnectStats();
+        control.sendKey(true, 0x0044);
+        control.sendKey(false, 0x0044);
+        for (int i = 0; i < 600 && control.reconnectStats().flushWaits == before.flushWaits; ++i) Sleep(10);
+        const auto inFlight = control.reconnectStats();
+        control.sendKey(true, 0x0042);   // D up (3.3 s old) ages out here
+        const auto mid = control.reconnectStats();
+        control.setFlushWouldBlockForTest(0, nullptr);
+        control.sendKey(false, 0x0042);
+        host.join();
+        control.setBeforeFlushSendForTest(nullptr);
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {}, why);
+        expect(auth1 && first.size() == 2 && slow && inFlight.flushWaits > before.flushWaits && inFlight.connecting &&
+                   mid.dropped == before.dropped + 1,
+               "r8 in flight, aged: D down waited 3.3 s and then with the send buffer full; D up aged out");
+        expect(auth2 && got.size() == 2 && isKey(got[0], 1, 0x42) && isKey(got[1], 0, 0x42) && count(got, 0x44) == 0 && paired,
+               "  D down was cancelled: the Mac got B and no D (" + std::to_string(got.size()) + " frames, " + why + ")");
+        expect(st.cancelledInFlight == 1 && st.owedOnDrop == 0, "  stats: cancelledInFlight=1, owedOnDrop=0");
+        control.stop();
+    }
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -1388,6 +1614,7 @@ int main() {
     r5Tests();
     r6Tests();
     r7Tests();
+    r8Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
