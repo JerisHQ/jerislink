@@ -325,6 +325,15 @@ final class ControlServer: @unchecked Sendable {
                 Darwin.close(c)
                 continue
             }
+            // r12: fail closed too. Every write to a viewer must be
+            // non-blocking (sendPacket); a socket that cannot be made so
+            // is not served.
+            if !nonBlockingSetter(c) {
+                rejectedClients += 1
+                print("Control reject peer=\(peerIP) reason=nonblocking_unset on \(bindIP):\(port); connection closed")
+                Darwin.close(c)
+                continue
+            }
             if let allowedClientIP, peerIP != allowedClientIP {
                 rejectedClients += 1
                 print("Control reject peer=\(peerIP) expected=\(allowedClientIP) on \(bindIP):\(port); connection closed")
@@ -1373,6 +1382,9 @@ final class ControlServer: @unchecked Sendable {
         return .ok(out)
     }
 
+    /// r12: viewer sockets are O_NONBLOCK, so a read with nothing there
+    /// waits in poll(POLLIN) with no timeout, as the blocking recv did
+    /// before: `stop()`'s shutdown still wakes it (recv then sees EOF).
     private func recvExact(_ fd: Int32, count: Int) -> [UInt8]? {
         if count == 0 { return [] }
         var out = [UInt8](repeating: 0, count: count)
@@ -1381,8 +1393,13 @@ final class ControlServer: @unchecked Sendable {
             let n = out.withUnsafeMutableBytes { raw -> Int in
                 Darwin.recv(fd, raw.baseAddress!.advanced(by: offset), count - offset, 0)
             }
-            if n <= 0 { return nil }
-            offset += n
+            if n > 0 { offset += n; continue }
+            if n == 0 { return nil }
+            let e = errno
+            if e == EINTR { continue }
+            guard e == EAGAIN else { return nil }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            if Darwin.poll(&pfd, 1, -1) < 0 && errno != EINTR { return nil }
         }
         return out
     }
@@ -1452,26 +1469,38 @@ final class ControlServer: @unchecked Sendable {
     /// swaps it for one that fails, to see the connection refused.
     var sendSliceSetter: (Int32) -> Bool = ControlServer.setSendSlice
 
-    /// Free room in `fd`'s send buffer (r11): SO_SNDBUF less the bytes it
-    /// still holds, sent or not (SO_NWRITE). nil when either read fails.
-    static func sendRoom(_ fd: Int32) -> Int? {
-        var size: Int32 = 0, held: Int32 = 0
-        var len = socklen_t(MemoryLayout<Int32>.size)
-        guard getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, &len) == 0 else { return nil }
-        len = socklen_t(MemoryLayout<Int32>.size)
-        guard getsockopt(fd, SOL_SOCKET, SO_NWRITE, &held, &len) == 0 else { return nil }
-        return Int(size) - Int(held)
+    /// O_NONBLOCK on a viewer socket (r12): false when fcntl fails, and the
+    /// accept loop then closes the connection.
+    static func setNonBlocking(_ fd: Int32) -> Bool {
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0 else { return false }
+        return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
     }
 
-    /// One MRC1 frame. r11: the wait for room is poll(POLLOUT) in
-    /// `sendSliceMillis` slices, never send(). After every wake (room, a
-    /// slice with none, a signal) `revoked` is asked first (an admitted
-    /// viewer, via sendChecked), and only then is one write made, no larger
-    /// than the room the buffer has, so the write does not wait: a window
-    /// that reopens after a block cannot carry bytes written after it.
-    /// Without `revoked` (handshake frames) the wait ends after
-    /// `handshakeSendSeconds`. SO_SNDTIMEO stays as the bound should a
-    /// write still find less room than measured.
+    /// Makes an accepted socket non-blocking (r12); swapped by the self-test.
+    var nonBlockingSetter: (Int32) -> Bool = ControlServer.setNonBlocking
+
+    /// Self-test only (r12): stands in for the kernel's send(), to model a
+    /// write the kernel cannot take although poll said writable.
+    var sendHook: ((Int32, String?, UnsafeRawPointer, Int) -> Int)?
+
+    private var sendCallMaxNanos: UInt64 = 0
+
+    /// The longest one send() call to a viewer took (r12, self-test): a
+    /// non-blocking write returns at once; one that waited shows here.
+    var longestSendCallMillis: Double {
+        txLock.lock(); defer { txLock.unlock() }
+        return Double(sendCallMaxNanos) / 1_000_000
+    }
+
+    /// One MRC1 frame. r12: the socket is O_NONBLOCK, so send() never waits
+    /// in the kernel; a write it cannot take returns EAGAIN (or short). The
+    /// wait for room is poll(POLLOUT) in `sendSliceMillis` slices. After
+    /// every wake (room, a slice with none, a signal) `revoked` is asked
+    /// first (an admitted viewer, via sendChecked), and only then is the
+    /// rest written; EAGAIN or a short write goes back to poll. Without
+    /// `revoked` (handshake frames) the wait ends after
+    /// `handshakeSendSeconds`.
     private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8], peerIP: String? = nil,
                             revoked: (() -> Bool)? = nil) -> Bool {
         let length = UInt16(payload.count)
@@ -1488,12 +1517,15 @@ final class ControlServer: @unchecked Sendable {
             if shouldStop { return false }
             guard ready > 0 else { continue }
             guard pfd.revents & Int16(POLLOUT) != 0 else { return false }
-            guard let room = Self.sendRoom(fd) else { return false }
-            guard room > 0 else { usleep(1000); continue }
-            let chunk = min(bytes.count - offset, room)
+            let started = DispatchTime.now().uptimeNanoseconds
             let n = bytes.withUnsafeBytes { raw -> Int in
-                Darwin.send(fd, raw.baseAddress!.advanced(by: offset), chunk, 0)
+                let p = raw.baseAddress!.advanced(by: offset), len = bytes.count - offset
+                if let sendHook { return sendHook(fd, peerIP, p, len) }
+                return Darwin.send(fd, p, len, 0)
             }
+            let sendErrno = errno
+            let took = DispatchTime.now().uptimeNanoseconds &- started
+            txLock.lock(); sendCallMaxNanos = max(sendCallMaxNanos, took); txLock.unlock()
             if n > 0 {
                 offset += n
                 if let peerIP {
@@ -1504,8 +1536,7 @@ final class ControlServer: @unchecked Sendable {
                     txLock.unlock()
                 }
             } else {
-                let e = errno
-                guard n < 0, e == EAGAIN || e == EINTR else { return false }
+                guard n < 0, sendErrno == EAGAIN || sendErrno == EINTR else { return false }
             }
         }
         return true

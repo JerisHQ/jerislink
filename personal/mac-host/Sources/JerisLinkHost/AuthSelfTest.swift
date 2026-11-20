@@ -45,6 +45,8 @@ enum AuthSelfTest {
         r10ReplyBlock(expect)
         r10StalledBlock(expect, reopen: true)
         r11SendSliceFailClosed(expect)
+        r12NonBlockingFailClosed(expect)
+        r12KernelWait(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -1890,7 +1892,9 @@ extension AuthSelfTest {
             let closeMs = Int(Date().timeIntervalSince(blockedAt) * 1000)
             Thread.sleep(forTimeInterval: 0.3)
             let after = rig.server.txCount(peer: vx)
-            let viewerRead = drain?.finish() ?? 0
+            let drained = drain?.finish()
+            let viewerRead = drained?.bytes ?? 0
+            let longestSend = rig.server.longestSendCallMillis
             var yBody: [UInt8] = []
             var yEnd: M?
             while let m = next(y) {
@@ -1898,11 +1902,16 @@ extension AuthSelfTest {
                 if case .fileEnd = m { yEnd = m; break }
                 if case .reply = m { break }
             }
-            print("\(reopen ? "r11 reopened" : "r10 stalled") info: source=\(viaJournal ? "journal" : "listen.plist") stalled=\(stalled) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) viewer_read_after_block=\(viewerRead); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
+            print("\(reopen ? "r11 reopened" : "r10 stalled") info: source=\(viaJournal ? "journal" : "listen.plist") stalled=\(stalled) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) viewer_read_after_block=\(viewerRead) viewer_saw_close=\(drained?.sawClose ?? false) longest_send_call_ms=\(String(format: "%.3f", longestSend)); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
             expect(stalled && closed && after.sends == atBlock.sends && after.bytes == atBlock.bytes
                    && yBody == body && yEnd == .fileEnd(transfer: ty, index: 0, sha256: FileUploadSelfTest.sha(body))
                    && rig.server.rejectedClients >= 1 && rig.watch.appliedChange == nil && !rig.gate.isRevoked
-                   && rig.gate.guardian.isBlocked(vx) && !rig.gate.guardian.isBlocked(vy),
+                   && rig.gate.guardian.isBlocked(vx) && !rig.gate.guardian.isBlocked(vy)
+                   // r12: no send() call waited in the kernel (SO_SNDTIMEO would show 100 ms)
+                   && longestSend < 50
+                   // r12 (Pepper 2): the window really reopened: the viewer read
+                   // bytes after the block, and then saw the socket close.
+                   && (!reopen || (viewerRead > 0 && drained?.sawClose == true)),
                    name)
         }
     }
@@ -1913,6 +1922,7 @@ extension AuthSelfTest {
         private let lock = NSLock()
         private var stop = false
         private var bytes = 0
+        private var closed = false
         private let done = DispatchSemaphore(value: 0)
 
         init(_ client: MRC1Client) {
@@ -1921,19 +1931,20 @@ extension AuthSelfTest {
                     lock.lock(); let s = stop; lock.unlock()
                     if s { break }
                     let n = client.readAny(timeout: 0.05)
-                    if n < 0 { break }
+                    if n < 0 { lock.lock(); closed = true; lock.unlock(); break }
                     lock.lock(); bytes += n; lock.unlock()
                 }
                 done.signal()
             }
         }
 
-        /// Stops reading; the bytes the viewer read.
-        func finish() -> Int {
+        /// Stops reading. `bytes`: what the viewer read before the host
+        /// closed; `sawClose`: the read loop ended on EOF/reset, not `finish`.
+        func finish() -> (bytes: Int, sawClose: Bool) {
             lock.lock(); stop = true; lock.unlock()
             done.wait()
             lock.lock(); defer { lock.unlock() }
-            return bytes
+            return (bytes, closed)
         }
     }
 
@@ -1959,6 +1970,82 @@ extension AuthSelfTest {
         let realOK = ControlServer.setSendSlice(s)
         print("r11 send timeout info: closed=\(closed) reply=\(reply != nil) rejected=\(rig.server.rejectedClients) real_setter_ok=\(realOK)")
         expect(closed && reply == nil && rig.server.rejectedClients >= 1 && realOK, name)
+    }
+
+    /// r12: a viewer socket that cannot be made O_NONBLOCK is not served
+    /// (fail closed), like r11's send timeout; the real setter sets the flag.
+    fileprivate static func r12NonBlockingFailClosed(_ expect: Expect) {
+        let v = "100.64.0.45"
+        let name = "r12 non-blocking unset: when O_NONBLOCK cannot be set on an accepted viewer socket the host closes that connection at once (fail closed): no reply, rejected count +1; on a real socket the setter sets O_NONBLOCK"
+        guard let rig = R10Rig(allowed: [v], settingsIP: v) else { expect(false, name); return }
+        rig.server.nonBlockingSetter = { _ in false }
+        guard rig.start(), let c = rig.viewer(v) else { rig.close(); expect(false, name); return }
+        defer { c.close(); rig.close() }
+        _ = c.send(type: 0x01, payload: [])
+        var closed = false
+        let t0 = Date()
+        while !closed && Date().timeIntervalSince(t0) < 1 {
+            Thread.sleep(forTimeInterval: 0.02)
+            closed = c.hostClosed()
+        }
+        let reply = c.receive(timeout: 0.3)
+        let s = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        defer { Darwin.close(s) }
+        let realOK = ControlServer.setNonBlocking(s) && fcntl(s, F_GETFL) & O_NONBLOCK != 0
+        print("r12 non-blocking info: closed=\(closed) reply=\(reply != nil) rejected=\(rig.server.rejectedClients) real_setter_sets_flag=\(realOK)")
+        expect(closed && reply == nil && rig.server.rejectedClients >= 1 && realOK, name)
+    }
+
+    /// r12 (Pepper 1): poll said writable (and r11's room estimate showed
+    /// room), but the kernel cannot take the write. The hook stands in for
+    /// that send(): on a blocking socket it waits, as the kernel would, until
+    /// released; on an O_NONBLOCK socket the kernel answers EAGAIN instead,
+    /// so the hook does too. The block lands while that write is pending;
+    /// 200 ms later the kernel "has room" again (release). The host writes 0
+    /// bytes to the viewer after the block and its socket closes.
+    fileprivate static func r12KernelWait(_ expect: Expect) {
+        typealias M = FileProto.Message
+        let vx = "100.64.0.46"
+        let body = FileAnnounceSelfTest.body(Int(FileAnnouncer.maxRequest))
+        for viaJournal in [true, false] {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let name = "r12 kernel wait: poll says writable but the kernel cannot take the write (hook); a block from \(source) lands during that wait; once the kernel has room the host writes 0 bytes to the viewer after the block (host write count), its socket closes within 2 s, no FILE_END; the send never waited in the kernel"
+            guard let rig = R10Rig(allowed: [vx], settingsIP: vx, srcBody: body), rig.start(),
+                  let x = rig.viewer(vx) else { expect(false, name); continue }
+            defer { x.close(); rig.close() }
+            let hook = R12KernelHook(peer: vx)
+            func next(_ timeout: Double = 3) -> M? {
+                x.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+            }
+            _ = x.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+            guard case .helloAck? = next(), settle({ rig.board.counts.changeCountReads >= 6 }) else { expect(false, name); continue }
+            rig.board.localCopyFiles([rig.src])
+            guard case let .offer(tx, _, _, _)? = next(), case .entry? = next() else { expect(false, name); continue }
+            rig.server.sendHook = hook.send
+            _ = x.send(type: FileProto.MsgType.request,
+                       payload: M.request(transfer: tx, index: 0, offset: 0, length: UInt32(body.count)).encode()!)
+            let fired = hook.waitFired(seconds: 3)
+            let atBlock = rig.server.txCount(peer: vx)
+            let blockedAt = Date()
+            rig.block(vx, viaJournal: viaJournal)
+            Thread.sleep(forTimeInterval: 0.2)
+            hook.release()
+            var closed = false
+            while !closed && Date().timeIntervalSince(blockedAt) < 2 {
+                Thread.sleep(forTimeInterval: 0.02)
+                closed = x.hostClosed()
+            }
+            let closeMs = Int(Date().timeIntervalSince(blockedAt) * 1000)
+            Thread.sleep(forTimeInterval: 0.3)
+            let after = rig.server.txCount(peer: vx)
+            var fileEnd = false
+            while let m = next(0.3) { if case .fileEnd = m { fileEnd = true; break } }
+            let longestSend = rig.server.longestSendCallMillis
+            print("r12 kernel wait info: source=\(viaJournal ? "journal" : "listen.plist") fired=\(fired) nonblocking=\(hook.sawNonBlocking) eagain_returned=\(hook.eagainCount) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) file_end=\(fileEnd) longest_send_call_ms=\(String(format: "%.3f", longestSend))")
+            expect(fired && after.sends == atBlock.sends && after.bytes == atBlock.bytes && closed && !fileEnd
+                   && rig.gate.guardian.isBlocked(vx) && !rig.gate.isRevoked && longestSend < 50,
+                   name)
+        }
     }
 
     /// r10 (blocker 2): a block that lands while a request is handled (after
@@ -2019,4 +2106,47 @@ final class R10Flag: @unchecked Sendable {
         v = x; return true
     }
     var value: UInt64? { lock.lock(); defer { lock.unlock() }; return v }
+}
+
+/// r12 self-test: the kernel's send() for one peer, from the moment it is
+/// armed until `release`: the write cannot be taken. Blocking socket: wait
+/// (the kernel's mbuf wait); O_NONBLOCK socket: EAGAIN. Then the real send.
+final class R12KernelHook: @unchecked Sendable {
+    private let peer: String
+    private let lock = NSLock()
+    private var released = false, didFire = false
+    private var nonBlocking = false, eagains = 0
+    private let firedSem = DispatchSemaphore(value: 0)
+    private let releaseSem = DispatchSemaphore(value: 0)
+
+    init(peer: String) { self.peer = peer }
+
+    func send(_ fd: Int32, _ peerIP: String?, _ p: UnsafeRawPointer, _ len: Int) -> Int {
+        guard peerIP == peer else { return Darwin.send(fd, p, len, 0) }
+        lock.lock()
+        if released { lock.unlock(); return Darwin.send(fd, p, len, 0) }
+        let first = !didFire
+        didFire = true
+        let nb = fcntl(fd, F_GETFL) & O_NONBLOCK != 0
+        if nb { nonBlocking = true; eagains += 1 }
+        lock.unlock()
+        if first { firedSem.signal() }
+        if nb {
+            errno = EAGAIN
+            return -1
+        }
+        releaseSem.wait()
+        releaseSem.signal()
+        return Darwin.send(fd, p, len, 0)
+    }
+
+    func waitFired(seconds: Double) -> Bool { firedSem.wait(timeout: .now() + seconds) == .success }
+
+    func release() {
+        lock.lock(); released = true; lock.unlock()
+        releaseSem.signal()
+    }
+
+    var sawNonBlocking: Bool { lock.lock(); defer { lock.unlock() }; return nonBlocking }
+    var eagainCount: Int { lock.lock(); defer { lock.unlock() }; return eagains }
 }
