@@ -34,6 +34,9 @@ enum AuthSelfTest {
         r4Waiting(expect)
         r4Pending(expect)
         r4Writers(expect)
+        r5Sessions(expect)
+        r5Lock(expect)
+        r5Journal(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -1023,7 +1026,7 @@ enum AuthSelfTest {
         chmod(conf.path, 0o555)
         for _ in 0..<20 { _ = a.gate.guardian.recordFailure(me) }
         expect(a.gate.guardian.pendingIPs == [me] && a.gate.guardian.isDurable
-               && PendingBlockFile(url: journalURL).load().map(\.ip) == [me] && ListenPlistBlocklist(url: url).load().isEmpty,
+               && PendingBlockFile(url: journalURL).load()?.map(\.ip) == [me] && ListenPlistBlocklist(url: url).load().isEmpty,
                "r4 b5: listen.plist cannot be written: the block is kept in the pending journal")
         a.servers.forEach { $0.stop() }
 
@@ -1036,7 +1039,7 @@ enum AuthSelfTest {
         guard let c = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b5: service restarts again"); return }
         defer { c.servers.forEach { $0.stop() } }
         expect(!pong(MRC1Client(port: c.port)) && ListenPlistBlocklist(url: url).load().map(\.ip) == [me]
-               && PendingBlockFile(url: journalURL).load().isEmpty && c.gate.guardian.pendingIPs.isEmpty,
+               && PendingBlockFile(url: journalURL).load()?.isEmpty == true && c.gate.guardian.pendingIPs.isEmpty,
                "r4 b5 service: once listen.plist is writable the restart moves the block into it and empties the journal")
 
         let store = MemoryBlocklist(); store.failNextSaves = 999
@@ -1087,5 +1090,213 @@ enum AuthSelfTest {
         group.wait()
         expect(Set(ListenPlistBlocklist(url: url).load().map(\.ip)).count == 32,
                "r4 b5: two writers (separate stores) never lose each other's blocks")
+    }
+
+    // MARK: r5
+
+    private static func loopbackBase(_ me: String) -> [String: Any] {
+        ["mode": "loopback", "clientIP": me, "allowedIPs": [me], "allowedIPsSource": "clientIP", "passwordSet": false]
+    }
+
+    /// B3 r5: the dedicated file and clipboard sessions leave the message
+    /// loop. After a policy change neither answers, sends the Mac clipboard
+    /// nor writes the PC's text. No poll or tick runs and the server keeps
+    /// running, so only the sessions' own checks can close them.
+    private static func r5Sessions(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let me = ListenConfig.loopbackIP
+        let base = loopbackBase(me)
+        writePlist(base, url)
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        let (resolution, plist) = read()
+        guard case .ready(let ep) = resolution, let port = ControlServiceSelfTest.freeLoopbackPort() else {
+            expect(false, "r5 b3: endpoint resolves"); return
+        }
+        let (made, snapshot) = ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil,
+                                                       blocklist: ListenPlistBlocklist(url: url))
+        guard let gate = made else { expect(false, "r5 b3: gate"); return }
+        let watch = PolicyWatch(started: ep, snapshot: snapshot, gate: gate, read: read, loadSecret: { nil },
+                                stamp: { ListenFileStamp.of(url) })
+        let board = FakeClipboard(text: "mac-before")
+        let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                    fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                    openFolder: { _ in })
+        let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
+                                   settingsClientIP: { me }, acceptProxy: false, allowFileSessions: true,
+                                   fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
+                                   fileSendFolder: folder, clipboard: board, authGate: gate,
+                                   admitConnection: { watch.admitNew() }, admitMessage: { watch.stillCurrent() })
+        guard (try? server.start()) != nil, let file = MRC1Client(port: port), let clip = MRC1Client(port: port) else {
+            expect(false, "r5 b3: server and sessions start"); return
+        }
+        defer { file.close(); clip.close(); server.stop() }
+        let ping = FileProto.Message.ping(token: [1, 2, 3, 4])
+        let pingBytes = ping.encode() ?? []
+        _ = file.send(type: 0x50, payload: [1, 0, 0])                 // FILE_HELLO
+        let ack = file.receive(timeout: 3)?.type == 0x51
+        _ = file.send(type: ping.type, payload: pingBytes)
+        let echoed = file.receive(timeout: 2)?.type == ping.type
+        _ = clip.send(type: 0x30, payload: [])                        // CLIPBOARD_HELLO
+        _ = clip.send(type: 0x31, payload: Array("pc-before".utf8))
+        let applied = settle { board.writes == ["pc-before"] }
+        expect(ack && echoed && applied,
+               "r5 b3: transition mode: the file session answers PING, the clipboard session writes the Mac clipboard")
+
+        var pw = base; pw["passwordSet"] = true
+        writePlist(pw, url)
+        // No watch.start, no tick; nothing stops the server.
+        board.localCopy("mac-after")
+        _ = clip.send(type: 0x31, payload: Array("pc-after".utf8))
+        _ = file.send(type: ping.type, payload: pingBytes)
+        Thread.sleep(forTimeInterval: 0.4)
+        let fileAfter = file.receive(timeout: 0.5)
+        let clipAfter = clip.receive(timeout: 0.5)
+        expect(fileAfter == nil && clipAfter == nil && board.writes == ["pc-before"],
+               "r5 b3: after a policy change the file session answers nothing and the clipboard session neither sends the Mac copy nor writes the PC text")
+        expect(server.rejectedClients == 2 && watch.appliedChange?.contains("passwordSet") == true && gate.isRevoked,
+               "r5 b3: both sessions are closed by their own policy check (reason=policy_changed), old gate revoked")
+    }
+
+    /// B5 r5: one lock protocol for listen.plist. A manual edit made the
+    /// Deploy/README.md way (lockf on listen.plist.lock) holds the same lock,
+    /// so a blacklist write waits for it and both edits stay. Without the
+    /// lock nothing is written.
+    private static func r5Lock(_ expect: Expect) {
+        let fm = FileManager.default
+        let dir = tempDir()
+        defer { try? fm.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let lockPath = url.path + ".lock"
+        writePlist(["mode": "loopback", "note": "keep"], url)
+
+        let editor = Process()
+        editor.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+        editor.arguments = ["-k", lockPath, "/bin/sh", "-c",
+                            "sleep 0.3; /usr/libexec/PlistBuddy -c 'Add :manual string yes' \"$0\"", url.path]
+        var held = false
+        if (try? editor.run()) != nil {
+            // Wait until lockf holds the lock (a probe that gets it lets go at once).
+            for _ in 0..<200 {
+                let fd = open(lockPath, O_RDWR | O_CLOEXEC)
+                if fd >= 0 {
+                    let busy = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK
+                    if !busy { flock(fd, LOCK_UN) }
+                    close(fd)
+                    if busy { held = true; break }
+                }
+                usleep(5_000)
+            }
+        }
+        let store = ListenPlistBlocklist(url: url)
+        store.lockWait = 10
+        let start = ProcessInfo.processInfo.systemUptime
+        let out = store.update(adding: [BlockedEntry(ip: "100.64.0.7", at: Date(), reason: "test")], removing: [])
+        let waited = ProcessInfo.processInfo.systemUptime - start
+        editor.waitUntilExit()
+        let file = readPlist(url) ?? [:]
+        expect(held && editor.terminationStatus == 0 && waited >= 0.1 && out?.map(\.ip) == ["100.64.0.7"]
+               && file["manual"] as? String == "yes" && file["note"] as? String == "keep"
+               && ListenPlistBlocklist.entries(in: file).map(\.ip) == ["100.64.0.7"],
+               "r5 b5: a blacklist write waits for a lockf + PlistBuddy edit holding the same lock; both edits are kept")
+
+        // The lock is held elsewhere past the wait: nothing written.
+        let before = try? Data(contentsOf: url)
+        let holder = open(lockPath, O_RDWR | O_CLOEXEC)
+        let gotIt = holder >= 0 && flock(holder, LOCK_EX | LOCK_NB) == 0
+        let busy = ListenPlistBlocklist(url: url)
+        busy.lockWait = 0.2
+        let busyOut = busy.update(adding: [BlockedEntry(ip: "100.64.0.8", at: Date(), reason: "test")], removing: [])
+        if holder >= 0 { flock(holder, LOCK_UN); close(holder) }
+        expect(gotIt && busyOut == nil && (try? Data(contentsOf: url)) == before,
+               "r5 b5: lock busy past the wait: the blacklist write gives up and writes nothing")
+
+        // The lock file cannot be opened (a directory in its place).
+        try? fm.removeItem(atPath: lockPath)
+        try? fm.createDirectory(atPath: lockPath, withIntermediateDirectories: false)
+        let noLock = ListenPlistBlocklist(url: url).update(adding: [BlockedEntry(ip: "100.64.0.8", at: Date(), reason: "test")], removing: [])
+        expect(noLock == nil && (try? Data(contentsOf: url)) == before,
+               "r5 b5: lock file cannot be opened: the blacklist write writes nothing")
+
+        // The guard: the unsaved block goes to the journal, listen.plist untouched.
+        let journal = MemoryPendingBlocks()
+        let g = AuthGuard(whitelist: [], blocklist: ListenPlistBlocklist(url: url), pause: { _ in }, journal: journal)
+        for _ in 0..<20 { _ = g.recordFailure("100.64.0.9") }
+        expect(g.pendingIPs == ["100.64.0.9"] && journal.entries.map(\.ip) == ["100.64.0.9"] && g.isDurable
+               && (try? Data(contentsOf: url)) == before,
+               "r5 b5: no lock: the block stays pending in the journal, listen.plist untouched")
+
+        // Migration takes the same lock.
+        let mdir = dir.appendingPathComponent("m", isDirectory: true)
+        try? fm.createDirectory(at: mdir, withIntermediateDirectories: true)
+        let murl = mdir.appendingPathComponent("listen.plist")
+        writePlist(["mode": "tailnet", "clientIP": "100.64.0.2"], murl)
+        try? fm.createDirectory(atPath: murl.path + ".lock", withIntermediateDirectories: false)
+        let mBefore = try? Data(contentsOf: murl)
+        expect(ListenMigration.migrate(url: murl) == "config.migrate_failed reason=lock"
+               && (try? Data(contentsOf: murl)) == mBefore && !fm.fileExists(atPath: murl.path + ".pre-0.4"),
+               "r5 b5: migration without the lock writes nothing (no backup, listen.plist unchanged)")
+    }
+
+    /// B5 r5: a pending journal that exists but does not read is not an
+    /// empty one. Nobody is admitted, the file is kept as it is, and
+    /// admission comes back once it reads again.
+    private static func r5Journal(_ expect: Expect) {
+        let fm = FileManager.default
+        let dir = tempDir()
+        defer { try? fm.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+        let me = ListenConfig.loopbackIP
+        writePlist(loopbackBase(me), url)
+        try? fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let garbage = Data("not a plist".utf8)
+        try? garbage.write(to: journalURL)
+        let noJournal = PendingBlockFile(url: dir.appendingPathComponent("auth-state/none.plist"))
+        expect(PendingBlockFile(url: journalURL).load() == nil && noJournal.load()?.isEmpty == true,
+               "r5 b5: journal: a missing file reads as empty, a corrupt one as unreadable")
+
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        let gate: (ListenEndpoint, [String: Any]?) -> (AuthGate?, AuthConfigSnapshot) = { ep, plist in
+            ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil, blocklist: ListenPlistBlocklist(url: url),
+                                    journal: PendingBlockFile(url: journalURL))
+        }
+        guard let a = bootService(read: read, url: url, gate: gate) else { expect(false, "r5 b5: service starts"); return }
+        defer { a.servers.forEach { $0.stop() } }
+        expect(!pong(MRC1Client(port: a.port)) && a.gate.guardian.lockdownReason() == "pending_journal_unreadable"
+               && (try? Data(contentsOf: journalURL)) == garbage,
+               "r5 b5 service: corrupt journal at start: even the whitelisted viewer is refused (transition mode), journal kept as is")
+
+        let pwGuard = AuthGuard(whitelist: [me], blocklist: ListenPlistBlocklist(url: url), pause: { _ in },
+                                journal: PendingBlockFile(url: journalURL))
+        expect(pwGuard.admit(me) == .globalLocked(retrySeconds: AuthGuard.pendingRetrySeconds),
+               "r5 b5: corrupt journal at start: password mode issues no challenge")
+
+        chmod(journalURL.path, 0o000)
+        let unreadable = PendingBlockFile(url: journalURL).load() == nil
+        chmod(journalURL.path, 0o600)
+        expect(unreadable || getuid() == 0, "r5 b5: journal: a file that cannot be opened reads as unreadable, not empty")
+
+        let mem = MemoryPendingBlocks(); mem.unreadable = true
+        let store = MemoryBlocklist(); store.failNextSaves = 999
+        let g = AuthGuard(whitelist: [], blocklist: store, pause: { _ in }, journal: mem)
+        for _ in 0..<20 { _ = g.recordFailure("100.64.0.7") }
+        expect(mem.entries.isEmpty && !g.isDurable && g.lockdownReason() != nil,
+               "r5 b5: while the journal does not read, a new unsaved block does not overwrite it and holds the exit")
+
+        _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: "100.64.0.9", at: Date(), reason: "test")])
+        let back = settle { pong(MRC1Client(port: a.port)) }
+        expect(back && a.gate.guardian.isBlocked("100.64.0.9") && ListenPlistBlocklist(url: url).load().map(\.ip) == ["100.64.0.9"]
+               && PendingBlockFile(url: journalURL).load()?.isEmpty == true,
+               "r5 b5 service: once the journal reads again its block is carried into listen.plist and the viewer is admitted")
     }
 }

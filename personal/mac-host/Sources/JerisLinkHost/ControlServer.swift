@@ -714,6 +714,8 @@ final class ControlServer: @unchecked Sendable {
         while true {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { reason = "stopping"; return }
+            // r5 (B3): nothing more is sent or served once the policy moved.
+            if sessionRevoked("file") { reason = "policy_changed"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
             if showsNotice {
                 let seq = currentNoticeSeq()
@@ -762,6 +764,7 @@ final class ControlServer: @unchecked Sendable {
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= FileProto.maxPayload else { reason = "too_long"; return }
             guard let payload = recvExact(fd, count: length) else { return }
+            if sessionRevoked("file") { reason = "policy_changed"; return }
             received += 1
             lastMessage = Date()
             pushBroker.heard(pushSession)
@@ -828,6 +831,18 @@ final class ControlServer: @unchecked Sendable {
         }
     }
 
+    /// r5 (B3): the dedicated file and clipboard sessions leave the main
+    /// message loop, so they ask `admitMessage` themselves: on every loop
+    /// turn (nothing is sent or written after a policy change) and again
+    /// before an inbound message is handled. One stat while listen.plist is
+    /// unchanged.
+    private func sessionRevoked(_ kind: String) -> Bool {
+        guard let admitMessage, !admitMessage() else { return false }
+        rejectedClients += 1
+        print("Control reject reason=policy_changed session=\(kind) on \(bindIP):\(port); open connection closed")
+        return true
+    }
+
     private func handleClipboardSession(_ fd: Int32) {
         // Each 100 ms poll reads only the change count, on this thread. The
         // contents are read (on the main thread) only when the count moved.
@@ -838,6 +853,8 @@ final class ControlServer: @unchecked Sendable {
         while true {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { return }
+            // r5 (B3): no clipboard read or write once the policy moved.
+            if sessionRevoked("clipboard") { return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -855,6 +872,7 @@ final class ControlServer: @unchecked Sendable {
                     let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
                     guard length <= Self.maxClipboardBytes,
                           let payload = recvExact(fd, count: length) else { return }
+                    if sessionRevoked("clipboard") { return }
 
                     if type == 0x31 {
                         guard let text = String(data: Data(payload), encoding: .utf8) else {
@@ -907,6 +925,8 @@ final class ControlServer: @unchecked Sendable {
                 continue
             }
             if text == lastSentText { continue }
+            // r5 (B3): the policy may have moved during the 100 ms poll.
+            if sessionRevoked("clipboard") { return }
             guard sendPacket(fd, type: 0x31, payload: payload) else { return }
             lastSentText = text
             clipboardSent += 1
@@ -1215,6 +1235,11 @@ final class ControlServer: @unchecked Sendable {
     /// Transition mode (no password yet): the 0.3 address check against the
     /// whitelist, plus the blacklist. No challenge, nothing counted.
     private func admitWithoutPassword(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> Bool {
+        if let why = gate.guardian.lockdownReason() {
+            rejectedClients += 1
+            print("auth.lockdown_hold reason=\(why) peer=\(peer.ip) on \(bindIP):\(port); connection closed")
+            return false
+        }
         if gate.guardian.isBlocked(peer.ip) {
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
             print("auth.blocked peer=\(peer.ip); connection closed")

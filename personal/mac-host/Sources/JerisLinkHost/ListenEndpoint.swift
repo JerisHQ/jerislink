@@ -89,16 +89,32 @@ enum ListenConfig {
             .appendingPathComponent("pending-blocks.plist")
     }
 
-    /// Runs `body` holding an exclusive flock on `<listen.plist>.lock`, so
-    /// the host's own read-modify-write writers (blacklist, migration) take
-    /// turns. Writers outside the host do not take it; the blacklist write
-    /// also compares the file before replacing it (ListenPlistBlocklist).
-    /// If the lock file cannot be opened, `body` runs without it.
-    static func withFileLock<T>(_ url: URL, _ body: () -> T) -> T {
-        let fd = open(url.path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { return body() }
+    /// The one locking protocol for listen.plist (r5, B5): every supported
+    /// writer holds an exclusive flock on `<listen.plist>.lock` from its
+    /// read to its replace. The host's writers (blacklist, migration) use
+    /// this; a manual edit uses `lockf -k <listen.plist>.lock PlistBuddy …`
+    /// (Deploy/README.md), which takes the same flock. A writer that skips
+    /// the lock is not supported.
+    ///
+    /// Fails closed: when the lock file cannot be opened or the lock is not
+    /// had within `wait` seconds, `body` does not run and the result is
+    /// nil, so nothing is written without the lock.
+    static func withFileLock<T>(_ url: URL, wait: TimeInterval = 0.5, _ body: () -> T) -> T? {
+        let fd = open(url.path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else {
+            print("config.lock_failed reason=open errno=\(errno) (nothing written)")
+            return nil
+        }
         defer { close(fd) }
-        while flock(fd, LOCK_EX) != 0 && errno == EINTR {}
+        let deadline = ProcessInfo.processInfo.systemUptime + wait
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let e = errno
+            guard e == EWOULDBLOCK || e == EINTR, ProcessInfo.processInfo.systemUptime < deadline else {
+                print("config.lock_failed reason=\(e == EWOULDBLOCK ? "busy" : "flock") errno=\(e) (nothing written)")
+                return nil
+            }
+            usleep(10_000)
+        }
         defer { flock(fd, LOCK_UN) }
         return body()
     }

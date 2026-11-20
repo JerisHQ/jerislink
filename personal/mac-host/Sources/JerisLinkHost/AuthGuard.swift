@@ -60,17 +60,20 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
     /// Self-test: runs after the new file is written, before it replaces
     /// listen.plist (to play an outside edit in that window).
     var beforeReplace: (() -> Void)?
+    /// How long a write waits for the listen.plist lock before it gives up
+    /// (and writes nothing).
+    var lockWait: TimeInterval = 0.5
 
-    /// B5 r4: writers are coordinated two ways. The host's own writers take
-    /// the flock on `listen.plist.lock` (ListenConfig.withFileLock), so two
-    /// stores or processes never interleave a read-modify-write. Writers
-    /// that take no lock (the host app, an editor, PlistBuddy) are caught by
-    /// compare-and-retry: the new file replaces listen.plist only if the
-    /// file is still the one that was read (same stamp), else it is read
-    /// again and merged again.
+    /// B5: every supported writer holds the flock on `listen.plist.lock`
+    /// from read to replace (ListenConfig.withFileLock; manual edits through
+    /// `lockf`, Deploy/README.md), so no read-modify-write interleaves with
+    /// another. Without the lock nothing is written (nil: the block stays
+    /// pending and goes to the journal). The stamp compare before the
+    /// replace stays as a second check against a writer that skipped the
+    /// lock; such a writer is not supported.
     func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]? {
         lock.lock(); defer { lock.unlock() }
-        return ListenConfig.withFileLock(url) { () -> [BlockedEntry]? in
+        let result = ListenConfig.withFileLock(url, wait: lockWait) { () -> [BlockedEntry]? in
             for _ in 1...Self.replaceAttempts {
                 guard let before = ListenFileStamp.of(url), before.exists, var dict = readDict() else {
                     print("auth.blocklist_not_saved reason=no_listen_plist")
@@ -101,6 +104,11 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
             print("auth.blocklist_not_saved reason=busy attempts=\(Self.replaceAttempts)")
             return nil
         }
+        guard let result else {
+            print("auth.blocklist_not_saved reason=lock")
+            return nil
+        }
+        return result
     }
 
     /// An atomic write replaces the file, so the folder must be writable too.
@@ -138,7 +146,9 @@ final class MemoryBlocklist: BlocklistStore, @unchecked Sendable {
 /// entries are blocked and still pending, so the host stays shut until they
 /// reach listen.plist) and empties it once they do.
 protocol PendingBlockStore: AnyObject {
-    func load() -> [BlockedEntry]
+    /// r5: [] when there is no journal; nil when one exists but cannot be
+    /// read or parsed (the guard then admits nobody: fail closed).
+    func load() -> [BlockedEntry]?
     /// Replaces the journal with `entries` (empty removes it). False when
     /// it could not be written.
     func save(_ entries: [BlockedEntry]) -> Bool
@@ -148,10 +158,15 @@ final class PendingBlockFile: PendingBlockStore, @unchecked Sendable {
     let url: URL
     init(url: URL) { self.url = url }
 
-    func load() -> [BlockedEntry] {
+    func load() -> [BlockedEntry]? {
+        var st = stat()
+        if stat(url.path, &st) != 0 { return errno == ENOENT ? [] : nil }
         guard let data = try? Data(contentsOf: url),
-              let dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any] else { return [] }
-        return ListenPlistBlocklist.entries(in: dict)
+              let dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
+              let items = dict["blockedIPs"] as? [Any] else { return nil }
+        let entries = ListenPlistBlocklist.entries(in: dict)
+        // An entry that does not read is not dropped silently.
+        return entries.count == items.count ? entries : nil
     }
 
     func save(_ entries: [BlockedEntry]) -> Bool {
@@ -169,7 +184,8 @@ final class PendingBlockFile: PendingBlockStore, @unchecked Sendable {
 final class MemoryPendingBlocks: PendingBlockStore, @unchecked Sendable {
     var entries: [BlockedEntry] = []
     var canWrite = true
-    func load() -> [BlockedEntry] { entries }
+    var unreadable = false
+    func load() -> [BlockedEntry]? { unreadable ? nil : entries }
     func save(_ entries: [BlockedEntry]) -> Bool {
         guard canWrite else { return false }
         self.entries = entries
@@ -269,6 +285,11 @@ final class AuthGuard: @unchecked Sendable {
     /// is what it holds as far as this guard knows.
     private let journal: PendingBlockStore?
     private var journaled: Set<String> = []
+    /// r5 (B5): a journal exists but could not be read at start. Nobody is
+    /// admitted (both modes) until it reads again or is removed; the file is
+    /// never overwritten meanwhile.
+    private var journalUnreadable = false
+    private var lastJournalRetry: TimeInterval = -.infinity
     private var lastPendingRetry: TimeInterval = -.infinity
     static let pendingRetryInterval: TimeInterval = 1
     static let pendingRetrySeconds: UInt32 = 5
@@ -289,11 +310,18 @@ final class AuthGuard: @unchecked Sendable {
         // B5 r4: a block that never reached listen.plist before the last
         // exit is blocked again and still pending, so the host stays shut
         // (no challenges) until listen.plist holds it.
-        let carried = (journal?.load() ?? []).filter { e in !loaded.contains { $0.ip == e.ip } }
+        // r5: read once; a journal that exists but does not read is not an
+        // empty one.
+        let fromJournal = journal.map { $0.load() } ?? []
+        let carried = (fromJournal ?? []).filter { e in !loaded.contains { $0.ip == e.ip } }
         self.blocked = loaded + carried
         self.pending = carried
-        self.journaled = Set((journal?.load() ?? []).map(\.ip))
-        if !carried.isEmpty {
+        self.journaled = Set((fromJournal ?? []).map(\.ip))
+        if fromJournal == nil {
+            journalUnreadable = true
+            lastJournalRetry = now()
+            print("auth.lockdown reason=pending_journal_unreadable (file kept as is; nobody is admitted until it reads or is removed)")
+        } else if !carried.isEmpty {
             print("auth.lockdown_restored peers=\(carried.count) source=pending_journal")
             lock.lock(); retryPendingLocked(force: true); lock.unlock()
         } else if !journaled.isEmpty {
@@ -306,6 +334,14 @@ final class AuthGuard: @unchecked Sendable {
     func admit(_ ip: String) -> Admission {
         lock.lock(); defer { lock.unlock() }
         return admitLocked(ip)
+    }
+
+    /// r5 (B5): why nobody may be admitted at all, whatever the address
+    /// (transition mode asks this before the blacklist). Nil when admission
+    /// can go on to the per-address checks.
+    func lockdownReason() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return journalHoldLocked() ? "pending_journal_unreadable" : nil
     }
 
     /// Blacklist only (transition mode: no challenge, so no counting).
@@ -390,6 +426,7 @@ final class AuthGuard: @unchecked Sendable {
             return .locked(retrySeconds: Self.seconds(p.lockedUntil - t), stage: p.stage)
         }
         if globalLockedUntil > t { return .globalLocked(retrySeconds: Self.seconds(globalLockedUntil - t)) }
+        if journalHoldLocked() { return .globalLocked(retrySeconds: Self.pendingRetrySeconds) }
         if !pending.isEmpty {
             retryPendingLocked(force: false)
             if !pending.isEmpty { return .globalLocked(retrySeconds: Self.pendingRetrySeconds) }
@@ -500,8 +537,33 @@ final class AuthGuard: @unchecked Sendable {
         return writeJournalLocked(pending)
     }
 
+    /// r5 (B5): while the journal does not read, try it again at most once
+    /// per `pendingRetryInterval`; true while it still does not. Once it
+    /// reads (repaired or removed), its blocks are carried in as at start.
+    private func journalHoldLocked() -> Bool {
+        guard journalUnreadable else { return false }
+        guard let journal else { journalUnreadable = false; return false }
+        let t = now()
+        guard t - lastJournalRetry >= Self.pendingRetryInterval else { return true }
+        lastJournalRetry = t
+        guard let entries = journal.load() else { return true }
+        journalUnreadable = false
+        journaled = Set(entries.map(\.ip))
+        let carried = entries.filter { e in !persisted.contains(e.ip) && !pending.contains { $0.ip == e.ip } }
+        for e in carried where !blocked.contains(where: { $0.ip == e.ip }) { blocked.append(e) }
+        pending.append(contentsOf: carried)
+        print("auth.lockdown_journal_readable peers=\(carried.count)")
+        if journaled != Set(pending.map(\.ip)) { _ = writeJournalLocked(pending) }
+        retryPendingLocked(force: true)
+        return false
+    }
+
     private func writeJournalLocked(_ entries: [BlockedEntry]) -> Bool {
         guard let journal else { return false }
+        guard !journalUnreadable else {
+            print("auth.pending_journal_not_saved peers=\(entries.count) reason=journal_unreadable (kept as is)")
+            return false
+        }
         guard journal.save(entries) else {
             print("auth.pending_journal_not_saved peers=\(entries.count)")
             return false
@@ -618,8 +680,13 @@ enum ListenMigration {
 
     /// Holds the listen.plist flock, so it never interleaves with a
     /// blacklist write from a control service that is still running.
+    /// r5 (B5): without the lock nothing is written.
     static func migrate(url: URL) -> String? {
-        ListenConfig.withFileLock(url) { migrateLocked(url: url) }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let result = ListenConfig.withFileLock(url, { migrateLocked(url: url) }) else {
+            return "config.migrate_failed reason=lock"
+        }
+        return result
     }
 
     private static func migrateLocked(url: URL) -> String? {
