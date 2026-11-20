@@ -467,53 +467,88 @@ final class LegacyAuthWatch: @unchecked Sendable {
 /// again whenever the stamp moves or stat fails. Not a latch: input comes
 /// back once the journal reads or is removed, as admission does in the
 /// control service.
+///
+/// r7 (B5): and the blacklist, as the control service's guard holds it:
+/// a viewer in listen.plist `blockedIPs` or in a journal that reads (a
+/// block restored from it, not yet in listen.plist) is dropped too. The
+/// same stamp check covers listen.plist.
 final class PendingJournalHold: @unchecked Sendable {
     private let lock = NSLock()
     private let load: @Sendable () -> [BlockedEntry]?
     private let stamp: @Sendable () -> ListenFileStamp?
+    private let loadBlocked: @Sendable () -> [BlockedEntry]
+    private let blockedStamp: @Sendable () -> ListenFileStamp?
     private var known: ListenFileStamp?
     private var held = false
+    private var journalIPs: Set<String> = []
+    private var knownBlocked: ListenFileStamp?
+    private var blockedIPs: Set<String> = []
+    private var lastVerdict: String?
 
-    /// The live journal next to listen.plist.
-    convenience init(url: URL = ListenConfig.pendingBlocksURL) {
+    /// The live journal next to listen.plist, and listen.plist itself.
+    convenience init(url: URL = ListenConfig.pendingBlocksURL, plistURL: URL = ListenConfig.plistURL) {
         let file = PendingBlockFile(url: url)
-        self.init(load: { file.load() }, stamp: { ListenFileStamp.of(url) })
+        self.init(load: { file.load() }, stamp: { ListenFileStamp.of(url) },
+                  loadBlocked: { ListenConfig.readPlist(url: plistURL).map(ListenPlistBlocklist.entries(in:)) ?? [] },
+                  blockedStamp: { ListenFileStamp.of(plistURL) })
     }
 
-    init(load: @escaping @Sendable () -> [BlockedEntry]?, stamp: @escaping @Sendable () -> ListenFileStamp?) {
+    init(load: @escaping @Sendable () -> [BlockedEntry]?, stamp: @escaping @Sendable () -> ListenFileStamp?,
+         loadBlocked: @escaping @Sendable () -> [BlockedEntry] = { [] },
+         blockedStamp: @escaping @Sendable () -> ListenFileStamp? = { ListenFileStamp(exists: false) }) {
         self.load = load
         self.stamp = stamp
+        self.loadBlocked = loadBlocked
+        self.blockedStamp = blockedStamp
     }
 
-    /// Nil while input may go on, else why not.
-    func reason() -> String? {
-        // Taken before the read: a write after it moves the stamp again.
+    /// Nil while input from `viewerIP` may go on, else why not. Without an
+    /// address only the journal lockdown is asked.
+    func reason(for viewerIP: String? = nil) -> String? {
+        // Taken before the reads: a write after them moves the stamps again.
         let now = stamp()
+        let nowBlocked = blockedStamp()
         lock.lock()
-        if let now, let known, now == known {
-            let h = held
-            lock.unlock()
-            return h ? "pending_journal_unreadable" : nil
+        let journalMoved = now == nil || now != known
+        let blockedMoved = nowBlocked == nil || nowBlocked != knownBlocked
+        lock.unlock()
+        let journal = journalMoved ? Optional(load()) : nil
+        let listed = blockedMoved ? loadBlocked() : nil
+        lock.lock()
+        if let journal {
+            held = journal == nil
+            journalIPs = Set((journal ?? []).map(\.ip))
+            known = now
         }
+        if let listed {
+            blockedIPs = Set(listed.map(\.ip))
+            knownBlocked = nowBlocked
+        }
+        let verdict: String?
+        if held {
+            verdict = "pending_journal_unreadable"
+        } else if let viewerIP, journalIPs.contains(viewerIP) || blockedIPs.contains(viewerIP) {
+            verdict = "blocked"
+        } else {
+            verdict = nil
+        }
+        let changed = verdict != lastVerdict
+        lastVerdict = verdict
         lock.unlock()
-        let readable = load() != nil
-        lock.lock()
-        let was = held
-        held = !readable
-        known = now
-        lock.unlock()
-        if was != held {
-            print(readable ? "auth.lockdown_journal_readable entry=udp_input (UDP input goes on)"
-                           : "auth.lockdown_hold reason=pending_journal_unreadable entry=udp_input; UDP 0x24 dropped until it reads or is removed")
+        if changed {
+            print(verdict.map { "auth.lockdown_hold reason=\($0) entry=udp_input peer=\(viewerIP ?? "-"); UDP 0x24 dropped until it clears" }
+                  ?? "auth.lockdown_cleared entry=udp_input (UDP input goes on)")
             fflush(stdout)
         }
-        return readable ? nil : "pending_journal_unreadable"
+        return verdict
     }
 
     /// What the video service's UDP input asks per 0x24 datagram: no
-    /// password set (`LegacyAuthWatch`) and no journal lockdown.
-    static func udpInputAllowed(legacy: LegacyAuthWatch, hold: PendingJournalHold) -> @Sendable () -> Bool {
-        { legacy.check() && hold.reason() == nil }
+    /// password set (`LegacyAuthWatch`), no journal lockdown and (r7) the
+    /// viewer it accepts not on the blacklist.
+    static func udpInputAllowed(legacy: LegacyAuthWatch, hold: PendingJournalHold,
+                                viewerIP: String? = nil) -> @Sendable () -> Bool {
+        { legacy.check() && hold.reason(for: viewerIP) == nil }
     }
 }
 

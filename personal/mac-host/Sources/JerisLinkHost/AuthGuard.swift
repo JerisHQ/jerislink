@@ -152,6 +152,14 @@ protocol PendingBlockStore: AnyObject {
     /// Replaces the journal with `entries` (empty removes it). False when
     /// it could not be written.
     func save(_ entries: [BlockedEntry]) -> Bool
+    /// r7: a cheap stamp of the journal (one stat). The guard reads the
+    /// journal again whenever it moves; nil (stat failed) reads it too.
+    func probeStamp() -> ListenFileStamp?
+}
+
+extension PendingBlockStore {
+    /// Stores without a file never move (they are read by `probeJournal`).
+    func probeStamp() -> ListenFileStamp? { ListenFileStamp(exists: false) }
 }
 
 final class PendingBlockFile: PendingBlockStore, @unchecked Sendable {
@@ -179,6 +187,8 @@ final class PendingBlockFile: PendingBlockStore, @unchecked Sendable {
         guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else { return false }
         return (try? data.write(to: url, options: .atomic)) != nil
     }
+
+    func probeStamp() -> ListenFileStamp? { ListenFileStamp.of(url) }
 }
 
 final class MemoryPendingBlocks: PendingBlockStore, @unchecked Sendable {
@@ -289,6 +299,8 @@ final class AuthGuard: @unchecked Sendable {
     /// admitted (both modes) until it reads again or is removed; the file is
     /// never overwritten meanwhile.
     private var journalUnreadable = false
+    /// r7: the journal's stamp when this guard last read it.
+    private var journalKnown: ListenFileStamp?
     private var lastJournalRetry: TimeInterval = -.infinity
     private var lastPendingRetry: TimeInterval = -.infinity
     static let pendingRetryInterval: TimeInterval = 1
@@ -312,7 +324,10 @@ final class AuthGuard: @unchecked Sendable {
         // (no challenges) until listen.plist holds it.
         // r5: read once; a journal that exists but does not read is not an
         // empty one.
+        // Taken before the read: a write after it moves the stamp again.
+        let journalStamp = journal?.probeStamp()
         let fromJournal = journal.map { $0.load() } ?? []
+        if fromJournal != nil { self.journalKnown = journalStamp }
         let carried = (fromJournal ?? []).filter { e in !loaded.contains { $0.ip == e.ip } }
         self.blocked = loaded + carried
         self.pending = carried
@@ -341,25 +356,67 @@ final class AuthGuard: @unchecked Sendable {
     /// can go on to the per-address checks.
     func lockdownReason() -> String? {
         lock.lock(); defer { lock.unlock() }
+        refreshJournalLocked(force: false)
         return journalHoldLocked() ? "pending_journal_unreadable" : nil
+    }
+
+    /// r7 (B5): what input that does not pass the direct listener's gate
+    /// asks for its viewer `ip` (the mouse relay on every connection and
+    /// every message): nil to go on, else why not. The journal lockdown,
+    /// then the same blacklist direct admission uses: listen.plist
+    /// `blockedIPs` plus the blocks restored from the pending journal.
+    func inputRefusal(_ ip: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        refreshJournalLocked(force: false)
+        if journalHoldLocked() { return "pending_journal_unreadable" }
+        return blocked.contains(where: { $0.ip == ip }) ? "blocked" : nil
     }
 
     /// r6 (B5): a journal that stops reading while the service runs holds
     /// everything as one found at start does (the UDP input in the video
     /// service reads the same file). The policy watch calls this every
-    /// second; the file is kept as it is.
+    /// second; the file is kept as it is. r7: every admission and every
+    /// relay message also looks (one stat), so this is only the fallback.
     func probeJournal() {
         lock.lock(); defer { lock.unlock() }
-        guard !journalUnreadable, let journal, journal.load() == nil else { return }
-        journalUnreadable = true
-        lastJournalRetry = now()
-        print("auth.lockdown reason=pending_journal_unreadable found=running (file kept as is; nobody is admitted and open connections stop until it reads or is removed)")
+        refreshJournalLocked(force: true)
+    }
+
+    /// r7 (B5): reads the journal when it moved since this guard last read
+    /// it (`force`: always), so the per-second probe leaves no window. One
+    /// that does not read holds everything (`journalUnreadable`; the file
+    /// is kept as it is). One that reads carries in any block this guard
+    /// does not hold yet (one another control-service process journaled on
+    /// its way out, say), as at start: blocked at once, pending until
+    /// listen.plist holds it.
+    private func refreshJournalLocked(force: Bool) {
+        guard let journal, !journalUnreadable else { return }
+        // Taken before the read: a write after it moves the stamp again.
+        let stamp = journal.probeStamp()
+        if !force, let stamp, stamp == journalKnown { return }
+        guard let entries = journal.load() else {
+            journalUnreadable = true
+            journalKnown = nil
+            lastJournalRetry = now()
+            print("auth.lockdown reason=pending_journal_unreadable found=running (file kept as is; nobody is admitted and open connections stop until it reads or is removed)")
+            fflush(stdout)
+            return
+        }
+        journalKnown = stamp
+        journaled = Set(entries.map(\.ip))
+        let carried = entries.filter { e in !persisted.contains(e.ip) && !pending.contains { $0.ip == e.ip } }
+        guard !carried.isEmpty else { return }
+        for e in carried where !blocked.contains(where: { $0.ip == e.ip }) { blocked.append(e) }
+        pending.append(contentsOf: carried)
+        print("auth.lockdown_restored peers=\(carried.count) source=pending_journal found=running")
         fflush(stdout)
+        retryPendingLocked(force: true)
     }
 
     /// Blacklist only (transition mode: no challenge, so no counting).
     func isBlocked(_ ip: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        refreshJournalLocked(force: false)
         return blocked.contains { $0.ip == ip }
     }
 
@@ -432,6 +489,7 @@ final class AuthGuard: @unchecked Sendable {
     }
 
     private func admitLocked(_ ip: String) -> Admission {
+        refreshJournalLocked(force: false)
         if blocked.contains(where: { $0.ip == ip }) { return .blocked }
         if !whitelist.isEmpty && !whitelist.contains(ip) { return .notAllowed }
         let t = now()
@@ -559,8 +617,11 @@ final class AuthGuard: @unchecked Sendable {
         let t = now()
         guard t - lastJournalRetry >= Self.pendingRetryInterval else { return true }
         lastJournalRetry = t
+        // r7: stamp first, so the next refresh does not read it again.
+        let stamp = journal.probeStamp()
         guard let entries = journal.load() else { return true }
         journalUnreadable = false
+        journalKnown = stamp
         journaled = Set(entries.map(\.ip))
         let carried = entries.filter { e in !persisted.contains(e.ip) && !pending.contains { $0.ip == e.ip } }
         for e in carried where !blocked.contains(where: { $0.ip == e.ip }) { blocked.append(e) }

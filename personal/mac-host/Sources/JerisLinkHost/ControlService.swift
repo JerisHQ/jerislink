@@ -46,9 +46,15 @@ enum ControlService {
         // (file and clipboard sessions included) and every relay connection
         // asks the guard first; the direct listener's new connections ask
         // it in the gate already.
+        // r7 (B5): the relay carries the moves of one viewer, the UDP
+        // client the video service accepts (clientIP), so its connections
+        // and messages also ask the guard's blacklist for that address,
+        // blocks restored from the pending journal included.
         let held = lockdownCheck(gate)
+        let relayHeld = lockdownCheck(gate, viewerIP: clientIP)
         let messageOK: @Sendable () -> Bool = { !held() && (admitMessage?() ?? true) }
-        let relayAdmit: @Sendable () -> Bool = { !held() && (admit?() ?? true) }
+        let relayMessageOK: @Sendable () -> Bool = { !relayHeld() && (admitMessage?() ?? true) }
+        let relayAdmit: @Sendable () -> Bool = { !relayHeld() && (admit?() ?? true) }
         do {
             // With a gate the whitelist, blacklist and password live in the
             // gate; without one (legacy callers) the 0.3 single-IP check.
@@ -70,7 +76,7 @@ enum ControlService {
                                           settingsClientIP: { clientIP }, acceptProxy: false,
                                           inputHelper: helper, announceInputSessions: false,
                                           allowSensitiveControl: false, relayMouseOnly: true,
-                                          admitConnection: relayAdmit, admitMessage: messageOK)
+                                          admitConnection: relayAdmit, admitMessage: relayMessageOK)
                 try relay.start()
                 servers.append(relay)
             }
@@ -82,14 +88,18 @@ enum ControlService {
     }
 
     /// True while the guard holds every admission (B5: the pending journal
-    /// does not read). Logs at most once a second; the listeners log each
-    /// refused connection or message themselves.
-    static func lockdownCheck(_ gate: AuthGate?) -> @Sendable () -> Bool {
+    /// does not read) and, with `viewerIP` (r7, the mouse relay), while
+    /// that address is on the blacklist. Logs at most once a second; the
+    /// listeners log each refused connection or message themselves.
+    static func lockdownCheck(_ gate: AuthGate?, viewerIP: String? = nil) -> @Sendable () -> Bool {
         guard let guardian = gate?.guardian else { return { false } }
         let throttle = OncePerInterval(1)
         return {
-            guard let why = guardian.lockdownReason() else { return false }
-            if throttle.due() { log("auth.lockdown_hold reason=\(why) entry=relay_or_open_connection; refused or closed") }
+            let why = viewerIP.map { guardian.inputRefusal($0) } ?? guardian.lockdownReason()
+            guard let why else { return false }
+            if throttle.due() {
+                log("auth.lockdown_hold reason=\(why) entry=\(viewerIP.map { "relay peer=\($0)" } ?? "open_connection"); refused or closed")
+            }
             return true
         }
     }
