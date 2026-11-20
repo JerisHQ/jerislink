@@ -41,6 +41,8 @@ enum AuthSelfTest {
         r7RelayBlacklist(expect)
         r8DirectBlacklist(expect)
         r9InFlightBlock(expect)
+        r10StalledBlock(expect)
+        r10ReplyBlock(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -176,8 +178,10 @@ enum AuthSelfTest {
         return dir
     }
 
+    /// Atomic (r10): a host thread checking the policy mid-write must not
+    /// read half a file as mode "invalid", which stops the service.
     private static func writePlist(_ dict: [String: Any], _ url: URL) {
-        if let d = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) { try? d.write(to: url) }
+        if let d = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) { try? d.write(to: url, options: .atomic) }
     }
 
     private static func readPlist(_ url: URL) -> [String: Any]? {
@@ -1739,7 +1743,7 @@ enum AuthSelfTest {
                 if case .fileEnd = m { yEnd = m; break }
                 if case .reply = m { break }
             }
-            print("r9 in-flight info: source=\(viaJournal ? "journal" : "listen.plist") blocked_viewer bytes_at_block=\(atBlock) bytes_total=\(xBytes) of \(body.count) frames_after_block=\(xFrames) file_end=\(xEnd) eof=\(x.sawEOF); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
+            print("r9 in-flight info: source=\(viaJournal ? "journal" : "listen.plist") blocked_viewer bytes_at_block=\(atBlock) bytes_total=\(xBytes) of \(body.count) frames_after_block=\(xFrames) file_end=\(xEnd) eof=\(x.sawEOF) tcp_closed=\(x.hostClosed()); other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
             expect(started && !xEnd && xBytes < body.count && x.sawEOF
                    && yBody == body && yEnd == .fileEnd(transfer: ty, index: 0, sha256: FileUploadSelfTest.sha(body))
                    && server.rejectedClients >= 1 && watch.appliedChange == nil && !gate.isRevoked
@@ -1747,4 +1751,207 @@ enum AuthSelfTest {
                    name)
         }
     }
+}
+
+extension AuthSelfTest {
+    /// r10 rig: the direct listener's wiring (as r9), viewers through a
+    /// PROXY header, a listen.plist and a journal in a temp folder.
+    fileprivate final class R10Rig: @unchecked Sendable {
+        let dir: URL, url: URL, journalURL: URL, src: URL
+        let server: ControlServer, gate: AuthGate, watch: PolicyWatch, board: FakeClipboard
+        let port: UInt16
+        let me = ListenConfig.loopbackIP
+
+        init?(allowed: [String], settingsIP: String, srcBody: [UInt8]? = nil) {
+            let fm = FileManager.default
+            let me = ListenConfig.loopbackIP
+            let dir = AuthSelfTest.tempDir()
+            let url = dir.appendingPathComponent("listen.plist")
+            let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+            let src = dir.appendingPathComponent("src/big.bin")
+            try? fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? fm.createDirectory(at: src.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let srcBody { fm.createFile(atPath: src.path, contents: Data(srcBody)) }
+            let local = [LocalAddress(interface: "lo0", ip: me)]
+            let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+                let plist = ListenConfig.readPlist(url: url)
+                return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+            }
+            AuthSelfTest.writePlist(["mode": "loopback", "clientIP": me, "allowedIPs": allowed, "passwordSet": false], url)
+            let (resolution, plist) = read()
+            guard case .ready(let ep) = resolution, let p = ControlServiceSelfTest.freeLoopbackPort() else { return nil }
+            let (made, snapshot) = ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil,
+                                                           blocklist: ListenPlistBlocklist(url: url),
+                                                           journal: PendingBlockFile(url: journalURL))
+            guard let g = made else { return nil }
+            let w = PolicyWatch(started: ep, snapshot: snapshot, gate: g, read: read, loadSecret: { nil },
+                                stamp: { ListenFileStamp.of(url) })
+            let board = FakeClipboard(text: "before")
+            let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                        fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                        openFolder: { _ in })
+            server = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                   settingsClientIP: { settingsIP }, acceptProxy: true, allowFileSessions: true,
+                                   fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
+                                   fileSendFolder: folder, clipboard: board, authGate: g,
+                                   admitConnection: { w.admitNew() }, admitMessage: { w.stillCurrent() },
+                                   admitPeerMessage: ControlService.peerCheck(g))
+            self.dir = dir; self.url = url; self.journalURL = journalURL; self.src = src
+            self.gate = g; self.watch = w; self.board = board; self.port = p
+        }
+
+        func start() -> Bool { (try? server.start()) != nil }
+
+        func viewer(_ ip: String, receiveBuffer: Int32? = nil) -> MRC1Client? {
+            guard let cl = MRC1Client(port: port, receiveBuffer: receiveBuffer),
+                  cl.sendRaw(Array("PROXY TCP4 \(ip) \(me) 40000 \(port)\r\n".utf8)) else { return nil }
+            return cl
+        }
+
+        /// Blocks `ip` from the journal or from listen.plist.
+        func block(_ ip: String, viaJournal: Bool) {
+            if viaJournal {
+                _ = PendingBlockFile(url: journalURL).save([BlockedEntry(ip: ip, at: Date(), reason: "20 wrong passwords")])
+            } else {
+                var d = AuthSelfTest.readPlist(url) ?? [:]
+                d["blockedIPs"] = ((d["blockedIPs"] as? [Any]) ?? []) + [ip]
+                AuthSelfTest.writePlist(d, url)
+            }
+        }
+
+        func close() {
+            server.stop()
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    /// r10 (blocker 1): the blocked viewer has stopped reading, so the host
+    /// is waiting for its window inside a 4 MiB REQUEST when the block lands.
+    /// The viewer never reads again; its connection is still closed within
+    /// 2 s, and the host writes nothing to it after the block (host count).
+    /// The other viewer's pull finishes with every byte and FILE_END.
+    fileprivate static func r10StalledBlock(_ expect: Expect) {
+        typealias M = FileProto.Message
+        let vx = "100.64.0.41", vy = "100.64.0.42"
+        let body = FileAnnounceSelfTest.body(Int(FileAnnouncer.maxRequest))
+        for viaJournal in [true, false] {
+            let source = viaJournal ? "the journal" : "listen.plist"
+            let name = "r10 stalled send: a block from \(source) lands while the host waits on a viewer that stopped reading mid-pull: its socket closes within 2 s without the viewer reading again, the host writes 0 bytes to it after the block, no FILE_END; the other viewer's pull finishes with every byte and FILE_END"
+            guard let rig = R10Rig(allowed: [vx, vy], settingsIP: vy, srcBody: body), rig.start(),
+                  let x = rig.viewer(vx, receiveBuffer: 8 * 1024), let y = rig.viewer(vy) else {
+                expect(false, name); continue
+            }
+            defer { x.close(); y.close(); rig.close() }
+            func next(_ c: MRC1Client, _ timeout: Double = 3) -> M? {
+                c.receive(timeout: timeout).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+            }
+            func announced(_ c: MRC1Client) -> UInt32? {
+                guard case let .offer(t, _, _, _)? = next(c), case .entry? = next(c) else { return nil }
+                return t
+            }
+            _ = x.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+            _ = y.send(type: 0x50, payload: [1, 0, UInt8(FileProto.Caps.announce)])
+            guard case .helloAck? = next(x), case .helloAck? = next(y),
+                  settle({ rig.board.counts.changeCountReads >= 6 }) else { expect(false, name); continue }
+            rig.board.localCopyFiles([rig.src])
+            guard let tx = announced(x), let ty = announced(y) else { expect(false, name); continue }
+            for (c, t) in [(x, tx), (y, ty)] {
+                _ = c.send(type: FileProto.MsgType.request,
+                           payload: M.request(transfer: t, index: 0, offset: 0, length: UInt32(body.count)).encode()!)
+            }
+            // x reads nothing more: wait until the host's writes to it stop
+            // (its window and the host's send buffer are full).
+            var last = rig.server.txCount(peer: vx).bytes, still = 0
+            let stallDeadline = Date().addingTimeInterval(5)
+            while still < 4 && Date() < stallDeadline {
+                Thread.sleep(forTimeInterval: 0.1)
+                let now = rig.server.txCount(peer: vx).bytes
+                if now == last && now > 0 { still += 1 } else { still = 0; last = now }
+            }
+            let stalled = still >= 4 && last < UInt64(body.count)
+            let atBlock = rig.server.txCount(peer: vx)
+            let blockedAt = Date()
+            rig.block(vx, viaJournal: viaJournal)
+            var closed = false
+            while !closed && Date().timeIntervalSince(blockedAt) < 2 {
+                Thread.sleep(forTimeInterval: 0.02)
+                closed = x.hostClosed()
+            }
+            let closeMs = Int(Date().timeIntervalSince(blockedAt) * 1000)
+            Thread.sleep(forTimeInterval: 0.3)
+            let after = rig.server.txCount(peer: vx)
+            var yBody: [UInt8] = []
+            var yEnd: M?
+            while let m = next(y) {
+                if case let .data(_, _, off, b) = m, off == UInt64(yBody.count) { yBody += b }
+                if case .fileEnd = m { yEnd = m; break }
+                if case .reply = m { break }
+            }
+            print("r10 stalled info: source=\(viaJournal ? "journal" : "listen.plist") stalled=\(stalled) host_bytes_at_block=\(atBlock.bytes) host_sends_after_block=\(after.sends - atBlock.sends) host_bytes_after_block=\(after.bytes - atBlock.bytes) closed=\(closed) close_ms=\(closeMs) viewer_read_after_block=0; other_viewer bytes=\(yBody.count) file_end=\(yEnd != nil)")
+            expect(stalled && closed && after.sends == atBlock.sends && after.bytes == atBlock.bytes
+                   && yBody == body && yEnd == .fileEnd(transfer: ty, index: 0, sha256: FileUploadSelfTest.sha(body))
+                   && rig.server.rejectedClients >= 1 && rig.watch.appliedChange == nil && !rig.gate.isRevoked
+                   && rig.gate.guardian.isBlocked(vx) && !rig.gate.guardian.isBlocked(vy),
+                   name)
+        }
+    }
+
+    /// r10 (blocker 2): a block that lands while a request is handled (after
+    /// the per-message check, before the reply) stops the reply: VIDEO_CONFIG
+    /// ACK, TCP PONG, open_ip_only RESULT, FILE_HELLO_ACK, clipboard PONG.
+    /// The hook lands the block right before the reply asks; the viewer gets
+    /// no reply, its connection closes, the host writes 0 bytes after it.
+    fileprivate static func r10ReplyBlock(_ expect: Expect) {
+        let v = "100.64.0.43"
+        let ping: [UInt8] = [9, 8, 7, 6]
+        // settingsIP: the video config cases name another address, so the host
+        // takes the reject path (settings read, never written) and still ACKs.
+        struct Case { let label: String; let viaJournal: Bool; let reply: UInt8; let first: [(UInt8, [UInt8])]; var settingsIP = "100.64.0.43" }
+        let cases = [
+            Case(label: "VIDEO_CONFIG_ACK (block lands while the config is applied)", viaJournal: true, reply: 0x41,
+                 first: [(0x40, [1, 0, 0, 0, 0, 0, 0, 0])], settingsIP: "100.64.0.99"),
+            Case(label: "VIDEO_CONFIG_ACK (block lands while the config is applied)", viaJournal: false, reply: 0x41,
+                 first: [(0x40, [1, 0, 0, 0, 0, 0, 0, 0])], settingsIP: "100.64.0.99"),
+            Case(label: "TCP PONG", viaJournal: true, reply: 0x02, first: [(0x01, ping)]),
+            Case(label: "open_ip_only RESULT", viaJournal: true, reply: ConnAuth.MsgType.result,
+                 first: [(ConnAuth.MsgType.response, [UInt8](repeating: 0, count: 8))]),
+            Case(label: "FILE_HELLO_ACK", viaJournal: true, reply: FileProto.MsgType.helloAck,
+                 first: [(FileProto.MsgType.hello, [1, 0, UInt8(FileProto.Caps.announce)])]),
+            Case(label: "clipboard PONG", viaJournal: true, reply: 0x02, first: [(0x30, []), (0x01, ping)]),
+        ]
+        for c in cases {
+            let name = "r10 reply: a block from \(c.viaJournal ? "the journal" : "listen.plist") that lands between the request check and its \(c.label) stops the reply: the viewer gets none, its connection closes, the host writes 0 bytes after the block"
+            guard let rig = R10Rig(allowed: [v], settingsIP: c.settingsIP) else { expect(false, name); continue }
+            let fired = R10Flag()
+            let server = rig.server
+            let reply = c.reply, viaJournal = c.viaJournal
+            server.beforeCheckedSend = { [weak rig] type in
+                guard type == reply, let rig, fired.setOnce(server.txCount(peer: v).bytes) else { return }
+                rig.block(v, viaJournal: viaJournal)
+            }
+            guard rig.start(), let cl = rig.viewer(v) else { expect(false, name); rig.close(); continue }
+            defer { cl.close(); rig.close() }
+            for (t, p) in c.first { _ = cl.send(type: t, payload: p) }
+            var got: [UInt8] = []
+            while let m = cl.receive(timeout: 1) { got.append(m.type) }
+            let closed = cl.sawEOF || cl.hostClosed()
+            let atBlock = fired.value
+            let after = server.txCount(peer: v).bytes
+            print("r10 reply info: reply=0x\(String(c.reply, radix: 16)) source=\(c.viaJournal ? "journal" : "listen.plist") fired=\(atBlock != nil) frames_received=\(got.map { String($0, radix: 16) }) host_bytes_after_block=\(after - (atBlock ?? after)) closed=\(closed)")
+            expect(atBlock != nil && !got.contains(c.reply) && closed && after == atBlock
+                   && rig.gate.guardian.isBlocked(v), name)
+        }
+    }
+}
+
+/// r10 self-test: set once, from any thread.
+final class R10Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: UInt64?
+    func setOnce(_ x: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if v != nil { return false }
+        v = x; return true
+    }
+    var value: UInt64? { lock.lock(); defer { lock.unlock() }; return v }
 }

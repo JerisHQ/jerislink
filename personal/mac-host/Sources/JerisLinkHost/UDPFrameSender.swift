@@ -197,6 +197,8 @@ final class UDPFrameSender: @unchecked Sendable {
     private var nackBytes: UInt64 = 0
     private var nackMiss: UInt64 = 0
     private var nackOverBudget: UInt64 = 0
+    /// Paced resends that waited for tokens before their recheck (r10).
+    private var nackPaceWaits: UInt64 = 0
     // ABR window: send queue max since the last abrWindow() call (lock).
     private var abrWindowQueueMax = 0
     // Send-cadence slope since the last abrWindow() call (lock).
@@ -207,6 +209,8 @@ final class UDPFrameSender: @unchecked Sendable {
     /// A frame that would wait behind this many queued frames goes out without
     /// pacing, so a too-low rate cannot build latency without bound.
     private let maxQueuedBeforeFlush = 4
+    /// r10: how often a frame being sent asks the stream gate again.
+    static let frameRecheckNanos: UInt64 = 2_000_000
 
     init(bindIP: String, clientIP: String, clientPort: UInt16, packetBytes: Int,
          pacing: UDPPacing = .off, retransmit: Bool = false, videoBitrateMbps: Int = 20,
@@ -317,6 +321,13 @@ final class UDPFrameSender: @unchecked Sendable {
         lock.lock(); streamAllowed = gate; lock.unlock()
     }
 
+    /// Self-test only (r10): runs on the send queue after a paced resend
+    /// waited for tokens and before it asks the gate again.
+    private var afterResendPaceWait: (@Sendable () -> Void)?
+    func setAfterResendPaceWait(_ hook: @escaping @Sendable () -> Void) {
+        lock.lock(); afterResendPaceWait = hook; lock.unlock()
+    }
+
     /// r9: true while the stream may go to the viewer; a refusal is counted.
     private func streamOpen() -> Bool {
         lock.lock(); let gate = streamAllowed; lock.unlock()
@@ -329,6 +340,9 @@ final class UDPFrameSender: @unchecked Sendable {
                            enqueuedNanos: UInt64, paced: Bool) {
         // r9: a frame queued before a block does not leave after it.
         guard streamOpen() else { return }
+        // r10: a paced frame can take many ms; it asks again every
+        // `frameRecheckNanos` of it, so a block stops it mid-frame.
+        var checkedAt = DispatchTime.now().uptimeNanoseconds
         let payloadCapacity = packetBytes - headerBytes
         var frameHadError = false
         var frameWaits: UInt64 = 0
@@ -345,6 +359,11 @@ final class UDPFrameSender: @unchecked Sendable {
                     frameWaits &+= 1
                     frameWaitNanos &+= waited
                 }
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now &- checkedAt >= Self.frameRecheckNanos {
+                guard streamOpen() else { return }
+                checkedAt = now
             }
 
             if !sendCounted(packet) { frameHadError = true }
@@ -403,7 +422,11 @@ final class UDPFrameSender: @unchecked Sendable {
         if pacing.enabled {
             sendQueue.async { [self] in drainRetransmits(paced: true) }
         } else {
-            for packet in packets { _ = sendCounted(packet) }
+            // r10: every resend asks right before it leaves.
+            for packet in packets {
+                guard streamOpen() else { return .held }
+                _ = sendCounted(packet)
+            }
         }
         return .sent(packets: packets.count)
     }
@@ -502,13 +525,9 @@ final class UDPFrameSender: @unchecked Sendable {
     }
 
     /// On `sendQueue` only (paced mode).
+    /// r10: each resend asks after its pacing wait, right before it leaves;
+    /// a refusal drops it and every resend still queued.
     private func drainRetransmits(paced: Bool) {
-        lock.lock(); let pending = !pendingRetransmit.isEmpty; lock.unlock()
-        // r9: resends queued before a block are dropped, not sent.
-        if pending, !streamOpen() {
-            lock.lock(); pendingRetransmit.removeAll(); lock.unlock()
-            return
-        }
         while true {
             lock.lock()
             guard !pendingRetransmit.isEmpty else {
@@ -517,9 +536,22 @@ final class UDPFrameSender: @unchecked Sendable {
             }
             let packet = pendingRetransmit.removeFirst()
             lock.unlock()
-            if paced { _ = takeTokens(packet.count) }
+            if paced, takeTokens(packet.count) > 0 {
+                lock.lock(); nackPaceWaits &+= 1; let hook = afterResendPaceWait; lock.unlock()
+                hook?()
+            }
+            guard streamOpen() else {
+                lock.lock(); pendingRetransmit.removeAll(); lock.unlock()
+                return
+            }
             _ = sendCounted(packet)
         }
+    }
+
+    /// Packets this sender wrote (r10, self-test).
+    func sentPacketCount() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return sentPackets
     }
 
     /// MRA1 audio: same socket as the video, to the viewer IP at `port`
@@ -623,7 +655,7 @@ final class UDPFrameSender: @unchecked Sendable {
             + "send_queue_max=\(maxQueuedFrames) pace_overflow=\(queueOverflowFrames) "
             + "max_kb_per_1ms=\(maxBytesPer1ms / 1024) "
             + "nack=\(retransmitEnabled ? "on" : "off") nack_rx=\(nackRequests) nack_packets_resent=\(nackPacketsResent) "
-            + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) "
+            + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) nack_pace_waits=\(nackPaceWaits) "
             + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
             + (streamHeld > 0 ? " stream_held=\(streamHeld)" : "")
             + (statsSuffix.map { " " + $0() } ?? "")

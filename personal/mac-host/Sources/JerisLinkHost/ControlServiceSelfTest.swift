@@ -1377,6 +1377,16 @@ final class MRC1Client {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
     }
 
+    /// r10: the host closed or reset this connection, seen without reading:
+    /// the TCP state has left ESTABLISHED (TSI_S_ESTABLISHED = 4).
+    func hostClosed() -> Bool {
+        guard fd >= 0 else { return true }
+        var info = tcp_connection_info()
+        var len = socklen_t(MemoryLayout<tcp_connection_info>.size)
+        guard getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &len) == 0 else { return true }
+        return info.tcpi_state != 4
+    }
+
     /// Bytes as they are (a PROXY header ahead of the MRC1 stream).
     func sendRaw(_ bytes: [UInt8]) -> Bool {
         let sent = bytes.withUnsafeBytes { Darwin.send(fd, $0.baseAddress!, bytes.count, 0) }
@@ -1401,7 +1411,8 @@ final class MRC1Client {
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             guard Darwin.poll(&pfd, 1, left) > 0 else { return nil }
             let n = out.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: off), count - off, 0) }
-            if n == 0 { sawEOF = true }
+            // r10: a reset (the host's SO_LINGER 0 close) is a close too.
+            if n == 0 || (n < 0 && errno == ECONNRESET) { sawEOF = true }
             if n <= 0 { return nil }
             off += n
         }

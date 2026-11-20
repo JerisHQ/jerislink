@@ -12,6 +12,8 @@ final class ControlServer: @unchecked Sendable {
     private let lock = NSLock()
     private var serverFD: Int32 = -1
     private var clientFDs: Set<Int32> = []
+    /// Sockets set to close with RST (resetPeer); `lock`.
+    private var resetFDs: Set<Int32> = []
     private var stopping = false
     private var inputHelper: InputHelperClient?
     private let videoSettings = VideoSettingsController()
@@ -62,6 +64,18 @@ final class ControlServer: @unchecked Sendable {
     /// per bump on its next poll (it owns its socket, so no cross-thread send).
     private var noticeSeq: UInt64 = 0
     private var finderPastesRefused: UInt64 = 0
+    /// r10: frames and bytes this host wrote to each viewer address (send
+    /// calls that wrote at least one byte). Read by the self-test.
+    private var txByPeer: [String: (sends: UInt64, bytes: UInt64)] = [:]
+    private let txLock = NSLock()
+    /// r10, self-test only: called with the frame type just before an
+    /// admitted viewer's frame asks the policy and its peer (`sendChecked`),
+    /// so a test can land a block between handling a request and its reply.
+    /// Set before start(); nil in the app.
+    var beforeCheckedSend: (@Sendable (UInt8) -> Void)?
+    /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
+    /// viewer's window before the connection is dropped.
+    static let handshakeSendSeconds: TimeInterval = 5
     /// Cmd+V to Finder while a transfer runs (FinderPasteGate).
     private var pasteGate = FinderPasteGate()
     /// The frontmost Mac app (a fake in the self-test).
@@ -301,6 +315,7 @@ final class ControlServer: @unchecked Sendable {
             var noSigPipe: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
             let keepAlive = Self.enableKeepAlive(c)
+            Self.setSendSlice(c)
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             if let allowedClientIP, peerIP != allowedClientIP {
@@ -327,7 +342,9 @@ final class ControlServer: @unchecked Sendable {
                 self.handleClient(c, tcpPeerIP: peerIP, tcpPeerPort: peerPort)
                 self.lock.lock()
                 self.clientFDs.remove(c)
+                let reset = self.resetFDs.remove(c) != nil
                 self.lock.unlock()
+                if reset { Self.settleBeforeReset(c) }
                 Darwin.close(c)
                 print("Control client disconnected: \(peerIP):\(peerPort)")
             }
@@ -433,17 +450,20 @@ final class ControlServer: @unchecked Sendable {
             if let admitMessage, !admitMessage() {
                 rejectedClients += 1
                 print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
+                resetPeer(fd)
                 return
             }
             if let admitPeerMessage, !admitPeerMessage(peer.ip) {
                 rejectedClients += 1
                 print("Control reject peer=\(peer.ip) reason=peer_refused type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
+                resetPeer(fd)
                 return
             }
             // Transition mode: a v0.4 viewer's probe learns that this host
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {
-                _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.openIPOnly.payload)
+                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: ConnAuth.MsgType.result,
+                                  payload: ConnAuth.Result.openIPOnly.payload) == .sent else { return }
                 continue
             }
             messages += 1
@@ -487,7 +507,7 @@ final class ControlServer: @unchecked Sendable {
                 return
             case 0x01: // PING
                 if payload.count == 4 {
-                    _ = sendPacket(fd, type: 0x02, payload: payload)
+                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload) == .sent else { return }
                 }
             case 0x40: // VIDEO_CONFIG_SET v1
                 let clientIP = settingsClientIP()
@@ -501,7 +521,9 @@ final class ControlServer: @unchecked Sendable {
                     print("Video config reject peer=\(peer.ip) verified=\(peer.verified) expected=\(clientIP ?? "unset") reason=\(reason); settings unchanged")
                     ack = videoSettings.currentAck(ignored: true)
                 }
-                _ = sendPacket(fd, type: 0x41, payload: ack.payload)
+                // r10: the ACK asks again; a block that landed while the
+                // settings were applied gets no reply.
+                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload) == .sent else { return }
                 print("Video config ACK status=\(ack.status) codec=\(ack.codec) bitrate_mbps=\(ack.bitrateMbps) flags=0x\(String(ack.flags, radix: 16)) remote_size=\(ack.framebufferWidth)x\(ack.framebufferHeight)")
             case 0x10: // KEY
                 if payload.count == 3 {
@@ -675,16 +697,22 @@ final class ControlServer: @unchecked Sendable {
         }
         let ack = FileProto.Message.helloAck(proto: FileProto.version, caps: FileProto.Caps.host,
                                              maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
-        guard let ackBytes = ack.encode(), sendPacket(fd, type: ack.type, payload: ackBytes) else { return }
+        guard let ackBytes = ack.encode(),
+              sendChecked(fd, peerIP: peerIP, kind: "file", type: ack.type, payload: ackBytes) == .sent else { return }
         print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16)) peer_caps=0x\(String(peerCaps, radix: 16))")
         // r9: every frame to the viewer asks first (the policy, then this
         // peer's block), so a block that lands mid-transfer stops a 4 MiB
         // pull or push before its next frame, not after it; the session
         // then closes and the socket with it. One stat each per frame.
+        // r10: and again while a frame waits for a viewer that stopped
+        // reading (sendChecked), so the wait cannot outlast the block.
         var revoked = false
         func sendGuarded(_ type: UInt8, _ payload: [UInt8]) -> Bool {
-            if sessionRevoked("file", peerIP: peerIP) { revoked = true; return false }
-            return sendPacket(fd, type: type, payload: payload)
+            switch sendChecked(fd, peerIP: peerIP, kind: "file", type: type, payload: payload) {
+            case .sent: return true
+            case .refused: revoked = true; return false
+            case .failed: return false
+            }
         }
         func sendMessage(_ m: FileProto.Message) -> Bool {
             guard let bytes = m.encode() else { return false }
@@ -718,6 +746,8 @@ final class ControlServer: @unchecked Sendable {
         }
         defer {
             if revoked { reason = "policy_changed" }
+            // r10: a session the policy ended is reset, not drained.
+            if reason == "policy_changed" { resetPeer(fd) }
             endPush()
             pushBroker.unregister(pushSession)
             receiver.abort(reason: reason)
@@ -885,7 +915,7 @@ final class ControlServer: @unchecked Sendable {
             lock.lock(); let shouldStop = stopping; lock.unlock()
             if shouldStop { return }
             // r5 (B3): no clipboard read or write once the policy moved.
-            if sessionRevoked("clipboard", peerIP: peerIP) { return }
+            if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -903,7 +933,7 @@ final class ControlServer: @unchecked Sendable {
                     let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
                     guard length <= Self.maxClipboardBytes,
                           let payload = recvExact(fd, count: length) else { return }
-                    if sessionRevoked("clipboard", peerIP: peerIP) { return }
+                    if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
 
                     if type == 0x31 {
                         guard let text = String(data: Data(payload), encoding: .utf8) else {
@@ -924,7 +954,7 @@ final class ControlServer: @unchecked Sendable {
                         clipboardReceived += 1
                         print("Clipboard RX bytes=\(payload.count)")
                     } else if type == 0x01, payload.count == 4 {
-                        _ = sendPacket(fd, type: 0x02, payload: payload)
+                        guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x02, payload: payload) == .sent else { return }
                     }
                 }
             }
@@ -957,8 +987,8 @@ final class ControlServer: @unchecked Sendable {
             }
             if text == lastSentText { continue }
             // r5 (B3): the policy may have moved during the 100 ms poll.
-            if sessionRevoked("clipboard", peerIP: peerIP) { return }
-            guard sendPacket(fd, type: 0x31, payload: payload) else { return }
+            // r10: sendChecked asks it right before the frame.
+            guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x31, payload: payload) == .sent else { return }
             lastSentText = text
             clipboardSent += 1
             print("Clipboard TX bytes=\(payload.count)")
@@ -1182,8 +1212,9 @@ final class ControlServer: @unchecked Sendable {
         }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
         let macH = ConnAuth.macHost(key: secret.key, hostNonce: hostNonce, clientNonce: response.clientNonce, channel: channel)
-        guard sendPacket(fd, type: ConnAuth.MsgType.result,
-                         payload: ConnAuth.Result.ok(macH: macH, sessionID: sessionID).payload) else { return nil }
+        // r10: OK is the first frame of an admitted session: it asks too.
+        guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
+                          payload: ConnAuth.Result.ok(macH: macH, sessionID: sessionID).payload) == .sent else { return nil }
         print("auth.ok peer=\(ip) chan=\(channel.name) session=\(ConnAuth.hex(sessionID))")
         return channel
     }
@@ -1349,16 +1380,101 @@ final class ControlServer: @unchecked Sendable {
         return out
     }
 
-    private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8]) -> Bool {
+    enum CheckedSend: Equatable { case sent, refused, failed }
+
+    /// r10: the one way a frame reaches an admitted viewer (control replies,
+    /// file and clipboard sessions). It asks the policy and this peer's block
+    /// (`sessionRevoked`) right before the frame, and again after every wait
+    /// for the viewer's window, so a viewer that stopped reading cannot hold
+    /// the thread past a block. A refusal resets the socket (`resetPeer`).
+    private func sendChecked(_ fd: Int32, peerIP: String, kind: String, type: UInt8,
+                             payload: [UInt8]) -> CheckedSend {
+        beforeCheckedSend?(type)
+        var refused = false
+        let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP) {
+            if self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
+            return refused
+        }
+        if refused { resetPeer(fd); return .refused }
+        return ok ? .sent : .failed
+    }
+
+    /// r10: a refused viewer's socket closes with RST (SO_LINGER 0) when
+    /// the handler returns: what the kernel still holds for it is dropped,
+    /// not delivered, and the close does not wait for its window.
+    private func resetPeer(_ fd: Int32) {
+        var l = linger(l_onoff: 1, l_linger: 0)
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, socklen_t(MemoryLayout<linger>.size))
+        lock.lock(); resetFDs.insert(fd); lock.unlock()
+    }
+
+    /// Before the RST close: give the segment already in flight time to be
+    /// acknowledged (two smoothed RTTs, 20 to 200 ms). Nothing more is
+    /// written. A viewer takes an RST only at exactly the sequence it
+    /// expects next (RFC 5961); one sent while data is in flight gets a
+    /// challenge ACK, which a Mac in stealth mode (net.inet.tcp.blackhole)
+    /// never answers, so that viewer would not learn of the close.
+    static func settleBeforeReset(_ fd: Int32) {
+        var info = tcp_connection_info()
+        var len = socklen_t(MemoryLayout<tcp_connection_info>.size)
+        let srtt = getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &len) == 0 ? Int(info.tcpi_srtt) : 0
+        usleep(useconds_t(min(200, max(20, 2 * srtt)) * 1000))
+    }
+
+    /// Frames and bytes this host wrote to `peer` (r10, self-test).
+    func txCount(peer: String) -> (sends: UInt64, bytes: UInt64) {
+        txLock.lock(); defer { txLock.unlock() }
+        return txByPeer[peer] ?? (0, 0)
+    }
+
+    /// The longest one send() may block before it returns (r10): a viewer
+    /// that stopped reading cannot hold a writer longer than this between
+    /// two checks. Set per connection as SO_SNDTIMEO (MSG_DONTWAIT is not
+    /// honoured by a blocking TCP socket on macOS: send still waits).
+    static let sendSliceMillis: Int32 = 100
+
+    /// SO_SNDTIMEO = `sendSliceMillis` on a viewer socket (r10).
+    static func setSendSlice(_ fd: Int32) {
+        var tv = timeval(tv_sec: 0, tv_usec: __darwin_suseconds_t(sendSliceMillis * 1000))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    /// One MRC1 frame (r10). The socket's send timeout (`setSendSlice`)
+    /// cuts a wait on a viewer's full window into 100 ms slices. `revoked`
+    /// (an admitted viewer, via sendChecked) is asked before the first write
+    /// and after every slice that left the frame unfinished; true ends the
+    /// frame there. Without it (handshake frames) the wait ends after
+    /// `handshakeSendSeconds`.
+    private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8], peerIP: String? = nil,
+                            revoked: (() -> Bool)? = nil) -> Bool {
+        if let revoked, revoked() { return false }
         let length = UInt16(payload.count)
         let bytes: [UInt8] = [0x4d, 0x52, 0x43, 0x31, 1, type, UInt8(length >> 8), UInt8(length & 0xff)] + payload
+        let deadline = revoked == nil ? ProcessInfo.processInfo.systemUptime + Self.handshakeSendSeconds : .infinity
         var offset = 0
         while offset < bytes.count {
             let n = bytes.withUnsafeBytes { raw -> Int in
                 Darwin.send(fd, raw.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
             }
-            if n <= 0 { return false }
-            offset += n
+            if n > 0 {
+                offset += n
+                if let peerIP {
+                    txLock.lock()
+                    var t = txByPeer[peerIP] ?? (0, 0)
+                    t.sends &+= 1; t.bytes &+= UInt64(n)
+                    txByPeer[peerIP] = t
+                    txLock.unlock()
+                }
+                if offset == bytes.count { break }
+                // A short write: the slice ran out with the window full.
+            } else {
+                let e = errno
+                guard n < 0, e == EAGAIN || e == EINTR else { return false }
+            }
+            if let revoked, revoked() { return false }
+            if ProcessInfo.processInfo.systemUptime > deadline { return false }
+            lock.lock(); let shouldStop = stopping; lock.unlock()
+            if shouldStop { return false }
         }
         return true
     }
