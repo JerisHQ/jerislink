@@ -111,6 +111,12 @@ final class ControlServer: @unchecked Sendable {
     /// closes it. The control service re-reads its policy here, the legacy
     /// listeners whether a password is set (LegacyAuthWatch).
     private let admitConnection: (@Sendable () -> Bool)?
+    /// Asked again for every message on an open connection (r4): false
+    /// closes it before the message is handled, so a policy change stops an
+    /// open connection (the mouse relay included) on its next message, not on
+    /// the next periodic check. Callers make it one stat while listen.plist
+    /// is unchanged (PolicyWatch.stillCurrent, LegacyAuthWatch.check).
+    private let admitMessage: (@Sendable () -> Bool)?
     private(set) var authFailures: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
@@ -129,6 +135,7 @@ final class ControlServer: @unchecked Sendable {
          pushBroker: PushBroker = .shared,
          authGate: AuthGate? = nil,
          admitConnection: (@Sendable () -> Bool)? = nil,
+         admitMessage: (@Sendable () -> Bool)? = nil,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
@@ -136,6 +143,7 @@ final class ControlServer: @unchecked Sendable {
         self.pushBroker = pushBroker
         self.authGate = authGate
         self.admitConnection = admitConnection
+        self.admitMessage = admitMessage
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -162,7 +170,7 @@ final class ControlServer: @unchecked Sendable {
         // The listener's own --control-client-ip wins; network.conf only decides when it is not set.
         ControlServer(bindIP: bindIP, allowedClientIP: allowedClientIP, port: port, inject: inject,
                       settingsClientIP: { allowedClientIP ?? globalClientIP() }, clipboard: clipboard,
-                      admitConnection: admit)
+                      admitConnection: admit, admitMessage: admit)
     }
 
     func start() throws {
@@ -413,6 +421,11 @@ final class ControlServer: @unchecked Sendable {
             let type = header[5]
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
+            if let admitMessage, !admitMessage() {
+                rejectedClients += 1
+                print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
+                return
+            }
             // Transition mode: a v0.4 viewer's probe learns that this host
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {

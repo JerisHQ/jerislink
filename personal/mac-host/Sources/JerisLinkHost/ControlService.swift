@@ -38,7 +38,8 @@ enum ControlService {
     static func startServers(bindIP: String, clientIP: String, port: UInt16, relayPort: UInt16,
                              inject: Bool, helper: InputHelperClient,
                              gate: AuthGate? = nil,
-                             admit: (@Sendable () -> Bool)? = nil) throws -> [ControlServer] {
+                             admit: (@Sendable () -> Bool)? = nil,
+                             admitMessage: (@Sendable () -> Bool)? = nil) throws -> [ControlServer] {
         var servers: [ControlServer] = []
         do {
             // With a gate the whitelist, blacklist and password live in the
@@ -47,7 +48,7 @@ enum ControlService {
                                        port: port, inject: inject,
                                        settingsClientIP: { clientIP }, acceptProxy: false,
                                        inputHelper: helper, allowFileSessions: true, authGate: gate,
-                                       admitConnection: admit)
+                                       admitConnection: admit, admitMessage: admitMessage)
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
@@ -61,7 +62,7 @@ enum ControlService {
                                           settingsClientIP: { clientIP }, acceptProxy: false,
                                           inputHelper: helper, announceInputSessions: false,
                                           allowSensitiveControl: false, relayMouseOnly: true,
-                                          admitConnection: admit)
+                                          admitConnection: admit, admitMessage: admitMessage)
                 try relay.start()
                 servers.append(relay)
             }
@@ -91,12 +92,20 @@ enum ControlService {
         log("starting control \(endpoint.summary) port=\(o.controlPort) relay=\(o.relayPort == 0 ? "off" : "127.0.0.1:\(o.relayPort)")")
         let secret = wantsPassword(plist) ? KeychainSecretStore().load() : nil
         let blocklist = ListenPlistBlocklist(url: ListenConfig.plistURL)
-        let (gate, snapshot) = authGate(clientIP: endpoint.clientIP, plist: plist, secret: secret, blocklist: blocklist)
+        let journal = PendingBlockFile(url: ListenConfig.pendingBlocksURL)
+        let (gate, snapshot) = authGate(clientIP: endpoint.clientIP, plist: plist, secret: secret, blocklist: blocklist,
+                                        journal: journal)
+        let plistURL = ListenConfig.plistURL
         let watch = PolicyWatch(started: endpoint, snapshot: snapshot, gate: gate,
                                 read: { ListenConfig.currentWithPlist() },
-                                loadSecret: { KeychainSecretStore().load() })
+                                loadSecret: { KeychainSecretStore().load() },
+                                stamp: { ListenFileStamp.of(plistURL) })
         watch.setOnChange { _ in
             running.forEach { $0.stop() }
+            // A block in neither listen.plist nor the pending journal would
+            // be gone after the restart: stay up, admitting nobody, until one
+            // of them is written.
+            _ = watch.waitUntilDurable()
             exit(0)
         }
         if gate == nil {
@@ -111,7 +120,8 @@ enum ControlService {
             running = try startServers(bindIP: endpoint.bindIP, clientIP: endpoint.clientIP,
                                        port: o.controlPort, relayPort: o.relayPort,
                                        inject: o.controlInject, helper: InputHelperClient(), gate: gate,
-                                       admit: { watch.admitNew() })
+                                       admit: { watch.admitNew() },
+                                       admitMessage: { watch.stillCurrent() })
         } catch {
             // Usually the address went away between the check and bind();
             // launchd restarts us after ThrottleInterval and we wait again.
@@ -154,7 +164,8 @@ extension ControlService {
     /// when the blacklist cannot be written: a block that cannot be stored
     /// would be lost on the next restart.
     static func authGate(clientIP: String, plist: [String: Any]?, secret: ConnSecret?,
-                         blocklist: BlocklistStore) -> (AuthGate?, AuthConfigSnapshot) {
+                         blocklist: BlocklistStore,
+                         journal: PendingBlockStore? = nil) -> (AuthGate?, AuthConfigSnapshot) {
         let snapshot = AuthConfigSnapshot.read(plist: plist, secret: secret)
         var policy = AuthPolicy.resolve(plist: plist, clientIP: clientIP, secretLoaded: secret != nil)
         if case .password = policy, !blocklist.writable() {
@@ -165,7 +176,7 @@ extension ControlService {
             return (nil, snapshot)
         }
         log("auth.policy \(policy.summary)")
-        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist), snapshot)
+        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist, journal: journal), snapshot)
     }
 }
 
@@ -176,14 +187,18 @@ extension ControlService {
 ///
 /// - `admitNew` runs for every accepted connection: when the settings no
 ///   longer match it refuses that connection, and the change is applied
-///   at once.
+///   at once. While the endpoint is waiting for its address it refuses
+///   every new connection (r4).
+/// - `stillCurrent` runs for every message on an open connection, the
+///   loopback mouse relay included (r4): one stat while listen.plist is
+///   unchanged, the same check as `admitNew` when it moved.
 /// - `start` checks every second as well, so connections already open are
-///   closed without waiting for a new one.
+///   closed without waiting for a new one or a message.
 /// Applying a change revokes the gate first (nothing more is admitted under
 /// the old policy), then calls the change handler, which in the service
 /// stops every listener and exits; launchd starts the new policy. Only an
-/// address that went down (`waiting`) keeps the older two-checks rule, since
-/// nothing can connect over it anyway.
+/// address that went down with the settings unchanged (`transient`) waits
+/// for a second check before exiting; nothing new is admitted meanwhile.
 final class PolicyWatch: @unchecked Sendable {
     enum Verdict: Equatable {
         case current
@@ -196,18 +211,23 @@ final class PolicyWatch: @unchecked Sendable {
     let gate: AuthGate?
     private let read: @Sendable () -> (ListenResolution, [String: Any]?)
     private let loadSecret: @Sendable () -> ConnSecret?
+    private let stamp: (@Sendable () -> ListenFileStamp?)?
     private let lock = NSLock()
     private var applied: String?
     private var onChange: (@Sendable (String) -> Void)?
+    /// listen.plist as of the last check that found everything current.
+    private var verifiedStamp: ListenFileStamp?
 
     init(started: ListenEndpoint, snapshot: AuthConfigSnapshot, gate: AuthGate?,
          read: @escaping @Sendable () -> (ListenResolution, [String: Any]?),
-         loadSecret: @escaping @Sendable () -> ConnSecret?) {
+         loadSecret: @escaping @Sendable () -> ConnSecret?,
+         stamp: (@Sendable () -> ListenFileStamp?)? = nil) {
         self.started = started
         self.snapshot = snapshot
         self.gate = gate
         self.read = read
         self.loadSecret = loadSecret
+        self.stamp = stamp
     }
 
     func setOnChange(_ handler: @escaping @Sendable (String) -> Void) {
@@ -218,36 +238,59 @@ final class PolicyWatch: @unchecked Sendable {
     var appliedChange: String? { lock.lock(); defer { lock.unlock() }; return applied }
 
     func evaluate() -> Verdict {
+        // Taken before the read: a write after it moves the stamp again.
+        let before = stamp?()
         let guardian = gate?.guardian
-        let before = guardian?.persistedIPs
+        let persistedBefore = guardian?.persistedIPs
         let (resolution, plist) = read()
+        var waiting: String?
         switch resolution {
         case .ready(let ep) where ep == started: break
         case .ready(let ep): return .changed("endpoint changed to \(ep.summary)")
         case .notConfigured(let reason): return .changed("not configured: \(reason)")
-        case .waiting(let reason): return .transient(reason)
+        case .waiting(let reason):
+            // B3 r4: settings naming another endpoint are a change now, and
+            // the auth inputs below are compared while waiting as well.
+            if let plist, ListenConfig.targetDiffers(plist: plist, from: started) {
+                return .changed("endpoint changed, new address not up yet: \(reason)")
+            }
+            waiting = reason
         }
         let secret = ControlService.wantsPassword(plist) ? loadSecret() : nil
         let now = AuthConfigSnapshot.read(plist: plist, secret: secret)
         if now != snapshot { return .changed("config.auth_changed keys=\(now.changes(from: snapshot))") }
-        if let guardian, let before {
+        if let guardian, let persistedBefore {
             let inFile = Set((plist.map(ListenPlistBlocklist.entries(in:)) ?? []).map(\.ip))
             // A write by the guard between the two reads is not an outside edit.
-            if inFile != before && guardian.persistedIPs == before {
+            if inFile != persistedBefore && guardian.persistedIPs == persistedBefore {
                 return .changed("config.auth_changed keys=blockedIPs")
             }
         }
+        if let waiting { return .transient(waiting) }
+        if let before { lock.lock(); verifiedStamp = before; lock.unlock() }
         return .current
     }
 
     /// For each accepted connection.
     func admitNew() -> Bool {
         if appliedChange != nil { return false }
-        if case .changed(let what) = evaluate() {
-            apply(what)
-            return false
+        switch evaluate() {
+        case .current: return true
+        case .changed(let what): apply(what); return false
+        // B3 r4: the address this process listens on is not the current
+        // one; nothing new until it is back or the service restarts.
+        case .transient: return false
         }
-        return true
+    }
+
+    /// For each message on an open connection.
+    func stillCurrent() -> Bool {
+        if appliedChange != nil { return false }
+        if let now = stamp?() {
+            lock.lock(); let known = verifiedStamp; lock.unlock()
+            if now == known { return true }
+        }
+        return admitNew()
     }
 
     /// One periodic check; returns the transient count to carry.
@@ -282,9 +325,30 @@ final class PolicyWatch: @unchecked Sendable {
         lock.unlock()
         gate?.revoke()
         if let guardian = gate?.guardian, !guardian.retryPending(force: true) {
-            ControlService.log("auth.lockdown_unpersisted peers=\(guardian.pendingIPs.count) (listen.plist not writable; password mode refuses to start until it is)")
+            ControlService.log("auth.lockdown_unpersisted peers=\(guardian.pendingIPs.count) journal=\(guardian.isDurable ? "saved" : "not_saved") (listen.plist not writable)")
         }
         ControlService.log("stopping: \(what) (was \(started.summary)); admissions under the old policy stopped, launchd restarts the service")
         handler?(what)
+    }
+
+    /// B5 r4: blocks the guard holds only in memory must not be lost by
+    /// exiting. Returns once every pending block is in listen.plist or the
+    /// pending journal (at once when there is none), retrying every
+    /// `interval`; false only when `maxWait` ran out. The gate is already
+    /// revoked, so nothing is admitted while this waits.
+    @discardableResult func waitUntilDurable(interval: TimeInterval = 1, maxWait: TimeInterval? = nil) -> Bool {
+        guard let guardian = gate?.guardian else { return true }
+        let deadline = maxWait.map { Date().addingTimeInterval($0) }
+        var logged = false
+        while true {
+            if guardian.retryPending(force: true) || guardian.isDurable { return true }
+            if !logged {
+                ControlService.log("auth.lockdown_hold peers=\(guardian.pendingIPs.count) (neither listen.plist nor the pending journal can be written; not exiting, admitting nobody)")
+                logged = true
+            }
+            if let deadline, Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: interval)
+            _ = guardian.saveJournal()
+        }
     }
 }

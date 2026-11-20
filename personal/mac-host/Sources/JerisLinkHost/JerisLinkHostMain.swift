@@ -365,7 +365,9 @@ struct JerisLinkHostMain {
                 // without AUTH. UDP input is only IP-checked, so it stays off
                 // until PR-C binds it to an authenticated session; video,
                 // audio and presence go on. Checked at start, per legacy
-                // connection and every 0.5 s (LegacyAuthWatch).
+                // connection, per UDP 0x24 datagram and every 0.5 s
+                // (LegacyAuthWatch); closing revokes the UDP input and its
+                // relay connection before anything else is handled.
                 let legacy = LegacyAuthWatch()
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
@@ -373,7 +375,8 @@ struct JerisLinkHostMain {
                     let server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: o.controlClientIP ?? clientIP,
                                                     port: mouseUDPPort, presence: viewer,
-                                                    inputAllowed: { legacy.isOpen })
+                                                    inputAllowed: { legacy.check() })
+                    legacy.onClose { reason in server.revokeInput(reason: reason) }
                     try server.start()
                     mouseUDP = server
                 }

@@ -30,6 +30,10 @@ enum AuthSelfTest {
         legacyRuntime(expect)
         serviceLevel(expect)
         blocklistMerge(expect)
+        r4RelayInput(expect)
+        r4Waiting(expect)
+        r4Pending(expect)
+        r4Writers(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -839,5 +843,249 @@ enum AuthSelfTest {
                "b5: password mode refuses to start while the blacklist cannot be written")
         expect(ControlService.authGate(clientIP: "127.0.0.1", plist: plist, secret: secret, blocklist: MemoryBlocklist()).0?.requiresPassword == true,
                "b5: and starts when it can")
+    }
+
+    // MARK: r4: no gap after a policy switch, waiting endpoint, durable blocks
+
+    private final class AddressSlot: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [LocalAddress]
+        init(_ value: [LocalAddress]) { stored = value }
+        var value: [LocalAddress] {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
+    }
+
+    private static func settle(_ ok: () -> Bool) -> Bool {
+        for _ in 0..<40 { if ok() { return true }; Thread.sleep(forTimeInterval: 0.05) }
+        return ok()
+    }
+
+    private struct Booted {
+        var watch: PolicyWatch
+        var servers: [ControlServer]
+        var port: UInt16
+        var relayPort: UInt16
+        var gate: AuthGate
+    }
+
+    /// One control-service start as ControlService.run does it, mouse relay
+    /// on (never relayPort 0), per-message checks on.
+    private static func bootService(read: @escaping @Sendable () -> (ListenResolution, [String: Any]?), url: URL,
+                                    gate makeGate: (ListenEndpoint, [String: Any]?) -> (AuthGate?, AuthConfigSnapshot)) -> Booted? {
+        let me = ListenConfig.loopbackIP
+        let (resolution, plist) = read()
+        guard case .ready(let ep) = resolution, let port = ControlServiceSelfTest.freeLoopbackPort(),
+              let relayPort = ControlServiceSelfTest.freeLoopbackPort(), relayPort != port else { return nil }
+        let (made, snapshot) = makeGate(ep, plist)
+        guard let gate = made else { return nil }
+        let watch = PolicyWatch(started: ep, snapshot: snapshot, gate: gate, read: read, loadSecret: { nil },
+                                stamp: { ListenFileStamp.of(url) })
+        guard let servers = try? ControlService.startServers(bindIP: me, clientIP: me, port: port, relayPort: relayPort, inject: false,
+                                                             helper: InputHelperClient(port: 9), gate: gate,
+                                                             admit: { watch.admitNew() },
+                                                             admitMessage: { watch.stillCurrent() }),
+              servers.count == 2 else { return nil }
+        watch.setOnChange { _ in servers.forEach { $0.stop() } }
+        return Booted(watch: watch, servers: servers, port: port, relayPort: relayPort, gate: gate)
+    }
+
+    /// B2 r4: a password switch stops the running mouse relay and UDP 0x24
+    /// input on their next message, with no poll in between.
+    private static func r4RelayInput(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let me = ListenConfig.loopbackIP
+        let base: [String: Any] = ["mode": "loopback", "clientIP": me, "allowedIPs": [me],
+                                   "allowedIPsSource": "clientIP", "passwordSet": false]
+        writePlist(base, url)
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        guard let svc = bootService(read: read, url: url, gate: { ep, plist in
+            ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil, blocklist: ListenPlistBlocklist(url: url))
+        }), let udpPort = ControlServiceSelfTest.freeLoopbackPort() else {
+            expect(false, "r4 b2: service starts with the mouse relay"); return
+        }
+        defer { svc.servers.forEach { $0.stop() } }
+        let relay = svc.servers[1]
+        // The video side: UDP input asks LegacyAuthWatch per datagram and
+        // relays to this service.
+        let legacy = LegacyAuthWatch(url: url)
+        let udp = MouseMoveUDPServer(bindIP: me, allowedClientIP: me, port: udpPort, relayPort: svc.relayPort,
+                                     inputAllowed: { legacy.check() })
+        legacy.onClose { reason in udp.revokeInput(reason: reason) }
+        guard (try? udp.start()) != nil else { expect(false, "r4 b2: UDP input starts"); return }
+        defer { udp.stop() }
+        let s = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        defer { Darwin.close(s) }
+        var addr = ControlServiceSelfTest.loopbackAddress(port: udpPort)
+        func move(_ seq: UInt8) {
+            let bytes: [UInt8] = [0x4d, 0x52, 0x4d, 0x31, 1, 0x24, 0, 0, 0, seq, 0x80, 0, 0x80, 0]
+            _ = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bytes.withUnsafeBytes { Darwin.sendto(s, $0.baseAddress!, bytes.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+            }
+        }
+        // A second relay connection, open before the switch.
+        let other = LocalControlMouseClient(port: svc.relayPort)
+        move(1)
+        let viaUDP = settle { udp.forwarded == 1 && relay.mouseEvents == 1 }
+        let viaRelay = other.sendMouseMoveNormalized(nx: 1, ny: 1) && settle { relay.mouseEvents == 2 }
+        expect(viaUDP && viaRelay, "r4 b2: transition mode: UDP 0x24 and an open relay connection reach the control service")
+        var pw = base; pw["passwordSet"] = true
+        writePlist(pw, url)
+        // No poll runs here: no startPolling, no watch.start, no tick.
+        move(2)
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(udp.forwarded == 1 && udp.inputDropped == 1 && relay.mouseEvents == 2,
+               "r4 b2: password set: the very next UDP 0x24 is dropped, nothing reaches the relay")
+        _ = other.sendMouseMoveNormalized(nx: 2, ny: 2)
+        Thread.sleep(forTimeInterval: 0.3)
+        expect(relay.mouseEvents == 2 && svc.watch.appliedChange?.contains("passwordSet") == true && svc.gate.isRevoked,
+               "r4 b2: the open relay connection is refused on its next message, old gate revoked")
+        let late = LocalControlMouseClient(port: svc.relayPort)
+        _ = late.sendMouseMoveNormalized(nx: 3, ny: 3)
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(relay.mouseEvents == 2 && !legacy.isOpen, "r4 b2: no relay connection gets through afterwards")
+    }
+
+    /// B3 r4: while the endpoint waits for its address no new connection is
+    /// admitted, and an auth change is still applied.
+    private static func r4Waiting(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        let me = ListenConfig.loopbackIP
+        let up = [LocalAddress(interface: "utun4", ip: "100.64.0.10")]
+        let base: [String: Any] = ["mode": "tailnet", "clientIP": "100.64.0.2", "allowedIPs": ["100.64.0.2"],
+                                   "allowedIPsSource": "clientIP", "passwordSet": false]
+        writePlist(base, url)
+        let addrs = AddressSlot(up)
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: addrs.value), plist)
+        }
+        // The endpoint is the tailnet one; the sockets are on loopback, and
+        // the gate admits this process as the viewer.
+        let gate: (ListenEndpoint, [String: Any]?) -> (AuthGate?, AuthConfigSnapshot) = { _, plist in
+            (AuthGate(policy: .transition(whitelist: [me]), guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist()), secret: nil),
+             AuthConfigSnapshot.read(plist: plist, secret: nil))
+        }
+        guard let a = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b3: service starts"); return }
+        expect(pong(MRC1Client(port: a.port)), "r4 b3: admits while the address is up")
+        addrs.value = []
+        expect(!pong(MRC1Client(port: a.port)) && a.watch.appliedChange == nil,
+               "r4 b3: address down (waiting): a new connection is refused, nothing applied yet")
+        var pw = base; pw["passwordSet"] = true
+        writePlist(pw, url)
+        expect(!pong(MRC1Client(port: a.port)) && a.watch.appliedChange?.contains("passwordSet") == true && a.gate.isRevoked,
+               "r4 b3: while waiting, a passwordSet change is still applied at once")
+        a.servers.forEach { $0.stop() }
+
+        writePlist(base, url)
+        addrs.value = up
+        guard let b = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b3: service restarts"); return }
+        defer { b.servers.forEach { $0.stop() } }
+        var moved = base; moved["bindIP"] = "100.64.0.11"
+        writePlist(moved, url)
+        expect(!pong(MRC1Client(port: b.port)) && b.watch.appliedChange?.hasPrefix("endpoint changed, new address not up yet") == true,
+               "r4 b3: bindIP moved to an address not up yet: the old address refuses new connections, change applied at once")
+    }
+
+    /// B5 r4: a block that never reached listen.plist is enforced after a
+    /// restart, and the service does not exit with a block in neither place.
+    private static func r4Pending(_ expect: Expect) {
+        let dir = tempDir()
+        let conf = dir.appendingPathComponent("conf", isDirectory: true)
+        try? FileManager.default.createDirectory(at: conf, withIntermediateDirectories: true)
+        defer { chmod(conf.path, 0o755); try? FileManager.default.removeItem(at: dir) }
+        let url = conf.appendingPathComponent("listen.plist")
+        let journalURL = dir.appendingPathComponent("auth-state/pending-blocks.plist")
+        let me = ListenConfig.loopbackIP
+        writePlist(["mode": "loopback", "clientIP": me, "allowedIPs": [me], "allowedIPsSource": "clientIP", "passwordSet": false], url)
+        let local = [LocalAddress(interface: "lo0", ip: me)]
+        let read: @Sendable () -> (ListenResolution, [String: Any]?) = {
+            let plist = ListenConfig.readPlist(url: url)
+            return (ListenConfig.resolve(plist: plist, conf: (nil, nil), local: local), plist)
+        }
+        let gate: (ListenEndpoint, [String: Any]?) -> (AuthGate?, AuthConfigSnapshot) = { ep, plist in
+            ControlService.authGate(clientIP: ep.clientIP, plist: plist, secret: nil, blocklist: ListenPlistBlocklist(url: url),
+                                    journal: PendingBlockFile(url: journalURL))
+        }
+        guard let a = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b5: service starts"); return }
+        expect(pong(MRC1Client(port: a.port)), "r4 b5 service: admits this viewer before any block")
+        chmod(conf.path, 0o555)
+        for _ in 0..<20 { _ = a.gate.guardian.recordFailure(me) }
+        expect(a.gate.guardian.pendingIPs == [me] && a.gate.guardian.isDurable
+               && PendingBlockFile(url: journalURL).load().map(\.ip) == [me] && ListenPlistBlocklist(url: url).load().isEmpty,
+               "r4 b5: listen.plist cannot be written: the block is kept in the pending journal")
+        a.servers.forEach { $0.stop() }
+
+        guard let b = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b5: service restarts"); return }
+        expect(!pong(MRC1Client(port: b.port)) && b.gate.guardian.admit(me) == .blocked && b.gate.guardian.pendingIPs == [me],
+               "r4 b5 service: after a restart the unsaved block still refuses that viewer")
+        b.servers.forEach { $0.stop() }
+
+        chmod(conf.path, 0o755)
+        guard let c = bootService(read: read, url: url, gate: gate) else { expect(false, "r4 b5: service restarts again"); return }
+        defer { c.servers.forEach { $0.stop() } }
+        expect(!pong(MRC1Client(port: c.port)) && ListenPlistBlocklist(url: url).load().map(\.ip) == [me]
+               && PendingBlockFile(url: journalURL).load().isEmpty && c.gate.guardian.pendingIPs.isEmpty,
+               "r4 b5 service: once listen.plist is writable the restart moves the block into it and empties the journal")
+
+        let store = MemoryBlocklist(); store.failNextSaves = 999
+        let journal = MemoryPendingBlocks(); journal.canWrite = false
+        let g = AuthGuard(whitelist: [], blocklist: store, pause: { _ in }, journal: journal)
+        for _ in 0..<20 { _ = g.recordFailure("100.64.0.7") }
+        let held = AuthGate(policy: .transition(whitelist: ["100.64.0.2"]), guardian: g, secret: nil)
+        let ep = ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "100.64.0.2", source: "listen.plist")
+        let w = PolicyWatch(started: ep, snapshot: AuthConfigSnapshot.read(plist: nil, secret: nil), gate: held,
+                            read: { (.ready(ep), nil) }, loadSecret: { nil })
+        w.apply("self-test")
+        let stillHeld = !w.waitUntilDurable(interval: 0.05, maxWait: 0.3)
+        journal.canWrite = true
+        expect(stillHeld && held.isRevoked && w.waitUntilDurable(interval: 0.05, maxWait: 2) && journal.entries.map(\.ip) == ["100.64.0.7"],
+               "r4 b5: a block in neither listen.plist nor the journal holds the exit (gate revoked) until one is written")
+    }
+
+    /// B5 r4: blacklist writes against other writers.
+    private static func r4Writers(_ expect: Expect) {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("listen.plist")
+        writePlist(["mode": "loopback", "note": "keep"], url)
+        let store = ListenPlistBlocklist(url: url)
+        var fired = false
+        store.beforeReplace = {
+            guard !fired else { return }
+            fired = true
+            var d = readPlist(url) ?? [:]
+            d["blockedIPs"] = ["100.64.0.9"]
+            d["passwordSet"] = false
+            writePlist(d, url)
+        }
+        let out = store.update(adding: [BlockedEntry(ip: "100.64.0.7", at: Date(), reason: "test")], removing: [])
+        store.beforeReplace = nil
+        let file = readPlist(url) ?? [:]
+        expect(fired && Set(out?.map(\.ip) ?? []) == ["100.64.0.9", "100.64.0.7"]
+               && Set(ListenPlistBlocklist.entries(in: file).map(\.ip)) == ["100.64.0.9", "100.64.0.7"]
+               && file["passwordSet"] as? Bool == false && file["note"] as? String == "keep",
+               "r4 b5: an outside edit between the blacklist read and replace is merged, not overwritten")
+        let s1 = ListenPlistBlocklist(url: url), s2 = ListenPlistBlocklist(url: url)
+        let group = DispatchGroup()
+        for (k, s) in [(1, s1), (2, s2)] {
+            DispatchQueue.global().async(group: group) {
+                for i in 1...15 { _ = s.update(adding: [BlockedEntry(ip: "100.64.\(k).\(i)", at: Date(), reason: "t")], removing: []) }
+            }
+        }
+        group.wait()
+        expect(Set(ListenPlistBlocklist(url: url).load().map(\.ip)).count == 32,
+               "r4 b5: two writers (separate stores) never lose each other's blocks")
     }
 }

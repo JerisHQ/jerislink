@@ -55,20 +55,52 @@ final class ListenPlistBlocklist: BlocklistStore, @unchecked Sendable {
         }
     }
 
+    /// Attempts when listen.plist changes between the read and the replace.
+    static let replaceAttempts = 5
+    /// Self-test: runs after the new file is written, before it replaces
+    /// listen.plist (to play an outside edit in that window).
+    var beforeReplace: (() -> Void)?
+
+    /// B5 r4: writers are coordinated two ways. The host's own writers take
+    /// the flock on `listen.plist.lock` (ListenConfig.withFileLock), so two
+    /// stores or processes never interleave a read-modify-write. Writers
+    /// that take no lock (the host app, an editor, PlistBuddy) are caught by
+    /// compare-and-retry: the new file replaces listen.plist only if the
+    /// file is still the one that was read (same stamp), else it is read
+    /// again and merged again.
     func update(adding: [BlockedEntry], removing: Set<String>) -> [BlockedEntry]? {
         lock.lock(); defer { lock.unlock() }
-        guard var dict = readDict() else {
-            print("auth.blocklist_not_saved reason=no_listen_plist")
+        return ListenConfig.withFileLock(url) { () -> [BlockedEntry]? in
+            for _ in 1...Self.replaceAttempts {
+                guard let before = ListenFileStamp.of(url), before.exists, var dict = readDict() else {
+                    print("auth.blocklist_not_saved reason=no_listen_plist")
+                    return nil
+                }
+                let out = Self.merged(Self.entries(in: dict), adding: adding, removing: removing)
+                dict["blockedIPs"] = out.map { ["ip": $0.ip, "at": $0.at, "reason": $0.reason] as [String: Any] }
+                let tmp = url.deletingLastPathComponent()
+                    .appendingPathComponent(".\(url.lastPathComponent).\(getpid()).\(UUID().uuidString.prefix(8))")
+                guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0),
+                      (try? data.write(to: tmp)) != nil else {
+                    print("auth.blocklist_not_saved reason=write_failed")
+                    return nil
+                }
+                beforeReplace?()
+                guard ListenFileStamp.of(url) == before else {
+                    unlink(tmp.path)
+                    print("auth.blocklist_retry reason=changed_during_write")
+                    continue
+                }
+                guard rename(tmp.path, url.path) == 0 else {
+                    unlink(tmp.path)
+                    print("auth.blocklist_not_saved reason=write_failed")
+                    return nil
+                }
+                return out
+            }
+            print("auth.blocklist_not_saved reason=busy attempts=\(Self.replaceAttempts)")
             return nil
         }
-        let out = Self.merged(Self.entries(in: dict), adding: adding, removing: removing)
-        dict["blockedIPs"] = out.map { ["ip": $0.ip, "at": $0.at, "reason": $0.reason] as [String: Any] }
-        guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0),
-              (try? data.write(to: url, options: .atomic)) != nil else {
-            print("auth.blocklist_not_saved reason=write_failed")
-            return nil
-        }
-        return out
     }
 
     /// An atomic write replaces the file, so the folder must be writable too.
@@ -100,6 +132,51 @@ final class MemoryBlocklist: BlocklistStore, @unchecked Sendable {
     }
     func writable() -> Bool { canWrite }
 }
+
+/// B5 r4: blocks that could not be written to listen.plist, kept in a second
+/// file so a restart still enforces them. The guard loads it at start (the
+/// entries are blocked and still pending, so the host stays shut until they
+/// reach listen.plist) and empties it once they do.
+protocol PendingBlockStore: AnyObject {
+    func load() -> [BlockedEntry]
+    /// Replaces the journal with `entries` (empty removes it). False when
+    /// it could not be written.
+    func save(_ entries: [BlockedEntry]) -> Bool
+}
+
+final class PendingBlockFile: PendingBlockStore, @unchecked Sendable {
+    let url: URL
+    init(url: URL) { self.url = url }
+
+    func load() -> [BlockedEntry] {
+        guard let data = try? Data(contentsOf: url),
+              let dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any] else { return [] }
+        return ListenPlistBlocklist.entries(in: dict)
+    }
+
+    func save(_ entries: [BlockedEntry]) -> Bool {
+        if entries.isEmpty {
+            return unlink(url.path) == 0 || errno == ENOENT
+        }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        let dict: [String: Any] = ["blockedIPs": entries.map { ["ip": $0.ip, "at": $0.at, "reason": $0.reason] as [String: Any] }]
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else { return false }
+        return (try? data.write(to: url, options: .atomic)) != nil
+    }
+}
+
+final class MemoryPendingBlocks: PendingBlockStore, @unchecked Sendable {
+    var entries: [BlockedEntry] = []
+    var canWrite = true
+    func load() -> [BlockedEntry] { entries }
+    func save(_ entries: [BlockedEntry]) -> Bool {
+        guard canWrite else { return false }
+        self.entries = entries
+        return true
+    }
+}
+
 
 /// Wrong-password limits (design §4).
 ///
@@ -188,6 +265,10 @@ final class AuthGuard: @unchecked Sendable {
     /// the write is retried (`retryPending`): a restart must not be able to
     /// drop a block that was never written, so the host stays shut instead.
     private var pending: [BlockedEntry] = []
+    /// B5 r4: the second place pending blocks are written to; `journaled`
+    /// is what it holds as far as this guard knows.
+    private let journal: PendingBlockStore?
+    private var journaled: Set<String> = []
     private var lastPendingRetry: TimeInterval = -.infinity
     static let pendingRetryInterval: TimeInterval = 1
     static let pendingRetrySeconds: UInt32 = 5
@@ -195,15 +276,29 @@ final class AuthGuard: @unchecked Sendable {
     init(whitelist: [String], blocklist: BlocklistStore,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          wallNow: @escaping () -> Date = { Date() },
-         pause: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) {
+         pause: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+         journal: PendingBlockStore? = nil) {
         self.whitelist = whitelist
         self.blocklist = blocklist
+        self.journal = journal
         self.now = now
         self.wallNow = wallNow
         self.pause = pause
         let loaded = blocklist.load()
-        self.blocked = loaded
         self.persisted = Set(loaded.map(\.ip))
+        // B5 r4: a block that never reached listen.plist before the last
+        // exit is blocked again and still pending, so the host stays shut
+        // (no challenges) until listen.plist holds it.
+        let carried = (journal?.load() ?? []).filter { e in !loaded.contains { $0.ip == e.ip } }
+        self.blocked = loaded + carried
+        self.pending = carried
+        self.journaled = Set((journal?.load() ?? []).map(\.ip))
+        if !carried.isEmpty {
+            print("auth.lockdown_restored peers=\(carried.count) source=pending_journal")
+            lock.lock(); retryPendingLocked(force: true); lock.unlock()
+        } else if !journaled.isEmpty {
+            lock.lock(); _ = writeJournalLocked([]); lock.unlock()
+        }
     }
 
     /// Blacklist first (it wins over the whitelist), then the whitelist, then
@@ -252,6 +347,13 @@ final class AuthGuard: @unchecked Sendable {
     @discardableResult func release(_ ip: String) -> ReleaseResult {
         lock.lock(); defer { lock.unlock() }
         guard blocked.contains(where: { $0.ip == ip }) else { return .notBlocked }
+        // The journal first: a restart must not bring the block back.
+        if journaled.contains(ip) {
+            guard writeJournalLocked(pending.filter { $0.ip != ip }) else {
+                print("auth.release_failed peer=\(ip) reason=journal_write_failed")
+                return .saveFailed
+            }
+        }
         guard writeLocked(adding: [], removing: [ip]) else {
             print("auth.release_failed peer=\(ip) reason=write_failed attempts=\(Self.saveAttempts)")
             return .saveFailed
@@ -324,7 +426,8 @@ final class AuthGuard: @unchecked Sendable {
             if !persisted && !pending.contains(where: { $0.ip == ip }) {
                 pending.append(entry)
                 lastPendingRetry = t
-                print("auth.lockdown reason=blocklist_unpersisted peer=\(ip) (no challenges until listen.plist is written)")
+                let journalSaved = writeJournalLocked(pending)
+                print("auth.lockdown reason=blocklist_unpersisted peer=\(ip) journal=\(journalSaved ? "saved" : "not_saved") (no challenges until listen.plist is written)")
             }
             return Failure(outcome: .blacklisted(persisted: persisted), failures: failures, globalTriggered: globalTriggered)
         }
@@ -378,8 +481,33 @@ final class AuthGuard: @unchecked Sendable {
         if blocklist.update(adding: waiting, removing: []) != nil {
             persisted.formUnion(waiting.map(\.ip))
             pending = []
+            _ = writeJournalLocked([])
             print("auth.lockdown_cleared persisted=listen.plist peers=\(waiting.count)")
         }
+    }
+
+    /// Every pending block is at least in the journal (true when none is
+    /// pending). The control service does not exit while this is false.
+    var isDurable: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pending.allSatisfy { journaled.contains($0.ip) }
+    }
+
+    /// Writes the pending blocks to the journal again. True when durable.
+    @discardableResult func saveJournal() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if pending.allSatisfy({ journaled.contains($0.ip) }) { return true }
+        return writeJournalLocked(pending)
+    }
+
+    private func writeJournalLocked(_ entries: [BlockedEntry]) -> Bool {
+        guard let journal else { return false }
+        guard journal.save(entries) else {
+            print("auth.pending_journal_not_saved peers=\(entries.count)")
+            return false
+        }
+        journaled = Set(entries.map(\.ip))
+        return true
     }
 
     private static func seconds(_ interval: TimeInterval) -> UInt32 {
@@ -488,7 +616,13 @@ enum ListenMigration {
         plist?[sourceKey] as? String == sourceClientIP
     }
 
+    /// Holds the listen.plist flock, so it never interleaves with a
+    /// blacklist write from a control service that is still running.
     static func migrate(url: URL) -> String? {
+        ListenConfig.withFileLock(url) { migrateLocked(url: url) }
+    }
+
+    private static func migrateLocked(url: URL) -> String? {
         guard let data = try? Data(contentsOf: url),
               var dict = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
               let clientIP = dict["clientIP"] as? String, ListenConfig.isIPv4(clientIP) else { return nil }
@@ -543,12 +677,13 @@ final class AuthGate: @unchecked Sendable {
     func revoke() { revokeLock.lock(); revoked = true; revokeLock.unlock() }
     var isRevoked: Bool { revokeLock.lock(); defer { revokeLock.unlock() }; return revoked }
 
-    static func make(policy: AuthPolicy, secret: ConnSecret?, blocklist: BlocklistStore) -> AuthGate {
+    static func make(policy: AuthPolicy, secret: ConnSecret?, blocklist: BlocklistStore,
+                     journal: PendingBlockStore? = nil) -> AuthGate {
         let whitelist: [String]
         switch policy {
         case .password(let w), .transition(let w): whitelist = w
         case .refused: whitelist = []
         }
-        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist), secret: secret)
+        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist, journal: journal), secret: secret)
     }
 }

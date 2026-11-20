@@ -41,6 +41,33 @@ struct LocalAddress: Equatable {
     var ip: String
 }
 
+/// What stat(2) says about listen.plist. Any write (an atomic replace, an
+/// edit in place, a delete) changes it, so an unchanged stamp means the file
+/// read last is still the file on disk. It is the per-message fast path of
+/// the auth checks: one stat while nothing changed, a full read otherwise.
+struct ListenFileStamp: Equatable, Sendable {
+    var exists: Bool
+    var dev: Int64 = 0
+    var ino: UInt64 = 0
+    var size: Int64 = 0
+    var mtime: Int64 = 0
+    var mtimeNs: Int = 0
+    var ctime: Int64 = 0
+    var ctimeNs: Int = 0
+
+    /// nil when stat fails for a reason other than "no such file": the
+    /// caller then reads the file in full.
+    static func of(_ url: URL) -> ListenFileStamp? {
+        var st = stat()
+        guard fstatat(AT_FDCWD, url.path, &st, 0) == 0 else {
+            return errno == ENOENT ? ListenFileStamp(exists: false) : nil
+        }
+        return ListenFileStamp(exists: true, dev: Int64(st.st_dev), ino: UInt64(st.st_ino), size: Int64(st.st_size),
+                               mtime: Int64(st.st_mtimespec.tv_sec), mtimeNs: st.st_mtimespec.tv_nsec,
+                               ctime: Int64(st.st_ctimespec.tv_sec), ctimeNs: st.st_ctimespec.tv_nsec)
+    }
+}
+
 enum ListenConfig {
     static let loopbackIP = "127.0.0.1"
 
@@ -49,6 +76,46 @@ enum ListenConfig {
             return URL(fileURLWithPath: path)
         }
         return VideoService.supportDirectory.appendingPathComponent("listen.plist")
+    }
+
+    /// Blocks the control service could not write to listen.plist (B5 r4),
+    /// in a folder of their own so a read-only listen.plist or a listen.plist
+    /// folder that cannot be written does not take this file with it.
+    static var pendingBlocksURL: URL {
+        if let path = ProcessInfo.processInfo.environment["JERISLINK_AUTH_PENDING"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return VideoService.supportDirectory.appendingPathComponent("auth-state", isDirectory: true)
+            .appendingPathComponent("pending-blocks.plist")
+    }
+
+    /// Runs `body` holding an exclusive flock on `<listen.plist>.lock`, so
+    /// the host's own read-modify-write writers (blacklist, migration) take
+    /// turns. Writers outside the host do not take it; the blacklist write
+    /// also compares the file before replacing it (ListenPlistBlocklist).
+    /// If the lock file cannot be opened, `body` runs without it.
+    static func withFileLock<T>(_ url: URL, _ body: () -> T) -> T {
+        let fd = open(url.path + ".lock", O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return body() }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 && errno == EINTR {}
+        defer { flock(fd, LOCK_UN) }
+        return body()
+    }
+
+    /// While the endpoint is `waiting`: whether listen.plist now names a
+    /// different endpoint than the one this process started with (another
+    /// mode, viewer or bind address). That is a change to apply now, not an
+    /// address that went down for a moment.
+    static func targetDiffers(plist: [String: Any], from started: ListenEndpoint) -> Bool {
+        guard started.source == "listen.plist" else { return true }
+        let rawMode = (plist["mode"] as? String)?.lowercased() ?? ""
+        guard let mode = ListenMode(rawValue: rawMode), mode == started.mode else { return true }
+        if mode == .tailnet {
+            if plist["clientIP"] as? String != started.clientIP { return true }
+            if let bindIP = plist["bindIP"] as? String, !bindIP.isEmpty, bindIP != started.bindIP { return true }
+        }
+        return false
     }
 
     /// Tailscale's CGNAT range 100.64.0.0/10.
@@ -285,18 +352,36 @@ enum ListenConfig {
 /// of the process, and handlers registered with `onClose` stop the
 /// listeners, which also closes their connections. Clearing the password
 /// does not reopen them: that needs a restart.
+///
+/// r4: `check` is also what the UDP input asks for every 0x24 datagram, so
+/// a password set between two polls closes the input on the next datagram.
+/// It costs one stat while listen.plist is unchanged (`ListenFileStamp`) and
+/// reads the file again whenever the stamp moved.
 final class LegacyAuthWatch: @unchecked Sendable {
     private let lock = NSLock()
     private let read: @Sendable () -> ListenConfig.PasswordState
+    private let stamp: (@Sendable () -> ListenFileStamp?)?
     private var open: Bool
     private var closedReason: String?
+    /// The stamp taken just before the last read that said `off`.
+    private var verifiedStamp: ListenFileStamp?
     private var handlers: [@Sendable (String) -> Void] = []
 
-    init(read: @escaping @Sendable () -> ListenConfig.PasswordState = { ListenConfig.passwordState() }) {
+    /// The live listen.plist.
+    convenience init(url: URL = ListenConfig.plistURL) {
+        self.init(read: { ListenConfig.passwordState(url: url) }, stamp: { ListenFileStamp.of(url) })
+    }
+
+    /// `stamp` nil: every check reads (self-test fakes).
+    init(read: @escaping @Sendable () -> ListenConfig.PasswordState,
+         stamp: (@Sendable () -> ListenFileStamp?)? = nil) {
         self.read = read
+        self.stamp = stamp
+        let before = stamp?()
         let state = read()
         open = state == .off
         closedReason = state == .off ? nil : state.reason
+        verifiedStamp = state == .off ? before : nil
     }
 
     var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return open }
@@ -307,9 +392,18 @@ final class LegacyAuthWatch: @unchecked Sendable {
     /// Reads listen.plist now. False, and closed from then on, unless it
     /// still says no password.
     @discardableResult func check() -> Bool {
-        guard isOpen else { return false }
+        lock.lock()
+        guard open else { lock.unlock(); return false }
+        let known = verifiedStamp
+        lock.unlock()
+        // Taken before the read: a write after it moves the stamp again.
+        let now = stamp?()
+        if let now, let known, now == known { return true }
         let state = read()
-        if state == .off { return true }
+        if state == .off {
+            lock.lock(); if open { verifiedStamp = now }; lock.unlock()
+            return true
+        }
         close(reason: state.reason)
         return false
     }
