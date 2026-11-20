@@ -695,8 +695,18 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const double ny = static_cast<double>(p.y - dy) / std::max(1, dh - 1);
     const uint16_t qx = static_cast<uint16_t>(std::clamp<long>(std::lround(nx * 65535.0), 0, 65535));
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
+    // A click that waits for a control reconnect is queued with this.
+    if (gControl) gControl->notePointer(qx, qy);
     if (gMouseMoveUdp) return gMouseMoveUdp->sendNormalized(qx, qy);
     return gControl->sendMouseMoveNormalized(qx, qy);
+}
+
+// Focus left the viewer: keys and clicks still waiting for a control
+// reconnect are stale and must not reach the Mac later.
+static void discardQueuedInput(const char* reason) {
+    if (!gControl) return;
+    const size_t n = gControl->discardQueuedInput();
+    if (n) logLine(std::string("input.queue_discarded reason=") + reason + " events=" + std::to_string(n));
 }
 
 static void releaseRemoteModifiers() {
@@ -3930,6 +3940,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gPasteGate.abandon();  // a held paste never lands after focus left
         gHookFilter.reset();
         gKeys.reset();
+        discardQueuedInput("focus_kill");
         releaseRemoteButtons("focus_kill");
         releaseRemoteModifiers();
         logLine("focus.kill");
@@ -3941,6 +3952,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_ACTIVATE:
         gViewerFocused = LOWORD(wParam) != WA_INACTIVE;
+        if (!gViewerFocused) discardQueuedInput("deactivate");
         logLine(std::string(gViewerFocused ? "focus.activate" : "focus.deactivate") +
                 " minimized=" + (HIWORD(wParam) ? "1" : "0") +
                 " click=" + (LOWORD(wParam) == WA_CLICKACTIVE ? "1" : "0"));
@@ -5273,6 +5285,7 @@ struct LaunchContext {
     // channel that ended the session): shown with the same countdown and
     // focus as one the screen got itself.
     std::optional<jl::auth::Report> authAnswer;
+    const char* authAnswerSource = "handoff";  // "handoff" (relaunch) or "cli" (command-line preflight)
 };
 static LaunchContext* gLaunch = nullptr;
 // The launch screen checked the connection password for this attempt (or
@@ -5288,6 +5301,9 @@ static jl::auth::Report authPreflight(const Options& o, std::wstring password, b
     jl::auth::Client::Options co;
     co.password = std::move(password);
     co.remember = remember;
+    // What this host answered before (password or not) carries over to
+    // this attempt: a host known to want a password is not probed again.
+    co.hostKey = o.sourceIp + ":" + std::to_string(o.controlPort);
     co.log = [](const std::string& m) { logLine(m); };
     auto client = std::make_shared<jl::auth::Client>(std::move(co));
     jl::auth::wipe(password);
@@ -5296,9 +5312,12 @@ static jl::auth::Report authPreflight(const Options& o, std::wstring password, b
     rep.outcome = jl::auth::Outcome::Network;
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
-        // Twice at most: the second covers a transition probe that crossed
-        // a late challenge (the host is then known to want a password).
+        // Twice at most, and the second only when the host's answer asked
+        // for it (Retry: a probe crossed a late challenge with 2+ tries
+        // left, or a stale "password" mark). A connection that failed
+        // without an answer is not retried here.
         for (int attempt = 1; attempt <= 2; ++attempt) {
+            if (attempt == 2 && client->lastOutcome() != jl::auth::Outcome::Retry) break;
             ControlChannel ch(o.bindIp, o.sourceIp, o.controlPort);
             ch.setAuthChannel(jl::auth::Channel::Ping);
             ch.setIoTimeoutMs(4000);
@@ -5657,7 +5676,7 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
             gLaunch->authAnswer.reset();
             launchShowAnswer(dlg, rep);
             logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(rep.outcome) +
-                    " source=handoff retry_s=" + std::to_string(rep.retrySeconds));
+                    " source=" + gLaunch->authAnswerSource + " retry_s=" + std::to_string(rep.retrySeconds));
         }
         logLine(std::string("launch.screen shown saved_host=") + (savedHost.empty() ? "no" : "yes") +
                 " note=" + (gLaunch && !gLaunch->note.empty() ? "yes" : "no"));
@@ -5828,9 +5847,16 @@ static int appMain(int argc, char** argv) {
                                                    static_cast<DWORD>(std::size(distrusted)));
         SetEnvironmentVariableA("JERISLINK_DISTRUSTED_HOSTS", nullptr);
         if (dlen > 0 && dlen < std::size(distrusted)) jl::auth::loadDistrusted(distrusted);
+        // Hosts the previous process found to want a password: not probed.
+        char pwHosts[64 * 22 + 1]{};
+        const DWORD plen = GetEnvironmentVariableA("JERISLINK_PASSWORD_HOSTS", pwHosts,
+                                                   static_cast<DWORD>(std::size(pwHosts)));
+        SetEnvironmentVariableA("JERISLINK_PASSWORD_HOSTS", nullptr);
+        if (plen > 0 && plen < std::size(pwHosts)) jl::auth::loadPasswordHosts(pwHosts);
         if (hlen > 0 && hlen < std::size(handoff)) {
             launch.authAnswer = jl::auth::ui::decodeHandoff(handoff, GetTickCount64());
             if (launch.authAnswer) launch.note.clear();  // the answer brings its own line
+            launch.authAnswerSource = "handoff";
             logLine(std::string("launch.auth_handoff ") + (launch.authAnswer ? "ok" : "invalid"));
         }
     }
@@ -5857,6 +5883,7 @@ static int appMain(int argc, char** argv) {
             if (!jl::auth::isTerminal(rep.outcome)) break;
             launch.note.clear();
             launch.authAnswer = rep;
+            launch.authAnswerSource = "cli";
             show = true;
             continue;
         }
@@ -6761,6 +6788,8 @@ static int appMain(int argc, char** argv) {
                 << " control_queued=" << (control ? control->reconnectStats().queued : 0)
                 << " control_flushed=" << (control ? control->reconnectStats().flushed : 0)
                 << " control_dropped=" << (control ? control->reconnectStats().dropped : 0)
+                << " control_discarded=" << (control ? control->reconnectStats().discarded : 0)
+                << " control_positioned=" << (control ? control->reconnectStats().positioned : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
                 << " keyframe_req_tx=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSent() : 0)
@@ -6832,6 +6861,17 @@ static int appMain(int argc, char** argv) {
         fileSession.reset();
         filePullSession.reset();
         mouseMoveUdp.reset();
+        if (control) {
+            // Cancel a background reconnect still running and join its
+            // thread before Winsock goes away.
+            const auto rs = control->reconnectStats();
+            const double joinMs = control->stop();
+            std::ostringstream jl_;
+            jl_ << "control.worker_stopped joined=" << (joinMs >= 0.0 ? "yes" : "none")
+                << " join_ms=" << std::fixed << std::setprecision(1) << (joinMs >= 0.0 ? joinMs : 0.0)
+                << " was_connecting=" << (rs.connecting ? "yes" : "no");
+            logLine(jl_.str());
+        }
         control.reset();
 
         if (wsaStarted) { WSACleanup(); wsaStarted = false; }
@@ -7525,6 +7565,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                                 gRelaunchAuth.empty() ? nullptr : gRelaunchAuth.c_str());
         const std::string distrusted = jl::auth::encodeDistrusted();
         SetEnvironmentVariableA("JERISLINK_DISTRUSTED_HOSTS", distrusted.empty() ? nullptr : distrusted.c_str());
+        const std::string pwHosts = jl::auth::encodePasswordHosts();
+        SetEnvironmentVariableA("JERISLINK_PASSWORD_HOSTS", pwHosts.empty() ? nullptr : pwHosts.c_str());
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};

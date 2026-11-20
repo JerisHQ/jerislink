@@ -27,7 +27,9 @@
 // needed), `Client` halts: no channel connects again until the launch
 // screen starts a new attempt, so background reconnects cannot spend the
 // lockout budget. Channels also take connectSlot() before they connect, so
-// only one connection at a time can answer a challenge.
+// only one connection at a time can probe or answer a challenge. What a host
+// answered (password / transition) is kept per host address, so a host known
+// to want a password is not probed again by a later attempt.
 //
 // open_ip_only is accepted only as the answer to our probe on a host that
 // sent no challenge; after a challenge it means the host skipped mac_h
@@ -149,7 +151,7 @@ inline std::string normalizedUtf8(const std::wstring& password) {
         if (got > 0) { nfc.resize(size_t(got)); break; }
         if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) { wipe(nfc); return {}; }
         need = -got;
-        nfc.clear();
+        wipe(nfc);  // a partial NFC copy may already hold password text
     }
     if (nfc.empty()) return {};
     int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, nfc.c_str(), int(nfc.size()), nullptr, 0, nullptr, nullptr);
@@ -549,6 +551,7 @@ enum class Outcome {
     HostTooOld,    // nothing within 2 s: a 0.3.x host
     NeedPassword,  // the Mac wants a password and none is known for it
     LocalError,    // Windows could not compute the HMAC: nothing was sent
+    RaceUnanswered,  // probe crossed a late challenge, the host said nothing: maybe one try spent
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
     Network,       // connection closed / malformed: an ordinary reconnect
 };
@@ -565,6 +568,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::HostTooOld: return "host_too_old";
     case Outcome::NeedPassword: return "need_password";
     case Outcome::LocalError: return "local_error";
+    case Outcome::RaceUnanswered: return "race_unanswered";
     case Outcome::Retry: return "retry";
     case Outcome::Network: return "network";
     }
@@ -577,7 +581,7 @@ inline bool isTerminal(Outcome o) {
     switch (o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
-    case Outcome::LocalError:
+    case Outcome::LocalError: case Outcome::RaceUnanswered:
         return true;
     default:
         return false;
@@ -588,8 +592,9 @@ struct Report {
     Outcome outcome = Outcome::Network;
     uint8_t triesLeft = 0;
     uint32_t retrySeconds = 0;
-    bool usedSavedKey = false;    // a Fail with a saved key: the file was deleted
+    bool usedSavedKey = false;    // a Fail with a saved key (see savedKeyFile for what removal did)
     bool probeRace = false;       // the host counted our transition probe as a wrong try
+    const char* savedKeyFile = nullptr;  // removal result when a saved key was dropped
 };
 
 // MARK: Saved keys judged invalid
@@ -604,6 +609,13 @@ inline void distrustHost(const HostId& id) {
     std::lock_guard<std::mutex> g(distrustMutex());
     auto& v = distrustList();
     if (std::find(v.begin(), v.end(), id) == v.end() && v.size() < 64) v.push_back(id);
+}
+// The user proved a new key for this host and it was saved: the mark goes,
+// so the next start (and a relaunch) loads the new copy.
+inline void undistrustHost(const HostId& id) {
+    std::lock_guard<std::mutex> g(distrustMutex());
+    auto& v = distrustList();
+    v.erase(std::remove(v.begin(), v.end(), id), v.end());
 }
 inline bool hostDistrusted(const HostId& id) {
     std::lock_guard<std::mutex> g(distrustMutex());
@@ -650,6 +662,61 @@ inline void clearDistrustedForTest() {
     distrustList().clear();
 }
 
+// MARK: Known host mode
+
+// What a host answered last time, per host address (ip:port of its control
+// port): for this process (every later Client, e.g. the next Connect) and,
+// for Password, through JERISLINK_PASSWORD_HOSTS the process a session
+// relaunches into. A host known to want a password is never probed again.
+enum class HostMode { Unknown, Password, Transition };
+inline std::mutex& knownModeMutex() { static std::mutex m; return m; }
+inline std::vector<std::pair<std::string, HostMode>>& knownModeList() {
+    static std::vector<std::pair<std::string, HostMode>> v;
+    return v;
+}
+inline HostMode knownMode(const std::string& host) {
+    if (host.empty()) return HostMode::Unknown;
+    std::lock_guard<std::mutex> g(knownModeMutex());
+    for (const auto& e : knownModeList()) if (e.first == host) return e.second;
+    return HostMode::Unknown;
+}
+inline void rememberMode(const std::string& host, HostMode m) {
+    if (host.empty()) return;
+    std::lock_guard<std::mutex> g(knownModeMutex());
+    auto& v = knownModeList();
+    auto it = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.first == host; });
+    if (m == HostMode::Unknown) { if (it != v.end()) v.erase(it); return; }
+    if (it != v.end()) it->second = m;
+    else if (v.size() < 64) v.emplace_back(host, m);
+}
+// Comma-separated ip:port of hosts known to want a password.
+inline std::string encodePasswordHosts() {
+    std::lock_guard<std::mutex> g(knownModeMutex());
+    std::string out;
+    for (const auto& e : knownModeList()) {
+        if (e.second != HostMode::Password) continue;
+        if (!out.empty()) out.push_back(',');
+        out += e.first;
+    }
+    return out;
+}
+inline void loadPasswordHosts(const std::string& text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find(',', pos);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(pos, end - pos);
+        pos = end + 1;
+        const bool ok = !item.empty() && item.size() <= 64 &&
+            std::all_of(item.begin(), item.end(), [](char c) { return (c >= '0' && c <= '9') || c == '.' || c == ':'; });
+        if (ok) rememberMode(item, HostMode::Password);
+    }
+}
+inline void clearKnownModesForTest() {
+    std::lock_guard<std::mutex> g(knownModeMutex());
+    knownModeList().clear();
+}
+
 // MARK: Client (one per host attempt; shared by every channel)
 
 class Client {
@@ -661,13 +728,17 @@ public:
         std::wstring password;     // typed on the launch screen; wiped once K is derived
         bool remember = false;     // "Remember password" ticked
         std::wstring storeDir;     // empty: HostKeyStore::defaultDir()
+        std::string hostKey;       // "ip:port" of the host; empty: mode not kept across Clients
         LogFn log;
     };
 
     explicit Client(Options o)
         : password_(std::move(o.password)), remember_(o.remember),
-          store_(o.storeDir.empty() ? HostKeyStore::defaultDir() : o.storeDir), log_(std::move(o.log)) {
+          store_(o.storeDir.empty() ? HostKeyStore::defaultDir() : o.storeDir), log_(std::move(o.log)),
+          hostKey_(std::move(o.hostKey)) {
         wipe(o.password);
+        mode_ = knownMode(hostKey_);
+        modeInherited_ = mode_ == Mode::Password;
     }
     ~Client() {
         std::lock_guard<std::mutex> g(m_);
@@ -678,22 +749,24 @@ public:
 
     void setTerminalHandler(TerminalFn fn) { std::lock_guard<std::mutex> g(m_); onTerminal_ = std::move(fn); }
 
-    enum class Mode { Unknown, Password, Transition };
+    using Mode = HostMode;
     Mode mode() const { std::lock_guard<std::mutex> g(m_); return mode_; }
     bool transition() const { return mode() == Mode::Transition; }
     bool halted() const { return halted_.load(); }
     Report lastTerminal() const { std::lock_guard<std::mutex> g(m_); return terminal_; }
+    // The outcome of the most recent handshake on any channel.
+    Outcome lastOutcome() const { std::lock_guard<std::mutex> g(m_); return last_; }
     const HostKeyStore& store() const { return store_; }
     // Tests: the client holds neither the typed password nor K.
     bool holdsSecrets() const { std::lock_guard<std::mutex> g(m_); return !password_.empty() || key_.has_value(); }
 
     // Taken by a channel before it connects, held until its handshake ends,
-    // whenever an answer could spend a try (any mode but transition). So one
-    // connection at a time answers a challenge; the next sees the outcome
-    // (halted, or K proven) instead of spending a try of its own. Taken
-    // before connect, so no host is kept waiting for an answer meanwhile.
+    // in every mode: a transition host can turn on a password at any time,
+    // and a probe that crosses its first challenge spends a try. So one
+    // connection at a time probes or answers; the next sees the outcome
+    // (mode Password, halted, or K proven) instead of spending a try of its
+    // own. Taken before connect, so no host is kept waiting meanwhile.
     std::unique_lock<std::mutex> connectSlot() {
-        if (mode() == Mode::Transition) return {};
         return std::unique_lock<std::mutex>(flightM_);
     }
 
@@ -705,7 +778,11 @@ public:
         note(std::string("auth.result chan=") + channelName(ch) + " outcome=" + outcomeName(r.outcome) +
              (r.outcome == Outcome::Fail ? " tries=" + std::to_string(r.triesLeft) : std::string()) +
              (r.outcome == Outcome::Locked ? " retry_s=" + std::to_string(r.retrySeconds) : std::string()) +
-             (r.usedSavedKey ? " saved_key=deleted" : std::string()));
+             (r.savedKeyFile ? std::string(" saved_key=") + r.savedKeyFile : std::string()));
+        {
+            std::lock_guard<std::mutex> g(m_);
+            last_ = r.outcome;
+        }
         if (isTerminal(r.outcome)) halt(r);
         return r;
     }
@@ -754,6 +831,15 @@ private:
         }
         if (io == Io::Timeout) {
             note("auth.no_challenge waited_ms=" + std::to_string(kOldHostTimeoutMs) + (probed ? " probed=1" : " probed=0"));
+            if (known == Mode::Password && inheritedPasswordMode()) {
+                // Only the mark from an earlier attempt said "password": the
+                // Mac may have dropped its password since. Forget the mark;
+                // the next connection probes as for an unknown host.
+                note("auth.known_mode_cleared reason=no_challenge");
+                setMode(Mode::Unknown);
+                rep.outcome = Outcome::Retry;
+                return rep;
+            }
             rep.outcome = Outcome::HostTooOld;
             return rep;
         }
@@ -849,8 +935,11 @@ private:
             res = Result::decode(payload);
         }
         if (!res) {
+            // We cannot tell whether that cost a try: no automatic retry.
+            // The host is now known to want a password, so the next attempt
+            // never probes.
             note(std::string("auth.probe_race chan=") + channelName(ch) + " answer=none");
-            rep.outcome = Outcome::Retry;
+            rep.outcome = Outcome::RaceUnanswered;
             return rep;
         }
         switch (res->status) {
@@ -884,10 +973,11 @@ private:
 
     // A saved key judged invalid: delete it, log what really happened, and
     // never load it again in this run whatever the delete did.
-    void dropSaved(const HostId& id, const char* reason) {
+    const char* dropSaved(const HostId& id, const char* reason) {
         distrustHost(id);
         const auto r = store_.remove(id);
         note(std::string("auth.saved_key_dropped reason=") + reason + " file=" + HostKeyStore::removalName(r));
+        return HostKeyStore::removalName(r);
     }
 
     Report fromResult(const Result& r, bool fromStore, const HostId* id = nullptr) {
@@ -898,7 +988,7 @@ private:
             rep.triesLeft = r.triesLeft;
             // The key is wrong: forget it, and delete the saved copy at once.
             forgetKey();
-            if (id && (fromStore || store_.exists(*id))) dropSaved(*id, "fail");
+            if (id && (fromStore || store_.exists(*id))) rep.savedKeyFile = dropSaved(*id, "fail");
             rep.usedSavedKey = fromStore;
             break;
         case Result::Status::Locked: rep.outcome = Outcome::Locked; rep.retrySeconds = r.retrySeconds; break;
@@ -990,14 +1080,27 @@ private:
         if (remember_) {
             HostKeyStore::Entry e{c.hostId, c.salt, c.iterations, k};
             bool ok = store_.save(e);
-            note(std::string("auth.saved_key ") + (ok ? "written=1" : "written=0"));
+            // Mutual check passed and DPAPI wrote the new copy: a mark from
+            // an older key that failed must not hide this one.
+            const bool wasDistrusted = ok && hostDistrusted(c.hostId);
+            if (ok) undistrustHost(c.hostId);
+            note(std::string("auth.saved_key ") + (ok ? "written=1" : "written=0") +
+                 (wasDistrusted ? " distrust=cleared" : ""));
         } else if (store_.exists(c.hostId)) {
             const auto r = store_.remove(c.hostId);
             note(std::string("auth.saved_key_removed reason=remember_off file=") + HostKeyStore::removalName(r));
         }
     }
 
-    void setMode(Mode m) { std::lock_guard<std::mutex> g(m_); mode_ = m; }
+    void setMode(Mode m) {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            mode_ = m;
+            modeInherited_ = false;
+        }
+        rememberMode(hostKey_, m);
+    }
+    bool inheritedPasswordMode() const { std::lock_guard<std::mutex> g(m_); return modeInherited_; }
 
     void halt(const Report& r) {
         TerminalFn fn;
@@ -1032,6 +1135,9 @@ private:
     bool keyVerified_ = false;
     std::atomic<bool> halted_{false};
     Report terminal_;
+    Outcome last_ = Outcome::Network;
+    std::string hostKey_;
+    bool modeInherited_ = false;  // mode_ came from knownMode(), not from this host's answer yet
 };
 
 // MARK: Process-wide hook for the channels

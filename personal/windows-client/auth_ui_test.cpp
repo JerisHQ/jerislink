@@ -93,6 +93,7 @@ void otherTests() {
         {Outcome::HostTooOld, L"too old", false},
         {Outcome::NeedPassword, L"Enter the connection password", false},
         {Outcome::LocalError, L"Nothing was sent", false},
+        {Outcome::RaceUnanswered, L"now needs a connection password", false},
     };
     for (const Case& c : cases) {
         expect(s.apply(rep(c.o), t0), std::string("shown: ") + outcomeName(c.o));
@@ -146,7 +147,7 @@ void handoffTests() {
     expect(back && back->outcome == Outcome::Fail && back->triesLeft == 2 && back->usedSavedKey && back->probeRace,
            "handoff: fail keeps tries, saved key, probe race");
     for (Outcome o : {Outcome::Blocked, Outcome::AuthRequired, Outcome::HostMismatch, Outcome::HostTooOld,
-                      Outcome::NeedPassword, Outcome::LocalError}) {
+                      Outcome::NeedPassword, Outcome::LocalError, Outcome::RaceUnanswered}) {
         back = decodeHandoff(encodeHandoff(rep(o), tick0), tick0);
         expect(back && back->outcome == o, std::string("handoff round trip: ") + outcomeName(o));
     }

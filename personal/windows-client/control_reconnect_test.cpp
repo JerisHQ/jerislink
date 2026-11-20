@@ -3,6 +3,9 @@
 // mouse calls return at once (the UI thread also presents video), events
 // wait in order and go out once connected, and an answer that ends the
 // attempt (Locked) reaches the viewer from the background thread.
+// r3: stop() cancels a reconnect in progress and joins the worker; input
+// queued before focus left is discarded; a queued click carries its pointer
+// position.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -11,6 +14,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -250,12 +254,133 @@ void reconnectTests() {
     setCurrent(nullptr);
 }
 
+// Pepper's PR-B review r2, blocker 2: closing the session while a
+// reconnect runs. The host accepts and never answers; stop() must cut the
+// attempt short and join the worker (no thread left using a socket).
+void stopTests() {
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    Listener l;
+    auto control = std::make_unique<ControlChannel>("127.0.0.1", "127.0.0.1", l.port);
+    control->setIoTimeoutMs(100);
+    control->setBackgroundReconnect(true);
+    std::atomic<bool> accepted{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(3000);
+        if (s == INVALID_SOCKET) return;
+        accepted = true;
+        Sleep(2500);  // silent host
+        closesocket(s);
+    });
+    UiClock ui;
+    ui.call([&] { return control->sendKey(true, 0x0041); });
+    for (int i = 0; i < 50 && !accepted; ++i) Sleep(10);
+    Sleep(100);
+    expect(accepted && control->reconnectStats().connecting, "stop: a reconnect is running (host silent)");
+    const double joinMs = control->stop();
+    const auto st = control->reconnectStats();
+    expect(joinMs >= 0.0 && st.joined, "stop: worker joined (" + std::to_string(int(joinMs)) + " ms)");
+    expect(joinMs < 2500.0, "  join did not wait for the whole AUTH timeout");
+    expect(st.reconnects == 0 && !st.connecting, "  attempt cancelled, nothing connected");
+    const bool sent = ui.call([&] { return control->sendKey(false, 0x0041); });
+    expect(!sent && ui.maxMs < kUiBudgetMs, "  after stop: calls fail fast");
+    control.reset();  // destructor after stop(): no second join, no crash
+    expect(l.accept(300) == INVALID_SOCKET, "  no further connection attempt");
+    host.join();
+    // Destroyed without stop() while a reconnect runs: the destructor joins.
+    auto c2 = std::make_unique<ControlChannel>("127.0.0.1", "127.0.0.1", l.port);
+    c2->setIoTimeoutMs(100);
+    c2->setBackgroundReconnect(true);
+    std::thread host2([&] {
+        SOCKET s = l.accept(3000);
+        if (s == INVALID_SOCKET) return;
+        Sleep(2500);
+        closesocket(s);
+    });
+    c2->sendKey(true, 0x0041);
+    Sleep(150);
+    const auto t0 = Clock::now();
+    c2.reset();
+    expect(msSince(t0) < 2500.0, "destructor during a reconnect: joined (" + std::to_string(int(msSince(t0))) + " ms)");
+    host2.join();
+    setCurrent(nullptr);
+}
+
+// Blocker 3: stale input. Keys and clicks queued before the viewer lost
+// focus never reach the Mac; a queued click goes out with its position.
+void staleInputTests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    Listener l;
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+
+    SOCKET hs = INVALID_SOCKET;
+    bool auth1 = false;
+    std::vector<std::pair<uint8_t, Bytes>> early;
+    std::thread host1([&] {
+        hs = l.accept(5000);
+        if (hs == INVALID_SOCKET) return;
+        auth1 = hostAuth(hs, sec, Answer::Ok, kFirstAuthMs);
+        if (auth1) early = readFrames(hs, 1, 800);
+    });
+    control.sendKey(true, 0x0041);
+    control.sendMouseButtonExtended(0, true, 1);
+    const size_t dropped = control.discardQueuedInput();  // WM_KILLFOCUS
+    host1.join();
+    expect(auth1 && dropped == 2, "focus lost: 2 queued events discarded");
+    expect(early.empty(), "  nothing replayed after the reconnect");
+    for (int i = 0; i < 100 && control.reconnectStats().reconnects == 0; ++i) Sleep(10);
+    expect(control.reconnectStats().discarded == 2 && control.reconnectStats().reconnects == 1, "  stats: discarded=2, reconnected");
+    control.sendKey(true, 0x0042);
+    auto fresh = readFrames(hs, 1, 2000);
+    expect(fresh.size() == 1 && fresh[0].first == 0x10 && fresh[0].second[2] == 0x42, "  new input after focus returns goes out");
+
+    // Click queued during a reconnect: its position (sent by UDP in the
+    // viewer) is queued right in front of it.
+    control.notePointer(0x1234, 0xABCD);
+    control.close();
+    shutdown(hs, SD_BOTH);
+    closesocket(hs);
+    std::vector<std::pair<uint8_t, Bytes>> got;
+    bool auth2 = false;
+    std::thread host2([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        auth2 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+        if (auth2) got = readFrames(s, 4, 3000);
+        Sleep(100);
+        closesocket(s);
+    });
+    control.sendMouseButtonExtended(0, true, 1);
+    control.sendMouseButtonExtended(0, false, 1);
+    host2.join();
+    const Bytes pos{0x12, 0x34, 0xAB, 0xCD};
+    expect(auth2 && got.size() == 4 && got[0].first == 0x24 && got[0].second == pos && got[1].first == 0x25 &&
+               got[1].second[1] == 1 && got[2].first == 0x24 && got[3].first == 0x25 && got[3].second[1] == 0,
+           "queued click: position, down, position, up (" + std::to_string(got.size()) + " frames)");
+    expect(control.reconnectStats().positioned == 2, "  stats: positioned=2");
+    control.stop();
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     reconnectTests();
+    stopTests();
+    staleInputTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

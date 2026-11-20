@@ -3,9 +3,12 @@
 #include <ws2tcpip.h>
 #include "conn_auth.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,13 +34,7 @@ public:
     ControlChannel(std::string localIp, std::string remoteIp, uint16_t port)
         : localIp_(std::move(localIp)), remoteIp_(std::move(remoteIp)), port_(port) {}
     ~ControlChannel() {
-        if (async_) {
-            // A reconnect still running finishes on its own and closes
-            // its socket (it shares only `async_`).
-            std::lock_guard<std::mutex> g(async_->m);
-            async_->stopping = true;
-            async_->queue.clear();
-        }
+        stop();
         close();
     }
 
@@ -50,23 +47,58 @@ public:
         closeSocket(s_);
     }
 
+    // Ends background reconnects: cancels a connect or AUTH in progress
+    // (shutdown of its socket), drops what is still queued and joins the
+    // worker thread. Returns how long the join took, in ms (-1: there was no
+    // worker). After this no thread of ours uses a socket, so Winsock may be
+    // cleaned up. Safe to call more than once.
+    double stop() {
+        std::shared_ptr<Async> a = async_;
+        if (!a) return -1.0;
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            a->stopping = true;
+            a->stats.dropped += a->queue.size();
+            a->queue.clear();
+            if (a->pending != INVALID_SOCKET) shutdown(a->pending, SD_BOTH);
+        }
+        a->cv.notify_all();
+        if (a->worker.joinable()) a->worker.join();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> g(a->m);
+        if (!a->stats.joined) {
+            a->stats.joined = true;
+            a->stats.joinMs = ms;
+        }
+        return a->stats.joinMs;
+    }
+
     // Once the session runs: a lost connection is re-made (TCP connect and
     // the connection password, up to a few seconds) on a background thread,
     // so a key or mouse event never waits for it on the UI thread, which
     // also presents the video. Events sent meanwhile wait in a short queue
     // (kQueueMax, kQueueMaxAgeMs) and go out in order once it is back.
     // Startup (ping, video negotiation) stays synchronous.
+    //
+    // Threads: the send methods, close(), stop() and discardQueuedInput()
+    // are called from one thread (the viewer's UI thread). One worker thread
+    // per channel makes the connections. Neither holds the shared lock while
+    // a socket call runs: the UI sends on the live socket only while no
+    // reconnect runs, and the worker connects and flushes on its own socket,
+    // handing it over (under the lock) once the queue is empty.
     void setBackgroundReconnect(bool on) {
         if (on == bool(async_)) return;
         if (on) {
-            async_ = std::make_shared<Async>();
-            async_->s = s_;
+            auto a = std::make_shared<Async>();
+            a->s = s_;
             s_ = INVALID_SOCKET;
+            a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
+            async_ = std::move(a);
         } else {
+            stop();
             std::shared_ptr<Async> a = std::move(async_);
             std::lock_guard<std::mutex> g(a->m);
-            a->stopping = true;
-            a->queue.clear();
             closeSocket(a->s);
         }
     }
@@ -75,9 +107,34 @@ public:
         uint64_t reconnects = 0;   // background reconnects that succeeded
         uint64_t queued = 0;       // events that waited for one
         uint64_t flushed = 0;      // of those, sent once connected
-        uint64_t dropped = 0;      // too old, queue full, or the attempt halted
+        uint64_t dropped = 0;      // too old, queue full, discarded, or the attempt halted
+        uint64_t discarded = 0;    // of those, dropped because the viewer lost focus
+        uint64_t positioned = 0;   // queued clicks given their pointer position
         bool connecting = false;
+        bool joined = false;       // stop() joined the worker
+        double joinMs = 0.0;
     };
+
+    // The viewer lost focus: input still waiting for a reconnect is stale
+    // (the user is elsewhere) and must not reach the Mac later. Returns how
+    // many events were dropped.
+    size_t discardQueuedInput() {
+        if (!async_) return 0;
+        std::lock_guard<std::mutex> g(async_->m);
+        const size_t n = async_->queue.size();
+        async_->queue.clear();
+        async_->stats.dropped += n;
+        async_->stats.discarded += n;
+        return n;
+    }
+
+    // The pointer position (MRC1 0x24 units) the viewer last showed the
+    // Mac, by UDP or TCP. A click that has to wait for a reconnect is
+    // queued right after this position, so it lands where it was made,
+    // not wherever the Mac cursor is when the queue is flushed.
+    void notePointer(uint16_t nx, uint16_t ny) {
+        lastPointer_.store((uint64_t(1) << 32) | (uint64_t(nx) << 16) | uint64_t(ny), std::memory_order_relaxed);
+    }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
         std::lock_guard<std::mutex> g(async_->m);
@@ -294,13 +351,22 @@ private:
 
     // TCP connect, then the connection password (v0.4.0) before the first
     // message. Blocking: the UI thread only reaches it at startup.
+    // `onSocket` (the background worker) is told the socket while it is
+    // being connected, so stop() can cut it short, and INVALID_SOCKET just
+    // before it is closed here; returning false aborts the attempt.
     static SOCKET openSocket(const std::string& localIp, const std::string& remoteIp, uint16_t port,
-                             DWORD ioTimeoutMs, jl::auth::Channel authChannel) {
+                             DWORD ioTimeoutMs, jl::auth::Channel authChannel,
+                             const std::function<bool(SOCKET)>& onSocket = {}) {
         // One connection at a time may answer a challenge (conn_auth.hpp).
         const auto slot = jl::auth::connectSlot();
         if (!jl::auth::mayConnect()) return INVALID_SOCKET;
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) return INVALID_SOCKET;
+        if (onSocket && !onSocket(s)) { closesocket(s); return INVALID_SOCKET; }
+        auto closesocket = [&onSocket](SOCKET x) {
+            if (onSocket) onSocket(INVALID_SOCKET);
+            return ::closesocket(x);
+        };
         BOOL noDelay = TRUE;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs), sizeof(ioTimeoutMs));
@@ -357,15 +423,19 @@ private:
         return s;
     }
 
-    // Shared with the background reconnect thread, which may outlive us.
+    // Shared by the UI thread and the worker thread.
     struct Queued {
         std::vector<uint8_t> bytes;
         std::chrono::steady_clock::time_point at;
     };
     struct Async {
         std::mutex m;
-        SOCKET s = INVALID_SOCKET;
-        bool connecting = false;
+        std::condition_variable cv;
+        std::thread worker;
+        SOCKET s = INVALID_SOCKET;        // live connection (UI sends on it)
+        SOCKET pending = INVALID_SOCKET;  // being connected by the worker
+        bool connecting = false;          // a reconnect is asked for or running
+        bool wake = false;                // the worker should start one
         bool stopping = false;
         std::chrono::steady_clock::time_point nextTry{};
         std::deque<Queued> queue;
@@ -385,12 +455,19 @@ private:
     static bool isMouseMove(const std::vector<uint8_t>& b) {
         return b.size() > 5 && (b[5] == 0x23 || b[5] == 0x24);
     }
+    static bool isMouseButton(const std::vector<uint8_t>& b) {
+        return b.size() > 5 && (b[5] == 0x21 || b[5] == 0x25);
+    }
 
-    static void enqueueLocked(Async& a, std::vector<uint8_t> b, std::chrono::steady_clock::time_point now) {
+    static void dropAgedLocked(Async& a, std::chrono::steady_clock::time_point now) {
         while (!a.queue.empty() && now - a.queue.front().at > std::chrono::milliseconds(kQueueMaxAgeMs)) {
             a.queue.pop_front();
             ++a.stats.dropped;
         }
+    }
+
+    static void enqueueLocked(Async& a, std::vector<uint8_t> b, std::chrono::steady_clock::time_point now) {
+        dropAgedLocked(a, now);
         // Only the latest absolute pointer position matters.
         if (isMouseMove(b) && !a.queue.empty() && isMouseMove(a.queue.back().bytes) &&
             a.queue.back().bytes[5] == b[5]) {
@@ -405,15 +482,83 @@ private:
         ++a.stats.queued;
     }
 
-    // UI thread. Sends at once when connected; otherwise queues the event and
-    // starts one background reconnect. Never waits for TCP connect or AUTH.
+    // The worker: one per channel, joined by stop(). Waits for a request,
+    // connects (TCP and AUTH, without the lock), then sends the queue one
+    // event at a time (lock only to pop) and hands the socket to the UI.
+    static void workerLoop(std::shared_ptr<Async> a, std::string localIp, std::string remoteIp, uint16_t port,
+                           DWORD timeout, jl::auth::Channel ch) {
+        const auto onSocket = [a](SOCKET x) {
+            std::lock_guard<std::mutex> g(a->m);
+            if (x != INVALID_SOCKET && a->stopping) return false;
+            a->pending = x;
+            return true;
+        };
+        std::unique_lock<std::mutex> lk(a->m);
+        for (;;) {
+            a->cv.wait(lk, [&] { return a->stopping || a->wake; });
+            if (a->stopping) break;
+            a->wake = false;
+            lk.unlock();
+            SOCKET s = openSocket(localIp, remoteIp, port, timeout, ch, onSocket);
+            lk.lock();
+            a->pending = INVALID_SOCKET;
+            if (a->stopping) { closeSocket(s); break; }
+            if (s == INVALID_SOCKET) {
+                // The queue waits for the next event's attempt (or ages out).
+                a->connecting = false;
+                a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                if (!jl::auth::mayConnect()) {
+                    a->stats.dropped += a->queue.size();
+                    a->queue.clear();
+                }
+                continue;
+            }
+            bool alive = true;
+            while (!a->stopping) {
+                dropAgedLocked(*a, std::chrono::steady_clock::now());
+                if (a->queue.empty()) break;
+                Queued q = std::move(a->queue.front());
+                a->queue.pop_front();
+                lk.unlock();
+                const bool ok = sendAllOn(s, q.bytes);
+                lk.lock();
+                if (ok) { ++a->stats.flushed; continue; }
+                ++a->stats.dropped;
+                alive = false;
+                break;
+            }
+            if (a->stopping) { closeSocket(s); break; }
+            a->connecting = false;
+            if (!alive) {
+                closeSocket(s);
+                a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                continue;
+            }
+            closeSocket(a->s);
+            a->s = s;
+            ++a->stats.reconnects;
+        }
+    }
+
+    // UI thread. Sends at once when connected and nothing waits ahead of
+    // it; otherwise queues the event and asks the worker for a reconnect.
+    // Never waits for TCP connect or AUTH, and never sends under the lock.
     bool sendQueued(std::vector<uint8_t> b) {
         std::shared_ptr<Async> a = async_;
-        std::lock_guard<std::mutex> g(a->m);
-        if (a->s != INVALID_SOCKET) {
-            if (sendAllOn(a->s, b)) return true;
-            closeSocket(a->s);
+        SOCKET live = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (a->stopping) return false;
+            if (!a->connecting && a->queue.empty()) live = a->s;
         }
+        if (live != INVALID_SOCKET) {
+            // Only this thread uses or closes a->s while no reconnect runs.
+            if (sendAllOn(live, b)) return true;
+            std::lock_guard<std::mutex> g(a->m);
+            if (a->s == live) closeSocket(a->s);
+        }
+        std::lock_guard<std::mutex> g(a->m);
+        if (a->stopping) return false;
         if (!jl::auth::mayConnect()) {
             // The attempt ended (wrong password, lockout...): nothing to wait for.
             a->stats.dropped += a->queue.size() + 1;
@@ -421,43 +566,19 @@ private:
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
+        const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
+        if (isMouseButton(b) && (ptr >> 32)) {
+            // The pointer moves by UDP; the click waits here for TCP. Put
+            // its position right in front of it.
+            enqueueLocked(*a, packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
+                                            uint8_t(ptr >> 8), uint8_t(ptr)}), now);
+            ++a->stats.positioned;
+        }
         enqueueLocked(*a, std::move(b), now);
         if (!a->connecting && now >= a->nextTry) {
             a->connecting = true;
-            std::thread([a, localIp = localIp_, remoteIp = remoteIp_, port = port_,
-                         timeout = ioTimeoutMs_, ch = authChannel_] {
-                SOCKET s = openSocket(localIp, remoteIp, port, timeout, ch);
-                std::lock_guard<std::mutex> lk(a->m);
-                a->connecting = false;
-                if (a->stopping) { closeSocket(s); return; }
-                if (s == INVALID_SOCKET) {
-                    // The queue waits for the next event's attempt (or ages out).
-                    a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
-                    if (!jl::auth::mayConnect()) {
-                        a->stats.dropped += a->queue.size();
-                        a->queue.clear();
-                    }
-                    return;
-                }
-                const auto t = std::chrono::steady_clock::now();
-                while (!a->queue.empty()) {
-                    Queued& q = a->queue.front();
-                    if (t - q.at > std::chrono::milliseconds(kQueueMaxAgeMs)) {
-                        ++a->stats.dropped;
-                    } else if (sendAllOn(s, q.bytes)) {
-                        ++a->stats.flushed;
-                    } else {
-                        closeSocket(s);
-                        break;
-                    }
-                    a->queue.pop_front();
-                }
-                if (s != INVALID_SOCKET) {
-                    closeSocket(a->s);
-                    a->s = s;
-                    ++a->stats.reconnects;
-                }
-            }).detach();
+            a->wake = true;
+            a->cv.notify_all();
         }
         return false;
     }
@@ -516,6 +637,7 @@ private:
     DWORD ioTimeoutMs_ = 100;
     jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
     std::shared_ptr<Async> async_;
+    std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

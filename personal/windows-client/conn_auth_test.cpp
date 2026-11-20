@@ -654,27 +654,40 @@ void oldAndTransitionTests() {
                "transition: next channel probes after <= 300 ms (" + std::to_string(afterMs2) + " ms)");
     }
 
-    // A late challenge crosses the probe: drop, reconnect without a probe.
+    // A late challenge crosses the probe and the host never says what it
+    // counted: no automatic retry (r3), and the next attempt (a new Client
+    // for the same host) authenticates without a probe.
     {
+        clearKnownModesForTest();
         const Secret sec = makeSecret(kGood);
         Logged log;
-        auto c = makeClient(kGood, false, L"", log);
+        Client::Options o;
+        o.password = kGood;
+        o.hostKey = "127.0.0.9:7001";
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
         Report r = host.run(*c, Channel::Control, [&](SOCKET s) {
             Sleep(450);
             std::array<uint8_t, kNonceBytes> hn{};
             hostSend(s, kTypeChallenge, challengeFor(sec, hn));
             uint8_t type = 0;
             Bytes p;
-            hostRecv(s, 1500, type, p);  // the probe
+            hostRecv(s, 1500, type, p);  // the probe; no answer
         });
-        expect(r.outcome == Outcome::Retry, "probe race: retry");
-        expect(!c->halted() && c->mode() == Client::Mode::Password, "probe race: not halted, host known to want a password");
+        expect(r.outcome == Outcome::RaceUnanswered && r.probeRace, "probe race, no answer: race_unanswered, no retry");
+        expect(c->halted() && c->mode() == Client::Mode::Password, "  halted; host known to want a password");
+        Client::Options o2;
+        o2.password = kGood;
+        o2.hostKey = "127.0.0.9:7001";
+        o2.log = log.fn();
+        auto c2 = std::make_shared<Client>(std::move(o2));
         Seen seen;
-        r = host.run(*c, Channel::Control, [&](SOCKET s) {
+        r = host.run(*c2, Channel::Control, [&](SOCKET s) {
             Sleep(450);  // still slow, but a password host is not probed again
             hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen);
         });
-        expect(r.outcome == Outcome::Ok && seen.macValid, "probe race: reconnect authenticates without a probe");
+        expect(r.outcome == Outcome::Ok && seen.macValid && !seen.probe, "  next attempt: no probe, authenticated");
+        clearKnownModesForTest();
     }
 }
 
@@ -874,6 +887,9 @@ void reviewFixTests() {
         Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Fail, Channel::Control, seen, 3); });
         expect(r.outcome == Outcome::Fail && r.usedSavedKey, "distrust: saved key fails");
         expect(log.containsText("auth.saved_key_dropped reason=fail file=failed"), "  log says the delete failed (not 'deleted')");
+        expect(r.savedKeyFile && std::string(r.savedKeyFile) == "failed" && log.containsText("tries=3 saved_key=failed") &&
+                   !log.containsText("saved_key=deleted"),
+               "  auth.result logs saved_key=failed, the real removal result");
         CloseHandle(hold);
         expect(st.load(sec.hostId).has_value(), "  (the file really is still there and readable)");
         Logged log2;
@@ -902,6 +918,7 @@ void reviewFixTests() {
         Seen seen;
         host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Fail, Channel::Control, seen, 3); });
         expect(log.containsText("auth.saved_key_dropped reason=fail file=deleted") && !st.exists(sec.hostId), "drop: deleted and logged deleted");
+        expect(log.containsText("tries=3 saved_key=deleted"), "  auth.result logs saved_key=deleted");
         clearDistrustedForTest();
         removeStore(dir);
     }
@@ -923,6 +940,185 @@ void reviewFixTests() {
     }
 }
 
+// Pepper's PR-B review r2 (blockers 1, 4).
+void r3Tests() {
+    const Secret sec = makeSecret(kGood);
+
+    // 1: a transition host turns on a password. Three channels reconnect at
+    // once; each connection gets the challenge 200 ms late, after the
+    // known-transition probe (100 ms on loopback) has left. Only the first
+    // may probe; the others wait for its outcome and never probe.
+    {
+        clearKnownModesForTest();
+        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        listen(ls, 8);
+        int n = sizeof(a);
+        getsockname(ls, reinterpret_cast<sockaddr*>(&a), &n);
+        const std::string hostKey = "127.0.0.1:" + std::to_string(ntohs(a.sin_port));
+        rememberMode(hostKey, HostMode::Transition);  // an earlier attempt saw open_ip_only
+        std::atomic<int> probes{0}, proofs{0}, accepted{0};
+        std::vector<std::thread> conns;
+        std::mutex connsM;
+        std::thread hostT([&] {
+            // 3 channels + the one reconnect after a counted probe.
+            for (int i = 0; i < 4; ++i) {
+                fd_set rs; FD_ZERO(&rs); FD_SET(ls, &rs);
+                timeval tv{3, 0};
+                if (select(0, &rs, nullptr, nullptr, &tv) <= 0) break;
+                SOCKET s = accept(ls, nullptr, nullptr);
+                if (s == INVALID_SOCKET) break;
+                ++accepted;
+                std::lock_guard<std::mutex> g(connsM);
+                conns.emplace_back([&, s] {
+                    Sleep(200);
+                    Seen seen;
+                    // A PR-A host: a zero-MAC answer is a wrong try (4 left).
+                    hostWithPassword(s, sec, HostAnswer::Ok, Channel::Clipboard, seen, 4);
+                    if (seen.gotResponse && seen.probe) ++probes;
+                    if (seen.gotResponse && seen.macValid) ++proofs;
+                    shutdown(s, SD_SEND);
+                    Sleep(200);
+                    closesocket(s);
+                });
+            }
+        });
+        Logged log;
+        Client::Options o;
+        o.password = kGood;
+        o.hostKey = hostKey;
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        expect(c->mode() == Client::Mode::Transition, "known mode: new client starts as transition");
+        setCurrent(c);
+        Report out[3];
+        auto channel = [&](int i) {
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                auto slot = connectSlot();
+                if (!mayConnect()) { out[i] = c->lastTerminal(); return; }
+                SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                const auto t0 = Clock::now();
+                connect(cs, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+                out[i] = c->handshake(cs, Channel::Clipboard, msSince(t0));
+                closesocket(cs);
+                if (out[i].outcome != Outcome::Retry) return;
+            }
+        };
+        std::thread t1(channel, 0), t2(channel, 1), t3(channel, 2);
+        t1.join(); t2.join(); t3.join();
+        hostT.join();
+        {
+            std::lock_guard<std::mutex> g(connsM);
+            for (auto& t : conns) t.join();
+        }
+        setCurrent(nullptr);
+        closesocket(ls);
+        expect(probes.load() <= 1, "concurrent probes: host counted at most 1 probe for 3 channels (" +
+                                       std::to_string(probes.load()) + ")");
+        expect(out[0].outcome == Outcome::Ok && out[1].outcome == Outcome::Ok && out[2].outcome == Outcome::Ok,
+               "  all three channels end authenticated");
+        expect(proofs.load() == 3, "  each channel proved K once (" + std::to_string(proofs.load()) + " proofs, " +
+                                       std::to_string(accepted.load()) + " connections)");
+        expect(knownMode(hostKey) == HostMode::Password, "  host now known to want a password");
+
+        // The next Connect on the same host (a new Client) does not probe.
+        Logged log2;
+        Client::Options o2;
+        o2.password = kGood;
+        o2.hostKey = hostKey;
+        o2.log = log2.fn();
+        auto c2 = std::make_shared<Client>(std::move(o2));
+        expect(c2->mode() == Client::Mode::Password, "known mode: next Connect starts as password");
+        FakeHost host;
+        Seen seen;
+        // (FakeHost listens on another port; the mode comes from the Client.)
+        Report r = host.run(*c2, Channel::Ping, [&](SOCKET s) {
+            Sleep(450);
+            hostWithPassword(s, sec, HostAnswer::Ok, Channel::Ping, seen);
+        });
+        expect(r.outcome == Outcome::Ok && seen.macValid && !seen.probe && log2.count("auth.probe ") == 0,
+               "  next Connect: no probe, authenticated");
+
+        // Carried across a relaunch (password hosts only).
+        rememberMode("10.0.0.5:7001", HostMode::Transition);
+        const std::string enc = encodePasswordHosts();
+        clearKnownModesForTest();
+        loadPasswordHosts("x;y," + enc + ",bad host");
+        expect(enc == hostKey && knownMode(hostKey) == HostMode::Password && knownMode("10.0.0.5:7001") == HostMode::Unknown,
+               "  relaunch list: password hosts round trip (junk ignored)");
+        clearKnownModesForTest();
+    }
+
+    // 1: a "password" mark from an earlier attempt, but the Mac dropped its
+    // password: no challenge comes. Retry once, mark forgotten, then probe.
+    {
+        clearKnownModesForTest();
+        rememberMode("127.0.0.9:7002", HostMode::Password);
+        Logged log;
+        Client::Options o;
+        o.hostKey = "127.0.0.9:7002";
+        o.log = log.fn();
+        auto c = std::make_shared<Client>(std::move(o));
+        FakeHost host;
+        Report r = host.run(*c, Channel::Ping, [&](SOCKET s) {
+            uint8_t type = 0;
+            Bytes p;
+            if (hostRecv(s, 3000, type, p) == Io::Ok) hostSend(s, kTypeResult, Bytes{5});
+        });
+        expect(r.outcome == Outcome::Retry && !c->halted() && log.containsText("auth.known_mode_cleared reason=no_challenge"),
+               "stale password mark: retry, not 'host too old'");
+        expect(knownMode("127.0.0.9:7002") == HostMode::Unknown && c->lastOutcome() == Outcome::Retry, "  mark forgotten");
+        r = host.run(*c, Channel::Ping, [&](SOCKET s) {
+            uint8_t type = 0;
+            Bytes p;
+            if (hostRecv(s, 3000, type, p) == Io::Ok) hostSend(s, kTypeResult, Bytes{5});
+        });
+        expect(r.outcome == Outcome::Open, "  retry probes and connects (open_ip_only)");
+        clearKnownModesForTest();
+    }
+
+    // 4: an old saved key failed (host distrusted); the user types the
+    // right password with Remember: the mark goes once the mutual check
+    // passed and DPAPI wrote the new key, so the next start uses it.
+    {
+        const std::wstring dir = tempStore(L"undistrust");
+        removeStore(dir);
+        clearDistrustedForTest();
+        distrustHost(sec.hostId);
+        FakeHost host;
+        Logged log;
+        auto c = makeClient(kGood, true, dir, log);
+        Seen seen;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen); });
+        HostKeyStore st(dir);
+        expect(r.outcome == Outcome::Ok && st.exists(sec.hostId), "undistrust: right password saved");
+        expect(!hostDistrusted(sec.hostId) && encodeDistrusted().empty() &&
+                   log.containsText("auth.saved_key written=1 distrust=cleared"),
+               "  mark lifted after mutual check + DPAPI write (not carried to a relaunch)");
+        Logged log2;
+        auto c2 = makeClient(L"", false, dir, log2);
+        Seen seen2;
+        r = host.run(*c2, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen2); });
+        expect(r.outcome == Outcome::Ok && seen2.macValid && !log2.containsText("saved_key_skipped"),
+               "  next start: connects with the new saved key");
+        removeStore(dir);
+
+        // DPAPI write fails: the mark stays.
+        distrustHost(sec.hostId);
+        Logged log3;
+        auto c3 = makeClient(kGood, true, dir + L"\bad?name", log3);
+        Seen seen3;
+        r = host.run(*c3, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen3); });
+        expect(r.outcome == Outcome::Ok && hostDistrusted(sec.hostId) && log3.containsText("auth.saved_key written=0"),
+               "  save failed: mark kept");
+        clearDistrustedForTest();
+        removeStore(dir);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -938,6 +1134,7 @@ int main(int argc, char** argv) {
     passwordHostTests();
     oldAndTransitionTests();
     reviewFixTests();
+    r3Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -149,6 +149,11 @@ public:
         case Outcome::LocalError:
             view_.text = L"Windows could not compute the connection check. Nothing was sent; try again.";
             break;
+        case Outcome::RaceUnanswered:
+            // The Mac switched to a password during our check and did not
+            // say what it counted. No automatic retry; it is not probed again.
+            view_.text = L"This Mac now needs a connection password. Enter it and connect again.";
+            break;
         }
         view_.focusPassword = true;
         return true;
