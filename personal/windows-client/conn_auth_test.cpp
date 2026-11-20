@@ -342,8 +342,8 @@ std::shared_ptr<Client> makeClient(const std::wstring& pw, bool remember, const 
     return std::make_shared<Client>(std::move(o));
 }
 
-const wchar_t* kGood = L"tést-good-1";   // NFC form; the client is given the decomposed one below
-const wchar_t* kGoodNfd = L"tést-good-1";
+const wchar_t* kGood = L"t\u00e9st-good-1";   // NFC form; the client is given the decomposed one below
+const wchar_t* kGoodNfd = L"te\u0301st-good-1";
 const wchar_t* kBad = L"test-bad-2";
 
 // MARK: Scenarios

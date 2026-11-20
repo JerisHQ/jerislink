@@ -383,7 +383,8 @@ static constexpr UINT WM_MR_CAPS_LOCK = WM_APP + 45;
 static constexpr UINT WM_MR_FILE_UPLOAD_DONE = WM_APP + 46;  // posted by the FileSession thread
 static constexpr UINT WM_MR_FILE_PULL_NOTICE = WM_APP + 47;  // F3 r2, wParam = FileSession::PullNotice
 static constexpr UINT WM_MR_SEND_TO = WM_APP + 48;           // F5a, lParam = new std::shared_ptr<SendToRequest>
-static constexpr UINT WM_MR_AUTH_PREFLIGHT = WM_APP + 49;   // launch screen, wParam = jl::auth::Outcome
+// Not WM_APP + 49: that is kMsgThemeDpiChanged (WM_APP + 0x31) on the dialogs.
+static constexpr UINT WM_MR_AUTH_PREFLIGHT = WM_APP + 0x60;  // launch screen, wParam = jl::auth::Outcome
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
@@ -1061,6 +1062,7 @@ static void commitAudioVolume(const char* source) {
 // viewer window uses, so the dialogs match the viewer's title bar.
 
 static constexpr UINT kMsgThemeDpiChanged = WM_APP + 0x31;
+static_assert(kMsgThemeDpiChanged != WM_MR_AUTH_PREFLIGHT, "launch dialog message ids must differ");
 static constexpr int kSettingsFooterTop = 201;  // dialog units, see jerislink.rc
 static constexpr int kVolumeFooterTop = 70;
 static constexpr int kLaunchFooterTop = 288;
@@ -5532,7 +5534,7 @@ static void launchConnect(HWND dlg) {
     gLaunch->auth.clear();
     KillTimer(dlg, kLaunchAuthTimer);
     launchSetError(dlg, L"");
-    SetDlgItemTextW(dlg, IDOK, L"Connecting…");
+    SetDlgItemTextW(dlg, IDOK, L"Connecting\u2026");
     EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
     std::wstring password = windowText(GetDlgItem(dlg, IDC_LAUNCH_PASSWORD));
     const bool remember = jl::ui::ownerChecked(dlg, IDC_LAUNCH_REMEMBER);
@@ -5566,7 +5568,7 @@ static void launchApplyAuthView(HWND dlg, bool tick = false) {
 static void launchOnAuthAnswer(HWND dlg, jl::auth::Outcome outcome) {
     if (!gLaunch) return;
     gLaunch->checking = false;
-    SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  →");
+    SetDlgItemTextW(dlg, IDOK, L"Connect to Mac  \u2192");
     EnableWindow(GetDlgItem(dlg, IDOK), TRUE);
     if (!jl::auth::isTerminal(outcome)) {
         // OK, open_ip_only, or the Mac did not answer at all: start the
