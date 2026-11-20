@@ -2044,6 +2044,9 @@ static uint64_t gSessionTicks = 0;
 // again on the launch screen, which shows gRelaunchNote.
 static bool gRelaunch = false;
 static std::wstring gRelaunchNote;
+// A connection-password answer that ended the session, for the relaunched
+// launch screen (auth_ui.hpp encodeHandoff), in JERISLINK_LAUNCH_AUTH.
+static std::wstring gRelaunchAuth;
 
 static void runSessionModalTick() {
     if (!gSessionModalTick || gInSessionTick) return;
@@ -5266,6 +5269,10 @@ struct LaunchContext {
     bool showPassword = false;
     wchar_t passwordChar = 0x25CF;
     jl::auth::ui::LaunchState auth;
+    // A terminal answer from before this screen (command-line start, or a
+    // channel that ended the session): shown with the same countdown and
+    // focus as one the screen got itself.
+    std::optional<jl::auth::Report> authAnswer;
 };
 static LaunchContext* gLaunch = nullptr;
 // The launch screen checked the connection password for this attempt (or
@@ -5323,6 +5330,7 @@ static std::wstring authNoteFor(const jl::auth::Report& r) {
 static std::atomic<bool> gAuthHalt{false};
 static std::mutex gAuthHaltMutex;
 static std::wstring gAuthHaltNote;
+static std::wstring gAuthHaltHandoff;  // encodeHandoff at the time it arrived
 
 static RECT dluRect(HWND dlg, int x, int y, int w, int h) {
     RECT r{x, y, x + w, y + h};
@@ -5536,7 +5544,13 @@ static void launchConnect(HWND dlg) {
     launchSetError(dlg, L"");
     SetDlgItemTextW(dlg, IDOK, L"Connecting\u2026");
     EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
-    std::wstring password = windowText(GetDlgItem(dlg, IDC_LAUNCH_PASSWORD));
+    HWND pwEdit = GetDlgItem(dlg, IDC_LAUNCH_PASSWORD);
+    std::wstring password = windowText(pwEdit);
+    // The field does not keep the password once submitted (nor its undo copy).
+    gLaunch->quietEdit = true;
+    SetWindowTextW(pwEdit, L"");
+    SendMessageW(pwEdit, EM_EMPTYUNDOBUFFER, 0, 0);
+    gLaunch->quietEdit = false;
     const bool remember = jl::ui::ownerChecked(dlg, IDC_LAUNCH_REMEMBER);
     logLine(std::string("launch.auth_check password=") + (password.empty() ? "empty" : "typed") +
             " remember=" + (remember ? "on" : "off"));
@@ -5560,9 +5574,20 @@ static void launchApplyAuthView(HWND dlg, bool tick = false) {
     if (v.clearPassword) {
         gLaunch->quietEdit = true;
         SetWindowTextW(pw, L"");
+        SendMessageW(pw, EM_EMPTYUNDOBUFFER, 0, 0);
         gLaunch->quietEdit = false;
     }
     if (v.focusPassword) SetFocus(pw);
+}
+
+// One path for every terminal answer: red line, countdown, Connect, focus.
+static void launchShowAnswer(HWND dlg, const jl::auth::Report& rep) {
+    if (!gLaunch) return;
+    const auto now = std::chrono::steady_clock::now();
+    gLaunch->auth.apply(rep, now);
+    launchApplyAuthView(dlg);
+    KillTimer(dlg, kLaunchAuthTimer);
+    if (gLaunch->auth.counting(now)) SetTimer(dlg, kLaunchAuthTimer, 1000, nullptr);
 }
 
 static void launchOnAuthAnswer(HWND dlg, jl::auth::Outcome outcome) {
@@ -5580,10 +5605,7 @@ static void launchOnAuthAnswer(HWND dlg, jl::auth::Outcome outcome) {
     auto client = jl::auth::current();
     jl::auth::Report rep = client ? client->lastTerminal() : jl::auth::Report{};
     rep.outcome = outcome;
-    const auto now = std::chrono::steady_clock::now();
-    gLaunch->auth.apply(rep, now);
-    launchApplyAuthView(dlg);
-    if (gLaunch->auth.counting(now)) SetTimer(dlg, kLaunchAuthTimer, 1000, nullptr);
+    launchShowAnswer(dlg, rep);
     logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(outcome));
 }
 
@@ -5630,6 +5652,13 @@ static INT_PTR CALLBACK LaunchDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
         launchSetTab(dlg, gLaunch && gLaunch->codeTab);
         SendMessageW(dlg, DM_SETDEFID, IDOK, 0);
         SetFocus(savedHost.empty() ? edit : GetDlgItem(dlg, IDOK));
+        if (gLaunch && gLaunch->authAnswer) {
+            const jl::auth::Report rep = *gLaunch->authAnswer;
+            gLaunch->authAnswer.reset();
+            launchShowAnswer(dlg, rep);
+            logLine(std::string("launch.auth_answer outcome=") + jl::auth::outcomeName(rep.outcome) +
+                    " source=handoff retry_s=" + std::to_string(rep.retrySeconds));
+        }
         logLine(std::string("launch.screen shown saved_host=") + (savedHost.empty() ? "no" : "yes") +
                 " note=" + (gLaunch && !gLaunch->note.empty() ? "yes" : "no"));
         return FALSE;  // focus set above
@@ -5789,6 +5818,21 @@ static int appMain(int argc, char** argv) {
                                                   static_cast<DWORD>(std::size(note)));
         if (len > 0 && len < std::size(note)) launch.note = note;
         SetEnvironmentVariableW(L"JERISLINK_LAUNCH_NOTE", nullptr);
+        wchar_t handoff[256]{};
+        const DWORD hlen = GetEnvironmentVariableW(L"JERISLINK_LAUNCH_AUTH", handoff,
+                                                   static_cast<DWORD>(std::size(handoff)));
+        SetEnvironmentVariableW(L"JERISLINK_LAUNCH_AUTH", nullptr);
+        // Saved keys the previous process found invalid stay unused.
+        char distrusted[64 * 33 + 1]{};
+        const DWORD dlen = GetEnvironmentVariableA("JERISLINK_DISTRUSTED_HOSTS", distrusted,
+                                                   static_cast<DWORD>(std::size(distrusted)));
+        SetEnvironmentVariableA("JERISLINK_DISTRUSTED_HOSTS", nullptr);
+        if (dlen > 0 && dlen < std::size(distrusted)) jl::auth::loadDistrusted(distrusted);
+        if (hlen > 0 && hlen < std::size(handoff)) {
+            launch.authAnswer = jl::auth::ui::decodeHandoff(handoff, GetTickCount64());
+            if (launch.authAnswer) launch.note.clear();  // the answer brings its own line
+            logLine(std::string("launch.auth_handoff ") + (launch.authAnswer ? "ok" : "invalid"));
+        }
     }
     const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     bool show = jl::showLaunchScreen(request, shiftHeld);
@@ -5811,7 +5855,8 @@ static int appMain(int argc, char** argv) {
             // remembered one can answer a Mac that wants it.
             const auto rep = authPreflight(request.options, std::wstring(), false);
             if (!jl::auth::isTerminal(rep.outcome)) break;
-            launch.note = authNoteFor(rep);
+            launch.note.clear();
+            launch.authAnswer = rep;
             show = true;
             continue;
         }
@@ -5837,6 +5882,7 @@ static int appMain(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> g(gAuthHaltMutex);
                 gAuthHaltNote = authNoteFor(r);
+                gAuthHaltHandoff = jl::auth::ui::encodeHandoff(r, GetTickCount64());
             }
             gAuthHalt = true;
         });
@@ -6090,6 +6136,10 @@ static int appMain(int argc, char** argv) {
             video = std::make_unique<VideoPipeline>(
                 hwnd, o.width, o.height, o.fps, o.videoBackend, effectiveCodec, o.presentMode);
         }
+
+        // From here a lost control connection (and its AUTH) is re-made off
+        // the UI thread, so input never stalls video presentation.
+        if (control) control->setBackgroundReconnect(true);
 
         gConnectionInfo.effectiveCodec = effectiveCodec;
         gConnectionInfo.effectiveBitrateMbps = effectiveBitrateMbps;
@@ -6361,6 +6411,7 @@ static int appMain(int argc, char** argv) {
                 {
                     std::lock_guard<std::mutex> g(gAuthHaltMutex);
                     gRelaunchNote = gAuthHaltNote;
+                    gRelaunchAuth = gAuthHaltHandoff;
                 }
                 logLine("session.end reason=auth");
                 break;
@@ -6706,6 +6757,10 @@ static int appMain(int argc, char** argv) {
                 << " gpu_keyframe_wait_drops=" << video->keyframeWaitDrops()
                 << " control_events=" << (control ? control->sentEvents() : 0)
                 << " control_failures=" << (control ? control->failures() : 0)
+                << " control_reconnects=" << (control ? control->reconnectStats().reconnects : 0)
+                << " control_queued=" << (control ? control->reconnectStats().queued : 0)
+                << " control_flushed=" << (control ? control->reconnectStats().flushed : 0)
+                << " control_dropped=" << (control ? control->reconnectStats().dropped : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
                 << " keyframe_req_tx=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSent() : 0)
@@ -7351,6 +7406,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
           gRelaunch && gWindowClosed && !IsWindowVisible(viewer) && !overlayVisible());
     gRelaunch = false;
     gRelaunchNote.clear();
+    gRelaunchAuth.clear();
     gWindowClosed = false;
     if (filter) UnhookWindowsHookEx(filter);
     const bool noModal = gSnapshotModalLoops == 0;
@@ -7465,6 +7521,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
         SetEnvironmentVariableW(L"JERISLINK_LAUNCH_NOTE",
                                 gRelaunchNote.empty() ? nullptr : gRelaunchNote.c_str());
+        SetEnvironmentVariableW(L"JERISLINK_LAUNCH_AUTH",
+                                gRelaunchAuth.empty() ? nullptr : gRelaunchAuth.c_str());
+        const std::string distrusted = jl::auth::encodeDistrusted();
+        SetEnvironmentVariableA("JERISLINK_DISTRUSTED_HOSTS", distrusted.empty() ? nullptr : distrusted.c_str());
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};

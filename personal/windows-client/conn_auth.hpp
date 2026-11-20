@@ -26,8 +26,18 @@
 // password, lockout, blocked, mutual check failed, old host, password
 // needed), `Client` halts: no channel connects again until the launch
 // screen starts a new attempt, so background reconnects cannot spend the
-// lockout budget. personal/protocol/auth_vectors.json has vectors for the
-// maths here; conn_auth_test.cpp checks them.
+// lockout budget. Channels also take connectSlot() before they connect, so
+// only one connection at a time can answer a challenge.
+//
+// open_ip_only is accepted only as the answer to our probe on a host that
+// sent no challenge; after a challenge it means the host skipped mac_h
+// (host identity mismatch). If CNG cannot compute a MAC nothing is sent
+// (LocalError). A probe that crosses a late challenge is read by a PR-A host
+// as a wrong try; the host's answer decides between one reconnect without a
+// probe and stopping for the user. A saved key that fails or goes stale is
+// never loaded again, even when its file could not be deleted.
+// personal/protocol/auth_vectors.json has vectors for the maths here;
+// conn_auth_test.cpp checks them.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -100,13 +110,23 @@ inline const char* channelName(Channel c) {
 }
 
 using Bytes = std::vector<uint8_t>;
-using Key = std::array<uint8_t, kKeyBytes>;
 using HostId = std::array<uint8_t, kHostIdBytes>;
 using Salt = std::array<uint8_t, kSaltBytes>;
 
 inline void wipe(void* p, size_t n) { if (p && n) SecureZeroMemory(p, n); }
 inline void wipe(std::wstring& s) { if (!s.empty()) wipe(&s[0], s.size() * sizeof(wchar_t)); s.clear(); }
 inline void wipe(std::string& s) { if (!s.empty()) wipe(&s[0], s.size()); s.clear(); }
+
+// K. Every copy, temporaries included (PBKDF2 output, the DPAPI copy, the
+// cache), is wiped when it goes out of scope.
+struct Key : std::array<uint8_t, kKeyBytes> {
+    Key() : std::array<uint8_t, kKeyBytes>{} {}
+    Key(const Key&) = default;
+    Key& operator=(const Key&) = default;
+    ~Key() { wipe(data(), size()); }
+};
+
+using Mac = std::array<uint8_t, kMacBytes>;
 
 inline std::string hex(const uint8_t* p, size_t n) {
     static const char* d = "0123456789abcdef";
@@ -154,41 +174,56 @@ inline bool pbkdf2(const std::string& utf8, const uint8_t* salt, size_t saltLen,
 
 inline std::optional<Key> deriveKey(const std::wstring& password, const uint8_t* salt, size_t saltLen, uint32_t iterations) {
     std::string utf8 = normalizedUtf8(password);
-    Key k{};
+    Key k;
     bool ok = pbkdf2(utf8, salt, saltLen, iterations, k.data(), k.size());
     wipe(utf8);
-    if (!ok) { wipe(k.data(), k.size()); return std::nullopt; }
+    if (!ok) return std::nullopt;
     return k;
 }
 
-inline std::array<uint8_t, 32> hmacSha256(const uint8_t* key, size_t keyLen, std::initializer_list<std::pair<const uint8_t*, size_t>> parts) {
-    std::array<uint8_t, 32> out{};
+// Tests only: the next n HMAC computations fail as if CNG had failed.
+inline std::atomic<int>& hmacFaultsForTest() {
+    static std::atomic<int> n{0};
+    return n;
+}
+
+// False when CNG fails; `out` is then all zero and must not be used (no
+// handshake goes on with it).
+inline bool hmacSha256(const uint8_t* key, size_t keyLen, std::initializer_list<std::pair<const uint8_t*, size_t>> parts, Mac& out) {
+    out.fill(0);
+    if (hmacFaultsForTest().load() > 0 && hmacFaultsForTest().fetch_sub(1) > 0) return false;
+    bool ok = false;
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE h = nullptr;
     if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG))) {
         if (NT_SUCCESS(BCryptCreateHash(alg, &h, nullptr, 0, const_cast<PUCHAR>(key), ULONG(keyLen), 0))) {
-            bool ok = true;
+            ok = true;
             for (const auto& part : parts) {
                 if (part.second && !NT_SUCCESS(BCryptHashData(h, const_cast<PUCHAR>(part.first), ULONG(part.second), 0))) ok = false;
             }
-            if (!ok || !NT_SUCCESS(BCryptFinishHash(h, out.data(), ULONG(out.size()), 0))) out.fill(0);
+            if (!ok || !NT_SUCCESS(BCryptFinishHash(h, out.data(), ULONG(out.size()), 0))) ok = false;
             BCryptDestroyHash(h);
         }
         BCryptCloseAlgorithmProvider(alg, 0);
     }
+    if (!ok) out.fill(0);
+    return ok;
+}
+
+inline std::optional<Mac> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId) {
+    const uint8_t label[4] = {'j', 'l', '-', 'c'};
+    const uint8_t c = uint8_t(ch);
+    Mac out;
+    if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}}, out)) return std::nullopt;
     return out;
 }
 
-inline std::array<uint8_t, 32> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId) {
-    const uint8_t label[4] = {'j', 'l', '-', 'c'};
-    const uint8_t c = uint8_t(ch);
-    return hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}});
-}
-
-inline std::array<uint8_t, 32> macHost(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch) {
+inline std::optional<Mac> macHost(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch) {
     const uint8_t label[4] = {'j', 'l', '-', 'h'};
     const uint8_t c = uint8_t(ch);
-    return hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}});
+    Mac out;
+    if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}}, out)) return std::nullopt;
+    return out;
 }
 
 inline bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
@@ -313,6 +348,53 @@ inline Io recvFrame(SOCKET s, Clock::time_point deadline, uint8_t& type, Bytes& 
     return io;
 }
 
+// Reads MRC1 frames and keeps a part-read frame across deadlines: a header
+// split over the probe wait is finished by the next read, not dropped.
+class FrameReader {
+public:
+    explicit FrameReader(SOCKET s) : s_(s) {}
+
+    // Some bytes of the next frame have arrived.
+    bool started() const { return have_ > 0; }
+
+    Io next(Clock::time_point deadline, uint8_t& type, Bytes& payload) {
+        Io io = fill(h_, sizeof(h_), have_, deadline);
+        if (io != Io::Ok) return io;
+        if (!(h_[0] == 'M' && h_[1] == 'R' && h_[2] == 'C' && h_[3] == '1' && h_[4] == 1)) return Io::Closed;
+        const size_t len = size_t(h_[6]) << 8 | h_[7];
+        if (!bodyStarted_) { body_.assign(len, 0); bodyHave_ = 0; bodyStarted_ = true; }
+        // The rest of a frame that has started arrives promptly.
+        io = fill(body_.data(), len, bodyHave_, std::max(deadline, Clock::now() + std::chrono::milliseconds(1000)));
+        if (io != Io::Ok) return io;
+        type = h_[5];
+        payload = std::move(body_);
+        body_.clear();
+        have_ = 0;
+        bodyHave_ = 0;
+        bodyStarted_ = false;
+        return Io::Ok;
+    }
+
+private:
+    Io fill(uint8_t* p, size_t n, size_t& got, Clock::time_point deadline) {
+        while (got < n) {
+            Io w = waitReadable(s_, deadline);
+            if (w != Io::Ok) return w;
+            int r = recv(s_, reinterpret_cast<char*>(p + got), int(n - got), 0);
+            if (r <= 0) return Io::Closed;
+            got += size_t(r);
+        }
+        return Io::Ok;
+    }
+
+    SOCKET s_;
+    uint8_t h_[8]{};
+    size_t have_ = 0;
+    Bytes body_;
+    size_t bodyHave_ = 0;
+    bool bodyStarted_ = false;
+};
+
 inline bool sendAllBytes(SOCKET s, const Bytes& b) {
     size_t off = 0;
     while (off < b.size()) {
@@ -329,7 +411,20 @@ inline bool sendAllBytes(SOCKET s, const Bytes& b) {
 // host_id | salt | iter | K). The password itself is never stored.
 class HostKeyStore {
 public:
-    struct Entry { HostId hostId{}; Salt salt{}; uint32_t iterations = 0; Key key{}; };
+    struct Entry { HostId hostId{}; Salt salt{}; uint32_t iterations = 0; Key key; };
+
+    // What remove() did. Emptied: the file could not be deleted, so it was
+    // cut to zero bytes and never loads again.
+    enum class Removal { Deleted, Missing, Emptied, Failed };
+    static const char* removalName(Removal r) {
+        switch (r) {
+        case Removal::Deleted: return "deleted";
+        case Removal::Missing: return "missing";
+        case Removal::Emptied: return "emptied";
+        case Removal::Failed: return "failed";
+        }
+        return "?";
+    }
 
     explicit HostKeyStore(std::wstring dir) : dir_(std::move(dir)) {}
 
@@ -402,7 +497,6 @@ public:
             x.iterations = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | uint32_t(p[3]); p += 4;
             std::memcpy(x.key.data(), p, kKeyBytes);
             if (x.hostId == id) e = x;
-            wipe(x.key.data(), x.key.size());
         }
         wipe(out.pbData, out.cbData);
         LocalFree(out.pbData);
@@ -413,9 +507,15 @@ public:
         return !dir_.empty() && GetFileAttributesW(pathFor(id).c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
-    bool remove(const HostId& id) const {
-        if (dir_.empty()) return false;
-        return DeleteFileW(pathFor(id).c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+    Removal remove(const HostId& id) const {
+        if (dir_.empty()) return Removal::Failed;
+        const std::wstring path = pathFor(id);
+        if (DeleteFileW(path.c_str())) return Removal::Deleted;
+        const DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return Removal::Missing;
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); return Removal::Emptied; }
+        return Removal::Failed;
     }
 
 private:
@@ -448,7 +548,8 @@ enum class Outcome {
     HostMismatch,  // OK without a valid mac_h: not the Mac that holds K
     HostTooOld,    // nothing within 2 s: a 0.3.x host
     NeedPassword,  // the Mac wants a password and none is known for it
-    Retry,         // probe crossed a late challenge; reconnect once
+    LocalError,    // Windows could not compute the HMAC: nothing was sent
+    Retry,         // probe crossed a late challenge and cost one try; reconnect once
     Network,       // connection closed / malformed: an ordinary reconnect
 };
 
@@ -463,6 +564,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::HostMismatch: return "host_mismatch";
     case Outcome::HostTooOld: return "host_too_old";
     case Outcome::NeedPassword: return "need_password";
+    case Outcome::LocalError: return "local_error";
     case Outcome::Retry: return "retry";
     case Outcome::Network: return "network";
     }
@@ -475,6 +577,7 @@ inline bool isTerminal(Outcome o) {
     switch (o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
+    case Outcome::LocalError:
         return true;
     default:
         return false;
@@ -486,7 +589,66 @@ struct Report {
     uint8_t triesLeft = 0;
     uint32_t retrySeconds = 0;
     bool usedSavedKey = false;    // a Fail with a saved key: the file was deleted
+    bool probeRace = false;       // the host counted our transition probe as a wrong try
 };
+
+// MARK: Saved keys judged invalid
+
+// A saved key that failed (or went stale) is never loaded again, even if
+// deleting its file did not work: for this process (every later Client,
+// e.g. the next Connect on the launch screen) and, through
+// JERISLINK_DISTRUSTED_HOSTS, the process a session relaunches into.
+inline std::mutex& distrustMutex() { static std::mutex m; return m; }
+inline std::vector<HostId>& distrustList() { static std::vector<HostId> v; return v; }
+inline void distrustHost(const HostId& id) {
+    std::lock_guard<std::mutex> g(distrustMutex());
+    auto& v = distrustList();
+    if (std::find(v.begin(), v.end(), id) == v.end() && v.size() < 64) v.push_back(id);
+}
+inline bool hostDistrusted(const HostId& id) {
+    std::lock_guard<std::mutex> g(distrustMutex());
+    const auto& v = distrustList();
+    return std::find(v.begin(), v.end(), id) != v.end();
+}
+// Comma-separated host_id hex, for the relaunch environment.
+inline std::string encodeDistrusted() {
+    std::lock_guard<std::mutex> g(distrustMutex());
+    std::string out;
+    for (const auto& id : distrustList()) {
+        if (!out.empty()) out.push_back(',');
+        out += hex(id.data(), id.size());
+    }
+    return out;
+}
+inline void loadDistrusted(const std::string& text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find(',', pos);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (item.size() != kHostIdBytes * 2) continue;
+        HostId id{};
+        bool ok = true;
+        for (size_t i = 0; i < kHostIdBytes && ok; ++i) {
+            unsigned v = 0;
+            for (int j = 0; j < 2; ++j) {
+                const char c = item[i * 2 + j];
+                v <<= 4;
+                if (c >= '0' && c <= '9') v |= unsigned(c - '0');
+                else if (c >= 'a' && c <= 'f') v |= unsigned(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') v |= unsigned(c - 'A' + 10);
+                else ok = false;
+            }
+            id[i] = uint8_t(v);
+        }
+        if (ok) distrustHost(id);
+    }
+}
+inline void clearDistrustedForTest() {
+    std::lock_guard<std::mutex> g(distrustMutex());
+    distrustList().clear();
+}
 
 // MARK: Client (one per host attempt; shared by every channel)
 
@@ -508,8 +670,8 @@ public:
         wipe(o.password);
     }
     ~Client() {
-        wipe(password_);
-        if (key_) wipe(key_->data(), key_->size());
+        std::lock_guard<std::mutex> g(m_);
+        wipeSecretsLocked();
     }
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
@@ -522,6 +684,18 @@ public:
     bool halted() const { return halted_.load(); }
     Report lastTerminal() const { std::lock_guard<std::mutex> g(m_); return terminal_; }
     const HostKeyStore& store() const { return store_; }
+    // Tests: the client holds neither the typed password nor K.
+    bool holdsSecrets() const { std::lock_guard<std::mutex> g(m_); return !password_.empty() || key_.has_value(); }
+
+    // Taken by a channel before it connects, held until its handshake ends,
+    // whenever an answer could spend a try (any mode but transition). So one
+    // connection at a time answers a challenge; the next sees the outcome
+    // (halted, or K proven) instead of spending a try of its own. Taken
+    // before connect, so no host is kept waiting for an answer meanwhile.
+    std::unique_lock<std::mutex> connectSlot() {
+        if (mode() == Mode::Transition) return {};
+        return std::unique_lock<std::mutex>(flightM_);
+    }
 
     // Runs the AUTH exchange on a freshly connected TCP socket, before the
     // channel's first message. `connectMs` is how long the TCP connect took
@@ -554,22 +728,28 @@ private:
             probeWaitMs = std::clamp(int(connectMs * 2), kProbeWaitMs, 1500);
         }
 
+        FrameReader rd(s);
         uint8_t type = 0;
         Bytes payload;
         bool probed = false;
         Io io = Io::Timeout;
         if (known == Mode::Password) {
-            io = recvFrame(s, oldHostDeadline, type, payload);
+            io = rd.next(oldHostDeadline, type, payload);
         } else {
-            io = recvFrame(s, start + std::chrono::milliseconds(probeWaitMs), type, payload);
-            if (io == Io::Timeout) {
+            io = rd.next(start + std::chrono::milliseconds(probeWaitMs), type, payload);
+            if (io == Io::Timeout && rd.started()) {
+                // A frame has begun: the host is answering. No probe; the
+                // bytes read so far are kept.
+                note(std::string("auth.probe_skipped chan=") + channelName(ch) + " reason=frame_started");
+                io = rd.next(oldHostDeadline, type, payload);
+            } else if (io == Io::Timeout) {
                 // Transition probe: random nonce, zero MAC (design §9).
                 uint8_t probe[kResponseBytes]{};
                 randomBytes(probe, kNonceBytes);
                 if (!sendAllBytes(s, frame(kTypeResponse, probe, sizeof(probe)))) { rep.outcome = Outcome::Network; return rep; }
                 probed = true;
                 note(std::string("auth.probe chan=") + channelName(ch) + " waited_ms=" + std::to_string(probeWaitMs));
-                io = recvFrame(s, oldHostDeadline, type, payload);
+                io = rd.next(oldHostDeadline, type, payload);
             }
         }
         if (io == Io::Timeout) {
@@ -584,6 +764,7 @@ private:
             auto res = Result::decode(payload);
             if (!res) { rep.outcome = Outcome::Network; return rep; }
             if (res->status == Result::Status::OpenIpOnly) {
+                // Only the answer to our probe on a host that sent no challenge.
                 if (!probed) { rep.outcome = Outcome::Network; return rep; }
                 setMode(Mode::Transition);
                 rep.outcome = Outcome::Open;
@@ -600,52 +781,113 @@ private:
             return rep;
         }
         setMode(Mode::Password);
-        if (probed) {
-            // The challenge was on its way when the probe left; the host now
-            // reads the probe as the answer. Drop this socket (nothing more is
-            // sent) and reconnect without a probe.
-            note("auth.probe_race");
-            rep.outcome = Outcome::Retry;
-            return rep;
-        }
+        if (probed) return afterProbeRace(rd, ch);
 
         bool fromStore = false;
         std::optional<Key> key = keyFor(*ch5, fromStore);
         if (!key) { rep.outcome = Outcome::NeedPassword; return rep; }
 
         uint8_t resp[kResponseBytes]{};
-        if (!randomBytes(resp, kNonceBytes)) { wipe(key->data(), key->size()); rep.outcome = Outcome::Network; return rep; }
+        if (!randomBytes(resp, kNonceBytes)) { rep.outcome = Outcome::Network; return rep; }
         auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data());
-        std::memcpy(resp + kNonceBytes, macC.data(), kMacBytes);
-        if (!sendAllBytes(s, frame(kTypeResponse, resp, sizeof(resp)))) { wipe(key->data(), key->size()); rep.outcome = Outcome::Network; return rep; }
+        if (!macC) {
+            // Never answer with a MAC CNG did not produce; closing without
+            // an answer costs no try on the host.
+            note(std::string("auth.hmac_failed chan=") + channelName(ch) + " step=mac_c sent=0");
+            rep.outcome = Outcome::LocalError;
+            return rep;
+        }
+        std::memcpy(resp + kNonceBytes, macC->data(), kMacBytes);
+        if (!sendAllBytes(s, frame(kTypeResponse, resp, sizeof(resp)))) { rep.outcome = Outcome::Network; return rep; }
 
-        io = recvFrame(s, Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
-        if (io != Io::Ok || type != kTypeResult) { wipe(key->data(), key->size()); rep.outcome = Outcome::Network; return rep; }
+        io = rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
+        if (io != Io::Ok || type != kTypeResult) { rep.outcome = Outcome::Network; return rep; }
         auto res = Result::decode(payload);
-        if (!res) { wipe(key->data(), key->size()); rep.outcome = Outcome::Network; return rep; }
+        if (!res) { rep.outcome = Outcome::Network; return rep; }
 
         if (res->status == Result::Status::Ok) {
             auto want = macHost(*key, ch5->hostNonce.data(), resp, ch);
-            if (!constantTimeEqual(want.data(), res->macH.data(), kMacBytes)) {
+            if (!want) {
+                note(std::string("auth.hmac_failed chan=") + channelName(ch) + " step=mac_h");
+                rep.outcome = Outcome::LocalError;
+                return rep;
+            }
+            if (!constantTimeEqual(want->data(), res->macH.data(), kMacBytes)) {
                 // Not the Mac that holds K. Keep nothing from this attempt.
-                note("auth.host_mismatch chan=" + std::string(channelName(ch)));
+                note("auth.host_mismatch chan=" + std::string(channelName(ch)) + " reason=mac_h");
                 forgetKey();
-                wipe(key->data(), key->size());
                 rep.outcome = Outcome::HostMismatch;
                 return rep;
             }
             accept(*ch5, *key, fromStore);
-            wipe(key->data(), key->size());
             rep.outcome = Outcome::Ok;
             return rep;
         }
-        wipe(key->data(), key->size());
         if (res->status == Result::Status::OpenIpOnly) {
-            setMode(Mode::Transition);
-            rep.outcome = Outcome::Open;
+            // open_ip_only only answers a probe on a host that sent no
+            // challenge. After a challenge and our proof it skips the mac_h
+            // check: not the Mac that holds K (or someone rewrote the answer).
+            note("auth.host_mismatch chan=" + std::string(channelName(ch)) + " reason=open_after_challenge");
+            forgetKey();
+            rep.outcome = Outcome::HostMismatch;
             return rep;
         }
         return fromResult(*res, fromStore, &ch5->hostId);
+    }
+
+    // The challenge was on its way when the probe left. A PR-A host reads
+    // the probe as this challenge's answer and counts a wrong try. Nothing
+    // more is sent on this socket; the host's answer says what that cost.
+    // No password was tried, so K and any saved copy stay.
+    Report afterProbeRace(FrameReader& rd, Channel ch) {
+        Report rep;
+        rep.probeRace = true;
+        uint8_t type = 0;
+        Bytes payload;
+        std::optional<Result> res;
+        if (rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload) == Io::Ok && type == kTypeResult) {
+            res = Result::decode(payload);
+        }
+        if (!res) {
+            note(std::string("auth.probe_race chan=") + channelName(ch) + " answer=none");
+            rep.outcome = Outcome::Retry;
+            return rep;
+        }
+        switch (res->status) {
+        case Result::Status::Fail: {
+            rep.triesLeft = res->triesLeft;
+            // One reconnect without a probe, only while it cannot be the
+            // try that starts a lockout. Otherwise the user decides.
+            bool retry = res->triesLeft >= 2;
+            if (retry) {
+                std::lock_guard<std::mutex> g(m_);
+                retry = !raceRetried_;
+                raceRetried_ = true;
+            }
+            rep.outcome = retry ? Outcome::Retry : Outcome::Fail;
+            break;
+        }
+        case Result::Status::Locked: rep.outcome = Outcome::Locked; rep.retrySeconds = res->retrySeconds; break;
+        case Result::Status::Blocked: rep.outcome = Outcome::Blocked; break;
+        case Result::Status::AuthRequired: rep.outcome = Outcome::AuthRequired; break;
+        default:
+            // OK or open_ip_only to a zero MAC after a challenge: not a host
+            // that checks K.
+            forgetKey();
+            rep.outcome = Outcome::HostMismatch;
+            break;
+        }
+        note(std::string("auth.probe_race chan=") + channelName(ch) + " answer=" + outcomeName(rep.outcome) +
+             (res->status == Result::Status::Fail ? " tries=" + std::to_string(rep.triesLeft) : std::string()));
+        return rep;
+    }
+
+    // A saved key judged invalid: delete it, log what really happened, and
+    // never load it again in this run whatever the delete did.
+    void dropSaved(const HostId& id, const char* reason) {
+        distrustHost(id);
+        const auto r = store_.remove(id);
+        note(std::string("auth.saved_key_dropped reason=") + reason + " file=" + HostKeyStore::removalName(r));
     }
 
     Report fromResult(const Result& r, bool fromStore, const HostId* id = nullptr) {
@@ -656,10 +898,7 @@ private:
             rep.triesLeft = r.triesLeft;
             // The key is wrong: forget it, and delete the saved copy at once.
             forgetKey();
-            if (id && store_.exists(*id)) {
-                store_.remove(*id);
-                note("auth.saved_key_deleted reason=fail");
-            }
+            if (id && (fromStore || store_.exists(*id))) dropSaved(*id, "fail");
             rep.usedSavedKey = fromStore;
             break;
         case Result::Status::Locked: rep.outcome = Outcome::Locked; rep.retrySeconds = r.retrySeconds; break;
@@ -679,7 +918,7 @@ private:
             std::lock_guard<std::mutex> g2(m_);
             if (key_ && keyHost_ == c.hostId && keySalt_ == c.salt && keyIter_ == c.iterations) {
                 fromStore = keyFromStore_;
-                return *key_;
+                return key_;
             }
         }
         std::wstring pw;
@@ -699,25 +938,25 @@ private:
             fromStore = false;
             return k;
         }
+        if (hostDistrusted(c.hostId)) {
+            note("auth.saved_key_skipped reason=distrusted");
+            return std::nullopt;
+        }
         if (auto e = store_.load(c.hostId)) {
             if (e->salt == c.salt && e->iterations == c.iterations) {
                 std::lock_guard<std::mutex> g2(m_);
                 cache(c, e->key, true);
                 fromStore = true;
-                Key k = e->key;
-                wipe(e->key.data(), e->key.size());
-                return k;
+                return e->key;
             }
             // The Mac's password changed (new salt): the saved key is stale.
-            wipe(e->key.data(), e->key.size());
-            store_.remove(c.hostId);
-            note("auth.saved_key_stale deleted=1");
+            e.reset();
+            dropSaved(c.hostId, "stale_salt");
         }
         return std::nullopt;
     }
 
     void cache(const Challenge& c, const Key& k, bool fromStore) {
-        if (key_) wipe(key_->data(), key_->size());
         key_ = k;
         keyHost_ = c.hostId;
         keySalt_ = c.salt;
@@ -728,9 +967,15 @@ private:
 
     void forgetKey() {
         std::lock_guard<std::mutex> g(m_);
-        if (key_) wipe(key_->data(), key_->size());
-        key_.reset();
+        wipeSecretsLocked();
+    }
+
+    // The one place the typed password and the cached K are cleared: a
+    // wrong or unproven key, any answer that ends the attempt, and the
+    // destructor. (Key copies wipe themselves when they go out of scope.)
+    void wipeSecretsLocked() {
         wipe(password_);
+        key_.reset();
     }
 
     // First OK for a typed password: save it if asked, else make sure no
@@ -745,11 +990,10 @@ private:
         if (remember_) {
             HostKeyStore::Entry e{c.hostId, c.salt, c.iterations, k};
             bool ok = store_.save(e);
-            wipe(e.key.data(), e.key.size());
             note(std::string("auth.saved_key ") + (ok ? "written=1" : "written=0"));
         } else if (store_.exists(c.hostId)) {
-            store_.remove(c.hostId);
-            note("auth.saved_key_removed reason=remember_off");
+            const auto r = store_.remove(c.hostId);
+            note(std::string("auth.saved_key_removed reason=remember_off file=") + HostKeyStore::removalName(r));
         }
     }
 
@@ -762,6 +1006,7 @@ private:
             if (halted_) return;
             terminal_ = r;
             halted_ = true;
+            wipeSecretsLocked();
             fn = onTerminal_;
         }
         if (fn) fn(r);
@@ -771,6 +1016,8 @@ private:
 
     mutable std::mutex m_;
     std::mutex keyM_;
+    std::mutex flightM_;
+    bool raceRetried_ = false;
     std::wstring password_;
     bool remember_ = false;
     HostKeyStore store_;
@@ -806,6 +1053,18 @@ inline std::shared_ptr<Client> current() {
 inline void setCurrent(std::shared_ptr<Client> c) {
     std::lock_guard<std::mutex> g(currentMutex());
     currentSlot() = std::move(c);
+}
+
+// See Client::connectSlot. Keeps the client alive while the slot is held.
+struct ConnectSlot {
+    std::shared_ptr<Client> client;
+    std::unique_lock<std::mutex> lock;
+};
+inline ConnectSlot connectSlot() {
+    ConnectSlot s;
+    s.client = current();
+    if (s.client) s.lock = s.client->connectSlot();
+    return s;
 }
 
 // Before connecting: false while the current attempt is halted.

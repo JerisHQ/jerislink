@@ -203,12 +203,19 @@ void FileSession::run() {
             if (!sleepFor(backoffMs)) break;
             continue;
         }
-        const auto connectStart = jl::auth::Clock::now();
-        SOCKET s = connectSocket();
-        // v0.4.0: AUTH for the file channel before FILE_HELLO.
-        if (s != INVALID_SOCKET && !jl::auth::gate(s, jl::auth::Channel::File, jl::auth::msSince(connectStart))) {
-            closeSocket(s);
-            s = INVALID_SOCKET;
+        SOCKET s = INVALID_SOCKET;
+        {
+            // One connection at a time may answer a challenge (conn_auth.hpp).
+            const auto slot = jl::auth::connectSlot();
+            if (jl::auth::mayConnect()) {
+                const auto connectStart = jl::auth::Clock::now();
+                s = connectSocket();
+                // v0.4.0: AUTH for the file channel before FILE_HELLO.
+                if (s != INVALID_SOCKET && !jl::auth::gate(s, jl::auth::Channel::File, jl::auth::msSince(connectStart))) {
+                    closeSocket(s);
+                    s = INVALID_SOCKET;
+                }
+            }
         }
         Outcome outcome = Outcome::ConnectFailed;
         if (s != INVALID_SOCKET) {

@@ -3,7 +3,10 @@
 // a fake host on loopback: correct password with and without Remember, the
 // DPAPI copy, wrong password, saved key deleted on fail, mutual check
 // failure, locked / blocked / auth_required, password needed, 0.3.x host
-// timeout, transition probe and the probe that crosses a late challenge.
+// timeout, transition probe and the probe that crosses a late challenge;
+// then the PR-B review fixes: open_ip_only after a proof, HMAC failure,
+// a header split across the probe wait, what a counted probe race costs,
+// one channel at a time, distrusted saved keys, secrets wiped.
 //
 // Usage: JerislinkConnAuthTest <path to auth_vectors.json>
 #include "conn_auth.hpp"
@@ -117,8 +120,8 @@ void vectorTests(const char* path) {
         const Bytes cn = unhex(jsonField(v, "client_nonce"));
         const Bytes hid = unhex(jsonField(v, "host_id"));
         const Channel ch = channelFrom(jsonField(v, "channel"));
-        auto mc = macClient(*k, hn.data(), cn.data(), ch, hid.data());
-        auto mh = macHost(*k, hn.data(), cn.data(), ch);
+        auto mc = *macClient(*k, hn.data(), cn.data(), ch, hid.data());
+        auto mh = *macHost(*k, hn.data(), cn.data(), ch);
         expect(hex(mc.data(), mc.size()) == jsonField(v, "mac_c"), "vector '" + name + "': mac_c");
         expect(hex(mh.data(), mh.size()) == jsonField(v, "mac_h"), "vector '" + name + "': mac_h");
         // Wire layout.
@@ -136,7 +139,7 @@ void vectorTests(const char* path) {
         // A wrong key gives a different mac_h (the mutual check can fail).
         Key bad = *k;
         bad[0] ^= 1;
-        auto mhBad = macHost(bad, hn.data(), cn.data(), ch);
+        auto mhBad = *macHost(bad, hn.data(), cn.data(), ch);
         expect(!constantTimeEqual(mhBad.data(), mh.data(), kMacBytes), "vector '" + name + "': wrong K fails mac_h");
     }
     expect(count >= 3, "at least 3 vectors read (" + std::to_string(count) + ")");
@@ -156,7 +159,7 @@ void wireTests() {
 // MARK: Fake host on loopback
 
 struct Secret {
-    Key key{};
+    Key key;
     Salt salt{};
     HostId hostId{};
     uint32_t iter = kMinIterations;
@@ -188,7 +191,7 @@ Bytes challengeFor(const Secret& sec, std::array<uint8_t, kNonceBytes>& hn) {
     return p;
 }
 
-enum class HostAnswer { Ok, BadMacH, Fail, AuthRequired };
+enum class HostAnswer { Ok, BadMacH, Fail, AuthRequired, OpenIpOnly };
 
 // What the fake host saw on one connection.
 struct Seen {
@@ -201,21 +204,36 @@ struct Seen {
 };
 
 // Challenge -> response -> result, as a v0.4.0 host with a password.
-void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expectChan, Seen& seen, uint8_t tries = 4) {
+// splitMs > 0: the challenge's first 3 bytes now, the rest splitMs later.
+void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expectChan, Seen& seen, uint8_t tries = 4,
+                      int splitMs = 0) {
     std::array<uint8_t, kNonceBytes> hn{};
-    hostSend(s, kTypeChallenge, challengeFor(sec, hn));
+    const Bytes chPayload = challengeFor(sec, hn);
+    if (splitMs > 0) {
+        const Bytes f = frame(kTypeChallenge, chPayload.data(), chPayload.size());
+        send(s, reinterpret_cast<const char*>(f.data()), 3, 0);
+        Sleep(DWORD(splitMs));
+        send(s, reinterpret_cast<const char*>(f.data() + 3), int(f.size() - 3), 0);
+    } else {
+        hostSend(s, kTypeChallenge, chPayload);
+    }
     uint8_t type = 0;
     Bytes p;
     if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || p.size() != kResponseBytes) return;
     seen.gotResponse = true;
-    auto want = macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data());
+    auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data());
     seen.macValid = constantTimeEqual(want.data(), p.data() + kNonceBytes, kMacBytes);
+    {
+        bool zero = true;
+        for (size_t i = kNonceBytes; i < p.size(); ++i) zero = zero && p[i] == 0;
+        seen.probe = zero;
+    }
     Bytes res;
     if (ans == HostAnswer::Ok || ans == HostAnswer::BadMacH) {
         if (!seen.macValid) {
             res = {1, tries};
         } else {
-            auto mh = macHost(sec.key, hn.data(), p.data(), expectChan);
+            auto mh = *macHost(sec.key, hn.data(), p.data(), expectChan);
             if (ans == HostAnswer::BadMacH) mh[5] ^= 0x40;
             res.push_back(0);
             res.insert(res.end(), mh.begin(), mh.end());
@@ -223,6 +241,8 @@ void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expec
         }
     } else if (ans == HostAnswer::Fail) {
         res = {1, tries};
+    } else if (ans == HostAnswer::OpenIpOnly) {
+        res = {5};
     } else {
         res = {4};
     }
@@ -381,8 +401,20 @@ void dpapiTests() {
         f.put('\x5A');
     }
     expect(!st.load(e.hostId).has_value(), "dpapi: damaged file loads nothing");
-    expect(st.remove(e.hostId) && !st.exists(e.hostId), "dpapi: remove");
-    expect(st.remove(e.hostId), "dpapi: remove of a missing file is fine");
+    expect(st.remove(e.hostId) == HostKeyStore::Removal::Deleted && !st.exists(e.hostId), "dpapi: remove reports deleted");
+    expect(st.remove(e.hostId) == HostKeyStore::Removal::Missing, "dpapi: remove of a missing file reports missing");
+    // A file that cannot be deleted (open without delete sharing) is emptied
+    // instead, and an empty file never loads.
+    expect(st.save(e), "dpapi: save again");
+    {
+        HANDLE hold = CreateFileW(st.pathFor(e.hostId).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const auto r = st.remove(e.hostId);
+        expect(r == HostKeyStore::Removal::Emptied, std::string("dpapi: undeletable file reports emptied (") + HostKeyStore::removalName(r) + ")");
+        CloseHandle(hold);
+        expect(!st.load(e.hostId).has_value(), "dpapi: emptied file loads nothing");
+        st.remove(e.hostId);
+    }
     removeStore(dir);
 }
 
@@ -452,6 +484,7 @@ void passwordHostTests() {
         r = host.run(*c3, Channel::Control, [&](SOCKET s) { hostWithPassword(s, changed, HostAnswer::Ok, Channel::Control, seen3); });
         expect(r.outcome == Outcome::NeedPassword && !seen3.gotResponse, "  new salt: need password, nothing sent");
         expect(!st.exists(sec.hostId), "  new salt: stale file deleted");
+        clearDistrustedForTest();
 
         // Typed password with Remember off deletes an old file on success.
         st.save(HostKeyStore::Entry{sec.hostId, sec.salt, sec.iter, sec.key});
@@ -494,6 +527,7 @@ void passwordHostTests() {
         Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Fail, Channel::Control, seen, 2); });
         expect(r.outcome == Outcome::Fail && r.usedSavedKey && r.triesLeft == 2, "saved key fails: fail, usedSavedKey");
         expect(!st.exists(sec.hostId), "  saved key file deleted after fail");
+        clearDistrustedForTest();
         removeStore(dir);
     }
 
@@ -644,6 +678,251 @@ void oldAndTransitionTests() {
     }
 }
 
+// Pepper's PR-B review (blockers 1, 2, should-fix 5, 6).
+void reviewFixTests() {
+    const Secret sec = makeSecret(kGood);
+    FakeHost host;
+
+    // 1: after our proof, open_ip_only skips mac_h: host identity mismatch.
+    {
+        const std::wstring dir = tempStore(L"openafter");
+        removeStore(dir);
+        Logged log;
+        auto c = makeClient(kGood, true, dir, log);
+        Seen seen;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::OpenIpOnly, Channel::Control, seen); });
+        expect(seen.gotResponse && seen.macValid, "open_ip_only after proof: host got a real mac_c");
+        expect(r.outcome == Outcome::HostMismatch, "open_ip_only after proof: host identity mismatch, no channel");
+        expect(c->halted() && c->mode() != Client::Mode::Transition, "  halted, not treated as a transition host");
+        expect(filesIn(dir) == 0, "  nothing saved even with remember on");
+        expect(!c->holdsSecrets(), "  password and K wiped");
+        expect(log.containsText("reason=open_after_challenge"), "  logged reason=open_after_challenge");
+        removeStore(dir);
+    }
+
+    // 1: CNG fails computing mac_c: stop, send nothing (no all-zero MAC).
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        Seen seen;
+        hmacFaultsForTest() = 1;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen); });
+        hmacFaultsForTest() = 0;
+        expect(r.outcome == Outcome::LocalError, "hmac failure: local error");
+        expect(!seen.gotResponse, "  hmac failure: no response sent to the host");
+        expect(c->halted() && !c->holdsSecrets(), "  hmac failure: halted, secrets wiped");
+        expect(log.containsText("auth.hmac_failed"), "  logged auth.hmac_failed");
+    }
+    // ...and computing mac_h after an OK: no channel.
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        Seen seen;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) {
+            // The client's mac_c succeeds; the next HMAC (its mac_h check) fails.
+            std::array<uint8_t, kNonceBytes> hn{};
+            hostSend(s, kTypeChallenge, challengeFor(sec, hn));
+            uint8_t type = 0;
+            Bytes p;
+            if (hostRecv(s, 15000, type, p) != Io::Ok || p.size() != kResponseBytes) return;
+            seen.gotResponse = true;
+            auto mh = *macHost(sec.key, hn.data(), p.data(), Channel::Control);
+            hmacFaultsForTest() = 1;
+            Bytes res{0};
+            res.insert(res.end(), mh.begin(), mh.end());
+            res.insert(res.end(), {1, 2, 3, 4, 5, 6, 7, 8});
+            hostSend(s, kTypeResult, res);
+        });
+        hmacFaultsForTest() = 0;
+        expect(r.outcome == Outcome::LocalError, "hmac failure on mac_h: local error, no channel");
+    }
+
+    // 2: the challenge's header arrives in pieces across the probe wait:
+    // the bytes are kept and no probe goes out.
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        Seen seen;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) {
+            Sleep(100);
+            hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen, 4, 600);
+        });
+        expect(r.outcome == Outcome::Ok && seen.macValid && !seen.probe, "split header: kept, no probe, ok");
+        expect(log.count("auth.probe ") == 0 && log.containsText("auth.probe_skipped"), "  probe skipped (frame started)");
+    }
+
+    // 2: probe crosses a late challenge and the host counted it.
+    auto raceHost = [&](Bytes answer) {
+        return [&sec, answer](SOCKET s) {
+            Sleep(450);
+            std::array<uint8_t, kNonceBytes> hn{};
+            hostSend(s, kTypeChallenge, challengeFor(sec, hn));
+            uint8_t type = 0;
+            Bytes p;
+            if (hostRecv(s, 1500, type, p) == Io::Ok) hostSend(s, kTypeResult, answer);
+        };
+    };
+    {
+        const std::wstring dir = tempStore(L"race");
+        removeStore(dir);
+        HostKeyStore st(dir);
+        Logged log;
+        auto c = makeClient(kGood, false, dir, log);
+        Report r = host.run(*c, Channel::Control, raceHost(Bytes{1, 4}));
+        expect(r.outcome == Outcome::Retry && r.probeRace && r.triesLeft == 4, "probe race counted (4 left): one retry");
+        expect(!c->halted() && c->holdsSecrets(), "  not halted; the password was never tried, so it is kept");
+        Seen seen;
+        r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen); });
+        expect(r.outcome == Outcome::Ok && seen.macValid && !seen.probe, "  retry: no probe, ok");
+        removeStore(dir);
+    }
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        Report r = host.run(*c, Channel::Control, raceHost(Bytes{1, 1}));
+        expect(r.outcome == Outcome::Fail && r.probeRace && r.triesLeft == 1, "probe race with 1 try left: stop, the user decides");
+        expect(c->halted(), "  halted (no retry can start a lockout)");
+    }
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        Report r = host.run(*c, Channel::Control, raceHost(Bytes{2, 0, 0, 1, 44}));
+        expect(r.outcome == Outcome::Locked && r.retrySeconds == 300 && r.probeRace, "probe race that locked: locked 300 s, no retry");
+        expect(c->halted(), "  halted");
+    }
+    {
+        // A saved key is not touched by a probe race (no password tried).
+        const std::wstring dir = tempStore(L"racesaved");
+        removeStore(dir);
+        HostKeyStore st(dir);
+        st.save(HostKeyStore::Entry{sec.hostId, sec.salt, sec.iter, sec.key});
+        Logged log;
+        auto c = makeClient(L"", false, dir, log);
+        Report r = host.run(*c, Channel::Control, raceHost(Bytes{1, 1}));
+        expect(r.outcome == Outcome::Fail && !r.usedSavedKey && st.exists(sec.hostId), "probe race: saved key kept");
+        removeStore(dir);
+    }
+
+    // 2: two background channels reconnect together against a host that
+    // answers Fail: only one of them answers a challenge.
+    {
+        Logged log;
+        auto c = makeClient(kBad, false, L"", log);  // mode unknown: still one at a time
+        SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        listen(ls, 4);
+        int n = sizeof(a);
+        getsockname(ls, reinterpret_cast<sockaddr*>(&a), &n);
+        std::atomic<int> responses{0};
+        std::atomic<int> accepted{0};
+        std::thread hostT([&] {
+            for (int i = 0; i < 2; ++i) {
+                fd_set rs; FD_ZERO(&rs); FD_SET(ls, &rs);
+                timeval tv{2, 0};
+                if (select(0, &rs, nullptr, nullptr, &tv) <= 0) break;
+                SOCKET s = accept(ls, nullptr, nullptr);
+                if (s == INVALID_SOCKET) break;
+                ++accepted;
+                std::thread([&, s] {
+                    Seen seen;
+                    hostWithPassword(s, sec, HostAnswer::Fail, Channel::Clipboard, seen, 4);
+                    if (seen.gotResponse) ++responses;
+                    shutdown(s, SD_SEND);
+                    Sleep(300);
+                    closesocket(s);
+                }).detach();
+            }
+        });
+        setCurrent(c);
+        Report out[2];
+        auto channel = [&](int i) {
+            auto slot = connectSlot();
+            if (!mayConnect()) { out[i] = c->lastTerminal(); return; }
+            SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            connect(cs, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            out[i] = c->handshake(cs, Channel::Clipboard, 1.0);
+            closesocket(cs);
+        };
+        std::thread t1(channel, 0), t2(channel, 1);
+        t1.join(); t2.join();
+        hostT.join();
+        Sleep(400);
+        setCurrent(nullptr);
+        closesocket(ls);
+        expect(responses.load() == 1, "single flight: host saw one response for two channels (" + std::to_string(responses.load()) + ")");
+        expect(out[0].outcome == Outcome::Fail && out[1].outcome == Outcome::Fail, "  both channels end with the same fail");
+        expect(accepted.load() == 1, "  the second channel did not even connect (" + std::to_string(accepted.load()) + ")");
+    }
+
+    // 6: a failed saved key whose file could not be deleted is never loaded
+    // again, by this client or the next one.
+    {
+        const std::wstring dir = tempStore(L"distrust");
+        removeStore(dir);
+        clearDistrustedForTest();
+        HostKeyStore st(dir);
+        st.save(HostKeyStore::Entry{sec.hostId, sec.salt, sec.iter, sec.key});
+        // Read-only share: neither delete nor truncate can succeed.
+        HANDLE hold = CreateFileW(st.pathFor(sec.hostId).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Logged log;
+        auto c = makeClient(L"", false, dir, log);
+        Seen seen;
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Fail, Channel::Control, seen, 3); });
+        expect(r.outcome == Outcome::Fail && r.usedSavedKey, "distrust: saved key fails");
+        expect(log.containsText("auth.saved_key_dropped reason=fail file=failed"), "  log says the delete failed (not 'deleted')");
+        CloseHandle(hold);
+        expect(st.load(sec.hostId).has_value(), "  (the file really is still there and readable)");
+        Logged log2;
+        auto c2 = makeClient(L"", false, dir, log2);
+        Seen seen2;
+        r = host.run(*c2, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen2); });
+        expect(r.outcome == Outcome::NeedPassword && !seen2.gotResponse, "  next client: not used again, nothing sent");
+        expect(log2.containsText("auth.saved_key_skipped reason=distrusted"), "  logged saved_key_skipped");
+        // Carried to a relaunched process.
+        const std::string enc = encodeDistrusted();
+        clearDistrustedForTest();
+        loadDistrusted("zz," + enc + ",0123");
+        expect(hostDistrusted(sec.hostId) && encodeDistrusted() == enc, "  relaunch list round trip (junk ignored)");
+        clearDistrustedForTest();
+        st.remove(sec.hostId);
+        removeStore(dir);
+    }
+    // 6: a successful delete is logged as such.
+    {
+        const std::wstring dir = tempStore(L"dropok");
+        removeStore(dir);
+        HostKeyStore st(dir);
+        st.save(HostKeyStore::Entry{sec.hostId, sec.salt, sec.iter, sec.key});
+        Logged log;
+        auto c = makeClient(L"", false, dir, log);
+        Seen seen;
+        host.run(*c, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Fail, Channel::Control, seen, 3); });
+        expect(log.containsText("auth.saved_key_dropped reason=fail file=deleted") && !st.exists(sec.hostId), "drop: deleted and logged deleted");
+        clearDistrustedForTest();
+        removeStore(dir);
+    }
+
+    // 5: every terminal answer wipes the password and K.
+    {
+        Logged log;
+        auto c = makeClient(kGood, false, L"", log);
+        expect(c->holdsSecrets(), "wipe: typed password held before the attempt");
+        Report r = host.run(*c, Channel::Control, [&](SOCKET s) { hostSend(s, kTypeResult, Bytes{2, 0, 0, 0, 60}); });
+        expect(r.outcome == Outcome::Locked && !c->holdsSecrets(), "wipe: locked before a challenge wipes the typed password");
+        auto c2 = makeClient(kGood, false, L"", log);
+        Seen seen;
+        host.run(*c2, Channel::Control, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::Ok, Channel::Control, seen); });
+        expect(c2->holdsSecrets(), "wipe: K kept in memory while the session runs");
+        Seen seen2;
+        r = host.run(*c2, Channel::File, [&](SOCKET s) { hostWithPassword(s, sec, HostAnswer::AuthRequired, Channel::File, seen2); });
+        expect(r.outcome == Outcome::AuthRequired && !c2->holdsSecrets(), "wipe: a background channel's terminal answer wipes K");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -658,6 +937,7 @@ int main(int argc, char** argv) {
     dpapiTests();
     passwordHostTests();
     oldAndTransitionTests();
+    reviewFixTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

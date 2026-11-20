@@ -167,3 +167,9 @@ target_link_libraries(JerislinkConnAuthTest PRIVATE ws2_32 bcrypt crypt32 normal
 add_executable(JerislinkAuthUiTest auth_ui_test.cpp)
 target_compile_definitions(JerislinkAuthUiTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(JerislinkAuthUiTest PRIVATE ws2_32 bcrypt crypt32 normaliz)
+
+# Console test: control channel reconnect and AUTH off the UI thread, events
+# queued in order, Locked from a background reconnect (control_channel.hpp).
+add_executable(JerislinkControlReconnectTest control_reconnect_test.cpp)
+target_compile_definitions(JerislinkControlReconnectTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkControlReconnectTest PRIVATE ws2_32 bcrypt crypt32 normaliz)

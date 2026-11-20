@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct VideoConfigResult {
@@ -26,15 +30,65 @@ class ControlChannel {
 public:
     ControlChannel(std::string localIp, std::string remoteIp, uint16_t port)
         : localIp_(std::move(localIp)), remoteIp_(std::move(remoteIp)), port_(port) {}
-    ~ControlChannel() { close(); }
+    ~ControlChannel() {
+        if (async_) {
+            // A reconnect still running finishes on its own and closes
+            // its socket (it shares only `async_`).
+            std::lock_guard<std::mutex> g(async_->m);
+            async_->stopping = true;
+            async_->queue.clear();
+        }
+        close();
+    }
 
     void close() {
-        if (s_ != INVALID_SOCKET) {
-            shutdown(s_, SD_BOTH);
-            closesocket(s_);
+        if (async_) {
+            std::lock_guard<std::mutex> g(async_->m);
+            closeSocket(async_->s);
+            return;
+        }
+        closeSocket(s_);
+    }
+
+    // Once the session runs: a lost connection is re-made (TCP connect and
+    // the connection password, up to a few seconds) on a background thread,
+    // so a key or mouse event never waits for it on the UI thread, which
+    // also presents the video. Events sent meanwhile wait in a short queue
+    // (kQueueMax, kQueueMaxAgeMs) and go out in order once it is back.
+    // Startup (ping, video negotiation) stays synchronous.
+    void setBackgroundReconnect(bool on) {
+        if (on == bool(async_)) return;
+        if (on) {
+            async_ = std::make_shared<Async>();
+            async_->s = s_;
             s_ = INVALID_SOCKET;
+        } else {
+            std::shared_ptr<Async> a = std::move(async_);
+            std::lock_guard<std::mutex> g(a->m);
+            a->stopping = true;
+            a->queue.clear();
+            closeSocket(a->s);
         }
     }
+
+    struct ReconnectStats {
+        uint64_t reconnects = 0;   // background reconnects that succeeded
+        uint64_t queued = 0;       // events that waited for one
+        uint64_t flushed = 0;      // of those, sent once connected
+        uint64_t dropped = 0;      // too old, queue full, or the attempt halted
+        bool connecting = false;
+    };
+    ReconnectStats reconnectStats() const {
+        if (!async_) return {};
+        std::lock_guard<std::mutex> g(async_->m);
+        ReconnectStats r = async_->stats;
+        r.connecting = async_->connecting;
+        return r;
+    }
+
+    static constexpr size_t kQueueMax = 256;
+    static constexpr int kQueueMaxAgeMs = 3000;
+    static constexpr int kRetryGapMs = 250;
 
     bool ping(double* rttMs = nullptr) {
         const uint32_t seq = 0x4d523031;
@@ -100,10 +154,13 @@ public:
 
     void setIoTimeoutMs(DWORD timeoutMs) {
         ioTimeoutMs_ = timeoutMs ? timeoutMs : 1;
-        if (s_ != INVALID_SOCKET) {
-            setsockopt(s_, SOL_SOCKET, SO_SNDTIMEO,
+        std::unique_lock<std::mutex> g;
+        SOCKET* sp = &s_;
+        if (async_) { g = std::unique_lock<std::mutex>(async_->m); sp = &async_->s; }
+        if (*sp != INVALID_SOCKET) {
+            setsockopt(*sp, SOL_SOCKET, SO_SNDTIMEO,
                        reinterpret_cast<const char*>(&ioTimeoutMs_), sizeof(ioTimeoutMs_));
-            setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO,
+            setsockopt(*sp, SOL_SOCKET, SO_RCVTIMEO,
                        reinterpret_cast<const char*>(&ioTimeoutMs_), sizeof(ioTimeoutMs_));
         }
     }
@@ -201,7 +258,13 @@ public:
     // default; the launch screen check uses Ping.
     void setAuthChannel(jl::auth::Channel c) { authChannel_ = c; }
 
-    bool connected() const { return s_ != INVALID_SOCKET; }
+    bool connected() const {
+        if (async_) {
+            std::lock_guard<std::mutex> g(async_->m);
+            return async_->s != INVALID_SOCKET;
+        }
+        return s_ != INVALID_SOCKET;
+    }
     uint64_t sentEvents() const { return sentEvents_; }
     uint64_t failures() const { return failures_; }
 
@@ -215,66 +278,188 @@ private:
         p.push_back(uint8_t(v >> 8)); p.push_back(uint8_t(v));
     }
 
+    static void closeSocket(SOCKET& s) {
+        if (s != INVALID_SOCKET) {
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+            s = INVALID_SOCKET;
+        }
+    }
+
     bool ensureConnected() {
         if (s_ != INVALID_SOCKET) return true;
-        if (!jl::auth::mayConnect()) return false;
+        s_ = openSocket(localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
+        return s_ != INVALID_SOCKET;
+    }
+
+    // TCP connect, then the connection password (v0.4.0) before the first
+    // message. Blocking: the UI thread only reaches it at startup.
+    static SOCKET openSocket(const std::string& localIp, const std::string& remoteIp, uint16_t port,
+                             DWORD ioTimeoutMs, jl::auth::Channel authChannel) {
+        // One connection at a time may answer a challenge (conn_auth.hpp).
+        const auto slot = jl::auth::connectSlot();
+        if (!jl::auth::mayConnect()) return INVALID_SOCKET;
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) return false;
+        if (s == INVALID_SOCKET) return INVALID_SOCKET;
         BOOL noDelay = TRUE;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs_), sizeof(ioTimeoutMs_));
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs_), sizeof(ioTimeoutMs_));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs), sizeof(ioTimeoutMs));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs), sizeof(ioTimeoutMs));
         sockaddr_in local{};
         local.sin_family = AF_INET;
         local.sin_port = 0;
-        if (inet_pton(AF_INET, localIp_.c_str(), &local.sin_addr) != 1 ||
+        if (inet_pton(AF_INET, localIp.c_str(), &local.sin_addr) != 1 ||
             bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            closesocket(s); return false;
+            closesocket(s); return INVALID_SOCKET;
         }
         sockaddr_in remote{};
         remote.sin_family = AF_INET;
-        remote.sin_port = htons(port_);
-        if (inet_pton(AF_INET, remoteIp_.c_str(), &remote.sin_addr) != 1) {
-            closesocket(s); return false;
+        remote.sin_port = htons(port);
+        if (inet_pton(AF_INET, remoteIp.c_str(), &remote.sin_addr) != 1) {
+            closesocket(s); return INVALID_SOCKET;
         }
 
         u_long nonBlocking = 1;
         if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
-            closesocket(s); return false;
+            closesocket(s); return INVALID_SOCKET;
         }
         const auto connectStart = jl::auth::Clock::now();
         int rc = connect(s, reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
         if (rc == SOCKET_ERROR) {
             int e = WSAGetLastError();
             if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEINVAL) {
-                closesocket(s); return false;
+                closesocket(s); return INVALID_SOCKET;
             }
             fd_set writeSet, errorSet;
             FD_ZERO(&writeSet); FD_ZERO(&errorSet);
             FD_SET(s, &writeSet); FD_SET(s, &errorSet);
             timeval tv{};
-            tv.tv_sec = static_cast<long>(ioTimeoutMs_ / 1000);
-            tv.tv_usec = static_cast<long>((ioTimeoutMs_ % 1000) * 1000);
+            tv.tv_sec = static_cast<long>(ioTimeoutMs / 1000);
+            tv.tv_usec = static_cast<long>((ioTimeoutMs % 1000) * 1000);
             rc = select(0, nullptr, &writeSet, &errorSet, &tv);
             if (rc <= 0 || FD_ISSET(s, &errorSet)) {
-                closesocket(s); return false;
+                closesocket(s); return INVALID_SOCKET;
             }
             int soError = 0;
             int soLen = sizeof(soError);
             if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &soLen) != 0 || soError != 0) {
-                closesocket(s); return false;
+                closesocket(s); return INVALID_SOCKET;
             }
         }
         nonBlocking = 0;
         if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
-            closesocket(s); return false;
+            closesocket(s); return INVALID_SOCKET;
         }
         // v0.4.0: prove the connection password before the first message.
-        if (!jl::auth::gate(s, authChannel_, jl::auth::msSince(connectStart))) {
-            closesocket(s); return false;
+        if (!jl::auth::gate(s, authChannel, jl::auth::msSince(connectStart))) {
+            closesocket(s); return INVALID_SOCKET;
         }
-        s_ = s;
+        return s;
+    }
+
+    // Shared with the background reconnect thread, which may outlive us.
+    struct Queued {
+        std::vector<uint8_t> bytes;
+        std::chrono::steady_clock::time_point at;
+    };
+    struct Async {
+        std::mutex m;
+        SOCKET s = INVALID_SOCKET;
+        bool connecting = false;
+        bool stopping = false;
+        std::chrono::steady_clock::time_point nextTry{};
+        std::deque<Queued> queue;
+        ReconnectStats stats;
+    };
+
+    static bool sendAllOn(SOCKET s, const std::vector<uint8_t>& b) {
+        size_t off = 0;
+        while (off < b.size()) {
+            int r = send(s, reinterpret_cast<const char*>(b.data() + off), static_cast<int>(b.size() - off), 0);
+            if (r <= 0) return false;
+            off += static_cast<size_t>(r);
+        }
         return true;
+    }
+
+    static bool isMouseMove(const std::vector<uint8_t>& b) {
+        return b.size() > 5 && (b[5] == 0x23 || b[5] == 0x24);
+    }
+
+    static void enqueueLocked(Async& a, std::vector<uint8_t> b, std::chrono::steady_clock::time_point now) {
+        while (!a.queue.empty() && now - a.queue.front().at > std::chrono::milliseconds(kQueueMaxAgeMs)) {
+            a.queue.pop_front();
+            ++a.stats.dropped;
+        }
+        // Only the latest absolute pointer position matters.
+        if (isMouseMove(b) && !a.queue.empty() && isMouseMove(a.queue.back().bytes) &&
+            a.queue.back().bytes[5] == b[5]) {
+            a.queue.back() = Queued{std::move(b), now};
+            return;
+        }
+        if (a.queue.size() >= kQueueMax) {
+            a.queue.pop_front();
+            ++a.stats.dropped;
+        }
+        a.queue.push_back(Queued{std::move(b), now});
+        ++a.stats.queued;
+    }
+
+    // UI thread. Sends at once when connected; otherwise queues the event and
+    // starts one background reconnect. Never waits for TCP connect or AUTH.
+    bool sendQueued(std::vector<uint8_t> b) {
+        std::shared_ptr<Async> a = async_;
+        std::lock_guard<std::mutex> g(a->m);
+        if (a->s != INVALID_SOCKET) {
+            if (sendAllOn(a->s, b)) return true;
+            closeSocket(a->s);
+        }
+        if (!jl::auth::mayConnect()) {
+            // The attempt ended (wrong password, lockout...): nothing to wait for.
+            a->stats.dropped += a->queue.size() + 1;
+            a->queue.clear();
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        enqueueLocked(*a, std::move(b), now);
+        if (!a->connecting && now >= a->nextTry) {
+            a->connecting = true;
+            std::thread([a, localIp = localIp_, remoteIp = remoteIp_, port = port_,
+                         timeout = ioTimeoutMs_, ch = authChannel_] {
+                SOCKET s = openSocket(localIp, remoteIp, port, timeout, ch);
+                std::lock_guard<std::mutex> lk(a->m);
+                a->connecting = false;
+                if (a->stopping) { closeSocket(s); return; }
+                if (s == INVALID_SOCKET) {
+                    // The queue waits for the next event's attempt (or ages out).
+                    a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                    if (!jl::auth::mayConnect()) {
+                        a->stats.dropped += a->queue.size();
+                        a->queue.clear();
+                    }
+                    return;
+                }
+                const auto t = std::chrono::steady_clock::now();
+                while (!a->queue.empty()) {
+                    Queued& q = a->queue.front();
+                    if (t - q.at > std::chrono::milliseconds(kQueueMaxAgeMs)) {
+                        ++a->stats.dropped;
+                    } else if (sendAllOn(s, q.bytes)) {
+                        ++a->stats.flushed;
+                    } else {
+                        closeSocket(s);
+                        break;
+                    }
+                    a->queue.pop_front();
+                }
+                if (s != INVALID_SOCKET) {
+                    closeSocket(a->s);
+                    a->s = s;
+                    ++a->stats.reconnects;
+                }
+            }).detach();
+        }
+        return false;
     }
 
     std::vector<uint8_t> packet(uint8_t type, const std::vector<uint8_t>& payload) const {
@@ -312,6 +497,11 @@ private:
     }
 
     bool sendPacketRetry(uint8_t type, const std::vector<uint8_t>& payload) {
+        if (async_) {
+            if (sendQueued(packet(type, payload))) { ++sentEvents_; return true; }
+            ++failures_;
+            return false;
+        }
         if (sendPacket(type, payload)) { ++sentEvents_; return true; }
         ++failures_;
         close();
@@ -325,6 +515,7 @@ private:
     SOCKET s_ = INVALID_SOCKET;
     DWORD ioTimeoutMs_ = 100;
     jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
+    std::shared_ptr<Async> async_;
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

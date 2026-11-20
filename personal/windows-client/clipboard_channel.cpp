@@ -232,19 +232,22 @@ void ClipboardChannel::run() {
 
     while (!stopRequested_) {
         if (s == INVALID_SOCKET) {
-            if (!jl::auth::mayConnect()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
+            bool authed = false;
+            {
+                // One connection at a time may answer a challenge, so
+                // background channels never spend tries together.
+                const auto slot = jl::auth::connectSlot();
+                if (jl::auth::mayConnect()) {
+                    const auto connectStart = jl::auth::Clock::now();
+                    s = connectSocket();
+                    // v0.4.0: AUTH for the clipboard channel before CLIPBOARD_HELLO.
+                    if (s != INVALID_SOCKET) {
+                        authed = jl::auth::gate(s, jl::auth::Channel::Clipboard, jl::auth::msSince(connectStart));
+                        if (!authed) closeSocket(s);
+                    }
+                }
             }
-            const auto connectStart = jl::auth::Clock::now();
-            s = connectSocket();
-            if (s == INVALID_SOCKET) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-            // v0.4.0: AUTH for the clipboard channel before CLIPBOARD_HELLO.
-            if (!jl::auth::gate(s, jl::auth::Channel::Clipboard, jl::auth::msSince(connectStart))) {
-                closeSocket(s);
+            if (!authed) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
             }

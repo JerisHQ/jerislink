@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cwchar>
+#include <cwctype>
+#include <optional>
 #include <string>
 
 namespace jl::auth::ui {
@@ -35,6 +37,69 @@ inline std::wstring failText(uint8_t triesLeft, bool savedKey) {
     return buf;
 }
 
+inline std::wstring probeRaceText(uint8_t triesLeft) {
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"The Mac counted a connection check as a wrong try (%u %ls left). Connect again.",
+                  unsigned(triesLeft), triesLeft == 1 ? L"try" : L"tries");
+    return buf;
+}
+
+// A terminal answer handed from the session (a background channel, or the
+// CLI preflight) back to the launch screen of the relaunched process, so it
+// shows the same line, countdown and focus as an answer it got itself.
+// "v1;o=<outcome>;t=<tries>;k=<saved key>;p=<probe race>;u=<locked until>"
+// where u is a GetTickCount64 value (shared by every process on the PC).
+inline std::wstring encodeHandoff(const Report& r, uint64_t nowTickMs) {
+    if (!isTerminal(r.outcome)) return {};
+    const uint64_t until = r.outcome == Outcome::Locked ? nowTickMs + uint64_t(r.retrySeconds) * 1000 : 0;
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"v1;o=%d;t=%u;k=%d;p=%d;u=%llu", int(r.outcome), unsigned(r.triesLeft),
+                  r.usedSavedKey ? 1 : 0, r.probeRace ? 1 : 0, static_cast<unsigned long long>(until));
+    return buf;
+}
+
+inline std::optional<Report> decodeHandoff(const std::wstring& text, uint64_t nowTickMs) {
+    if (text.rfind(L"v1;", 0) != 0) return std::nullopt;
+    long long o = -1, t = -1, k = -1, p = -1;
+    unsigned long long u = 0;
+    bool haveU = false;
+    size_t pos = 3;
+    while (pos < text.size()) {
+        size_t end = text.find(L';', pos);
+        if (end == std::wstring::npos) end = text.size();
+        const std::wstring field = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (field.size() < 3 || field[1] != L'=') return std::nullopt;
+        const std::wstring value = field.substr(2);
+        if (value.empty() || value.size() > 20) return std::nullopt;
+        for (wchar_t c : value) if (!std::iswdigit(c)) return std::nullopt;
+        const unsigned long long n = std::wcstoull(value.c_str(), nullptr, 10);
+        switch (field[0]) {
+        case L'o': o = static_cast<long long>(n); break;
+        case L't': t = static_cast<long long>(n); break;
+        case L'k': k = static_cast<long long>(n); break;
+        case L'p': p = static_cast<long long>(n); break;
+        case L'u': u = n; haveU = true; break;
+        default: return std::nullopt;
+        }
+    }
+    if (o < 0 || o > int(Outcome::Network) || t < 0 || t > 255 || k < 0 || k > 1 || p < 0 || p > 1 || !haveU)
+        return std::nullopt;
+    Report r;
+    r.outcome = static_cast<Outcome>(o);
+    if (!isTerminal(r.outcome)) return std::nullopt;
+    r.triesLeft = static_cast<uint8_t>(t);
+    r.usedSavedKey = k == 1;
+    r.probeRace = p == 1;
+    if (r.outcome == Outcome::Locked) {
+        // Time spent relaunching counts; a lockout never exceeds a day.
+        const uint64_t left = u > nowTickMs ? u - nowTickMs : 0;
+        if (left > 24ull * 3600 * 1000) return std::nullopt;
+        r.retrySeconds = static_cast<uint32_t>((left + 999) / 1000);
+    }
+    return r;
+}
+
 class LaunchState {
 public:
     using Clock = std::chrono::steady_clock;
@@ -51,6 +116,11 @@ public:
         case Outcome::Retry:
             return false;
         case Outcome::Fail:
+            if (r.probeRace) {
+                // Not a wrong password: the probe (no password) was counted.
+                view_.text = probeRaceText(r.triesLeft);
+                break;
+            }
             view_.text = failText(r.triesLeft, r.usedSavedKey);
             view_.clearPassword = true;
             break;
@@ -75,6 +145,9 @@ public:
             break;
         case Outcome::NeedPassword:
             view_.text = L"Enter the connection password for this Mac.";
+            break;
+        case Outcome::LocalError:
+            view_.text = L"Windows could not compute the connection check. Nothing was sent; try again.";
             break;
         }
         view_.focusPassword = true;
