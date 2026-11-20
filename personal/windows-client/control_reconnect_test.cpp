@@ -696,7 +696,7 @@ void r5Tests() {
         control.setBackgroundReconnect(true);
         bool auth1 = false, auth2 = false;
         std::atomic<int> silent{0}, probes{0}, noiseConns{0};
-        std::atomic<bool> noiseDone{false};
+        std::atomic<bool> noiseDone{false}, noiseOver{false};
         std::vector<std::pair<uint8_t, Bytes>> got;
         std::thread host([&] {
             SOCKET s = l.accept(5000);
@@ -716,6 +716,7 @@ void r5Tests() {
                 s = l.accept(50);
                 if (s != INVALID_SOCKET) { ++noiseConns; closesocket(s); }
             }
+            noiseOver = true;  // the fresh key's connection is not taken for noise
             s = l.accept(15000);
             if (s == INVALID_SOCKET) return;
             auth2 = hostAuth(s, sec, Answer::Ok, 100);
@@ -754,6 +755,7 @@ void r5Tests() {
                    " connections, " + std::to_string(quiet.pausedDrops) + " dropped)");
         expect(ui.maxMs < kUiBudgetMs && c->takePausedChannels() == 0,
                "  r6: UI calls return at once while paused, no second paused report");
+        for (int i = 0; i < 100 && !noiseOver; ++i) Sleep(10);
         const bool resumed = control.resumeOnUserKey();  // a fresh key press
         control.sendKey(true, 0x0045);
         host.join();
