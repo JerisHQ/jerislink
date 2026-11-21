@@ -79,8 +79,15 @@ enum ConnAuth {
         return out
     }
 
-    static func macClient(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel, hostID: [UInt8]) -> [UInt8] {
-        hmac(key, [Array("jl-c".utf8), hostNonce, clientNonce, [channel.rawValue], hostID])
+    /// r5 (Pepper's r4 review, item 2): a reconnect's resume id (the session
+    /// it names) is covered too, appended after host_id, so the host knows
+    /// the viewer that proved K is the one naming that session. Without a
+    /// resume id the value is unchanged (the vectors still hold).
+    static func macClient(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel, hostID: [UInt8],
+                          resume: [UInt8]? = nil) -> [UInt8] {
+        var parts: [[UInt8]] = [Array("jl-c".utf8), hostNonce, clientNonce, [channel.rawValue], hostID]
+        if let resume { parts.append(resume) }
+        return hmac(key, parts)
     }
 
     static func macHost(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel) -> [UInt8] {
@@ -112,10 +119,12 @@ enum ConnAuth {
     }
 
     /// The channel whose mac_c matches, or nil. Always computes all four.
-    static func matchChannel(mac: [UInt8], key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], hostID: [UInt8]) -> Channel? {
+    static func matchChannel(mac: [UInt8], key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], hostID: [UInt8],
+                             resume: [UInt8]? = nil) -> Channel? {
         var found: Channel?
         for channel in Channel.allCases {
-            let want = macClient(key: key, hostNonce: hostNonce, clientNonce: clientNonce, channel: channel, hostID: hostID)
+            let want = macClient(key: key, hostNonce: hostNonce, clientNonce: clientNonce, channel: channel, hostID: hostID,
+                                 resume: resume)
             if constantTimeEqual(want, mac) && found == nil { found = channel }
         }
         return found
@@ -176,8 +185,9 @@ enum ConnAuth {
     /// its last control AUTH: 72 bytes instead of 64. The host refuses the
     /// reconnect (`.replaced`) while another viewer holds the session, so a
     /// replaced viewer never takes it back, even if it missed the notice.
-    /// The id is not under mac_c: it only narrows what the host allows, and
-    /// stripping it is no worse than dropping the connection.
+    /// r5 (Pepper's r4 review, item 2): the id is under mac_c
+    /// (`macClient(resume:)`), so it cannot be added, stripped or changed
+    /// without K: the host checks the reconnect's identity, not just its key.
     struct Response: Equatable {
         var clientNonce: [UInt8]
         var mac: [UInt8]

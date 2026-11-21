@@ -229,11 +229,19 @@ inline bool hmacSha256(const uint8_t* key, size_t keyLen, std::initializer_list<
     return ok;
 }
 
-inline std::optional<Mac> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId) {
+// PR-C r5 (Pepper's r4 review, item 2): a reconnect's resume session id
+// (the 8 bytes after mac_c in a 72-byte RESPONSE) is under mac_c too, so
+// nobody on the path can add, change or strip it. nullptr: no resume id.
+inline std::optional<Mac> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId,
+                                    const uint8_t* resume = nullptr) {
     const uint8_t label[4] = {'j', 'l', '-', 'c'};
     const uint8_t c = uint8_t(ch);
     Mac out;
-    if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}}, out)) return std::nullopt;
+    const bool ok = resume
+        ? hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes},
+                                          {resume, kSessionIdBytes}}, out)
+        : hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}}, out);
+    if (!ok) return std::nullopt;
     return out;
 }
 
@@ -999,7 +1007,9 @@ private:
                 respBytes = kResumeResponseBytes;
             }
         }
-        auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data());
+        // r5: the resume id, when named, is signed with the rest.
+        auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data(),
+                              respBytes == kResumeResponseBytes ? resp + kResponseBytes : nullptr);
         if (!macC) {
             // Never answer with a MAC CNG did not produce; closing without
             // an answer costs no try on the host.

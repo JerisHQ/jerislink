@@ -6318,6 +6318,18 @@ static int appMain(int argc, char** argv) {
         // From here a lost control connection (and its AUTH) is re-made off
         // the UI thread, so input never stalls video presentation.
         if (control) control->setBackgroundReconnect(true);
+        // PR-C r5 (Pepper's r4 review, item 3): a read-only view negotiates
+        // the video configuration again on every new control session, on the
+        // reconnect worker (never the UI thread). It asks for what the
+        // session already runs, so the Mac keeps the stream as it is; the
+        // loop below applies what the ACK says now (audio).
+        if (control && !o.controlEnabled) {
+            const bool hevcNow = effectiveCodec == "hevc";
+            const uint16_t bitrateNow = videoNegotiatedAtStart ? effectiveBitrateMbps : o.bitrateMbps;
+            control->setRenegotiateOnReconnect(effectiveCodec, h264Supported, hevcNow, bitrateNow, o.audio == "on");
+            logLine("video.renegotiate_on_reconnect codec=" + effectiveCodec +
+                    " bitrate_mbps=" + std::to_string(bitrateNow));
+        }
         // Hand tests only: JERISLINK_TEST_FLUSH_HOLD_MS (1-5000) holds each
         // event the reconnect worker took from the queue for that long
         // before its focus check and send, so a focus loss can be made to
@@ -6380,6 +6392,15 @@ static int appMain(int argc, char** argv) {
                 logLine("audio.start_failed reason=" + audioErr);
                 audio.reset();
             }
+        };
+        // r5 (item 3): a renegotiation whose ACK no longer offers audio.
+        auto stopAudio = [&] {
+            if (!audio) return;
+            if (mouseMoveUdp) mouseMoveUdp->sendAudioRequest(false, 0);
+            audio->stop();
+            gAudio = nullptr;
+            audio.reset();
+            logLine("audio.stopped reason=host_audio_off");
         };
         startAudio();
         logLine(std::string("audio=") + (audio ? "on" : "off") +
@@ -6616,7 +6637,7 @@ static int appMain(int argc, char** argv) {
 
         double nextPausedCheckMs = 0;
         // r4 (item 2): a read-only view gets its session back on its own.
-        jl::viewer::ReadOnlyRecovery readOnly(videoNegotiatedAtStart);
+        jl::viewer::ReadOnlyRecovery readOnly;
         uint64_t readOnlyReconnects = 0;
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
@@ -6662,25 +6683,28 @@ static int appMain(int argc, char** argv) {
                                     " next_gap_ms=" + std::to_string(int(readOnly.resumeGapMs())));
                         }
                         control->keepSession();
-                        if (readOnly.wantNegotiate(control->connected(), nowMs)) {
-                            // h264 only: the decoder was made for it at start.
-                            const auto vc = control->negotiateVideoOnLive("h264", h264Supported, false, o.bitrateMbps,
-                                                                          o.audio == "on");
-                            if (vc.negotiated && vc.codec == "h264") {
-                                readOnly.negotiateOk();
-                                hostSupportsAudio = vc.hostSupportsAudio;
-                                mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, vc.hostSupportsNack,
+                        // r5 (Pepper's r4 review, item 3): the worker
+                        // renegotiated on a new control session; apply what
+                        // the Mac offers now. Nothing here waits.
+                        if (const auto vc = control->takeRenegotiated()) {
+                            if (vc->negotiated && vc->codec == effectiveCodec) {
+                                hostSupportsAudio = vc->hostSupportsAudio;
+                                // NACK stays as the start set it: the
+                                // receiver was built for that.
+                                mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
                                                                o.audio == "on", hostSupportsAudio);
-                                startAudio();
-                                // NACK and ABR stay as the start set them (off).
-                                logLine(std::string("video.negotiated_late codec=h264 bitrate_mbps=") +
-                                        std::to_string(vc.bitrateMbps) +
-                                        " host_audio=" + (vc.hostSupportsAudio ? "yes" : "no") +
+                                if (mrm1Plan.audio) startAudio();
+                                else stopAudio();
+                                logLine(std::string("video.renegotiated codec=") + vc->codec +
+                                        " bitrate_mbps=" + std::to_string(vc->bitrateMbps) +
+                                        " restarted=" + (vc->streamRestarted ? "yes" : "no") +
+                                        " host_audio=" + (vc->hostSupportsAudio ? "yes" : "no") +
                                         " keepalive=" + (mrm1Plan.keepAlive ? "on" : "off") +
-                                        " audio=" + (audio ? "on" : "off"));
+                                        " audio=" + (audio ? "on" : "off") +
+                                        " reconnects=" + std::to_string(rs.reconnects));
                             } else {
-                                readOnly.negotiateFailed(nowMs);
-                                logLine("video.negotiate_late_failed tries=" + std::to_string(readOnly.negotiateFailures()));
+                                logLine(std::string("video.renegotiate_refused negotiated=") + (vc->negotiated ? "yes" : "no") +
+                                        " codec=" + vc->codec + " running=" + effectiveCodec + " audio=unchanged");
                             }
                         }
                     }

@@ -487,6 +487,15 @@ final class ControlServer: @unchecked Sendable {
                 }
                 return
             }
+            // r5 (Pepper's r4 review, item 2): OK only now, with the session in
+            // the broker. Before r5 OK went first, and a clipboard or file
+            // AUTH naming the new id in that gap was refused as REPLACED.
+            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) {
+                // The viewer never learned this session id: undo it.
+                sessionBroker.end(token, abandoned: true)
+                kick.finish()
+                return
+            }
             defer {
                 sessionBroker.end(token)
                 kick.finish()
@@ -509,6 +518,7 @@ final class ControlServer: @unchecked Sendable {
                 }
             }
         } else {
+            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) { return }
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
         }
     }
@@ -1325,7 +1335,8 @@ final class ControlServer: @unchecked Sendable {
         var matched: ConnAuth.Channel?
         let settlement = gate.guardian.settle(ip) {
             matched = ConnAuth.matchChannel(mac: response.mac, key: secret.key, hostNonce: hostNonce,
-                                            clientNonce: response.clientNonce, hostID: secret.hostID)
+                                            clientNonce: response.clientNonce, hostID: secret.hostID,
+                                            resume: response.resume)
             return matched != nil
         }
         guard settlement == .ok, let channel = matched else {
@@ -1343,13 +1354,22 @@ final class ControlServer: @unchecked Sendable {
         }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
         let macH = ConnAuth.macHost(key: secret.key, hostNonce: hostNonce, clientNonce: response.clientNonce, channel: channel)
-        // r10: OK is the first frame of an admitted session: it asks too.
-        guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
-                          payload: ConnAuth.Result.ok(macH: macH, sessionID: sessionID).payload) == .sent else { return nil }
-        print("auth.ok peer=\(ip) chan=\(channel.name) session=\(ConnAuth.hex(sessionID))")
         let sessionKey = ConnAuth.sessionKey(key: secret.key, hostNonce: hostNonce,
                                              clientNonce: response.clientNonce, sessionID: sessionID)
-        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID, resume: response.resume)
+        // r5 (Pepper's r4 review, item 2): OK is not sent here. The caller
+        // sends it (`sendAuthOK`) once the session broker has taken this
+        // session, so a viewer never holds a session id the host does not
+        // know yet (its next channel's AUTH would name it and be refused).
+        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID, resume: response.resume, macH: macH)
+    }
+
+    /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
+    /// the first frame of an admitted session: it asks too.
+    private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
+        guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
+                          payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload) == .sent else { return false }
+        print("auth.ok peer=\(ip) chan=\(ok.channel.name) session=\(ConnAuth.hex(ok.sessionID))")
+        return true
     }
 
     /// r4: answers a refused reconnect (`.replaced`, the same status as the
@@ -1373,6 +1393,8 @@ final class ControlServer: @unchecked Sendable {
         /// r4: the session_id sent in OK, and the one a reconnect named.
         var sessionID: [UInt8]
         var resume: [UInt8]?
+        /// r5: mac_h for the OK that `sendAuthOK` sends.
+        var macH: [UInt8]
     }
 
     /// No challenge, or a challenge whose answer came after a wait or the

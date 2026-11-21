@@ -117,6 +117,9 @@ final class SessionBroker: @unchecked Sendable {
         /// r4: the AUTH_RESULT session_id of this connection (password mode).
         var authSession: [UInt8]?
         var close: @Sendable () -> Void
+        /// r5: what `accepted` was before this control connection set it, so
+        /// an admit whose AUTH_OK never reached the viewer can be undone.
+        var acceptedBefore: [[UInt8]]? = nil
     }
 
     let passwordMode: Bool
@@ -134,6 +137,14 @@ final class SessionBroker: @unchecked Sendable {
     private let log: (String) -> Void
     private var replacedCount: UInt64 = 0
     private var resumeRefusedCount: UInt64 = 0
+    /// r5 (Pepper's r4 review, item 1): the control sessions a reconnect may
+    /// name. Set by every admitted control AUTH and kept after its connection
+    /// closes, so a replaced viewer stays replaced when the viewer that took
+    /// over has gone too: only a new attempt (no resume id) starts over.
+    /// Holds the newest session, plus the one before it when the newest
+    /// named it (the same viewer reconnecting; another of its channels may
+    /// still name the older id). Empty: no control AUTH since this start.
+    private var accepted: [[UInt8]] = []
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
@@ -168,10 +179,12 @@ final class SessionBroker: @unchecked Sendable {
 
     /// r4 (Pepper's r3 review, item 1): a viewer reconnecting on its own
     /// names the control session it had (`resume`, the session_id of its
-    /// last control AUTH). While another control session is live, that
-    /// viewer was replaced, whether or not it heard the notice: refused.
-    /// No live control session, or its own: allowed (the new AUTH then
-    /// takes over as before).
+    /// last control AUTH). r5 (Pepper's r4 review, item 1): refused unless it
+    /// names the newest control session (or the one that session replaced on
+    /// the same viewer's own reconnect), whether or not the viewer holding the
+    /// newest session is still connected. A replaced viewer, notice or not,
+    /// stays replaced until the user starts a new attempt. No control AUTH
+    /// since this start: allowed.
     func resumeRefused(_ resume: [UInt8]?) -> Bool {
         guard passwordMode, let resume else { return false }
         lock.lock(); defer { lock.unlock() }
@@ -179,7 +192,7 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        entries.contains { $0.channel == .control && $0.authSession != nil && $0.authSession != resume }
+        !accepted.isEmpty && !accepted.contains(resume)
     }
 
     /// One admitted connection. Password mode: only the control channel,
@@ -213,8 +226,16 @@ final class SessionBroker: @unchecked Sendable {
             kicked = entries.filter { $0.channel == .control || $0.peerIP != peerIP }
             entries.removeAll { e in kicked.contains { $0.token == e.token } }
         }
-        entries.append(Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
-                             authSession: authSession, close: close))
+        var entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
+                          authSession: authSession, close: close)
+        if passwordMode && channel == .control, let authSession {
+            // r5: the newest session; the one before it stays valid only for
+            // the same viewer's own reconnect (which named it).
+            entry.acceptedBefore = accepted
+            let chained = resume != nil && accepted.first == resume
+            accepted = chained ? [authSession, resume!] : [authSession]
+        }
+        entries.append(entry)
         replacedCount &+= UInt64(kicked.count)
         let change = recomputeLocked()
         lock.unlock()
@@ -230,9 +251,16 @@ final class SessionBroker: @unchecked Sendable {
         return token
     }
 
-    func end(_ token: UInt64) {
+    /// `abandoned` (r5): the viewer never got this connection's AUTH_OK, so it
+    /// does not know the session id: the ids a reconnect may name go back to
+    /// what they were, unless a newer control AUTH has set them since.
+    func end(_ token: UInt64, abandoned: Bool = false) {
         orderLock.lock()
         lock.lock()
+        if abandoned, let e = entries.first(where: { $0.token == token }), let before = e.acceptedBefore,
+           let id = e.authSession, accepted.first == id {
+            accepted = before
+        }
         entries.removeAll { $0.token == token }
         let change = recomputeLocked()
         lock.unlock()

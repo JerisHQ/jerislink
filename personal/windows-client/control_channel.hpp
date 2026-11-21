@@ -12,9 +12,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 struct VideoConfigResult {
@@ -71,6 +73,7 @@ public:
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::lock_guard<std::mutex> g(a->m);
         a->connecting = false;  // a cut-short attempt is over: nothing connects any more
+        closeSocket(a->noticeSock);  // r5: handed over for the notice, not read (stopping)
         if (!a->stats.joined) {
             a->stats.joined = true;
             a->stats.joinMs = ms;
@@ -125,6 +128,9 @@ public:
         uint64_t positionsSkipped = 0;  // r7: click positions left out with a button up not sent again
         uint64_t cancelledInFlight = 0;  // r8: downs taken by the worker, not sent yet, whose up was dropped
         uint64_t owedBeforeInput = 0;    // r9: owed releases sent ahead of an item the worker had taken, before it went out
+        uint64_t noticeReads = 0;        // r5: failed live connections handed to the worker for the notice
+        uint64_t renegotiations = 0;     // r5: background VIDEO_CONFIG exchanges that got an ACK
+        uint64_t renegotiateFailures = 0;  // r5: those without one (connection closed, tried again)
         bool pausedNow = false;    // r6: paused right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
@@ -178,14 +184,11 @@ public:
             return n;
         }
         // r3 (item 1): same as sendQueued: a notice still arriving is read
-        // before the close, so no reconnect takes the session back.
-        const bool replaced = readNoticeBeforeClose(live);
-        if (replaced) {
-            if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
-        }
+        // before the close, so no reconnect takes the session back. r5: by
+        // the worker (handOverForNoticeLocked), not here on the UI thread.
         g.lock();
         restoreOwedLocked(*a, owed);
-        if (a->s == live) closeSocket(a->s);  // the next event reconnects and sends them first
+        handOverForNoticeLocked(*a, live);  // the next event reconnects and sends them first
         return n;
     }
 
@@ -357,17 +360,13 @@ public:
         }
     }
 
-    VideoConfigResult negotiateVideo(
-        const std::string& requestedCodec,
-        bool clientH264,
-        bool clientHevc,
-        uint16_t requestedBitrateMbps,
-        bool clientAudio = false) {
-        VideoConfigResult result;
+    // The MRC1 0x40 VIDEO_CONFIG payload; empty for an unknown codec.
+    static std::vector<uint8_t> videoConfigPayload(const std::string& requestedCodec, bool clientH264, bool clientHevc,
+                                                   uint16_t requestedBitrateMbps, bool clientAudio) {
         uint8_t codec = 0;
         if (requestedCodec == "h264") codec = 1;
         else if (requestedCodec == "hevc") codec = 2;
-        else if (requestedCodec != "auto") return result;
+        else if (requestedCodec != "auto") return {};
 
         uint8_t caps = 0;
         if (clientH264) caps |= 0x01;
@@ -375,50 +374,49 @@ public:
         // 0x04: this viewer wants audio. Informational for the host log; the
         // audio itself starts with MRM1 0x45 on the video process.
         if (clientAudio) caps |= 0x04;
-        std::vector<uint8_t> payload{
-            1,
-            codec,
-            caps,
-            0,
-            uint8_t(requestedBitrateMbps >> 8),
-            uint8_t(requestedBitrateMbps)
-        };
+        return {1, codec, caps, 0, uint8_t(requestedBitrateMbps >> 8), uint8_t(requestedBitrateMbps)};
+    }
 
-        if (!sendPacket(0x40, payload)) {
-            close();
-            return result;
-        }
+    // One VIDEO_CONFIG exchange on a blocking socket: sends the request,
+    // reads the ACK and fills `result`. Ok: an ACK came (result.negotiated
+    // false when the Mac refused the config; the connection is still good).
+    // Failed: no ACK (the caller closes the socket). Replaced (PR-C r5): the
+    // Mac sent the "replaced" notice in place of the ACK. Shared by the
+    // start-up negotiation (UI thread) and the background renegotiation
+    // after each reconnect (worker, r5).
+    enum class VideoExchange { Ok, Failed, Replaced };
+    static VideoExchange exchangeVideoConfig(SOCKET s, DWORD ioTimeoutMs, const std::vector<uint8_t>& payload,
+                                             bool clientHevc, VideoConfigResult& result) {
+        const uint16_t n = static_cast<uint16_t>(payload.size());
+        std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, 0x40, uint8_t(n >> 8), uint8_t(n)};
+        b.insert(b.end(), payload.begin(), payload.end());
+        if (!sendAllOn(s, b)) return VideoExchange::Failed;
 
         // Applying a new video configuration can synchronously stop the old
         // Host before ACK so the client never feeds old-codec packets into a
         // newly selected decoder. Allow more time than the low-latency input
         // path's normal 100 ms receive timeout for this one control exchange.
-        const DWORD previousTimeoutMs = ioTimeoutMs_;
-        DWORD configTimeoutMs = std::max<DWORD>(1500, previousTimeoutMs);
-        setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&configTimeoutMs),
+        DWORD configTimeoutMs = std::max<DWORD>(1500, ioTimeoutMs);
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&configTimeoutMs),
                    sizeof(configTimeoutMs));
-
         uint8_t h[8]{};
-        if (!recvExact(h, sizeof(h))) {
-            close();
-            return result;
-        }
+        if (!recvExactOn(s, h, sizeof(h))) return VideoExchange::Failed;
         uint16_t len = uint16_t((uint16_t(h[6]) << 8) | h[7]);
         std::vector<uint8_t> reply(len);
-        if (len && !recvExact(reply.data(), len)) {
-            close();
-            return result;
-        }
-        DWORD normalTimeoutMs = previousTimeoutMs;
-        setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&normalTimeoutMs),
+        if (len && !recvExactOn(s, reply.data(), len)) return VideoExchange::Failed;
+        DWORD normalTimeoutMs = ioTimeoutMs;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
                    sizeof(normalTimeoutMs));
+        if (len == 1) {
+            uint8_t frame[kHostNoticeBytes]{};
+            std::copy(h, h + 8, frame);
+            frame[8] = reply[0];
+            if (isReplacedNotice(frame, kHostNoticeBytes)) return VideoExchange::Replaced;
+        }
         if (!(h[0]=='M' && h[1]=='R' && h[2]=='C' && h[3]=='1' &&
               h[4]==1 && h[5]==0x41 &&
               (reply.size()==6 || reply.size()==10) && reply[0]==1)) {
-            close();
-            return result;
+            return VideoExchange::Failed;
         }
 
         const uint8_t status = reply[1];
@@ -427,7 +425,7 @@ public:
         const uint16_t bitrate = uint16_t((uint16_t(reply[4]) << 8) | reply[5]);
         if (status != 0 || (selected != 1 && selected != 2) ||
             (selected == 2 && !clientHevc)) {
-            return result;
+            return VideoExchange::Ok;
         }
 
         result.negotiated = true;
@@ -443,42 +441,57 @@ public:
             result.remoteWidth = uint16_t((uint16_t(reply[6]) << 8) | reply[7]);
             result.remoteHeight = uint16_t((uint16_t(reply[8]) << 8) | reply[9]);
         }
+        return VideoExchange::Ok;
+    }
+
+    VideoConfigResult negotiateVideo(
+        const std::string& requestedCodec,
+        bool clientH264,
+        bool clientHevc,
+        uint16_t requestedBitrateMbps,
+        bool clientAudio = false) {
+        VideoConfigResult result;
+        const auto payload = videoConfigPayload(requestedCodec, clientH264, clientHevc, requestedBitrateMbps, clientAudio);
+        if (payload.empty()) return result;
+        if (!ensureConnected()) return result;
+        const VideoExchange x = exchangeVideoConfig(s_, ioTimeoutMs_, payload, clientHevc, result);
+        if (x == VideoExchange::Replaced) {
+            if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
+        }
+        if (x != VideoExchange::Ok) close();
         return result;
     }
 
-    // PR-C r4 (Pepper's r3 review, item 2): negotiateVideo once the session
-    // runs, on the connection a background reconnect made (a read-only view
-    // whose start-up negotiation failed, read_only_session.hpp). UI thread
-    // only, like the other sends on the live socket; nothing when no live
-    // connection is there or a reconnect runs. The worker never touches the
-    // live socket while no reconnect runs, so the exchange borrows it and
-    // hands it back (closed when the exchange failed: the next keepSession
-    // reconnects, and a "replaced" notice in place of the ACK is caught by
-    // that reconnect's AUTH, which names the old session).
-    VideoConfigResult negotiateVideoOnLive(const std::string& requestedCodec, bool clientH264, bool clientHevc,
-                                           uint16_t requestedBitrateMbps, bool clientAudio) {
-        std::shared_ptr<Async> a = async_;
-        if (!a) return negotiateVideo(requestedCodec, clientH264, clientHevc, requestedBitrateMbps, clientAudio);
-        {
-            std::lock_guard<std::mutex> g(a->m);
-            if (a->stopping || a->connecting || a->s == INVALID_SOCKET) return {};
-            s_ = std::exchange(a->s, INVALID_SOCKET);
-        }
-        // The synchronous path (s_, close(), recvExact) for this one exchange.
-        async_.reset();
-        VideoConfigResult r = negotiateVideo(requestedCodec, clientH264, clientHevc, requestedBitrateMbps, clientAudio);
-        async_ = a;
-        std::lock_guard<std::mutex> g(a->m);
-        const bool lost = s_ == INVALID_SOCKET;  // negotiateVideo closed it (no ACK)
-        if (a->stopping) {
-            closeSocket(s_);
-        } else {
-            a->s = std::exchange(s_, INVALID_SOCKET);  // also when the Mac only refused the config
-        }
-        if (lost) {
-            a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
-        }
-        return r;
+    // PR-C r5 (Pepper's r4 review, item 3): a read-only view (--no-control)
+    // renegotiates the video configuration on every new control session,
+    // not only the first. The worker runs the exchange on each connection a
+    // background reconnect made, right after AUTH and before the connection
+    // goes live, so the UI thread never waits for the ACK. The request names
+    // what the session already runs (codec, bitrate), so the Mac does not
+    // restart the stream; the ACK says again what the Mac offers now (audio,
+    // 0x80). takeRenegotiated() hands the newest answer to the UI thread.
+    // An exchange without an ACK closes that connection and the next
+    // keepSession tries again (renegotiating again); a "replaced" notice in
+    // place of the ACK halts the attempt.
+    void setRenegotiateOnReconnect(const std::string& codec, bool clientH264, bool clientHevc,
+                                   uint16_t bitrateMbps, bool clientAudio) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->renegotiate = videoConfigPayload(codec, clientH264, clientHevc, bitrateMbps, clientAudio);
+        async_->renegotiateHevc = clientHevc;
+    }
+    // UI thread: the answer of the latest background renegotiation, once.
+    std::optional<VideoConfigResult> takeRenegotiated() {
+        if (!async_) return std::nullopt;
+        std::lock_guard<std::mutex> g(async_->m);
+        return std::exchange(async_->renegotiated, std::nullopt);
+    }
+    // Tests (r5): runs on the worker before each renegotiation exchange,
+    // without the lock.
+    void setBeforeRenegotiateForTest(std::function<void()> fn) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->beforeRenegotiate = std::move(fn);
     }
 
     // The AUTH channel this connection proves (design §5). Control by
@@ -550,7 +563,8 @@ public:
     // once. The Mac sends the notice, then FIN, and keeps the socket open
     // about a second (no RST), so the rest is normally already here.
     static constexpr int kNoticeWaitMs = 250;
-    static bool readNoticeBeforeClose(SOCKET s) {
+    // r5: run by the worker; `cancel` (stop()) ends the wait.
+    static bool readNoticeBeforeClose(SOCKET s, const std::atomic<bool>* cancel = nullptr) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kNoticeWaitMs);
         uint8_t b[kHostNoticeBytes]{};
         for (;;) {
@@ -566,6 +580,7 @@ public:
             }
             if (!isNoticePrefix(b, n)) return false;
             if (std::chrono::steady_clock::now() >= deadline) return false;
+            if (cancel && cancel->load()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
@@ -727,6 +742,17 @@ private:
         bool inflightCancelled = false;
         bool paused = false;  // r6: retries ran out; waits for a fresh key press
         bool resume = false;  // r6: a fresh key press ended the pause
+        // r5 (Pepper's r4 review, item 1): a live connection whose send
+        // failed on the UI thread. The worker reads a "replaced" notice still
+        // arriving on it (up to kNoticeWaitMs) and closes it, before it starts
+        // any reconnect, so the UI thread never waits for it.
+        SOCKET noticeSock = INVALID_SOCKET;
+        // r5 (item 3): the VIDEO_CONFIG request run on each new connection
+        // (empty: none), and the newest answer for the UI thread.
+        std::vector<uint8_t> renegotiate;
+        bool renegotiateHevc = false;
+        std::optional<VideoConfigResult> renegotiated;
+        std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
 
@@ -907,6 +933,15 @@ private:
         size_t off = 0;
         while (off < b.size()) {
             int r = send(s, reinterpret_cast<const char*>(b.data() + off), static_cast<int>(b.size() - off), 0);
+            if (r <= 0) return false;
+            off += static_cast<size_t>(r);
+        }
+        return true;
+    }
+    static bool recvExactOn(SOCKET s, uint8_t* p, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            int r = recv(s, reinterpret_cast<char*>(p + off), static_cast<int>(n - off), 0);
             if (r <= 0) return false;
             off += static_cast<size_t>(r);
         }
@@ -1099,8 +1134,24 @@ private:
         jl::auth::NoChallengeRetry noChallenge(ch);
         std::unique_lock<std::mutex> lk(a->m);
         for (;;) {
-            a->cv.wait(lk, [&] { return a->stopping || a->wake; });
+            a->cv.wait(lk, [&] { return a->stopping || a->wake || a->noticeSock != INVALID_SOCKET; });
             if (a->stopping) break;
+            if (a->noticeSock != INVALID_SOCKET) {
+                // r5 (item 1): a live connection whose send failed. Its
+                // "replaced" notice, when one is arriving, is read before
+                // any reconnect: seen, the attempt halts and the reconnect
+                // below finds mayConnect() false.
+                SOCKET ns = std::exchange(a->noticeSock, INVALID_SOCKET);
+                lk.unlock();
+                const bool replaced = readNoticeBeforeClose(ns, &a->cancel);
+                closeSocket(ns);
+                if (replaced) {
+                    if (auto c = jl::auth::current()) c->hostReplaced(ch);
+                }
+                lk.lock();
+                if (a->stopping) break;
+                if (!a->wake) continue;
+            }
             a->wake = false;
             if (a->resume) {
                 // r6: a fresh key press after a pause: a new retry budget.
@@ -1140,6 +1191,37 @@ private:
                 continue;
             }
             noChallenge.reset();
+            if (!a->renegotiate.empty()) {
+                // r5 (Pepper's r4 review, item 3): a new control session:
+                // the video configuration is negotiated again, here and not
+                // on the UI thread. pending again, so stop() cuts it short.
+                const std::vector<uint8_t> req = a->renegotiate;
+                const bool hevc = a->renegotiateHevc;
+                const std::function<void()> hook = a->beforeRenegotiate;
+                a->pending = s;
+                lk.unlock();
+                if (hook) hook();
+                VideoConfigResult vc;
+                const VideoExchange x = exchangeVideoConfig(s, timeout, req, hevc, vc);
+                if (x == VideoExchange::Replaced) {
+                    if (auto c = jl::auth::current()) c->hostReplaced(ch);
+                }
+                lk.lock();
+                a->pending = INVALID_SOCKET;
+                if (a->stopping) { closeSocket(s); break; }
+                if (x != VideoExchange::Ok) {
+                    // No ACK: this connection is not used. The next
+                    // keepSession (or input) reconnects and asks again.
+                    closeSocket(s);
+                    ++a->stats.renegotiateFailures;
+                    a->connecting = false;
+                    a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                    if (!jl::auth::mayConnect()) dropQueueLocked(*a);
+                    continue;
+                }
+                ++a->stats.renegotiations;
+                a->renegotiated = vc;
+            }
             bool alive = setNonBlocking(s, true);
             // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
             // out, (2) sends the releases owed (including those that aging
@@ -1195,6 +1277,19 @@ private:
         }
     }
 
+    // r5 (Pepper's r4 review, item 1): UI thread, lock held. A send on the
+    // live socket failed: the socket stops being live and goes to the
+    // worker, which reads a "replaced" notice still arriving on it and
+    // closes it before any reconnect (workerLoop). Nothing waits here.
+    static void handOverForNoticeLocked(Async& a, SOCKET live) {
+        if (a.s != live || live == INVALID_SOCKET) return;
+        closeSocket(a.noticeSock);  // not taken yet: only the newest matters
+        a.noticeSock = live;
+        a.s = INVALID_SOCKET;
+        ++a.stats.noticeReads;
+        a.cv.notify_all();
+    }
+
     // UI thread. Sends at once when connected and nothing waits ahead of
     // it; otherwise queues the event and asks the worker for a reconnect.
     // Never waits for TCP connect or AUTH, and never sends under the lock.
@@ -1233,18 +1328,17 @@ private:
             }
             // r3 (Pepper's r2 review, item 1): read a "replaced" notice that
             // is still arriving before closing, or the next input would AUTH
-            // and take the session back. Seen: mayConnect() is false below
-            // and the queue is dropped.
-            if (readNoticeBeforeClose(live)) {
-                if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
-            }
+            // and take the session back. r5 (Pepper's r4 review, item 1): the
+            // worker reads it (up to kNoticeWaitMs) before the reconnect this
+            // input asks for below, so the UI thread does not wait. Seen: the
+            // reconnect finds mayConnect() false and drops the queue.
             std::lock_guard<std::mutex> g(a->m);
             restoreOwedLocked(*a, owed);
             // r6 (win01 hand test): the send failed (the Mac had already
             // reset the connection), so the Mac did not get these downs:
             // undo the note. The item waits for the reconnect below.
             restoreHeldLocked(*a, held);
-            if (a->s == live) closeSocket(a->s);
+            handOverForNoticeLocked(*a, live);
         }
         std::lock_guard<std::mutex> g(a->m);
         if (a->stopping) return false;

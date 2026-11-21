@@ -170,6 +170,28 @@ void vectorTests(const char* path) {
 }
 
 void wireTests() {
+    // PR-C r5 (Pepper's r4 review, item 2): the resume id is under mac_c.
+    // Fixed inputs; the same hex is checked by the Mac self-test (AuthSelfTest
+    // crypto, "prc r5 vector") and was computed independently (Perl
+    // Digest::SHA hmac_sha256 over "jl-c"|hn|cn|1|hid[|resume]).
+    {
+        Key k{};
+        k.fill(0x11);
+        std::array<uint8_t, kNonceBytes> hn{}, cn{};
+        hn.fill(0x22);
+        cn.fill(0x33);
+        std::array<uint8_t, kHostIdBytes> hid{};
+        hid.fill(0x44);
+        const uint8_t resume[kSessionIdBytes] = {1, 2, 3, 4, 5, 6, 7, 8};
+        const auto plain = macClient(k, hn.data(), cn.data(), Channel::Control, hid.data());
+        const auto signedResume = macClient(k, hn.data(), cn.data(), Channel::Control, hid.data(), resume);
+        expect(plain && hex(plain->data(), plain->size()) == "f80179160e285469a687e3e15aa31a4b9d4c1839d172211f97629a2194cb93bc",
+               "prc r5 vector: mac_c without a resume id (unchanged)");
+        expect(signedResume && hex(signedResume->data(), signedResume->size()) ==
+                                   "d683830f256aebbd4193876e4db47cce29fc0c36e54da8f81c0510136e1a43d5",
+               "prc r5 vector: mac_c covers the resume id");
+    }
+
     expect(!Challenge::decode(Bytes(68)).has_value(), "challenge of 68 bytes rejected");
     expect(!Result::decode(Bytes{1}).has_value(), "fail without tries rejected");
     auto r = Result::decode(Bytes{2, 0, 0, 1, 44});
@@ -250,7 +272,8 @@ void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expec
     Bytes p;
     if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return;
     seen.gotResponse = true;
-    auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data());
+    auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data(),
+                            p.size() == kResumeResponseBytes ? p.data() + kResponseBytes : nullptr);  // r5
     seen.macValid = constantTimeEqual(want.data(), p.data() + kNonceBytes, kMacBytes);
     {
         bool zero = true;
