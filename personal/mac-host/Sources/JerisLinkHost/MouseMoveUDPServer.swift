@@ -192,6 +192,15 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var cursorSequence: UInt32 = 0
     private var cursorProbePending = false
     private var lastCursorProbeNs: UInt64 = 0
+    /// PR-C: the session link's view of the viewer (nil: the fixed
+    /// allowedClientIP, as 0.3). With it, only the session peer is heard,
+    /// and in password mode only datagrams with a valid v2h tag; replies
+    /// are sealed with the h2v tagger. No session: everything is dropped.
+    private let udpSession: UDPSessionState?
+    /// Receive loop only.
+    private var lastGeneration: UInt64?
+    let badTags = BadTagLog(entry: "mrm1")
+    private(set) var noSession: UInt64 = 0
 
     private static let cursorProbeIntervalNs: UInt64 = 16_000_000
     private static let cursorSettleDelayNs: UInt64 = 8_000_000
@@ -253,7 +262,9 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     init(bindIP: String, allowedClientIP: String?, port: UInt16, presence: ViewerPresence? = nil,
          relayPort: UInt16 = 38411,
          inputAllowed: @escaping @Sendable () -> Bool = { true },
-         outputAllowed: @escaping @Sendable () -> Bool = { true }) {
+         outputAllowed: @escaping @Sendable () -> Bool = { true },
+         udpSession: UDPSessionState? = nil) {
+        self.udpSession = udpSession
         self.relayPort = relayPort
         self.controlRelay = LocalControlMouseClient(port: relayPort)
         self.presence = presence
@@ -309,7 +320,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lastCursorProbeNs = 0
         lock.unlock()
 
-        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(allowedClientIP ?? "any"), relay=\(inputEnabled ? "127.0.0.1:\(relayPort)" : "off (password mode)"), cursor_state=move-triggered")
+        print("MouseMove UDP: \(bindIP):\(port), allowedClient=\(udpSession != nil ? "session" : allowedClientIP ?? "any"), relay=\(inputEnabled ? "127.0.0.1:\(relayPort)" : "off (password mode)"), cursor_state=move-triggered")
         queue.async { [weak self] in self?.receiveLoop() }
     }
 
@@ -370,7 +381,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected) audio_requests_rx=\(audioRequestRx)"
+        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_no_session=\(noSession) mouse_udp_bad_tag=\(badTags.total) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected) audio_requests_rx=\(audioRequestRx)"
     }
 
     /// Coalesce cursor-shape checks onto a separate queue. There is no periodic
@@ -447,17 +458,9 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             lock.lock(); lastCursorShape = nil; lock.unlock()
             return
         }
-        var destination = peer
-        let n = packet.withUnsafeBytes { raw -> Int in
-            guard let base = raw.baseAddress else { return -1 }
-            return withUnsafePointer(to: &destination) { p in
-                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    Darwin.sendto(s, base, packet.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
+        let n = reply(packet, to: peer, socket: s)
         lock.lock()
-        if n == packet.count {
+        if n {
             cursorUpdates &+= 1
         } else {
             cursorUpdateDrops &+= 1
@@ -466,8 +469,32 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Sends a reply datagram to `peer`, sealed when the session is
+    /// tagged. Nothing goes out when the session ended or moved to another
+    /// peer since the datagram that asked for it. True when it all went.
+    private func reply(_ packet: [UInt8], to peer: sockaddr_in, socket s: Int32) -> Bool {
+        var destination = peer
+        var tagger: UDPTagger?
+        if let udpSession {
+            guard let snap = udpSession.snapshot, snap.address.s_addr == peer.sin_addr.s_addr else { return false }
+            tagger = snap.send
+        }
+        return packet.withUnsafeBytes { raw -> Bool in
+            withUnsafePointer(to: &destination) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa -> Bool in
+                    let len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                    if let tagger {
+                        return tagger.withSealed(raw) { Darwin.sendto(s, $0.baseAddress!, $0.count, 0, sa, len) == $0.count }
+                    }
+                    return Darwin.sendto(s, raw.baseAddress!, raw.count, 0, sa, len) == raw.count
+                }
+            }
+        }
+    }
+
     private func receiveLoop() {
-        var buffer = [UInt8](repeating: 0, count: 256)
+        // 256 bytes of MRM1 plus a tag.
+        var buffer = [UInt8](repeating: 0, count: 256 + UDPTag.bytes)
         while true {
             lock.lock()
             let shouldStop = stopping
@@ -478,7 +505,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             var peer = sockaddr_in()
             var peerLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let capacity = buffer.count
-            let n = buffer.withUnsafeMutableBytes { raw -> Int in
+            let got = buffer.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
                 return withUnsafeMutablePointer(to: &peer) { p in
                     p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -486,15 +513,43 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                     }
                 }
             }
-            if n < 0 {
+            if got < 0 {
                 lock.lock(); let nowStopping = stopping; lock.unlock()
                 if nowStopping { return }
                 continue
             }
+            var n = got
             received &+= 1
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
-            if let allowedClientIP, peerIP != allowedClientIP {
+            var tagged = false
+            if let udpSession {
+                // PR-C: only the session peer, and nothing with no session.
+                guard let snap = udpSession.snapshot else { noSession &+= 1; continue }
+                guard snap.address.s_addr == peer.sin_addr.s_addr else { rejected &+= 1; continue }
+                if let rx = snap.receive {
+                    // Password mode: verify before anything else (no new
+                    // session, no presence, no reply for a forged datagram).
+                    let ok = buffer.withUnsafeBytes { rx.verify($0.baseAddress!, n) }
+                    guard ok else {
+                        let reason: String
+                        if n <= UDPTag.bytes + UDPTag.versionByte { reason = "short" }
+                        else if buffer[UDPTag.versionByte] & UDPTag.flag == 0 { reason = "no_tag" }
+                        else { reason = "bad_tag" }
+                        badTags.drop(peer: peerIP, reason: reason)
+                        continue
+                    }
+                    n -= UDPTag.bytes
+                    buffer[UDPTag.versionByte] &= ~UDPTag.flag
+                    tagged = true
+                }
+                // A new session (new AUTH, new key or another viewer):
+                // sequence starts over and the viewer gets a fresh IDR.
+                if lastGeneration != snap.session.generation {
+                    lastGeneration = snap.session.generation
+                    lastPeerPort = nil
+                }
+            } else if let allowedClientIP, peerIP != allowedClientIP {
                 rejected &+= 1
                 continue
             }
@@ -503,8 +558,18 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             // starts its packet sequence again at 1. Treat a source-port
             // change as a new mouse session so the new viewer is not mistaken
             // for stale/reordered traffic from the previous process.
+            // PR-C tagged: a new viewer process means a new AUTH, so the
+            // generation check above starts the session; a port change alone
+            // (NAT rebinding) only moves the reply address, and the sequence
+            // goes on, so a recorded datagram cannot be replayed from
+            // another port.
             let peerPort = UInt16(bigEndian: peer.sin_port)
-            if lastPeerPort != peerPort {
+            if tagged, lastPeerPort != nil, lastPeerPort != peerPort {
+                lastPeerPort = peerPort
+                lock.lock(); lastPeerAddress = peer; lock.unlock()
+                print("MouseMove UDP peer port moved peer=\(peerIP):\(peerPort) (same session)")
+                fflush(stdout)
+            } else if lastPeerPort != peerPort {
                 presenceNewSession = true
                 lastPeerPort = peerPort
                 lastSequence = nil
@@ -599,16 +664,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 guard outputAllowed() else { pongDrops &+= 1; continue }
                 var pong = Array(buffer[0..<18])
                 pong[5] = 0x44
-                var destination = peer
-                let sent = pong.withUnsafeBytes { raw -> Int in
-                    guard let base = raw.baseAddress else { return -1 }
-                    return withUnsafePointer(to: &destination) { p in
-                        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            Darwin.sendto(s, base, 18, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                        }
-                    }
-                }
-                if sent != 18 { pongDrops &+= 1 }
+                if !reply(pong, to: peer, socket: s) { pongDrops &+= 1 }
             case 0x45:
                 guard let req = Self.parseAudioRequest(buffer, length: n) else {
                     badPackets &+= 1

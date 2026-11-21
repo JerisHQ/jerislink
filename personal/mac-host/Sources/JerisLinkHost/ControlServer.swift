@@ -139,6 +139,13 @@ final class ControlServer: @unchecked Sendable {
     /// viewer's sessions on their next message; other viewers go on.
     private let admitPeerMessage: (@Sendable (String) -> Bool)?
     private(set) var authFailures: UInt64 = 0
+    /// PR-C: which viewer the UDP paths serve (the session link to the
+    /// video service). Every admitted connection registers here; in password
+    /// mode the control channel carries K_s and a new one replaces the old
+    /// session. nil: legacy listeners and the loopback relay.
+    private let sessionBroker: SessionBroker?
+    /// Zero-MAC probes answered without counting (item 5, PR-C).
+    private(set) var probesUncounted: UInt64 = 0
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
@@ -158,6 +165,7 @@ final class ControlServer: @unchecked Sendable {
          admitConnection: (@Sendable () -> Bool)? = nil,
          admitMessage: (@Sendable () -> Bool)? = nil,
          admitPeerMessage: (@Sendable (String) -> Bool)? = nil,
+         sessionBroker: SessionBroker? = nil,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
@@ -167,6 +175,7 @@ final class ControlServer: @unchecked Sendable {
         self.admitConnection = admitConnection
         self.admitMessage = admitMessage
         self.admitPeerMessage = admitPeerMessage
+        self.sessionBroker = sessionBroker
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -423,6 +432,7 @@ final class ControlServer: @unchecked Sendable {
         // checks run. `authChannel` is the channel the viewer authenticated
         // for; the connection is held to it.
         var authChannel: ConnAuth.Channel?
+        var udpSessionKey: [UInt8]?
         if let authGate {
             // The policy this gate holds was replaced (ControlService.PolicyWatch):
             // nothing more is admitted under it.
@@ -431,13 +441,34 @@ final class ControlServer: @unchecked Sendable {
                 return
             }
             if authGate.requiresPassword {
-                guard pending == nil, let channel = authenticate(fd, peer: peer, gate: authGate) else { return }
-                authChannel = channel
+                guard pending == nil, let ok = authenticate(fd, peer: peer, gate: authGate) else { return }
+                authChannel = ok.channel
+                udpSessionKey = ok.channel == .control ? ok.sessionKey : nil
             } else {
                 guard admitWithoutPassword(fd, peer: peer, gate: authGate) else { return }
             }
         }
         let authenticated = authChannel != nil
+        // The gate let this connection in: a password-authenticated viewer,
+        // or in transition mode a whitelisted address seen on the real
+        // socket (the direct listener reads no PROXY header). Either is a
+        // configured viewer for VIDEO_CONFIG_SET and the sensitive messages,
+        // now that the whitelist replaces clientIP.
+        let gateAdmitted = authenticated || (authGate != nil && !acceptProxy && peer.verified)
+        if let sessionBroker, authGate != nil {
+            let token = sessionBroker.begin(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
+                                            close: { Darwin.shutdown(fd, SHUT_RDWR) })
+            defer { sessionBroker.end(token) }
+            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
+        } else {
+            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
+        }
+    }
+
+    /// The message loop of one admitted connection.
+    private func serveAdmitted(_ fd: Int32, peer: ControlPeer, pending: [UInt8]?,
+                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool) {
+        let authenticated = gateAdmitted
         // A connection is an input session only once it sends its first key
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
         // are. One bool test per message, one helper message per session edge.
@@ -1165,7 +1196,13 @@ final class ControlServer: @unchecked Sendable {
     /// answer is settled by `AuthGuard.settle`, which checks the waits again
     /// under the same lock, so a challenge sent before a wait or a blacklist
     /// entry cannot get OK afterwards. Never logs nonces, K or MACs.
-    private func authenticate(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> ConnAuth.Channel? {
+    ///
+    /// PR-C: an all-zero MAC is a v0.4 viewer's transition probe that
+    /// crossed a late CHALLENGE (conn_auth.hpp afterProbeRace), not a
+    /// password: it is answered FAIL with the tries left as they are, after
+    /// the same admission check, and never counted. A real MAC is all zero
+    /// with probability 2^-256.
+    private func authenticate(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> AuthOK? {
         guard let secret = gate.secret else { return nil }
         let ip = peer.ip
         let admission = gate.guardian.admit(ip)
@@ -1216,6 +1253,17 @@ final class ControlServer: @unchecked Sendable {
             settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
             return nil
         }
+        if response.mac.allSatisfy({ $0 == 0 }) {
+            switch gate.guardian.probe(ip) {
+            case .refused(let admission):
+                refuse(fd, ip: ip, admission: admission, afterChallenge: true)
+            case .triesLeft(let tries):
+                lock.lock(); probesUncounted += 1; lock.unlock()
+                _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.fail(triesLeft: tries).payload)
+                print("auth.probe_race peer=\(ip) tries=\(tries) counted=0")
+            }
+            return nil
+        }
         var matched: ConnAuth.Channel?
         let settlement = gate.guardian.settle(ip) {
             matched = ConnAuth.matchChannel(mac: response.mac, key: secret.key, hostNonce: hostNonce,
@@ -1232,7 +1280,16 @@ final class ControlServer: @unchecked Sendable {
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
                           payload: ConnAuth.Result.ok(macH: macH, sessionID: sessionID).payload) == .sent else { return nil }
         print("auth.ok peer=\(ip) chan=\(channel.name) session=\(ConnAuth.hex(sessionID))")
-        return channel
+        let sessionKey = ConnAuth.sessionKey(key: secret.key, hostNonce: hostNonce,
+                                             clientNonce: response.clientNonce, sessionID: sessionID)
+        return AuthOK(channel: channel, sessionKey: sessionKey)
+    }
+
+    /// An authenticated connection: its channel and its UDP session key
+    /// (K_s, design §5.1; used for the control channel only).
+    struct AuthOK {
+        var channel: ConnAuth.Channel
+        var sessionKey: [UInt8]
     }
 
     /// No challenge, or a challenge whose answer came after a wait or the

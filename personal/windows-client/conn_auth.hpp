@@ -67,6 +67,8 @@
 #include <utility>
 #include <vector>
 
+#include "udp_tag.hpp"
+
 #ifdef _MSC_VER
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -236,6 +238,29 @@ inline std::optional<Mac> macHost(const Key& k, const uint8_t* hostNonce, const 
     Mac out;
     if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}}, out)) return std::nullopt;
     return out;
+}
+
+// K_s for the UDP tags (design §5.1), from the control channel's AUTH.
+inline std::optional<udptag::SessionKey> sessionKey(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce,
+                                                    const uint8_t* sessionId) {
+    const uint8_t label[6] = {'j', 'l', '-', 'u', 'd', 'p'};
+    Mac out;
+    if (!hmacSha256(k.data(), k.size(), {{label, 6}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {sessionId, kSessionIdBytes}}, out)) return std::nullopt;
+    udptag::SessionKey ks{};
+    std::memcpy(ks.data(), out.data(), ks.size());
+    wipe(out.data(), out.size());
+    return ks;
+}
+
+// The first 8 bytes of HMAC(K_s, "v2h"/"h2v" | packet): the vectors' udp_tag.
+inline std::optional<std::array<uint8_t, udptag::kTagBytes>> udpTag(const udptag::SessionKey& ks, bool hostToViewer,
+                                                                    const uint8_t* p, size_t n) {
+    const uint8_t* dir = reinterpret_cast<const uint8_t*>(hostToViewer ? "h2v" : "v2h");
+    Mac out;
+    if (!hmacSha256(ks.data(), ks.size(), {{dir, 3}, {p, n}}, out)) return std::nullopt;
+    std::array<uint8_t, udptag::kTagBytes> t{};
+    std::memcpy(t.data(), out.data(), t.size());
+    return t;
 }
 
 inline bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
@@ -913,6 +938,11 @@ private:
                 // Only the answer to our probe on a host that sent no challenge.
                 if (!probed) { rep.outcome = Outcome::Network; return rep; }
                 setMode(Mode::Transition);
+                // No password: UDP stays untagged, as in 0.3.
+                if (ch == Channel::Control) {
+                    udptag::publishOpen();
+                    note("udp.session mode=open");
+                }
                 rep.outcome = Outcome::Open;
                 return rep;
             }
@@ -966,6 +996,15 @@ private:
                 return rep;
             }
             accept(*ch5, *key, fromStore);
+            if (ch == Channel::Control) {
+                // PR-C: this control session's K_s tags every UDP datagram
+                // from now on; the host switches to it at the same time.
+                auto ks = sessionKey(*key, ch5->hostNonce.data(), resp, res->sessionId.data());
+                const bool keyed = ks && udptag::publishKey(*ks);
+                if (ks) wipe(ks->data(), ks->size());
+                if (!keyed) udptag::publishPending();
+                note(std::string("udp.session mode=") + (keyed ? "keyed" : "pending reason=hmac_failed"));
+            }
             rep.outcome = Outcome::Ok;
             return rep;
         }
@@ -1158,6 +1197,9 @@ private:
             mode_ = m;
         }
         rememberMode(hostKey_, m);
+        // A host that wants a password: no untagged UDP is taken from now
+        // until the control channel brings K_s (a key already there stays).
+        if (m == Mode::Password && udptag::current()->mode == udptag::Mode::Open) udptag::publishPending();
     }
 
     void halt(const Report& r) {

@@ -513,6 +513,23 @@ final class AuthGuard: @unchecked Sendable {
         return .released
     }
 
+    enum ProbeAnswer: Equatable {
+        case triesLeft(UInt8)
+        case refused(Admission)
+    }
+
+    /// PR-C item 5: a zero-MAC transition probe that crossed a CHALLENGE.
+    /// The admission is checked again (a wait or block that started since
+    /// the challenge still wins), and the answer is the tries left now.
+    /// Nothing is recorded: the probe is not a password.
+    func probe(_ ip: String) -> ProbeAnswer {
+        lock.lock(); defer { lock.unlock() }
+        let admission = admitLocked(ip)
+        guard admission == .challenge else { return .refused(admission) }
+        let failures = peers[ip]?.failures ?? 0
+        return .triesLeft(UInt8(Self.failuresPerStage - failures % Self.failuresPerStage))
+    }
+
     func failures(_ ip: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         return peers[ip]?.failures ?? 0
@@ -783,8 +800,10 @@ struct AuthConfigSnapshot: Equatable, Sendable {
 /// First start of v0.4.0 (design §9): a listen.plist with `clientIP` gets
 /// `allowedIPs = [clientIP]`, `allowedIPsSource = clientIP` and
 /// `passwordSet = false`; the file as it was is kept as
-/// `listen.plist.pre-0.4`. `clientIP` itself stays: the UDP video and mouse
-/// paths still use it until PR-C. While `allowedIPsSource` is `clientIP`
+/// `listen.plist.pre-0.4`. `clientIP` itself stays (0.3 hosts reading the
+/// file still need it); since PR-C the UDP paths follow the session, not
+/// clientIP, and the host app's 連線設定 removes it with the source key
+/// when it saves a whitelist. While `allowedIPsSource` is `clientIP`
 /// the whitelist follows `clientIP`; whoever edits `allowedIPs` by hand or
 /// in the host app removes that key.
 enum ListenMigration {

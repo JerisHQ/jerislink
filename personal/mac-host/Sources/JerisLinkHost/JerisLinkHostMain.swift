@@ -1,5 +1,6 @@
 import Foundation
 import ApplicationServices
+import AppKit
 
 struct Options {
     var durationSeconds: Double = 10
@@ -39,6 +40,9 @@ struct Options {
     var relayPort: UInt16 = 38411
     var mouseUDPPort: UInt16?
     var controlClientIP: String?
+    /// PR-C (`--service video`): serve the viewer the control service
+    /// announces over the session link instead of the fixed clientIP.
+    var sessionLink = false
     var controlInject = false
     var controlOnly = false
     var controlServerEnabled = true
@@ -202,8 +206,23 @@ struct JerisLinkHostMain {
             let video = VideoDiagSelfTest.run()
             let files = FileProtocolSelfTest.run()
             let auth = AuthSelfTest.run()
+            let udpAuth = UDPAuthSelfTest.run()
+            let connSettings = ConnectionSettingsSelfTest.run()
             let bundle = JerisLinkBundle.selfTest()
-            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && auth == 0 && bundle == 0 ? 0 : 1)
+            exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && auth == 0 && udpAuth == 0 && connSettings == 0 && bundle == 0 ? 0 : 1)
+        }
+        // PR-C: what the UDP tags cost on this Mac at 4K60 (default 50, 80, 150 Mbps).
+        // PR-C: the 連線設定 window on its own (also a button in the launcher).
+        if rawArgs.count == 2, rawArgs[1] == "--connection-settings" {
+            await MainActor.run {
+                NSApplication.shared.setActivationPolicy(.accessory)
+                ConnectionSettingsWindow().runModal()
+            }
+            exit(0)
+        }
+        if rawArgs.count >= 2, rawArgs[1] == "--udp-tag-bench" {
+            let rates = rawArgs.dropFirst(2).compactMap { Int($0) }
+            exit(UDPAuthSelfTest.bench(mbps: rates.isEmpty ? [50, 80, 150] : rates))
         }
         // H.264 encode -> decode check on the hardware encoder at the capped
         // sizes. No screen capture, no network, no settings change.
@@ -373,24 +392,58 @@ struct JerisLinkHostMain {
                 // blacklist (listen.plist or the pending journal).
                 let journalHold = PendingJournalHold()
                 let legacy = LegacyAuthWatch()
+                // PR-C: with the session link the viewer is the control
+                // service's live session (peer IP and, in password mode, the
+                // UDP key), not clientIP. No session: nothing is sent and no
+                // datagram is taken. Tags are required while listen.plist
+                // does not say "no password" (unknown included).
+                var udpSession: UDPSessionState?
+                if o.sessionLink {
+                    let state = UDPSessionState(requireTags: ListenConfig.passwordState() != .off)
+                    udpSession = state
+                    sender?.setSession(state)
+                    SessionLinkClient(state: state).start()
+                }
                 // r9: nor does video, audio or a NACK resend go to a blocked
                 // viewer (or while the journal does not read): asked per frame.
                 if let sender {
                     let streamHold = PendingJournalHold(entry: "udp_stream")
-                    let streamViewer = clientIP
-                    sender.setStreamGate { streamHold.reason(for: streamViewer) == nil }
+                    if let udpSession {
+                        sender.setStreamGate { streamHold.reason(for: udpSession.session?.peerIP) == nil }
+                    } else {
+                        let streamViewer = clientIP
+                        sender.setStreamGate { streamHold.reason(for: streamViewer) == nil }
+                    }
                 }
                 if let mouseUDPPort = o.mouseUDPPort {
                     let viewer = ViewerPresence()
                     presence = viewer
-                    let udpViewer = o.controlClientIP ?? clientIP
-                    let server = MouseMoveUDPServer(bindIP: bindIP,
+                    let server: MouseMoveUDPServer
+                    if let udpSession {
+                        // Tagged input is authenticated (K_s from the control
+                        // AUTH), so a password does not close it; untagged
+                        // (transition) input still asks LegacyAuthWatch.
+                        server = MouseMoveUDPServer(bindIP: bindIP, allowedClientIP: nil,
+                                                    port: mouseUDPPort, presence: viewer,
+                                                    inputAllowed: {
+                                                        guard let s = udpSession.session else { return false }
+                                                        return (s.tagged || legacy.check()) && journalHold.reason(for: s.peerIP) == nil
+                                                    },
+                                                    outputAllowed: { journalHold.reason(for: udpSession.session?.peerIP) == nil },
+                                                    udpSession: udpSession)
+                        if !udpSession.requireTags {
+                            legacy.onClose { reason in server.revokeInput(reason: reason) }
+                        }
+                    } else {
+                        let udpViewer = o.controlClientIP ?? clientIP
+                        server = MouseMoveUDPServer(bindIP: bindIP,
                                                     allowedClientIP: udpViewer,
                                                     port: mouseUDPPort, presence: viewer,
                                                     inputAllowed: PendingJournalHold.udpInputAllowed(legacy: legacy, hold: journalHold,
                                                                                                      viewerIP: udpViewer),
                                                     outputAllowed: { journalHold.reason(for: udpViewer) == nil })
-                    legacy.onClose { reason in server.revokeInput(reason: reason) }
+                        legacy.onClose { reason in server.revokeInput(reason: reason) }
+                    }
                     try server.start()
                     mouseUDP = server
                 }

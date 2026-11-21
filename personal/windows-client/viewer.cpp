@@ -42,6 +42,7 @@
 #include "send_to_win.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
+#include "udp_tag.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -152,6 +153,17 @@ public:
         if (event_ != WSA_INVALID_EVENT) WSACloseEvent(event_);
     }
 
+    // PR-C: every MRM1 datagram goes out through here, sealed with the
+    // control session's K_s when the host has a password (udp_tag.hpp).
+    // Sends come from the window, receive and video threads.
+    int sendDatagram(const uint8_t* p, size_t n) {
+        std::lock_guard<std::mutex> g(txM_);
+        return tx_.send(p, n, [&](const uint8_t* b, int len) {
+            return sendto(s_, reinterpret_cast<const char*>(b), len, 0,
+                          reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        });
+    }
+
     // Signalled when an MRM1 datagram (pong, cursor shape) is waiting.
     HANDLE readEvent() const { return event_ == WSA_INVALID_EVENT ? nullptr : event_; }
 
@@ -163,8 +175,7 @@ public:
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
             uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)
         };
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++sent_; return true; }
         ++dropped_;
         return false;
@@ -186,8 +197,7 @@ public:
             'M','R','M','1', 1, 0x40,
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)
         };
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++keyframeRequestsSent_; return true; }
         ++keyframeRequestDrops_;
         return false;
@@ -197,8 +207,7 @@ public:
     bool sendNack(uint64_t fid, const std::vector<jl::NackRange>& ranges) {
         if (s_ == INVALID_SOCKET || ranges.empty()) return false;
         const auto p = jl::encodeNack(++sequence_, fid, ranges);
-        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p.data(), p.size());
         if (n == static_cast<int>(p.size())) { ++nackSent_; return true; }
         ++nackDrops_;
         return false;
@@ -213,8 +222,7 @@ public:
         uint8_t p[18]{'M','R','M','1', 1, 0x43,
                       uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)};
         for (int i = 0; i < 8; ++i) p[10 + i] = uint8_t(t >> (56 - 8 * i));
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++pingSent_; return true; }
         return false;
     }
@@ -230,8 +238,7 @@ public:
                       uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
                       uint8_t(enable ? (jl::audio::kRequestEnable | jl::audio::kRequestOpus) : 0x00),
                       uint8_t(port >> 8), uint8_t(port)};
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++audioRequestsSent_; return true; }
         ++audioRequestDrops_;
         return false;
@@ -244,8 +251,7 @@ public:
     bool sendReceiverReport(const jl::ReceiverReport& r) {
         if (s_ == INVALID_SOCKET) return false;
         const auto p = jl::encodeReceiverReport(++sequence_, r);
-        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p.data(), p.size());
         if (n == static_cast<int>(p.size())) { ++reportSent_; return true; }
         ++reportDrops_;
         return false;
@@ -278,6 +284,15 @@ public:
                 if (e == WSAEWOULDBLOCK) break;
                 ++cursorRxBad_;
                 break;
+            }
+            if (peer.sin_addr.s_addr == remote_.sin_addr.s_addr && peer.sin_port == remote_.sin_port) {
+                // PR-C: tag first; a datagram that fails it is never parsed.
+                const auto v = rx_.open(p, n);
+                if (v != jl::udptag::Verdict::Ok) {
+                    ++udpTagDrops_;
+                    dropLog_.note("mrm1", v, [](const std::string& m) { logLine(m); });
+                    continue;
+                }
             }
             if (peer.sin_addr.s_addr == remote_.sin_addr.s_addr &&
                 peer.sin_port == remote_.sin_port &&
@@ -326,8 +341,14 @@ public:
     uint64_t cursorRx() const { return cursorRx_; }
     uint64_t cursorRxBad() const { return cursorRxBad_; }
     uint64_t cursorRxStale() const { return cursorRxStale_; }
+    uint64_t udpTagDrops() const { return udpTagDrops_; }
 
 private:
+    std::mutex txM_;
+    jl::udptag::View tx_;  // under txM_
+    jl::udptag::View rx_;  // receive loop thread only
+    jl::udptag::DropLog dropLog_;
+    uint64_t udpTagDrops_ = 0;
     SOCKET s_ = INVALID_SOCKET;
     WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
@@ -5340,6 +5361,10 @@ static jl::auth::Report authPreflight(const Options& o, std::wstring password, b
     auto client = std::make_shared<jl::auth::Client>(std::move(co));
     jl::auth::wipe(password);
     jl::auth::setCurrent(client);
+    // PR-C: UDP tags follow this attempt. A host known to want a password
+    // takes no untagged UDP until the control channel brings K_s.
+    if (client->mode() == jl::auth::HostMode::Password) jl::udptag::publishPending();
+    else jl::udptag::publishOpen();
     jl::auth::Report rep;
     rep.outcome = jl::auth::Outcome::Network;
     WSADATA wsa{};
@@ -6491,12 +6516,26 @@ static int appMain(int argc, char** argv) {
                 lastAudioRequest = now;
             }
         };
-        // Returns false for a datagram from another address (dropped).
+        jl::udptag::View videoTag;
+        jl::udptag::DropLog videoTagLog;
+        uint64_t videoTagDrops = 0;
+        // Returns false for a datagram from another address or with a bad
+        // tag (dropped).
         auto onDatagram = [&](int n, const sockaddr_in& peer,
                               std::chrono::steady_clock::time_point now) {
             const auto packetGapMs = gotAny
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
                 : 0;
+            // PR-C: a datagram without a good tag is dropped before it counts
+            // as a sign of life or reaches the receiver.
+            if (peer.sin_addr.s_addr == allowed.s_addr) {
+                const auto v = videoTag.open(buf.data(), n);
+                if (v != jl::udptag::Verdict::Ok) {
+                    ++videoTagDrops;
+                    videoTagLog.note("mr02", v, [](const std::string& m) { logLine(m); });
+                    return false;
+                }
+            }
             if (!gotAny) firstPacket = now;
             gotAny = true;
             lastPacket = now;
@@ -6932,6 +6971,8 @@ static int appMain(int argc, char** argv) {
                 << " cursor_state_rx=" << (mouseMoveUdp ? mouseMoveUdp->cursorRx() : 0)
                 << " cursor_state_bad=" << (mouseMoveUdp ? mouseMoveUdp->cursorRxBad() : 0)
                 << " cursor_state_stale=" << (mouseMoveUdp ? mouseMoveUdp->cursorRxStale() : 0)
+                << " udp_tag_drops_video=" << videoTagDrops
+                << " udp_tag_drops_mrm1=" << (mouseMoveUdp ? mouseMoveUdp->udpTagDrops() : 0)
                 << " clipboard_tx=" << (clipboard ? clipboard->sent() : 0)
                 << " clipboard_rx=" << (clipboard ? clipboard->received() : 0)
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
@@ -6963,6 +7004,7 @@ static int appMain(int argc, char** argv) {
                 << " audio_played_ms=" << audioStats.jb.framesPlayed / 48
                 << " audio_silence_ms=" << audioStats.jb.framesSilence / 48
                 << " audio_rx_bad_peer=" << audioStats.rxBadPeer
+                << " audio_rx_bad_tag=" << audioStats.rxBadTag
                 << " audio_rx_malformed=" << audioStats.rxMalformed
                 << " audio_device_opens=" << audioStats.deviceOpens
                 << " audio_device_errors=" << audioStats.deviceErrors
