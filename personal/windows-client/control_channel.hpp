@@ -383,10 +383,14 @@ public:
     // Failed: no ACK (the caller closes the socket). Replaced (PR-C r5): the
     // Mac sent the "replaced" notice in place of the ACK. Shared by the
     // start-up negotiation (UI thread) and the background renegotiation
-    // after each reconnect (worker, r5).
+    // after each reconnect (worker, r5). `cancel` (the worker's, set by
+    // stop()): the ACK is awaited in 50 ms slices so stop() ends the wait at
+    // once; Winsock's shutdown() does not wake a recv() blocked in another
+    // thread.
     enum class VideoExchange { Ok, Failed, Replaced };
     static VideoExchange exchangeVideoConfig(SOCKET s, DWORD ioTimeoutMs, const std::vector<uint8_t>& payload,
-                                             bool clientHevc, VideoConfigResult& result) {
+                                             bool clientHevc, VideoConfigResult& result,
+                                             const std::atomic<bool>* cancel = nullptr) {
         const uint16_t n = static_cast<uint16_t>(payload.size());
         std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, 0x40, uint8_t(n >> 8), uint8_t(n)};
         b.insert(b.end(), payload.begin(), payload.end());
@@ -399,11 +403,15 @@ public:
         DWORD configTimeoutMs = std::max<DWORD>(1500, ioTimeoutMs);
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&configTimeoutMs),
                    sizeof(configTimeoutMs));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(configTimeoutMs);
+        auto recvAck = [&](uint8_t* p, size_t count) {
+            return cancel ? recvExactCancellable(s, p, count, deadline, *cancel) : recvExactOn(s, p, count);
+        };
         uint8_t h[8]{};
-        if (!recvExactOn(s, h, sizeof(h))) return VideoExchange::Failed;
+        if (!recvAck(h, sizeof(h))) return VideoExchange::Failed;
         uint16_t len = uint16_t((uint16_t(h[6]) << 8) | h[7]);
         std::vector<uint8_t> reply(len);
-        if (len && !recvExactOn(s, reply.data(), len)) return VideoExchange::Failed;
+        if (len && !recvAck(reply.data(), len)) return VideoExchange::Failed;
         DWORD normalTimeoutMs = ioTimeoutMs;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
                    sizeof(normalTimeoutMs));
@@ -948,6 +956,26 @@ private:
         return true;
     }
 
+    // r5: recvExactOn for the worker: waits for data in 50 ms slices, so
+    // `cancel` (stop()) or the deadline ends it at once.
+    static bool recvExactCancellable(SOCKET s, uint8_t* p, size_t n,
+                                     std::chrono::steady_clock::time_point deadline,
+                                     const std::atomic<bool>& cancel) {
+        size_t off = 0;
+        while (off < n) {
+            if (cancel || std::chrono::steady_clock::now() >= deadline) return false;
+            fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
+            timeval tv{0, 50 * 1000};
+            const int sel = select(0, &rd, nullptr, nullptr, &tv);
+            if (sel < 0) return false;
+            if (sel == 0) continue;
+            int r = recv(s, reinterpret_cast<char*>(p + off), static_cast<int>(n - off), 0);
+            if (r <= 0) return false;
+            off += static_cast<size_t>(r);
+        }
+        return true;
+    }
+
     static bool setNonBlocking(SOCKET s, bool on) {
         u_long v = on ? 1 : 0;
         return ioctlsocket(s, FIONBIO, &v) == 0;
@@ -1202,7 +1230,7 @@ private:
                 lk.unlock();
                 if (hook) hook();
                 VideoConfigResult vc;
-                const VideoExchange x = exchangeVideoConfig(s, timeout, req, hevc, vc);
+                const VideoExchange x = exchangeVideoConfig(s, timeout, req, hevc, vc, &a->cancel);
                 if (x == VideoExchange::Replaced) {
                     if (auto c = jl::auth::current()) c->hostReplaced(ch);
                 }
