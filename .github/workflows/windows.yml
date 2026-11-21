@@ -125,6 +125,12 @@ jobs:
         run: cmake --build build --config Release --target JerislinkConnAuthTest
       - name: Connection password test (shared vectors, NFC, mutual check, DPAPI round trip, no file when Remember is off, saved key deleted on fail, locked / blocked / auth_required, 0.3.x host 2 s timeout, transition probe and probe race, every channel on its own, PBKDF2 once, open_ip_only after a proof, HMAC failure, split header, one channel at a time, distrusted saved key, secrets wiped)
         run: build\Release\JerislinkConnAuthTest.exe ..\protocol\auth_vectors.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-connauth-test
+          path: |
+            personal/windows-client/build/Release/JerislinkConnAuthTest.exe
+            personal/protocol/auth_vectors.json
       - name: Build launch screen password test
         run: cmake --build build --config Release --target JerislinkAuthUiTest
       - name: Launch screen password test (tries left, locked M min S s countdown with Connect greyed out, blocked, auth_required, host too old, focus back to the password field, probe race, local error, relaunch handoff)
