@@ -476,6 +476,15 @@ final class ControlServer: @unchecked Sendable {
             if kick.kicked && authChannel == .control {
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
                 print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
+                // r3 (Pepper's r2 review, item 1): FIN after the notice, then
+                // keep the socket open a moment instead of closing it at once.
+                // A close with input still unread on our side sends an RST,
+                // and Windows may throw away a notice the viewer has not read
+                // yet; the viewer would then reconnect and take the session back.
+                if sent {
+                    Darwin.shutdown(fd, SHUT_WR)
+                    Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+                }
             }
         } else {
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
@@ -1246,14 +1255,20 @@ final class ControlServer: @unchecked Sendable {
         let type = header[5]
         let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
         let isMRC1 = header[0] == 0x4d && header[1] == 0x52 && header[2] == 0x43 && header[3] == 0x31 && header[4] == 1
-        guard isMRC1, type == ConnAuth.MsgType.response else {
-            // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...) or noise.
+        if isMRC1, type != ConnAuth.MsgType.response, Self.isLegacyFirstHeader(type: type, length: length) {
+            // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...).
             // r2 (Pepper's PR-C review, item 8): no password was tried, so it
             // is not counted. A 0.3.x viewer reconnects in a loop; counting
             // each attempt locked its address out within seconds.
+            // r3 (item 4): only a header that a real 0.3.x viewer sends, with
+            // its exact length, is exempt. Anything else is counted below.
             lock.lock(); oldViewersUncounted += 1; lock.unlock()
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.authRequired.payload)
             authLog.log("auth.old_viewer", peer: ip, "auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16)) counted=0")
+            return nil
+        }
+        guard isMRC1, type == ConnAuth.MsgType.response else {
+            settleFailure(fd, ip: ip, gate: gate, reason: "bad_header", reply: nil)
             return nil
         }
         guard length == 64 else {
@@ -1281,7 +1296,7 @@ final class ControlServer: @unchecked Sendable {
             case .triesLeft(let tries):
                 lock.lock(); probesUncounted += 1; lock.unlock()
                 _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.fail(triesLeft: tries).payload)
-                print("auth.probe_race peer=\(ip) tries=\(tries) counted=0")
+                authLog.log("auth.probe_race", peer: ip, "auth.probe_race peer=\(ip) tries=\(tries) counted=0")
             }
             return nil
         }
@@ -1340,8 +1355,8 @@ final class ControlServer: @unchecked Sendable {
     /// password was tried, so nothing is counted.
     private func noteNoResponse(ip: String, outcome: RecvOutcome) {
         switch outcome {
-        case .error(let code): print("auth.no_response peer=\(ip) reason=read_error errno=\(code) counted=0")
-        default: print("auth.no_response peer=\(ip) reason=closed counted=0")
+        case .error(let code): authLog.log("auth.no_response", peer: ip, "auth.no_response peer=\(ip) reason=read_error errno=\(code) counted=0")
+        default: authLog.log("auth.no_response", peer: ip, "auth.no_response peer=\(ip) reason=closed counted=0")
         }
     }
 
@@ -1412,6 +1427,24 @@ final class ControlServer: @unchecked Sendable {
             return false
         }
         return true
+    }
+
+    /// r3 (Pepper's r2 review, item 4): the first header a real 0.3.x viewer
+    /// sends, with that message's exact payload length. Only these skip the
+    /// failure count when a password is required.
+    static func isLegacyFirstHeader(type: UInt8, length: Int) -> Bool {
+        switch type {
+        case 0x01: return length == 4                    // PING
+        case 0x10: return length == 3                    // KEY
+        case 0x20, 0x22, 0x23, 0x24: return length == 4  // mouse move / scroll
+        case 0x21: return length == 2                    // MOUSE_BUTTON
+        case 0x25: return length == 3                    // MOUSE_BUTTON_EXT
+        case 0x30: return length == 0                    // CLIPBOARD_HELLO
+        case 0x40: return length == 6                    // VIDEO_CONFIG_SET v1
+        case FileProto.MsgType.hello: return length == 3 // FILE_HELLO
+        case 0x60: return length == 0                    // FORCE_QUIT_OPEN
+        default: return false
+        }
     }
 
     /// The connection stays on the channel it authenticated for: a MAC for

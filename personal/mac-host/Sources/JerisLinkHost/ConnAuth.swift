@@ -362,10 +362,23 @@ final class AuthLogThrottle: @unchecked Sendable {
         self.write = write
     }
 
+    /// r3 (Pepper's r2 review, item 4): the table never holds more than
+    /// `maxKeys` entries, even when every key is younger than `window`.
+    /// A new key that finds the table full (after dropping expired keys)
+    /// shares one overflow key, so a flood of peers costs at most one line
+    /// per window plus a count.
+    static let overflowKey = "auth.overflow *"
+
+    var keyCount: Int { lock.lock(); defer { lock.unlock() }; return last.count }
+
     func log(_ event: String, peer: String, _ line: String) {
-        let key = event + " " + peer
+        var key = event + " " + peer
         lock.lock()
         let t = now()
+        if last[key] == nil, last.count >= Self.maxKeys - 1 {
+            last = last.filter { t - $0.value.at < Self.window }
+            if last.count >= Self.maxKeys - 1 { key = Self.overflowKey }
+        }
         if let e = last[key], t - e.at < Self.window {
             last[key] = (e.at, e.skipped + 1)
             suppressed &+= 1
@@ -373,9 +386,9 @@ final class AuthLogThrottle: @unchecked Sendable {
             return
         }
         let skipped = last[key]?.skipped ?? 0
-        if last.count >= Self.maxKeys { last = last.filter { t - $0.value.at < Self.window } }
         last[key] = (t, 0)
         lock.unlock()
-        write(skipped > 0 ? line + " suppressed=\(skipped)" : line)
+        let out = key == Self.overflowKey ? "auth.overflow keys=\(Self.maxKeys) first=\(line)" : line
+        write(skipped > 0 ? out + " suppressed=\(skipped)" : out)
     }
 }

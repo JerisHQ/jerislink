@@ -19,6 +19,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include "control_channel.hpp"
+#include "udp_plan.hpp"
 #include "auth_ui.hpp"
 #include <cstdlib>
 #include <utility>
@@ -167,8 +168,14 @@ public:
     // Signalled when an MRM1 datagram (pong, cursor shape) is waiting.
     HANDLE readEvent() const { return event_ == WSA_INVALID_EVENT ? nullptr : event_; }
 
+    // r3 (item 2): a read-only view keeps the channel for video and audio
+    // but sends no pointer moves.
+    void setInputEnabled(bool on) { inputEnabled_ = on; }
+    bool inputEnabled() const { return inputEnabled_; }
+
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
+        if (!inputEnabled_) { ++inputBlocked_; return false; }
         const uint32_t seq = ++sequence_;
         uint8_t p[14]{
             'M','R','M','1', 1, 0x24,
@@ -342,6 +349,7 @@ public:
     uint64_t cursorRxBad() const { return cursorRxBad_; }
     uint64_t cursorRxStale() const { return cursorRxStale_; }
     uint64_t udpTagDrops() const { return udpTagDrops_; }
+    uint64_t inputBlocked() const { return inputBlocked_; }
 
 private:
     std::mutex txM_;
@@ -349,6 +357,8 @@ private:
     jl::udptag::View rx_;  // receive loop thread only
     jl::udptag::DropLog dropLog_;
     uint64_t udpTagDrops_ = 0;
+    bool inputEnabled_ = true;  // UI thread only
+    uint64_t inputBlocked_ = 0;
     SOCKET s_ = INVALID_SOCKET;
     WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
@@ -697,7 +707,9 @@ static LRESULT CALLBACK ViewerKeyboardHook(int code, WPARAM wParam, LPARAM lPara
 }
 
 static bool sendAbsolutePointer(HWND hwnd, POINT p) {
-    if ((!gControl && !gMouseMoveUdp) || gRemoteWidth == 0 || gRemoteHeight == 0) return false;
+    // r3: a read-only view has the MRM1 channel but sends no pointer moves.
+    const bool udpInput = gMouseMoveUdp && gMouseMoveUdp->inputEnabled();
+    if ((!gControl && !udpInput) || gRemoteWidth == 0 || gRemoteHeight == 0) return false;
     RECT client{};
     GetClientRect(hwnd, &client);
     const int cw = std::max<LONG>(1, client.right - client.left);
@@ -718,7 +730,7 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
     // A click that waits for a control reconnect is queued with this.
     if (gControl) gControl->notePointer(qx, qy);
-    if (gMouseMoveUdp) return gMouseMoveUdp->sendNormalized(qx, qy);
+    if (udpInput) return gMouseMoveUdp->sendNormalized(qx, qy);
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
@@ -6225,10 +6237,17 @@ static int appMain(int argc, char** argv) {
             }
             control->setIoTimeoutMs(100);
         }
+        // r3 (Pepper's r2 review, item 2): a read-only view (--no-control)
+        // opens the MRM1 channel too, for the keep-alive, keyframe requests,
+        // NACKs and the audio request; only its pointer moves are off.
+        const jl::viewer::UdpPlan chanPlan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, false, false, false);
+        if (chanPlan.channel) {
+            mouseMoveUdp = std::make_unique<MouseMoveUdpChannel>(o.bindIp, o.sourceIp, o.mouseUdpPort);
+            mouseMoveUdp->setInputEnabled(chanPlan.input);
+            gMouseMoveUdp = mouseMoveUdp.get();
+        }
         if (o.controlEnabled) {
-            if (o.mouseMoveTransport == "udp") {
-                mouseMoveUdp = std::make_unique<MouseMoveUdpChannel>(o.bindIp, o.sourceIp, o.mouseUdpPort);
-                gMouseMoveUdp = mouseMoveUdp.get();
+            if (chanPlan.input) {
                 logLine("mouse.move_transport=udp remote=" + o.sourceIp + ":" + std::to_string(o.mouseUdpPort));
             } else {
                 gMouseMoveUdp = nullptr;
@@ -6262,7 +6281,7 @@ static int appMain(int argc, char** argv) {
             filePullSession->start();
             gFilePullSession = filePullSession.get();
         } else {
-            gMouseMoveUdp = nullptr;
+            logLine("mrm1.read_only remote=" + o.sourceIp + ":" + std::to_string(o.mouseUdpPort) + " input=off");
             logLine("control.disabled");
             logLine("clipboard.disabled");
         }
@@ -6340,7 +6359,10 @@ static int appMain(int argc, char** argv) {
         // Audio: the host said it can (ACK flag 0x80) and the MRM1 channel is
         // up. The player has its own socket and threads; the loop below only
         // repeats the MRM1 0x45 request naming that socket's port every second.
-        if (o.audio == "on" && hostSupportsAudio && mouseMoveUdp) {
+        // r3 (item 2): also in a read-only view (udp_plan.hpp).
+        const jl::viewer::UdpPlan mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
+                                                                o.audio == "on", hostSupportsAudio);
+        if (mrm1Plan.audio && mouseMoveUdp) {
             audio = std::make_unique<jl::audio::AudioPlayer>([](const std::string& m) { logLine(m); });
             std::string audioErr;
             if (audio->start(o.bindIp, o.sourceIp, audioErr)) {
@@ -6507,7 +6529,9 @@ static int appMain(int argc, char** argv) {
         // Keep-alives and packet handling, shared by the main loop and the
         // session timer that runs while Windows holds a modal loop.
         auto sendKeepAlives = [&](std::chrono::steady_clock::time_point now) {
-            if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
+            // r3 (item 2): a read-only view pings even without NACK support;
+            // the ping keeps its presence up on the Mac.
+            if (mrm1Plan.keepAlive && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
             }
@@ -6974,6 +6998,7 @@ static int appMain(int argc, char** argv) {
                 << " control_paused_drops=" << (control ? control->reconnectStats().pausedDrops : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
+                << " mouse_udp_input_blocked=" << (mouseMoveUdp ? mouseMoveUdp->inputBlocked() : 0)
                 << " keyframe_req_tx=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSent() : 0)
                 << " keyframe_req_suppressed=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSuppressed() : 0)
                 << " keyframe_req_drops=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestDrops() : 0)

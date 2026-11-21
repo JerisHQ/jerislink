@@ -311,7 +311,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     static let requestTimeoutNs: UInt64 = 10_000_000_000
     static let logIntervalNs: UInt64 = 5_000_000_000
 
-    private let send: (Data, UInt16) -> Bool
+    private let send: (Data, UInt16, UInt64?) -> Bool
     private let state = DispatchQueue(label: "JerisLink.AudioState", qos: .userInitiated)
     private let sampleQueue = DispatchQueue(label: "JerisLink.AudioCapture", qos: .userInteractive)
     private let lock = NSLock()
@@ -329,6 +329,9 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     // `lock`.
     private var port: UInt16 = 0
+    /// r3 (Pepper's PR-C r2 review, item 5): the session generation the
+    /// request came in; the sender drops audio for any other session.
+    private var generation: UInt64?
     private var opus = false
     private var encoder: OpusAudioEncoder?
     private var chunker = AudioChunker()
@@ -353,7 +356,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var startFailures: UInt64 = 0
     private var stalls: UInt64 = 0
 
-    init(send: @escaping (Data, UInt16) -> Bool) {
+    init(send: @escaping (Data, UInt16, UInt64?) -> Bool) {
         self.send = send
         super.init()
     }
@@ -365,7 +368,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
 
     /// MRM1 0x45 from the allowed viewer. enable=false stops at once.
     /// opus: the viewer decodes MRA1 v2 (request flag 0x02).
-    func noteRequest(enable: Bool, port: UInt16, opus: Bool = false) {
+    func noteRequest(enable: Bool, port: UInt16, opus: Bool = false, generation: UInt64? = nil) {
         state.async { [self] in
             requests &+= 1
             if !enable || port == 0 {
@@ -374,8 +377,9 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 return
             }
             lock.lock()
-            let portChanged = self.port != port
+            let portChanged = self.port != port || self.generation != generation
             self.port = port
+            self.generation = generation
             let codecChanged = self.opus != opus || (opus && encoder == nil)
             var encoderFailed = false
             if codecChanged {
@@ -393,12 +397,29 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             }
             let codec = self.codecSummaryLocked()
             lock.unlock()
-            if portChanged { Self.log("viewer audio port=\(port)") }
+            if portChanged { Self.log("viewer audio port=\(port) gen=\(generation.map(String.init) ?? "none")") }
             if encoderFailed { Self.log("opus encoder init failed; sending PCM") }
             if codecChanged { Self.log("viewer audio codec=\(codec)") }
             requestedUntilNs = DispatchTime.now().uptimeNanoseconds + Self.requestTimeoutNs
             ensureTimer()
             startIfNeeded()
+        }
+    }
+
+    /// r3 (Pepper's PR-C r2 review, item 5): the session moved on (another
+    /// viewer, a new AUTH, or none). A request from an older session is
+    /// forgotten and capture stops; the new viewer's own MRM1 0x45 starts
+    /// audio again, to its own port.
+    func sessionChanged(to current: UInt64?) {
+        state.async { [self] in
+            lock.lock()
+            let stale = generation != nil && generation != current
+            if stale { port = 0; generation = nil }
+            lock.unlock()
+            guard stale else { return }
+            requestedUntilNs = 0
+            stopStream()
+            Self.log("session changed gen=\(current.map(String.init) ?? "none"); waiting for the new viewer's request")
         }
     }
 
@@ -616,6 +637,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         meter.add(samples)
         let chunks = chunker.append(samples, micros: micros)
         let port = self.port
+        let generation = self.generation
         var packets: [Data] = []
         for c in chunks {
             let p: Data
@@ -643,7 +665,7 @@ final class AudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         if let formatLine { Self.log(formatLine) }
         var sent: UInt64 = 0, errors: UInt64 = 0
         for p in packets {
-            if send(p, port) { sent &+= 1 } else { errors &+= 1 }
+            if send(p, port, generation) { sent &+= 1 } else { errors &+= 1 }
         }
         if !packets.isEmpty {
             lock.lock(); packetsSent &+= sent; sendErrors &+= errors; lock.unlock()

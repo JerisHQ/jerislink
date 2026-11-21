@@ -149,6 +149,8 @@ final class UDPFrameSender: @unchecked Sendable {
     /// When nil (bench, self-tests, no link) the fixed clientIP is used.
     private var udpSession: UDPSessionState?
     private var sessionDrops: UInt64 = 0
+    /// r3 item 5: audio for a session that is no longer the current one.
+    private var audioStaleDrops: UInt64 = 0
     private var maxPacketsPerFrame: UInt64 = 0
     private var maxFrameBytes: UInt64 = 0
     private var keyFrames: UInt64 = 0
@@ -564,9 +566,13 @@ final class UDPFrameSender: @unchecked Sendable {
     /// MRA1 audio: same socket as the video, to the viewer IP at `port`
     /// (the port its MRM1 0x45 request named). Not paced and not counted in
     /// the video stats; AudioStreamer keeps its own counters.
-    func sendAudio(_ packet: Data, port: UInt16) -> Bool {
+    /// r3 (Pepper's PR-C r2 review, item 5): `generation` is the session
+    /// that request came in. With a session link, audio leaves only while
+    /// that session is still the current one: never to the next viewer's
+    /// IP and key at the old viewer's port.
+    func sendAudio(_ packet: Data, port: UInt16, generation: UInt64? = nil) -> Bool {
         guard streamOpen() else { return false }
-        return sendTo(packet, port: port.bigEndian).sent
+        return sendTo(packet, port: port.bigEndian, audioGeneration: generation, checkGeneration: true).sent
     }
 
     /// PR-C: binds this sender to the session link (JerisLinkHostMain).
@@ -577,7 +583,8 @@ final class UDPFrameSender: @unchecked Sendable {
     /// The datagram as it leaves: to the session peer (sealed when the
     /// session is tagged), else to the fixed destination. `port` is
     /// network order; nil keeps the destination's. bytes: what went out.
-    private func sendTo(_ packet: Data, port: in_port_t? = nil) -> (sent: Bool, bytes: Int) {
+    private func sendTo(_ packet: Data, port: in_port_t? = nil, audioGeneration: UInt64? = nil,
+                        checkGeneration: Bool = false) -> (sent: Bool, bytes: Int) {
         var dest = destination
         if let port { dest.sin_port = port }
         lock.lock(); let state = udpSession; lock.unlock()
@@ -585,6 +592,10 @@ final class UDPFrameSender: @unchecked Sendable {
         if let state {
             guard let snap = state.snapshot else {
                 lock.lock(); sessionDrops &+= 1; lock.unlock()
+                return (false, 0)
+            }
+            if checkGeneration, snap.session.generation != audioGeneration {
+                lock.lock(); audioStaleDrops &+= 1; lock.unlock()
                 return (false, 0)
             }
             dest.sin_addr = snap.address
@@ -684,7 +695,7 @@ final class UDPFrameSender: @unchecked Sendable {
             + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) nack_pace_waits=\(nackPaceWaits) "
             + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
             + (streamHeld > 0 ? " stream_held=\(streamHeld)" : "")
-            + (udpSession != nil ? " session_drops=\(sessionDrops)" : "")
+            + (udpSession != nil ? " session_drops=\(sessionDrops) audio_stale_drops=\(audioStaleDrops)" : "")
             + (statsSuffix.map { " " + $0() } ?? "")
     }
 

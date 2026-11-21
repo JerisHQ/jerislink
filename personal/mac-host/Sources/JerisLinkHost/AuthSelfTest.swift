@@ -382,6 +382,12 @@ enum AuthSelfTest {
                        && notice.flatMap({ ConnAuth.Result.decode($0.payload) }) == .replaced
                        && first.client?.receive(timeout: 2) == nil,
                        "replace: the old control connection gets REPLACED (status 6), then closes")
+                // r3 (item 1): the old viewer's input still in flight does
+                // not turn the close into a reset; it sees the notice, then FIN.
+                _ = first.client?.send(type: 0x10, payload: [1, 0, 0x41])
+                let eof = first.client?.receive(timeout: 2) == nil
+                expect(eof && first.client?.sawEOF == true && first.client?.sawReset == false,
+                       "replace: after the notice the old connection ends with FIN, not RST")
                 expect(pong(second.client), "replace: the new viewer's control channel works")
                 expect(broker.replaced == 1, "replace: one connection replaced")
                 s.stop()
@@ -394,7 +400,10 @@ enum AuthSelfTest {
             guard case let (s, p)? = server(.password(whitelist: [me]), secret: secret) else { expect(false, "e2e: listener"); continue }
             let c = MRC1Client(port: p)
             let ch = c?.receive(timeout: 2)
-            _ = c?.send(type: type, payload: type == 0x01 ? [1, 2, 3, 4] : [0, 0, 0])
+            // r3 (item 4): each first message as a real 0.3.x viewer sends it;
+            // FORCE_QUIT_OPEN and CLIPBOARD_HELLO carry no payload.
+            let legacy: [UInt8] = type == 0x01 ? [1, 2, 3, 4] : (type == 0x60 || type == 0x30) ? [] : [0, 0, 0]
+            _ = c?.send(type: type, payload: legacy)
             let r = c?.receive(timeout: 2)
             expect(ch?.type == ConnAuth.MsgType.challenge && r?.type == ConnAuth.MsgType.result
                    && r.flatMap({ ConnAuth.Result.decode($0.payload) }) == .authRequired && c?.receive(timeout: 1) == nil,
@@ -433,6 +442,51 @@ enum AuthSelfTest {
         l.t += 10
         throttle.log("auth.locked", peer: "100.64.0.5", "auth.locked peer=100.64.0.5")
         expect(l.out.last == "auth.locked peer=100.64.0.5 suppressed=139", "log: the next line after 10 s says how many were left out")
+
+        // r3 (item 4): the throttle table stays at 1024 keys even when 3000
+        // peers arrive within one window; new peers share one overflow line.
+        let flood = Lines()
+        let capped = AuthLogThrottle(now: { flood.t }, write: { flood.out.append($0) })
+        for i in 0..<3000 { capped.log("auth.no_response", peer: "100.64.\(i / 256).\(i % 256)", "auth.no_response peer=\(i)") }
+        let overflowLines = flood.out.filter { $0.hasPrefix("auth.overflow ") }.count
+        expect(capped.keyCount <= AuthLogThrottle.maxKeys && flood.out.count == AuthLogThrottle.maxKeys && overflowLines == 1,
+               "log: 3000 peers in 10 s keep the table at \(AuthLogThrottle.maxKeys) keys (\(capped.keyCount)) with one overflow line")
+        flood.t += 10
+        capped.log("auth.no_response", peer: "100.99.0.1", "auth.no_response peer=late")
+        expect(capped.keyCount <= AuthLogThrottle.maxKeys && flood.out.last == "auth.no_response peer=late",
+               "log: after 10 s expired keys make room again")
+
+        // r3 (item 4): only a real 0.3.x header is exempt. A wrong length
+        // for PING, an unknown type or non-MRC1 bytes count a failure.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            var fails: [ConnAuth.Result?] = []
+            for raw in [[0x4d, 0x52, 0x43, 0x31, 1, 0x01, 0, 2, 9, 9] as [UInt8],
+                        [0x4d, 0x52, 0x43, 0x31, 1, 0x7e, 0, 0],
+                        Array("GET / HTTP/1.1\r\n\r\n".utf8)] {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                _ = c?.sendRaw(raw)
+                fails.append(c?.receive(timeout: 2).flatMap { ConnAuth.Result.decode($0.payload) })
+                c?.close()
+            }
+            expect(fails == [.fail(triesLeft: 4), .fail(triesLeft: 3), .fail(triesLeft: 2)]
+                   && s.authFailures == 3 && s.oldViewersUncounted == 0,
+                   "e2e: malformed headers are counted, not exempt as old viewers (\(fails))")
+            s.stop()
+        }
+
+        // r3 (item 4): a viewer that closes before answering, in a loop,
+        // logs one auth.no_response line per window.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            for _ in 0..<6 {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                c?.close()
+            }
+            expect(settle { s.authLog.suppressed >= 5 } && s.authFailures == 0,
+                   "e2e: 6 closes before answering log one no_response line (suppressed=\(s.authLog.suppressed))")
+            s.stop()
+        }
 
         if case let (s, p)? = server(.password(whitelist: [me]), secret: secret, timeout: 0.3) {
             let c = MRC1Client(port: p)

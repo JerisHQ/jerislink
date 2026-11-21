@@ -23,6 +23,8 @@ enum UDPAuthSelfTest {
         replayWindow(expect)
         mouseServer(expect)
         frameSender(expect)
+        r3MouseServer(expect)
+        r3AudioSession(expect)
         probe(expect)
         return failures == 0 ? 0 : 1
     }
@@ -390,13 +392,115 @@ enum UDPAuthSelfTest {
                && got.allSatisfy { $0.count <= 1200 + UDPTag.bytes },
                "sender: tagged session, every MR02 packet sealed h2v (\(got.count) packets)")
         let audio = Data(Array("MRA1".utf8) + [1, 0, 0, 1] + [UInt8](repeating: 7, count: 40))
-        _ = sender.sendAudio(audio, port: rx.port)
+        _ = sender.sendAudio(audio, port: rx.port, generation: 1)
         let a = receiveUDP(rx.fd)
         expect(a.map { p in p.count == audio.count + 8 && p.withUnsafeBytes { h2v.verify($0.baseAddress!, p.count) } } ?? false,
                "sender: MRA1 audio sealed h2v")
         state.set(nil)
-        _ = sender.sendAudio(audio, port: rx.port)
+        _ = sender.sendAudio(audio, port: rx.port, generation: 1)
         expect(receiveUDP(rx.fd) == nil, "sender: session gone, no audio leaves")
+    }
+
+    // MARK: r3 (Pepper's PR-C r2 review, items 2, 3 and 5)
+
+    /// Item 3: a replayed, malformed or too-old datagram moves nothing: not
+    /// the reply port, not presence. Item 2: a read-only viewer (pings and
+    /// 0x45 only, no 0x24) is enough for presence and an audio request.
+    /// Item 5: the request carries the session it came in.
+    private static func r3MouseServer(_ expect: Expect) {
+        let k = key(20)
+        func dgram(_ type: UInt8, _ seq: UInt32, _ body: [UInt8]) -> [UInt8] {
+            Array("MRM1".utf8) + [1, type, UInt8(seq >> 24), UInt8(seq >> 16 & 0xff), UInt8(seq >> 8 & 0xff), UInt8(seq & 0xff)] + body
+        }
+        func ping(_ seq: UInt32) -> [UInt8] { dgram(0x43, seq, [UInt8](repeating: 0x22, count: 8)) }
+        func audioReq(_ seq: UInt32, port: UInt16) -> [UInt8] { dgram(0x45, seq, [0x03, UInt8(port >> 8), UInt8(port & 0xff)]) }
+        guard let port = freeUDPPort(), let a = udpSocket(), let b = udpSocket() else { expect(false, "r3 mouse: sockets"); return }
+        defer { Darwin.close(a.fd); Darwin.close(b.fd) }
+        let state = UDPSessionState(requireTags: true)
+        let presence = ViewerPresence()
+        let server = MouseMoveUDPServer(bindIP: "127.0.0.1", allowedClientIP: nil, port: port, presence: presence,
+                                        relayPort: 1, inputAllowed: { false }, udpSession: state)
+        let requests = LockedBox<[(Bool, UInt16, UInt64?)]>([])
+        server.setAudioRequestHandler { enable, p, _, gen in requests.mutate { $0.append((enable, p, gen)) } }
+        guard (try? server.start()) != nil else { expect(false, "r3 mouse: server starts"); return }
+        defer { server.stop() }
+        state.set(UDPPeerSession(generation: 1, peerIP: "127.0.0.1", sessionKey: k))
+        let v2h = UDPTagger(sessionKey: k, hostToViewer: false)
+
+        // Read-only viewer: a ping and an audio request, never a move.
+        let first = v2h.seal(ping(1))
+        sendUDP(a.fd, first, to: port)
+        let pong = receiveUDP(a.fd)
+        sendUDP(a.fd, v2h.seal(audioReq(2, port: 40001)), to: port)
+        Thread.sleep(forTimeInterval: 0.2)
+        let r1 = requests.value
+        expect(pong?[5] == 0x44 && presence.isActive() && presence.datagramsHeard == 2 && server.replyPortForTest == a.port
+               && r1.count == 1 && r1[0].0 && r1[0].1 == 40001 && r1[0].2 == 1 && server.forwarded == 0,
+               "r3 read-only: ping + 0x45 alone make presence active and an audio request for gen 1, no move sent")
+
+        // Item 3: replay of seen datagrams from another port.
+        sendUDP(b.fd, first, to: port)
+        sendUDP(b.fd, v2h.seal(audioReq(2, port: 40002)), to: port)
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(receiveUDP(b.fd) == nil && server.replyPortForTest == a.port && presence.datagramsHeard == 2 && requests.value.count == 1,
+               "r3 replay: seen seqs from another port change neither the reply port nor presence, no audio request")
+        // A malformed one (valid tag, wrong length) from that port.
+        sendUDP(b.fd, v2h.seal(dgram(0x43, 30, [1, 2])), to: port)
+        sendUDP(b.fd, v2h.seal(dgram(0x45, 31, [0x01, 0, 0])), to: port)
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(receiveUDP(b.fd) == nil && server.replyPortForTest == a.port && presence.datagramsHeard == 2,
+               "r3 format: malformed 0x43 / 0x45 change neither the reply port nor presence")
+        // Malformed seq 30/31 did not move the window: seq 3 still counts.
+        sendUDP(b.fd, v2h.seal(ping(3)), to: port)
+        let moved = receiveUDP(b.fd)
+        expect(moved?[5] == 0x44 && server.replyPortForTest == b.port && presence.datagramsHeard == 3,
+               "r3 port move: a fresh seq from the new port moves the reply port (NAT rebinding)")
+        // Too old behind the window from the old port: nothing moves back.
+        sendUDP(a.fd, v2h.seal(ping(200)), to: port)
+        _ = receiveUDP(a.fd)
+        sendUDP(b.fd, v2h.seal(ping(100)), to: port)
+        Thread.sleep(forTimeInterval: 0.2)
+        expect(receiveUDP(b.fd) == nil && server.replyPortForTest == a.port && presence.datagramsHeard == 4,
+               "r3 too old: seq 100 behind 200 from the other port gets nothing and moves nothing")
+
+        // Item 5: a new session; its requests carry gen 2.
+        let k2 = key(21)
+        state.set(UDPPeerSession(generation: 2, peerIP: "127.0.0.1", sessionKey: k2))
+        sendUDP(b.fd, UDPTagger(sessionKey: k2, hostToViewer: false).seal(audioReq(1, port: 40003)), to: port)
+        Thread.sleep(forTimeInterval: 0.2)
+        let last = requests.value.last
+        expect(requests.value.count == 2 && last?.1 == 40003 && last?.2 == 2 && server.replyPortForTest == b.port,
+               "r3 session: the new viewer's request carries gen 2")
+    }
+
+    /// Item 5: audio goes out only while the session its request came in is
+    /// the current one.
+    private static func r3AudioSession(_ expect: Expect) {
+        guard let rx = udpSocket() else { expect(false, "r3 audio: socket"); return }
+        defer { Darwin.close(rx.fd) }
+        guard let sender = try? UDPFrameSender(bindIP: "127.0.0.1", clientIP: "0.0.0.0", clientPort: rx.port, packetBytes: 1200) else {
+            expect(false, "r3 audio: sender starts"); return
+        }
+        let state = UDPSessionState(requireTags: true)
+        sender.setSession(state)
+        let k1 = key(22), k2 = key(23)
+        let audio = Data(Array("MRA1".utf8) + [1, 0, 0, 1] + [UInt8](repeating: 9, count: 40))
+        state.set(UDPPeerSession(generation: 1, peerIP: "127.0.0.1", sessionKey: k1))
+        let ok1 = sender.sendAudio(audio, port: rx.port, generation: 1)
+        let p1 = receiveUDP(rx.fd)
+        let h2v1 = UDPTagger(sessionKey: k1, hostToViewer: true)
+        expect(ok1 && (p1.map { p in p.withUnsafeBytes { h2v1.verify($0.baseAddress!, p.count) } } ?? false),
+               "r3 audio: gen 1 request, gen 1 session: audio leaves sealed with its key")
+        state.set(UDPPeerSession(generation: 2, peerIP: "127.0.0.1", sessionKey: k2))
+        let stale = sender.sendAudio(audio, port: rx.port, generation: 1)
+        let none = sender.sendAudio(audio, port: rx.port)
+        expect(!stale && !none && receiveUDP(rx.fd) == nil && sender.statsLine().contains("audio_stale_drops=2"),
+               "r3 audio: after a new viewer, the old request's audio is dropped (not sent with the new IP/key to the old port)")
+        let ok2 = sender.sendAudio(audio, port: rx.port, generation: 2)
+        let p2 = receiveUDP(rx.fd)
+        let h2v2 = UDPTagger(sessionKey: k2, hostToViewer: true)
+        expect(ok2 && (p2.map { p in p.withUnsafeBytes { h2v2.verify($0.baseAddress!, p.count) } } ?? false),
+               "r3 audio: the new viewer's own request (gen 2) gets audio")
     }
 
     // MARK: Zero-MAC probe
@@ -494,4 +598,13 @@ enum UDPAuthSelfTest {
         if sink == 0xff { print("") }
         return okCount == n ? 0 : 1
     }
+}
+
+/// r3 self-test: a value shared with a server callback thread.
+private final class LockedBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T
+    init(_ value: T) { stored = value }
+    var value: T { lock.lock(); defer { lock.unlock() }; return stored }
+    func mutate(_ change: (inout T) -> Void) { lock.lock(); change(&stored); lock.unlock() }
 }

@@ -169,11 +169,19 @@ public:
         if (a->connecting || a->s == INVALID_SOCKET || !hasOwedLocked(*a)) return n;
         const SOCKET live = a->s;
         const Owed owed = takeOwedLocked(*a);
+        bool failNow = false;  // tests (r3)
+        if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
         g.unlock();
-        if (sendAllOn(live, owed.bytes)) {
+        if (!failNow && sendAllOn(live, owed.bytes)) {
             g.lock();
             a->stats.released += owed.count;
             return n;
+        }
+        // r3 (item 1): same as sendQueued: a notice still arriving is read
+        // before the close, so no reconnect takes the session back.
+        const bool replaced = readNoticeBeforeClose(live);
+        if (replaced) {
+            if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
         g.lock();
         restoreOwedLocked(*a, owed);
@@ -242,6 +250,13 @@ public:
         std::lock_guard<std::mutex> g(async_->m);
         async_->forceWouldBlock = n;
         async_->flushGap = std::move(gap);
+    }
+    // Tests (r3): the next `n` sends on the live socket from the UI thread
+    // (sendQueued, discardQueuedInput) fail as if the Mac had reset it.
+    void setFailLiveSendsForTest(int n) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->failLiveSends = n;
     }
 
     // The pointer position (MRC1 0x24 units) the viewer last showed the
@@ -485,6 +500,40 @@ public:
                b[5] == jl::auth::kTypeResult && b[6] == 0 && b[7] == 1 &&
                b[8] == uint8_t(jl::auth::Result::Status::Replaced);
     }
+    static bool isNoticePrefix(const uint8_t* b, int n) {
+        static const uint8_t want[kHostNoticeBytes] = {
+            'M', 'R', 'C', '1', 1, jl::auth::kTypeResult, 0, 1, uint8_t(jl::auth::Result::Status::Replaced)};
+        if (n <= 0 || n > kHostNoticeBytes) return false;
+        for (int i = 0; i < n; ++i) if (b[i] != want[i]) return false;
+        return true;
+    }
+    // r3 (Pepper's r2 review, item 1): a send on the live socket failed and
+    // the socket is about to be closed. When the bytes waiting are the start
+    // of the "replaced" notice, wait (at most kNoticeWaitMs) for the rest and
+    // read it, so the attempt halts instead of the next input reconnecting
+    // and taking the session back. Nothing waiting, or other bytes: false at
+    // once. The Mac sends the notice, then FIN, and keeps the socket open
+    // about a second (no RST), so the rest is normally already here.
+    static constexpr int kNoticeWaitMs = 250;
+    static bool readNoticeBeforeClose(SOCKET s) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kNoticeWaitMs);
+        uint8_t b[kHostNoticeBytes]{};
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
+            const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
+            if (isReplacedNotice(b, n)) {
+                recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+                return true;
+            }
+            if (!isNoticePrefix(b, n)) return false;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
 
     uint64_t sentEvents() const { return sentEvents_; }
     uint64_t failures() const { return failures_; }
@@ -622,6 +671,7 @@ private:
         std::function<void()> atCommit;         // tests only (r5)
         std::function<void()> flushGap;         // tests only (r5)
         int forceWouldBlock = 0;                // tests only (r5)
+        int failLiveSends = 0;                  // tests only (r3): live sends that fail
         std::atomic<int> discardWaiting{0};     // r5: a focus loss wants the lock
         // r6: what the Mac has down from us, as put on the wire: key
         // semantics, and mouse buttons with the frame type (0x21 / 0x25)
@@ -1120,6 +1170,7 @@ private:
         std::vector<uint8_t> wire;
         Owed owed;
         Held held;
+        bool failNow = false;  // tests (r3)
         {
             std::lock_guard<std::mutex> g(a->m);
             if (a->stopping) return false;
@@ -1134,15 +1185,23 @@ private:
                 wire.insert(wire.end(), own.begin(), own.end());
                 held = heldLocked(*a);
                 noteWireLocked(*a, b);
+                if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
             }
         }
         if (live != INVALID_SOCKET) {
-            if (wire.empty() || sendAllOn(live, wire)) {
+            if (!failNow && (wire.empty() || sendAllOn(live, wire))) {
                 if (owed.count) {
                     std::lock_guard<std::mutex> g(a->m);
                     a->stats.released += owed.count;
                 }
                 return true;
+            }
+            // r3 (Pepper's r2 review, item 1): read a "replaced" notice that
+            // is still arriving before closing, or the next input would AUTH
+            // and take the session back. Seen: mayConnect() is false below
+            // and the queue is dropped.
+            if (readNoticeBeforeClose(live)) {
+                if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
             }
             std::lock_guard<std::mutex> g(a->m);
             restoreOwedLocked(*a, owed);

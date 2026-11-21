@@ -29,6 +29,7 @@
 // the viewer knows the Mac wants a password (no probe then); the first
 // connection answers after 150 ms, before the transition probe would go.
 #include "control_channel.hpp"
+#include "udp_plan.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -1767,6 +1768,88 @@ void prcR2Tests() {
     setCurrent(nullptr);
 }
 
+
+// r3 (Pepper's r2 review, item 1): the "replaced" notice arrives in two
+// parts and the input send in between fails. The viewer reads the rest of
+// the notice before closing, so the attempt halts and nothing reconnects.
+void prcR3Tests() {
+    // r3 (item 2): a read-only view keeps the UDP channel for picture and
+    // sound (keep-alive ping even without NACK support, audio request),
+    // and only pointer input is off.
+    {
+        using jl::viewer::udpPlan;
+        const auto ro = udpPlan(false, "udp", false, true, true);
+        const auto roTcp = udpPlan(false, "tcp", false, true, true);
+        const auto roNoAudio = udpPlan(false, "udp", true, false, true);
+        const auto rw = udpPlan(true, "udp", true, true, true);
+        const auto rwOldHost = udpPlan(true, "udp", false, true, false);
+        const auto rwTcp = udpPlan(true, "tcp", true, true, true);
+        expect(ro.channel && !ro.input && ro.keepAlive && ro.audio,
+               "prc r3 read-only: UDP channel, keep-alive and audio on, input off");
+        expect(roTcp.channel && !roTcp.input && roTcp.keepAlive && roTcp.audio,
+               "  read-only with --mouse-move-transport tcp: the same");
+        expect(roNoAudio.channel && roNoAudio.keepAlive && !roNoAudio.audio, "  read-only, audio off: no audio request");
+        expect(rw.channel && rw.input && rw.keepAlive && rw.audio, "  with control: as before");
+        expect(rwOldHost.channel && rwOldHost.input && !rwOldHost.keepAlive && !rwOldHost.audio,
+               "  with control, old host: no ping, no audio (as before)");
+        expect(!rwTcp.channel && !rwTcp.input && !rwTcp.keepAlive && !rwTcp.audio, "  with control over TCP: no UDP channel (as before)");
+    }
+
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    const uint8_t other[4] = {'M', 'R', 'C', '1'};
+    const uint8_t wrong[2] = {'M', 'X'};
+    expect(ControlChannel::isNoticePrefix(notice, 4) && ControlChannel::isNoticePrefix(other, 4) &&
+               !ControlChannel::isNoticePrefix(wrong, 2) && !ControlChannel::isNoticePrefix(notice, 0),
+           "prc r3: notice prefix recognised, other bytes not");
+
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    bool auth = false;
+    std::atomic<bool> go{false}, partSent{false}, restSent{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        auth = hostAuth(s, sec, Answer::Ok, 100);
+        while (!go) Sleep(10);
+        const Bytes all(notice, notice + sizeof(notice));
+        partSent = sendAllBytes(s, Bytes(all.begin(), all.begin() + 4));
+        Sleep(80);  // the viewer's send fails in this gap
+        restSent = sendAllBytes(s, Bytes(all.begin() + 4, all.end()));
+        shutdown(s, SD_SEND);
+        Sleep(1200);  // like the Mac: FIN, then linger, no RST
+        closesocket(s);
+    });
+    control.keepSession();
+    for (int i = 0; i < 500 && (control.reconnectStats().connecting || control.reconnectStats().reconnects == 0); ++i) Sleep(10);
+    expect(auth && control.reconnectStats().reconnects == 1, "prc r3: session authenticated");
+
+    go = true;
+    for (int i = 0; i < 300 && !partSent; ++i) Sleep(5);
+    Sleep(20);  // the first 4 bytes are in the viewer's receive buffer
+    control.setFailLiveSendsForTest(1);
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool sent = control.sendKey(true, 0x0041);
+    const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    expect(partSent && restSent && !sent && terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
+           "prc r3 split notice + failed send: rest of the notice read, Replaced, attempt halted");
+    expect(waitedMs < ControlChannel::kNoticeWaitMs + 200, "  waited only for the rest of the notice");
+    expect(!control.keepSession() && !control.sendKey(true, 0x0042), "  no reconnect: keepSession and input do nothing");
+    expect(l.accept(500) == INVALID_SOCKET, "  no further connection attempt (no AUTH taking the session back)");
+    host.join();
+    control.stop();
+    setCurrent(nullptr);
+}
 }  // namespace
 
 int main() {
@@ -1782,6 +1865,7 @@ int main() {
     r8Tests();
     r9Tests();
     prcR2Tests();
+    prcR3Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -927,6 +927,7 @@ final class AuthFailureLog: @unchecked Sendable {
             all.append(rec)
             if all.count > Self.limit { all.removeFirst(all.count - Self.limit) }
             Self.write(all, url: url)
+            Self.countHour(at: rec.at, url: Self.countsURL(for: url))
         }
     }
 
@@ -944,9 +945,52 @@ final class AuthFailureLog: @unchecked Sendable {
         }
     }
 
+    // r3 (Pepper's r2 review, item 6; design §4.4): the window shows how
+    // many failures the last 24 hours had and the last address. The list
+    // above keeps only `limit` records, so failures are also counted per
+    // hour in a small sidecar file (the hour's start in seconds -> count),
+    // keeping the last 25 hours.
+    static func countsURL(for url: URL) -> URL {
+        url.deletingPathExtension().appendingPathExtension("hours.plist")
+    }
+
+    static func hourKey(_ at: Date) -> Int { Int((at.timeIntervalSince1970 / 3600).rounded(.down)) * 3600 }
+
+    static func loadCounts(url: URL) -> [Int: Int] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
+        else { return [:] }
+        var out: [Int: Int] = [:]
+        for (k, v) in raw { if let h = Int(k), let n = v as? Int, n > 0 { out[h] = n } }
+        return out
+    }
+
+    private static func countHour(at: Date, url: URL) {
+        let hour = hourKey(at)
+        var counts = loadCounts(url: url).filter { $0.key > hour - 25 * 3600 }
+        counts[hour, default: 0] += 1
+        let raw = Dictionary(uniqueKeysWithValues: counts.map { (String($0.key), $0.value) })
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: raw, format: .xml, options: 0) else { return }
+        writeAtomic(data, url: url)
+    }
+
+    /// Failures in the 24 hours up to `now` (counted by whole hours: the
+    /// current hour and the 23 before it) and the last failing address.
+    static func summary(url: URL, now: Date = Date()) -> (last24h: Int, lastIP: String?, lastAt: Date?) {
+        let hour = hourKey(now)
+        let total = loadCounts(url: countsURL(for: url)).filter { $0.key > hour - 24 * 3600 && $0.key <= hour }
+            .reduce(0) { $0 + $1.value }
+        let last = load(url: url).last
+        return (total, last?.ip, last?.at)
+    }
+
     private static func write(_ records: [Record], url: URL) {
         let raw: [[String: Any]] = records.map { ["at": $0.at, "ip": $0.ip, "reason": $0.reason, "failures": $0.failures] }
         guard let data = try? PropertyListSerialization.data(fromPropertyList: raw, format: .xml, options: 0) else { return }
+        writeAtomic(data, url: url)
+    }
+
+    private static func writeAtomic(_ data: Data, url: URL) {
         let tmp = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).\(getpid()).\(UUID().uuidString.prefix(8))")
         let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)

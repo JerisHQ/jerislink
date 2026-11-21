@@ -91,14 +91,18 @@ enum ConnectionSettings {
             ?? .refused("另一個連線設定正在儲存，請稍後再試。")
     }
 
+    static let notTailnet = "唔係 tailnet IPv4 地址（要喺 100.64.0.0/10 範圍內）："
+
     /// One IPv4 address per line, or separated by commas or spaces. Returns
     /// the addresses (order kept, no duplicates) and anything that is not one.
     static func parseIPs(_ text: String) -> (ips: [String], invalid: [String]) {
         let parts = text.split(whereSeparator: { $0 == "\n" || $0 == "," || $0 == " " || $0 == "\t" || $0 == "\r" })
             .map { String($0) }
             .filter { !$0.isEmpty }
-        let invalid = parts.filter { !ListenConfig.isIPv4($0) }
-        return (dedupe(parts.filter { ListenConfig.isIPv4($0) }), invalid)
+        // r3 (Pepper's r2 review, item 6): design §4.3, every address is a
+        // tailnet address (100.64.0.0/10); anything else is refused.
+        let invalid = parts.filter { !ListenConfig.isTailnetIPv4($0) }
+        return (dedupe(parts.filter { ListenConfig.isTailnetIPv4($0) }), invalid)
     }
 
     private static func dedupe(_ ips: [String]) -> [String] {
@@ -198,7 +202,7 @@ enum ConnectionSettings {
 
     static func saveWhitelist(_ text: String, url: URL) -> Outcome {
         let parsed = parseIPs(text)
-        guard parsed.invalid.isEmpty else { return .refused("唔係 IPv4 地址：" + parsed.invalid.joined(separator: ", ")) }
+        guard parsed.invalid.isEmpty else { return .refused(notTailnet + parsed.invalid.joined(separator: ", ")) }
         return transaction(url: url) { saveWhitelistLocked(parsed.ips, url: url) }
     }
 
@@ -220,7 +224,7 @@ enum ConnectionSettings {
 
     static func saveBlacklist(_ text: String, url: URL) -> Outcome {
         let parsed = parseIPs(text)
-        guard parsed.invalid.isEmpty else { return .refused("唔係 IPv4 地址：" + parsed.invalid.joined(separator: ", ")) }
+        guard parsed.invalid.isEmpty else { return .refused(notTailnet + parsed.invalid.joined(separator: ", ")) }
         let current = Set(state(url: url).blacklist)
         let want = Set(parsed.ips)
         let adding = parsed.ips.filter { !current.contains($0) }.map { BlockedEntry(ip: $0, at: Date(), reason: "manual") }
@@ -235,6 +239,8 @@ enum ConnectionSettings {
     /// r2 item 6: one row's 解除封鎖 (design §10). Restarts the control
     /// service like any blacklist removal.
     static func unblock(_ ip: String, url: URL) -> Outcome {
+        // An entry stored before r3 may be outside the tailnet range: it can
+        // still be removed.
         guard ListenConfig.isIPv4(ip) else { return .refused("唔係 IPv4 地址：" + ip) }
         guard state(url: url).blacklist.contains(ip) else { return .ok("\(ip) 已經唔喺黑名單。") }
         guard ListenPlistBlocklist(url: url).update(adding: [], removing: [ip]) != nil else {
@@ -246,7 +252,7 @@ enum ConnectionSettings {
     /// r2 item 6: 人手加 IP 落黑名單 (design §10); applies at once.
     static func block(_ text: String, url: URL) -> Outcome {
         let ip = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ListenConfig.isIPv4(ip) else { return .refused("唔係 IPv4 地址：" + ip) }
+        guard ListenConfig.isTailnetIPv4(ip) else { return .refused(notTailnet + ip) }
         guard !state(url: url).blacklist.contains(ip) else { return .ok("\(ip) 已經喺黑名單。") }
         guard ListenPlistBlocklist(url: url).update(adding: [BlockedEntry(ip: ip, at: Date(), reason: "manual")],
                                                     removing: []) != nil else {
@@ -269,8 +275,19 @@ enum ConnectionSettings {
         case "wrong_password": return "密碼錯"
         case "timeout": return "逾時冇回應"
         case "bad_response": return "回應格式錯"
+        case "bad_header": return "開頭格式錯"
         default: return reason
         }
+    }
+}
+
+extension ConnectionSettings {
+    /// r3 (Pepper's r2 review, item 6; design §4.4): 「最近 24 小時錯 N 次」
+    /// and the last address.
+    static func failureSummaryText(last24h: Int, lastIP: String?, lastAt: Date?, format: DateFormatter) -> String {
+        let count = "最近 24 小時錯 \(last24h) 次"
+        guard let lastIP else { return count + "。" }
+        return count + "；最後一個 IP：\(lastIP)" + (lastAt.map { "（\(format.string(from: $0))）" } ?? "") + "。"
     }
 }
 
@@ -295,6 +312,7 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
     private var blockIPs: [String] = []
     private let addBlockField = NSTextField()
     private let failuresView = NSTextView()
+    private let failureSummary = NSTextField(wrappingLabelWithString: "")
     private let failureLogURL: URL
     private let status = NSTextField(wrappingLabelWithString: "")
 
@@ -392,7 +410,7 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
         clearButton.bezelStyle = .rounded
 
         let pwButtons = NSStackView(views: [button("設定／更改密碼", #selector(setPassword)), clearButton])
-        let wlLabel = NSTextField(wrappingLabelWithString: "白名單：每行一個 IPv4。空白 = 任何 IP 都要密碼（要先設定密碼）。")
+        let wlLabel = NSTextField(wrappingLabelWithString: "白名單：每行一個 tailnet IPv4（100.64.0.0/10）。空白 = 任何 IP 都要密碼（要先設定密碼）。")
         let blLabel = NSTextField(wrappingLabelWithString: "黑名單：永遠拒絕（優先過白名單）。錯密碼太多次會自動加入。")
         let flLabel = NSTextField(wrappingLabelWithString: "最近 auth 失敗（最新喺最底，最多 \(AuthFailureLog.limit) 條）")
         for l in [wlLabel, blLabel, flLabel, clearNote] { l.textColor = .secondaryLabelColor }
@@ -401,7 +419,7 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
         blockRows.orientation = .vertical
         blockRows.alignment = .leading
         blockRows.spacing = 4
-        addBlockField.placeholderString = "IPv4，例如 100.64.0.99"
+        addBlockField.placeholderString = "tailnet IPv4，例如 100.64.0.99"
         addBlockField.widthAnchor.constraint(equalToConstant: 200).isActive = true
         let addRow = NSStackView(views: [addBlockField, button("加入黑名單", #selector(addBlock))])
         failuresView.isEditable = false
@@ -419,7 +437,7 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
             section("連線密碼"), passwordStatus, newPassword, confirmPassword, pwButtons, clearNote,
             section("白名單"), wlLabel, listEditor(whitelistView), button("儲存白名單", #selector(saveWhitelist)),
             section("黑名單"), blLabel, scrollBox(blockRows, height: 110), addRow,
-            section("最近 auth 失敗"), flLabel, failuresScroll, button("重新整理", #selector(refresh)),
+            section("最近 auth 失敗"), failureSummary, flLabel, failuresScroll, button("重新整理", #selector(refresh)),
             status,
         ])
         stack.orientation = .vertical
@@ -471,6 +489,9 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
             blockRows.addArrangedSubview(NSStackView(views: [text, unblock]))
         }
 
+        let summary = AuthFailureLog.summary(url: failureLogURL)
+        failureSummary.stringValue = ConnectionSettings.failureSummaryText(
+            last24h: summary.last24h, lastIP: summary.lastIP, lastAt: summary.lastAt, format: Self.timeFormat)
         let failures = AuthFailureLog.load(url: failureLogURL)
         failuresView.string = failures.isEmpty ? "（冇紀錄）" : failures.map {
             "\(Self.timeFormat.string(from: $0.at))  \($0.ip)  \(ConnectionSettings.failureReasonText($0.reason))（第 \($0.failures) 次）"
@@ -694,6 +715,41 @@ enum ConnectionSettingsSelfTest {
         expect(recs.count == AuthFailureLog.limit && recs.first?.ip == "100.64.0.6" && recs.last?.failures == 25,
                "failure log: newest \(AuthFailureLog.limit) kept, oldest dropped")
         expect(stat(flURL.path, &st) == 0 && st.st_mode & 0o777 == 0o600, "failure log: file mode 0600")
+
+        // r3 (item 6, design §4.4): 最近 24 小時錯 N 次 and the last IP. The
+        // count is not limited by the 20 records kept above.
+        let now = Date()
+        let s24 = AuthFailureLog.summary(url: flURL, now: now)
+        expect(s24.last24h == 25 && s24.lastIP == "100.64.0.25",
+               "failure summary: 25 failures in the last 24 h (\(s24.last24h)), last IP 100.64.0.25")
+        let fl2URL = dir.appendingPathComponent("auth-failures-2.plist")
+        let fl2 = AuthFailureLog(url: fl2URL)
+        fl2.record(ip: "100.64.1.1", reason: "wrong_password", failures: 1, at: now.addingTimeInterval(-30 * 3600))
+        fl2.record(ip: "100.64.1.2", reason: "timeout", failures: 1, at: now.addingTimeInterval(-2 * 3600))
+        fl2.record(ip: "100.64.1.3", reason: "bad_header", failures: 2, at: now)
+        fl2.flush()
+        let s2 = AuthFailureLog.summary(url: fl2URL, now: now)
+        expect(s2.last24h == 2 && s2.lastIP == "100.64.1.3", "failure summary: a failure 30 h ago is not counted (\(s2.last24h))")
+        let text = ConnectionSettings.failureSummaryText(last24h: s2.last24h, lastIP: s2.lastIP, lastAt: nil, format: DateFormatter())
+        expect(text == "最近 24 小時錯 2 次；最後一個 IP：100.64.1.3。", "failure summary: window text \(text)")
+        expect(ConnectionSettings.failureSummaryText(last24h: 0, lastIP: nil, lastAt: nil, format: DateFormatter()) == "最近 24 小時錯 0 次。",
+               "failure summary: none yet")
+        let s3 = AuthFailureLog.summary(url: dir.appendingPathComponent("none.plist"), now: now)
+        expect(s3.last24h == 0 && s3.lastIP == nil, "failure summary: no file, zero")
+
+        // r3 (item 6, design §4.3): whitelist and blacklist addresses are
+        // tailnet addresses (100.64.0.0/10).
+        let before = ConnectionSettings.state(url: url)
+        let lan = ConnectionSettings.saveWhitelist("100.64.0.21\n192.168.1.5", url: url)
+        expect(!lan.ok && lan.message.contains("192.168.1.5") && ConnectionSettings.state(url: url).whitelist == before.whitelist,
+               "tailnet: whitelist with 192.168.1.5 refused, nothing written")
+        expect(!ConnectionSettings.saveWhitelist("100.128.0.1", url: url).ok, "tailnet: 100.128.0.1 (just past /10) refused")
+        expect(!ConnectionSettings.saveBlacklist("8.8.8.8", url: url).ok && ConnectionSettings.state(url: url).blacklist == before.blacklist,
+               "tailnet: blacklist with 8.8.8.8 refused, nothing written")
+        expect(!ConnectionSettings.block("10.0.0.1", url: url).ok, "tailnet: block 10.0.0.1 by hand refused")
+        expect(ConnectionSettings.block("100.127.255.254", url: url).ok
+               && ConnectionSettings.state(url: url).blacklist.contains("100.127.255.254"), "tailnet: 100.127.255.254 (top of /10) accepted")
+        expect(ConnectionSettings.parseIPs("100.64.0.1 100.63.255.255").invalid == ["100.63.255.255"], "tailnet: 100.63.255.255 is outside")
         return failures == 0 ? 0 : 1
     }
 }

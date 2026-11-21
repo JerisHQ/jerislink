@@ -186,7 +186,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
     private var newSessionHandler: (() -> Void)?
     private var receiverReportHandler: ((ReceiverReport) -> Void)?
-    private var audioRequestHandler: ((Bool, UInt16, Bool) -> Void)?
+    private var audioRequestHandler: ((Bool, UInt16, Bool, UInt64?) -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
     private var cursorSequence: UInt32 = 0
@@ -357,11 +357,20 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     /// Called on the receive queue for each valid MRM1 0x45 audio request
-    /// (enable, viewer audio port, opus). The peer IP was already checked.
-    func setAudioRequestHandler(_ handler: @escaping (Bool, UInt16, Bool) -> Void) {
+    /// (enable, viewer audio port, opus, session generation). The peer IP
+    /// was already checked. r3 (Pepper's PR-C r2 review, item 5): the
+    /// generation is the session the request came in (nil without a session
+    /// link), so audio for it never goes to the next viewer.
+    func setAudioRequestHandler(_ handler: @escaping (Bool, UInt16, Bool, UInt64?) -> Void) {
         lock.lock()
         audioRequestHandler = handler
         lock.unlock()
+    }
+
+    /// r3 self-test: the source port replies go to (nil: none yet).
+    var replyPortForTest: UInt16? {
+        lock.lock(); defer { lock.unlock() }
+        return lastPeerAddress.map { UInt16(bigEndian: $0.sin_port) }
     }
 
     func stop() {
@@ -527,6 +536,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             var tagged = false
+            var generationMoved: UInt64?
             if let udpSession {
                 // PR-C: only the session peer, and nothing with no session.
                 guard let snap = udpSession.snapshot else { noSession &+= 1; continue }
@@ -549,9 +559,10 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 }
                 // A new session (new AUTH, new key or another viewer):
                 // sequence starts over and the viewer gets a fresh IDR.
+                // r3: noted here, applied only once the datagram passed the
+                // format and anti-replay checks below.
                 if lastGeneration != snap.session.generation {
-                    lastGeneration = snap.session.generation
-                    lastPeerPort = nil
+                    generationMoved = snap.session.generation
                 }
             } else if let allowedClientIP, peerIP != allowedClientIP {
                 rejected &+= 1
@@ -568,33 +579,19 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             // goes on, so a recorded datagram cannot be replayed from
             // another port.
             let peerPort = UInt16(bigEndian: peer.sin_port)
-            if tagged, lastPeerPort != nil, lastPeerPort != peerPort {
-                lastPeerPort = peerPort
-                lock.lock(); lastPeerAddress = peer; lock.unlock()
-                print("MouseMove UDP peer port moved peer=\(peerIP):\(peerPort) (same session)")
-                fflush(stdout)
-            } else if lastPeerPort != peerPort {
-                presenceNewSession = true
-                lastPeerPort = peerPort
-                replayWindow = SeqReplayWindow()
-                lock.lock()
-                lastPeerAddress = peer
-                lastCursorShape = nil
-                let sessionHandler = newSessionHandler
-                lock.unlock()
-                print("MouseMove UDP new session peer=\(peerIP):\(peerPort)")
-                fflush(stdout)
-                sessionHandler?()
-            }
+            let knownPort: UInt16? = generationMoved != nil ? nil : lastPeerPort
+            let portMoved = tagged && knownPort != nil && knownPort != peerPort
+            let newSession = !portMoved && knownPort != peerPort
+            // r3 (Pepper's PR-C r2 review, item 3): format and anti-replay
+            // first. A malformed, replayed or too-old datagram changes
+            // nothing: not the reply address, not presence, not the session.
             guard n >= 10,
                   buffer[0] == 0x4d, buffer[1] == 0x52, buffer[2] == 0x4d, buffer[3] == 0x31,
-                  buffer[4] == 1 else {
+                  buffer[4] == 1, Self.wellFormed(buffer, length: n) else {
                 badPackets &+= 1
+                if n >= 10, buffer[5] == 0x42 { receiverReportRejected &+= 1 }
                 continue
             }
-            presence?.heard(type: buffer[5], newSession: presenceNewSession)
-            presenceNewSession = false
-
             let seq = UInt32(buffer[6]) << 24 |
                       UInt32(buffer[7]) << 16 |
                       UInt32(buffer[8]) << 8 |
@@ -604,17 +601,19 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             // the newest, is dropped. One that arrives late but was never
             // seen is taken (a reordered NACK or receiver report still
             // matters), except a pointer move or an audio request: those
-            // set state, so only the newest counts, as before.
-            switch replayWindow.check(seq) {
+            // set state, so only the newest counts, as before. A new session
+            // is checked against a fresh window, kept only if it passes.
+            var window = newSession ? SeqReplayWindow() : replayWindow
+            switch window.check(seq) {
             case .newest:
                 break
             case .late:
+                window.mark(seq)
                 if buffer[5] == 0x24 || buffer[5] == 0x45 {
-                    replayWindow.mark(seq)
+                    replayWindow = window
                     staleDropped &+= 1
                     continue
                 }
-                replayWindow.mark(seq)
                 lateAccepted &+= 1
             case .duplicate:
                 replayDropped &+= 1
@@ -623,6 +622,29 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 staleDropped &+= 1
                 continue
             }
+
+            // Accepted: now the state moves.
+            replayWindow = window
+            if let generationMoved { lastGeneration = generationMoved }
+            if portMoved {
+                lastPeerPort = peerPort
+                lock.lock(); lastPeerAddress = peer; lock.unlock()
+                print("MouseMove UDP peer port moved peer=\(peerIP):\(peerPort) (same session)")
+                fflush(stdout)
+            } else if newSession {
+                presenceNewSession = true
+                lastPeerPort = peerPort
+                lock.lock()
+                lastPeerAddress = peer
+                lastCursorShape = nil
+                let sessionHandler = newSessionHandler
+                lock.unlock()
+                print("MouseMove UDP new session peer=\(peerIP):\(peerPort)")
+                fflush(stdout)
+                sessionHandler?()
+            }
+            presence?.heard(type: buffer[5], newSession: presenceNewSession)
+            presenceNewSession = false
 
             switch buffer[5] {
             case 0x24:
@@ -697,7 +719,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 let handler = audioRequestHandler
                 lock.unlock()
                 audioRequestRx &+= 1
-                handler?(req.enable, req.port, req.opus)
+                handler?(req.enable, req.port, req.opus, udpSession == nil ? nil : lastGeneration)
             default:
                 badPackets &+= 1
             }
@@ -708,6 +730,21 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// newer when it is less than 2^31 steps ahead of `last`.
     static func isNewer(_ seq: UInt32, than last: UInt32) -> Bool {
         Int32(bitPattern: seq &- last) > 0
+    }
+
+    /// r3: the per-type length and layout checks, run before a datagram may
+    /// move any state (reply address, presence, anti-replay window).
+    static func wellFormed(_ b: [UInt8], length n: Int) -> Bool {
+        guard n >= 10, n <= b.count else { return false }
+        switch b[5] {
+        case 0x24: return n == 14
+        case 0x40: return n == 10
+        case 0x41: return parseNack(b, length: n) != nil
+        case 0x42: return ReceiverReport.parse(Array(b[0..<n])) != nil
+        case 0x43: return n == 18
+        case 0x45: return parseAudioRequest(b, length: n) != nil
+        default: return false
+        }
     }
 
     /// Parses an MRM1 0x45 audio request: flags u8, port u16 (13 bytes).

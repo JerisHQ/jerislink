@@ -375,6 +375,8 @@ struct JerisLinkHostMain {
             var mouseUDP: MouseMoveUDPServer?
             // Capture runs only while the viewer is heard on the MRM1 port.
             var presence: ViewerPresence?
+            // PR-C: the session link state, when on (audio follows it, r3).
+            var sessionState: UDPSessionState?
             if let bindIP = o.bindIP, let clientIP = o.clientIP {
                 sender = try UDPFrameSender(bindIP: bindIP, clientIP: clientIP,
                                             clientPort: o.clientPort, packetBytes: o.packetBytes,
@@ -404,6 +406,7 @@ struct JerisLinkHostMain {
                 if o.sessionLink {
                     let state = UDPSessionState(requireTags: ListenConfig.passwordState() != .off)
                     udpSession = state
+                    sessionState = state
                     sender?.setSession(state)
                     SessionLinkClient(state: state).start()
                 }
@@ -469,8 +472,16 @@ struct JerisLinkHostMain {
             defer { mouseUDP?.stop() }
             var audio: AudioStreamer?
             if o.audioEnabled, let audioSender = sender, let mouseUDP {
-                let streamer = AudioStreamer(send: { packet, port in audioSender.sendAudio(packet, port: port) })
-                mouseUDP.setAudioRequestHandler { enable, port, opus in streamer.noteRequest(enable: enable, port: port, opus: opus) }
+                let streamer = AudioStreamer(send: { packet, port, generation in
+                    audioSender.sendAudio(packet, port: port, generation: generation)
+                })
+                mouseUDP.setAudioRequestHandler { enable, port, opus, generation in
+                    streamer.noteRequest(enable: enable, port: port, opus: opus, generation: generation)
+                }
+                // r3 (Pepper's PR-C r2 review, item 5): a request belongs to the
+                // session it came in. Another viewer (or none) ends it; the
+                // new viewer's own 0x45 starts audio to its own port.
+                sessionState?.onChange { session in streamer.sessionChanged(to: session?.generation) }
                 audio = streamer
             }
             defer { audio?.shutdown() }

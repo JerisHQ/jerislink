@@ -460,6 +460,9 @@ final class SessionLinkClient: @unchecked Sendable {
 /// no-op, so a reused descriptor number is never touched.
 final class KickHandle: @unchecked Sendable {
     static let hardCloseAfter: TimeInterval = 2
+    /// r3: how long the control channel keeps a kicked socket open after
+    /// the "replaced" notice and FIN (below hardCloseAfter).
+    static let noticeLinger: TimeInterval = 1
     private let lock = NSLock()
     private var fd: Int32
     private var wasKicked = false
