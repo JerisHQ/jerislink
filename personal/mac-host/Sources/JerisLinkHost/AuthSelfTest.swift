@@ -379,12 +379,15 @@ enum AuthSelfTest {
                 let second = login(p, password: password, channel: .control)
                 // r3 (item 1): the old viewer's input still in flight does
                 // not turn the close into a reset; it sees the notice, then FIN.
-                // r4: the input goes out before the viewer reads anything, as
-                // in the real case, so it reaches the host well inside the
-                // notice linger. Sent only after the FIN, a runner stalled
-                // past the linger would hit the closed socket and get an RST
-                // from the test itself.
-                let inputSent = first.client?.send(type: 0x10, payload: [1, 0, 0x41]) == true
+                // r4: the input goes out right after the replacing AUTH,
+                // before the viewer reads anything, as from a viewer still
+                // moving the mouse. With the old read-side shutdown macOS
+                // answered it with an RST and the notice was never written
+                // (`auth.replaced_notice sent=0` on the CI runner).
+                var inputSent = true
+                for i in 0..<20 where first.client?.send(type: 0x10, payload: [1, 0, UInt8(0x41 + i)]) != true {
+                    inputSent = false
+                }
                 let notice = first.client?.receive(timeout: 2)
                 expect(notice?.type == ConnAuth.MsgType.result
                        && notice.flatMap({ ConnAuth.Result.decode($0.payload) }) == .replaced

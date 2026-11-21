@@ -465,11 +465,12 @@ final class ControlServer: @unchecked Sendable {
         let gateAdmitted = authenticated || (authGate != nil && !acceptProxy && peer.verified)
         if let sessionBroker, authGate != nil {
             // r2 (Pepper's PR-C review, item 2): a newer AUTH ends this
-            // connection through `kick` (any thread). The read side shuts at
-            // once (input stops, the loop below returns); the control
-            // channel then tells the viewer it was replaced, so it stops
+            // connection through `kick` (any thread). The loop below returns
+            // at once and takes no more input (r4: a control connection is
+            // woken through `wakeFD`, other channels shut the read side); the
+            // control channel then tells the viewer it was replaced, so it stops
             // reconnecting instead of taking the session back.
-            let kick = KickHandle(fd)
+            let kick = KickHandle(fd, wake: authChannel == .control)
             // r4: the reconnect check again, now atomically with taking the
             // session (an AUTH may have finished since `authenticate`).
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
@@ -482,7 +483,7 @@ final class ControlServer: @unchecked Sendable {
                             "auth.resume_refused peer=\(peer.ip) chan=\(authChannel?.name ?? "open") stage=admit sent=\(sent ? 1 : 0) counted=0")
                 if sent {
                     Darwin.shutdown(fd, SHUT_WR)
-                    Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+                    KickHandle.drainAfterNotice(fd)
                 }
                 return
             }
@@ -490,7 +491,8 @@ final class ControlServer: @unchecked Sendable {
                 sessionBroker.end(token)
                 kick.finish()
             }
-            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
+            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted,
+                          wake: kick.wakeFD)
             if kick.kicked && authChannel == .control {
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
                 print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
@@ -499,9 +501,11 @@ final class ControlServer: @unchecked Sendable {
                 // A close with input still unread on our side sends an RST,
                 // and Windows may throw away a notice the viewer has not read
                 // yet; the viewer would then reconnect and take the session back.
+                // r4: the viewer's input is read and dropped until it closes
+                // (at most `noticeLinger`), so nothing is left unread at close.
                 if sent {
                     Darwin.shutdown(fd, SHUT_WR)
-                    Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+                    KickHandle.drainAfterNotice(fd)
                 }
             }
         } else {
@@ -511,7 +515,7 @@ final class ControlServer: @unchecked Sendable {
 
     /// The message loop of one admitted connection.
     private func serveAdmitted(_ fd: Int32, peer: ControlPeer, pending: [UInt8]?,
-                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool) {
+                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool, wake: Int32 = -1) {
         let authenticated = gateAdmitted
         // A connection is an input session only once it sends its first key
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
@@ -528,7 +532,7 @@ final class ControlServer: @unchecked Sendable {
         var connectionMessages = 0
         while true {
             let next: [UInt8]?
-            if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8) }
+            if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8, wake: wake) }
             firstHeader = nil
             guard let header = next else { return }
             guard header[0] == 0x4d, header[1] == 0x52, header[2] == 0x43, header[3] == 0x31, header[4] == 1 else {
@@ -537,7 +541,7 @@ final class ControlServer: @unchecked Sendable {
             }
             let type = header[5]
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
-            guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
+            guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length, wake: wake) else { return }
             if let admitMessage, !admitMessage() {
                 rejectedClients += 1
                 print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
@@ -1357,7 +1361,7 @@ final class ControlServer: @unchecked Sendable {
                     "auth.resume_refused peer=\(ip) chan=\(channel.name) resume=\(resume.map(ConnAuth.hex) ?? "-") sent=\(sent ? 1 : 0) counted=0")
         if sent {
             Darwin.shutdown(fd, SHUT_WR)
-            Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+            KickHandle.drainAfterNotice(fd)
         }
     }
 
@@ -1542,11 +1546,23 @@ final class ControlServer: @unchecked Sendable {
     /// r12: viewer sockets are O_NONBLOCK, so a read with nothing there
     /// waits in poll(POLLIN) with no timeout, as the blocking recv did
     /// before: `stop()`'s shutdown still wakes it (recv then sees EOF).
-    private func recvExact(_ fd: Int32, count: Int) -> [UInt8]? {
+    /// r4: with `wake` (a kicked control connection, `KickHandle.wakeFD`) it
+    /// also returns nil once that fd is readable, checked before every read
+    /// so a viewer that keeps sending cannot hold the loop.
+    private func recvExact(_ fd: Int32, count: Int, wake: Int32 = -1) -> [UInt8]? {
         if count == 0 { return [] }
         var out = [UInt8](repeating: 0, count: count)
         var offset = 0
         while offset < count {
+            if wake >= 0 {
+                var pfds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                            pollfd(fd: wake, events: Int16(POLLIN), revents: 0)]
+                if Darwin.poll(&pfds, 2, -1) < 0 {
+                    if errno == EINTR { continue }
+                    return nil
+                }
+                if pfds[1].revents != 0 { return nil }
+            }
             let n = out.withUnsafeMutableBytes { raw -> Int in
                 Darwin.recv(fd, raw.baseAddress!.advanced(by: offset), count - offset, 0)
             }
@@ -1555,6 +1571,7 @@ final class ControlServer: @unchecked Sendable {
             let e = errno
             if e == EINTR { continue }
             guard e == EAGAIN else { return nil }
+            if wake >= 0 { continue }   // r4: the poll above waits on both
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             if Darwin.poll(&pfd, 1, -1) < 0 && errno != EINTR { return nil }
         }

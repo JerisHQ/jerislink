@@ -509,12 +509,19 @@ final class SessionLinkClient: @unchecked Sendable {
 }
 
 /// r2 (Pepper's PR-C review, item 2): how SessionBroker ends a connection
-/// that a newer AUTH replaced. `kick` (any thread) shuts the read side, so
-/// the connection's loop sees EOF and takes no more input, and the handler
-/// can still write the "replaced" notice. A handler stuck writing to a
-/// viewer that stopped reading is cut off fully after `hardCloseAfter`.
-/// `finish` (the handler, before its fd is closed) makes a late kick a
-/// no-op, so a reused descriptor number is never touched.
+/// that a newer AUTH replaced. `kick` (any thread) stops the connection's
+/// loop, so it takes no more input, and the handler can still write the
+/// "replaced" notice. A handler stuck writing to a viewer that stopped
+/// reading is cut off fully after `hardCloseAfter`. `finish` (the handler,
+/// before its fd is closed) makes a late kick a no-op, so a reused
+/// descriptor number is never touched.
+///
+/// r4: a connection that gets the notice (`wake`: the control channel) is
+/// woken through a pipe instead of a read-side shutdown. On macOS, input
+/// that reaches a socket after `shutdown(SHUT_RD)` is answered with an RST,
+/// so a viewer still sending mouse input reset its own connection before
+/// the notice could be written (`auth.replaced_notice sent=0`). Other
+/// channels still shut the read side.
 final class KickHandle: @unchecked Sendable {
     static let hardCloseAfter: TimeInterval = 2
     /// r3: how long the control channel keeps a kicked socket open after
@@ -523,8 +530,26 @@ final class KickHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var fd: Int32
     private var wasKicked = false
+    private var wakeRead: Int32 = -1
+    private var wakeWrite: Int32 = -1
 
-    init(_ fd: Int32) { self.fd = fd }
+    init(_ fd: Int32, wake: Bool = false) {
+        self.fd = fd
+        var p: [Int32] = [-1, -1]
+        if wake, Darwin.pipe(&p) == 0 {
+            _ = Darwin.fcntl(p[1], F_SETFL, Darwin.fcntl(p[1], F_GETFL) | O_NONBLOCK)
+            wakeRead = p[0]
+            wakeWrite = p[1]
+        }
+    }
+
+    deinit {
+        if wakeRead >= 0 { Darwin.close(wakeRead) }
+        if wakeWrite >= 0 { Darwin.close(wakeWrite) }
+    }
+
+    /// r4: readable once kicked (-1 when this handle shuts the read side).
+    var wakeFD: Int32 { wakeRead }
 
     var kicked: Bool { lock.lock(); defer { lock.unlock() }; return wasKicked }
 
@@ -533,7 +558,12 @@ final class KickHandle: @unchecked Sendable {
         defer { lock.unlock() }
         guard fd >= 0, !wasKicked else { return }
         wasKicked = true
-        Darwin.shutdown(fd, SHUT_RD)
+        if wakeWrite >= 0 {
+            var one: UInt8 = 1
+            _ = Darwin.write(wakeWrite, &one, 1)
+        } else {
+            Darwin.shutdown(fd, SHUT_RD)
+        }
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.hardCloseAfter) { [self] in
             lock.lock(); defer { lock.unlock() }
             if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) }
@@ -542,5 +572,25 @@ final class KickHandle: @unchecked Sendable {
 
     func finish() {
         lock.lock(); fd = -1; lock.unlock()
+    }
+
+    /// r4: after the notice and FIN, reads and drops what the viewer still
+    /// sends until it closes, for at most `noticeLinger`. Closing with input
+    /// unread would send an RST, and Windows may then throw away a notice
+    /// the viewer has not read yet.
+    static func drainAfterNotice(_ fd: Int32) {
+        let deadline = ProcessInfo.processInfo.systemUptime + noticeLinger
+        var scratch = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let left = deadline - ProcessInfo.processInfo.systemUptime
+            if left <= 0 { return }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = Darwin.poll(&pfd, 1, Int32(max(1, left * 1000)))
+            if ready < 0 && errno == EINTR { continue }
+            if ready <= 0 { return }
+            let n = scratch.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!, 4096, 0) }
+            if n < 0 && (errno == EINTR || errno == EAGAIN) { continue }
+            if n <= 0 { return }
+        }
     }
 }
