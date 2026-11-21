@@ -6922,6 +6922,7 @@ static int appMain(int argc, char** argv) {
                 << " control_owed_on_drop=" << (control ? control->reconnectStats().owedOnDrop : 0)
                 << " control_positions_skipped=" << (control ? control->reconnectStats().positionsSkipped : 0)
                 << " control_cancelled_in_flight=" << (control ? control->reconnectStats().cancelledInFlight : 0)
+                << " control_owed_before_input=" << (control ? control->reconnectStats().owedBeforeInput : 0)
                 << " control_paused_drops=" << (control ? control->reconnectStats().pausedDrops : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)

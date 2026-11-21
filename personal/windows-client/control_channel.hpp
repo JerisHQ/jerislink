@@ -124,6 +124,7 @@ public:
         uint64_t owedOnDrop = 0;   // r7: ups dropped unsent while the Mac had their down: sent later instead
         uint64_t positionsSkipped = 0;  // r7: click positions left out with a button up not sent again
         uint64_t cancelledInFlight = 0;  // r8: downs taken by the worker, not sent yet, whose up was dropped
+        uint64_t owedBeforeInput = 0;    // r9: owed releases sent ahead of an item the worker had taken, before it went out
         bool pausedNow = false;    // r6: paused right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
@@ -831,6 +832,24 @@ private:
                 ++a.stats.dropped;
                 ++a.stats.cancelledInFlight;
                 return Flush::Discarded;
+            }
+            if (q.kind != Kind::Release && hasOwedLocked(a)) {
+                // r9 (Pepper's r8 review): an up was dropped while this item
+                // waited (for room in the send buffer, without the lock),
+                // and its release is owed now. The release goes first, so
+                // the Mac never gets this input with a key still held that
+                // the user already let go. Then every check runs again.
+                const Owed owed = takeOwedLocked(a);
+                const Queued rel{owed.bytes, std::chrono::steady_clock::now(), Kind::Release, a.generation};
+                const Flush fl = flushOneLocked(a, lk, s, rel);
+                if (fl == Flush::Sent) {
+                    a.stats.released += owed.count;
+                    ++a.stats.owedBeforeInput;
+                    continue;
+                }
+                restoreOwedLocked(a, owed);
+                if (fl == Flush::Stopped) return Flush::Stopped;
+                return failedUnsent();  // nothing of this item went out
             }
             if (a.atCommit && q.kind != Kind::Release) a.atCommit();
             // r6: an up for a key released on focus loss is not sent again.

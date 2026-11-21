@@ -1602,6 +1602,92 @@ void r8Tests() {
     setCurrent(nullptr);
 }
 
+// Pepper's r8 review: the worker lets the lock go while it waits for room
+// in the send buffer. An up the UI thread drops meanwhile (aged out) makes
+// a release owed; that release must reach the Mac before the item the
+// worker is holding, never after it.
+void r9Tests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    auto isKey = [](const std::pair<uint8_t, Bytes>& f, int down, uint8_t k) {
+        return f.first == 0x10 && f.second.size() == 3 && f.second[0] == down && f.second[2] == k;
+    };
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    constexpr uint16_t kShift = 0x0038;
+
+    // (u) Shift went down live, then the connection dropped. K down (K is
+    // still held) and Shift up wait for the reconnect. The worker takes K
+    // down, is slow (2 s) and then finds the send buffer full; while it
+    // waits without the lock, B down comes and Shift up is found aged out
+    // by the UI thread. The Mac must get Shift up before K down.
+    {
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<bool> firstIn{false};
+        std::vector<std::pair<uint8_t, Bytes>> first, got;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) { firstIn = true; return; }
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            if (auth1) first = readFrames(s, 1, 2000);
+            firstIn = true;
+            SOCKET s2 = l.accept(5000);
+            closesocket(s);
+            if (s2 == INVALID_SOCKET) return;
+            auth2 = hostAuth(s2, sec, Answer::Ok, 100);
+            if (auth2) got = readFrames(s2, 5, 7000);
+            closesocket(s2);
+        });
+        control.sendKey(true, kShift);
+        for (int i = 0; i < 300 && !firstIn; ++i) Sleep(10);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        std::atomic<bool> slow{false};
+        control.setBeforeFlushSendForTest([&] {
+            if (!slow.exchange(true)) Sleep(2000);
+        });
+        control.setFlushWouldBlockForTest(1000000, [] { Sleep(20); });
+        control.close();                        // the connection dropped
+        const auto before = control.reconnectStats();
+        control.sendKey(true, 0x004B);          // K down: taken by the worker
+        control.sendKey(false, kShift);         // Shift up: queued behind it
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 600 && control.reconnectStats().flushWaits == before.flushWaits; ++i) Sleep(10);
+        const auto inFlight = control.reconnectStats();  // K down waits for room, lock let go
+        std::this_thread::sleep_until(t0 + std::chrono::milliseconds(ControlChannel::kQueueMaxAgeMs + 300));
+        control.sendKey(true, 0x0042);          // B down: Shift up (3.3 s old) ages out here
+        const auto mid = control.reconnectStats();
+        control.setFlushWouldBlockForTest(0, nullptr);
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+        control.sendKey(false, 0x004B);
+        control.sendKey(false, 0x0042);
+        host.join();
+        control.setBeforeFlushSendForTest(nullptr);
+        const auto st = control.reconnectStats();
+        std::string why;
+        const bool paired = pairedOnly(got, {kShift}, why);
+        expect(auth1 && first.size() == 1 && isKey(first[0], 1, 0x38) && slow &&
+                   inFlight.flushWaits > before.flushWaits && inFlight.connecting && mid.connecting &&
+                   mid.owedOnDrop == before.owedOnDrop + 1 && mid.flushed == before.flushed,
+               "r9 owed while in flight: K down waited for room without the lock; Shift up aged out meanwhile");
+        expect(auth2 && got.size() == 5 && isKey(got[0], 0, 0x38) && isKey(got[1], 1, 0x4B) && isKey(got[2], 1, 0x42) &&
+                   isKey(got[3], 0, 0x4B) && isKey(got[4], 0, 0x42) && paired,
+               "  the Mac got Shift up before K down, then B, K up, B up (" + std::to_string(got.size()) + " frames, " +
+                   why + ")");
+        expect(st.owedBeforeInput == 1 && st.released == 1 && st.cancelledInFlight == 0 && st.swallowed == 0,
+               "  stats: owedBeforeInput=1, released=1, cancelledInFlight=0");
+        control.stop();
+    }
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -1615,6 +1701,7 @@ int main() {
     r6Tests();
     r7Tests();
     r8Tests();
+    r9Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
