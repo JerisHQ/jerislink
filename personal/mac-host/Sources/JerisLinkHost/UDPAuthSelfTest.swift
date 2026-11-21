@@ -25,6 +25,8 @@ enum UDPAuthSelfTest {
         frameSender(expect)
         r3MouseServer(expect)
         r3AudioSession(expect)
+        r4Broker(expect)
+        r4Restart(expect)
         probe(expect)
         return failures == 0 ? 0 : 1
     }
@@ -138,9 +140,9 @@ enum UDPAuthSelfTest {
         expect(SessionLinkWire.decode(type: 1, body: Array(body.dropLast())) == nil, "wire: short key is malformed")
         expect(SessionLinkWire.decode(type: 1, body: body + [0]) == nil, "wire: trailing byte is malformed")
         expect(SessionLinkWire.decode(type: 7, body: body) == nil, "wire: unknown type is malformed")
-        var badIP = body; badIP[9] = UInt8(ascii: "x")
+        var badIP = body; badIP[17] = UInt8(ascii: "x")
         expect(SessionLinkWire.decode(type: 1, body: badIP) == nil, "wire: a non-IPv4 peer is malformed")
-        expect(SessionLinkWire.decode(type: 0, body: Array(body.prefix(9))) == nil, "wire: none with a body is malformed")
+        expect(SessionLinkWire.decode(type: 0, body: Array(body.prefix(17))) == nil, "wire: none with a body is malformed")
         // r2 (item 1): stale frames are refused, "none" included.
         let g7 = SessionLinkWire.Frame(generation: 7, session: tagged)
         let none6 = SessionLinkWire.Frame(generation: 6, session: nil)
@@ -392,12 +394,12 @@ enum UDPAuthSelfTest {
                && got.allSatisfy { $0.count <= 1200 + UDPTag.bytes },
                "sender: tagged session, every MR02 packet sealed h2v (\(got.count) packets)")
         let audio = Data(Array("MRA1".utf8) + [1, 0, 0, 1] + [UInt8](repeating: 7, count: 40))
-        _ = sender.sendAudio(audio, port: rx.port, generation: 1)
+        _ = sender.sendAudio(audio, port: rx.port, generation: .init(boot: 0, generation: 1))
         let a = receiveUDP(rx.fd)
         expect(a.map { p in p.count == audio.count + 8 && p.withUnsafeBytes { h2v.verify($0.baseAddress!, p.count) } } ?? false,
                "sender: MRA1 audio sealed h2v")
         state.set(nil)
-        _ = sender.sendAudio(audio, port: rx.port, generation: 1)
+        _ = sender.sendAudio(audio, port: rx.port, generation: .init(boot: 0, generation: 1))
         expect(receiveUDP(rx.fd) == nil, "sender: session gone, no audio leaves")
     }
 
@@ -420,7 +422,7 @@ enum UDPAuthSelfTest {
         let presence = ViewerPresence()
         let server = MouseMoveUDPServer(bindIP: "127.0.0.1", allowedClientIP: nil, port: port, presence: presence,
                                         relayPort: 1, inputAllowed: { false }, udpSession: state)
-        let requests = LockedBox<[(Bool, UInt16, UInt64?)]>([])
+        let requests = LockedBox<[(Bool, UInt16, UDPPeerSession.ID?)]>([])
         server.setAudioRequestHandler { enable, p, _, gen in requests.mutate { $0.append((enable, p, gen)) } }
         guard (try? server.start()) != nil else { expect(false, "r3 mouse: server starts"); return }
         defer { server.stop() }
@@ -435,7 +437,7 @@ enum UDPAuthSelfTest {
         Thread.sleep(forTimeInterval: 0.2)
         let r1 = requests.value
         expect(pong?[5] == 0x44 && presence.isActive() && presence.datagramsHeard == 2 && server.replyPortForTest == a.port
-               && r1.count == 1 && r1[0].0 && r1[0].1 == 40001 && r1[0].2 == 1 && server.forwarded == 0,
+               && r1.count == 1 && r1[0].0 && r1[0].1 == 40001 && r1[0].2?.generation == 1 && server.forwarded == 0,
                "r3 read-only: ping + 0x45 alone make presence active and an audio request for gen 1, no move sent")
 
         // Item 3: replay of seen datagrams from another port.
@@ -469,7 +471,7 @@ enum UDPAuthSelfTest {
         sendUDP(b.fd, UDPTagger(sessionKey: k2, hostToViewer: false).seal(audioReq(1, port: 40003)), to: port)
         Thread.sleep(forTimeInterval: 0.2)
         let last = requests.value.last
-        expect(requests.value.count == 2 && last?.1 == 40003 && last?.2 == 2 && server.replyPortForTest == b.port,
+        expect(requests.value.count == 2 && last?.1 == 40003 && last?.2?.generation == 2 && server.replyPortForTest == b.port,
                "r3 session: the new viewer's request carries gen 2")
     }
 
@@ -486,21 +488,100 @@ enum UDPAuthSelfTest {
         let k1 = key(22), k2 = key(23)
         let audio = Data(Array("MRA1".utf8) + [1, 0, 0, 1] + [UInt8](repeating: 9, count: 40))
         state.set(UDPPeerSession(generation: 1, peerIP: "127.0.0.1", sessionKey: k1))
-        let ok1 = sender.sendAudio(audio, port: rx.port, generation: 1)
+        let ok1 = sender.sendAudio(audio, port: rx.port, generation: .init(boot: 0, generation: 1))
         let p1 = receiveUDP(rx.fd)
         let h2v1 = UDPTagger(sessionKey: k1, hostToViewer: true)
         expect(ok1 && (p1.map { p in p.withUnsafeBytes { h2v1.verify($0.baseAddress!, p.count) } } ?? false),
                "r3 audio: gen 1 request, gen 1 session: audio leaves sealed with its key")
         state.set(UDPPeerSession(generation: 2, peerIP: "127.0.0.1", sessionKey: k2))
-        let stale = sender.sendAudio(audio, port: rx.port, generation: 1)
+        let stale = sender.sendAudio(audio, port: rx.port, generation: .init(boot: 0, generation: 1))
         let none = sender.sendAudio(audio, port: rx.port)
         expect(!stale && !none && receiveUDP(rx.fd) == nil && sender.statsLine().contains("audio_stale_drops=2"),
                "r3 audio: after a new viewer, the old request's audio is dropped (not sent with the new IP/key to the old port)")
-        let ok2 = sender.sendAudio(audio, port: rx.port, generation: 2)
+        let ok2 = sender.sendAudio(audio, port: rx.port, generation: .init(boot: 0, generation: 2))
         let p2 = receiveUDP(rx.fd)
         let h2v2 = UDPTagger(sessionKey: k2, hostToViewer: true)
         expect(ok2 && (p2.map { p in p.withUnsafeBytes { h2v2.verify($0.baseAddress!, p.count) } } ?? false),
                "r3 audio: the new viewer's own request (gen 2) gets audio")
+    }
+
+
+    // MARK: r4 (Pepper's r3 review, items 1 and 3)
+
+    /// Item 1: a reconnect naming a control session that is no longer the
+    /// live one is refused, atomically with taking the session.
+    private static func r4Broker(_ expect: Expect) {
+        let closed = Closed()
+        let b = SessionBroker(passwordMode: true, log: { _ in })
+        let a = "100.64.0.1", c = "100.64.0.2"
+        let idA: [UInt8] = [1, 1, 1, 1, 1, 1, 1, 1], idB: [UInt8] = [2, 2, 2, 2, 2, 2, 2, 2]
+        expect(!b.resumeRefused(idA), "r4 broker: no live session, a reconnect is let in")
+        let ctlA = b.admit(peerIP: a, channel: .control, sessionKey: key(30), authSession: idA, resume: nil,
+                           close: { closed.add("a-ctl") })
+        expect(ctlA != nil && !b.resumeRefused(idA), "r4 broker: the live session's own reconnect is let in")
+        _ = b.admit(peerIP: c, channel: .control, sessionKey: key(31), authSession: idB, resume: nil, close: { closed.add("c-ctl") })
+        let (s1, g1) = b.current
+        expect(s1?.peerIP == c && closed.all == ["a-ctl"], "r4 broker: another viewer took the session")
+        // The old viewer never heard the notice and reconnects on its own.
+        expect(b.resumeRefused(idA), "r4 broker: the replaced viewer's reconnect is refused")
+        let back = b.admit(peerIP: a, channel: .control, sessionKey: key(32), authSession: [3, 3, 3, 3, 3, 3, 3, 3], resume: idA,
+                           close: { closed.add("a-ctl2") })
+        let clip = b.admit(peerIP: a, channel: .clipboard, sessionKey: nil, authSession: nil, resume: idA, close: { closed.add("a-clip") })
+        expect(back == nil && clip == nil && b.current.1 == g1 && b.current.0?.peerIP == c && closed.all == ["a-ctl"]
+               && b.resumesRefused == 2 && b.replaced == 1,
+               "r4 broker: refused at admit too (control and clipboard): nothing kicked, session and generation unchanged")
+        expect(!b.resumeRefused(nil), "r4 broker: a new attempt (no resume id) is not refused")
+        if let ctlA { b.end(ctlA) }
+    }
+
+    /// Item 3: the session identity is (boot, generation). After a control
+    /// service restart the generation is 1 again, but audio still queued for
+    /// the old session never leaves for the new one.
+    private static func r4Restart(_ expect: Expect) {
+        let s = UDPPeerSession(generation: 1, peerIP: "100.64.0.9", sessionKey: key(40), boot: 0xA1B2_C3D4_E5F6_0718)
+        let f = SessionLinkWire.encode(s, generation: 1)
+        let back = SessionLinkWire.decode(type: f[4], body: Array(f[7...]))
+        expect(back?.session == s && back?.session?.boot == s.boot && back?.boot == s.boot, "r4 wire: the boot number round trips")
+        let n = SessionLinkWire.encode(nil, generation: 4, boot: 77)
+        expect(SessionLinkWire.decode(type: n[4], body: Array(n[7...])) == .init(generation: 4, session: nil, boot: 77),
+               "r4 wire: a none frame carries the boot number too")
+        let before = SessionBroker(passwordMode: true, log: { _ in })
+        let after = SessionBroker(passwordMode: true, log: { _ in })
+        _ = before.begin(peerIP: "127.0.0.1", channel: .control, sessionKey: key(41), close: {})
+        _ = after.begin(peerIP: "127.0.0.1", channel: .control, sessionKey: key(42), close: {})
+        let old = before.current.0, new = after.current.0
+        expect(before.boot != 0 && after.boot != 0 && before.boot != after.boot && old?.generation == 1 && new?.generation == 1
+               && old?.id != new?.id,
+               "r4 restart: both first sessions are generation 1, their identities differ")
+
+        guard let rx = udpSocket(), let old, let new else { expect(false, "r4 restart: setup"); return }
+        defer { Darwin.close(rx.fd) }
+        guard let sender = try? UDPFrameSender(bindIP: "127.0.0.1", clientIP: "0.0.0.0", clientPort: rx.port, packetBytes: 1200) else {
+            expect(false, "r4 restart: sender starts"); return
+        }
+        let state = UDPSessionState(requireTags: true)
+        sender.setSession(state)
+        let audio = Data(Array("MRA1".utf8) + [1, 0, 0, 1] + [UInt8](repeating: 5, count: 40))
+        state.set(old)
+        // Captured with the old session's identity (AudioStreamer reads it
+        // under its lock, then sends after it lets go).
+        let pending = old.id
+        let ok1 = sender.sendAudio(audio, port: rx.port, generation: pending)
+        let p1 = receiveUDP(rx.fd)
+        // The control service restarts: link down, then the new service
+        // announces its own first session (generation 1, same IP).
+        state.set(nil)
+        state.set(new)
+        let stale = sender.sendAudio(audio, port: rx.port, generation: pending)
+        let leaked = receiveUDP(rx.fd)
+        let ok2 = sender.sendAudio(audio, port: rx.port, generation: new.id)
+        let p2 = receiveUDP(rx.fd)
+        let h2vNew = UDPTagger(sessionKey: key(42), hostToViewer: true)
+        expect(ok1 && p1 != nil, "r4 restart: audio for the old session leaves while it is current")
+        expect(!stale && leaked == nil && sender.statsLine().contains("audio_stale_drops=1"),
+               "r4 restart: audio still queued with the old identity is dropped after the restart (generation 1 both times)")
+        expect(ok2 && (p2.map { p in p.withUnsafeBytes { h2vNew.verify($0.baseAddress!, p.count) } } ?? false),
+               "r4 restart: the new session's own audio leaves with its key")
     }
 
     // MARK: Zero-MAC probe

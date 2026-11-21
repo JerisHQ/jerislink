@@ -20,6 +20,7 @@
 #include <wrl/client.h>
 #include "control_channel.hpp"
 #include "udp_plan.hpp"
+#include "read_only_session.hpp"
 #include "auth_ui.hpp"
 #include <cstdlib>
 #include <utility>
@@ -6070,6 +6071,7 @@ static int appMain(int argc, char** argv) {
     bool hostSupportsNack = false;
     bool hostSupportsAbr = false;
     bool hostSupportsAudio = false;
+    bool videoNegotiatedAtStart = false;  // r4: a read-only view negotiates later otherwise
     gRemoteWidth = o.width;
     gRemoteHeight = o.height;
     gScrollScale = o.scrollScale;
@@ -6177,6 +6179,7 @@ static int appMain(int argc, char** argv) {
                 const auto videoConfig = control->negotiateVideo(
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
                 if (videoConfig.negotiated) {
+                    videoNegotiatedAtStart = true;
                     effectiveCodec = videoConfig.codec;
                     hostSupportsNack = videoConfig.hostSupportsNack;
                     hostSupportsAbr = videoConfig.hostSupportsAbr;
@@ -6360,9 +6363,11 @@ static int appMain(int argc, char** argv) {
         // up. The player has its own socket and threads; the loop below only
         // repeats the MRM1 0x45 request naming that socket's port every second.
         // r3 (item 2): also in a read-only view (udp_plan.hpp).
-        const jl::viewer::UdpPlan mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
-                                                                o.audio == "on", hostSupportsAudio);
-        if (mrm1Plan.audio && mouseMoveUdp) {
+        jl::viewer::UdpPlan mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
+                                                           o.audio == "on", hostSupportsAudio);
+        // r4 (item 2): also run by a read-only view that negotiates later.
+        auto startAudio = [&] {
+            if (audio || !mrm1Plan.audio || !mouseMoveUdp) return;
             audio = std::make_unique<jl::audio::AudioPlayer>([](const std::string& m) { logLine(m); });
             std::string audioErr;
             if (audio->start(o.bindIp, o.sourceIp, audioErr)) {
@@ -6375,7 +6380,8 @@ static int appMain(int argc, char** argv) {
                 logLine("audio.start_failed reason=" + audioErr);
                 audio.reset();
             }
-        }
+        };
+        startAudio();
         logLine(std::string("audio=") + (audio ? "on" : "off") +
                 " requested=" + o.audio +
                 " host_audio=" + (hostSupportsAudio ? "yes" : "no") +
@@ -6609,6 +6615,9 @@ static int appMain(int argc, char** argv) {
         overlayShow(false, "session-start", 4000);
 
         double nextPausedCheckMs = 0;
+        // r4 (item 2): a read-only view gets its session back on its own.
+        jl::viewer::ReadOnlyRecovery readOnly(videoNegotiatedAtStart);
+        uint64_t readOnlyReconnects = 0;
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
         gLoopResponsiveMs = steadyMsNow();
@@ -6639,7 +6648,42 @@ static int appMain(int argc, char** argv) {
                     control->pollHostNotice();
                     // Read-only: no input ever asks for a reconnect, so the
                     // session is brought back here when it dropped.
-                    if (!o.controlEnabled) control->keepSession();
+                    if (!o.controlEnabled) {
+                        // r4 (item 2): also the negotiation the start-up
+                        // could not do, and a new round after a pause.
+                        const double nowMs = steadyMsNow();
+                        const auto rs = control->reconnectStats();
+                        if (rs.reconnects != readOnlyReconnects) {
+                            readOnlyReconnects = rs.reconnects;
+                            readOnly.sessionBack();
+                        }
+                        if (readOnly.wantResume(rs.pausedNow, nowMs) && control->resumeOnUserKey()) {
+                            logLine("control.read_only_resume round=" + std::to_string(readOnly.resumes()) +
+                                    " next_gap_ms=" + std::to_string(int(readOnly.resumeGapMs())));
+                        }
+                        control->keepSession();
+                        if (readOnly.wantNegotiate(control->connected(), nowMs)) {
+                            // h264 only: the decoder was made for it at start.
+                            const auto vc = control->negotiateVideoOnLive("h264", h264Supported, false, o.bitrateMbps,
+                                                                          o.audio == "on");
+                            if (vc.negotiated && vc.codec == "h264") {
+                                readOnly.negotiateOk();
+                                hostSupportsAudio = vc.hostSupportsAudio;
+                                mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, vc.hostSupportsNack,
+                                                               o.audio == "on", hostSupportsAudio);
+                                startAudio();
+                                // NACK and ABR stay as the start set them (off).
+                                logLine(std::string("video.negotiated_late codec=h264 bitrate_mbps=") +
+                                        std::to_string(vc.bitrateMbps) +
+                                        " host_audio=" + (vc.hostSupportsAudio ? "yes" : "no") +
+                                        " keepalive=" + (mrm1Plan.keepAlive ? "on" : "off") +
+                                        " audio=" + (audio ? "on" : "off"));
+                            } else {
+                                readOnly.negotiateFailed(nowMs);
+                                logLine("video.negotiate_late_failed tries=" + std::to_string(readOnly.negotiateFailures()));
+                            }
+                        }
+                    }
                 }
             }
             phaseMarkMs = steadyMsNow();

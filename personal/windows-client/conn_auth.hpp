@@ -93,6 +93,11 @@ constexpr size_t kMacBytes = 32;
 constexpr size_t kSessionIdBytes = 8;
 constexpr size_t kChallengeBytes = kNonceBytes + kSaltBytes + 4 + 1 + kHostIdBytes;  // 69
 constexpr size_t kResponseBytes = kNonceBytes + kMacBytes;                          // 64
+// r4 (Pepper's r3 review, item 1): a channel reconnecting on its own, after
+// a control AUTH of this attempt, appends that AUTH's session_id. The host
+// answers REPLACED while another viewer holds the session, so a viewer that
+// missed the "replaced" notice still never takes the session back.
+constexpr size_t kResumeResponseBytes = kResponseBytes + kSessionIdBytes;           // 72
 
 constexpr uint8_t kTypeResponse = 0x03;
 constexpr uint8_t kTypeResult = 0x04;
@@ -982,8 +987,18 @@ private:
         std::optional<Key> key = keyFor(*ch5, fromStore);
         if (!key) { rep.outcome = Outcome::NeedPassword; return rep; }
 
-        uint8_t resp[kResponseBytes]{};
+        uint8_t resp[kResumeResponseBytes]{};
         if (!randomBytes(resp, kNonceBytes)) { rep.outcome = Outcome::Network; return rep; }
+        // r4: only a reconnect within this attempt names the session; the
+        // first AUTH of an attempt from the launch screen never does.
+        size_t respBytes = kResponseBytes;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            if (resumeId_) {
+                std::memcpy(resp + kResponseBytes, resumeId_->data(), kSessionIdBytes);
+                respBytes = kResumeResponseBytes;
+            }
+        }
         auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data());
         if (!macC) {
             // Never answer with a MAC CNG did not produce; closing without
@@ -993,7 +1008,8 @@ private:
             return rep;
         }
         std::memcpy(resp + kNonceBytes, macC->data(), kMacBytes);
-        if (!sendAllBytes(s, frame(kTypeResponse, resp, sizeof(resp)))) { rep.outcome = Outcome::Network; return rep; }
+        if (!sendAllBytes(s, frame(kTypeResponse, resp, respBytes))) { rep.outcome = Outcome::Network; return rep; }
+        if (respBytes == kResumeResponseBytes) note(std::string("auth.resume chan=") + channelName(ch));
 
         io = rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
         if (io != Io::Ok || type != kTypeResult) { rep.outcome = Outcome::Network; return rep; }
@@ -1016,6 +1032,10 @@ private:
             }
             accept(*ch5, *key, fromStore);
             if (ch == Channel::Control) {
+                {
+                    std::lock_guard<std::mutex> g(m_);
+                    resumeId_ = res->sessionId;
+                }
                 // PR-C: this control session's K_s tags every UDP datagram
                 // from now on; the host switches to it at the same time.
                 auto ks = sessionKey(*key, ch5->hostNonce.data(), resp, res->sessionId.data());
@@ -1112,6 +1132,12 @@ private:
         case Result::Status::Locked: rep.outcome = Outcome::Locked; rep.retrySeconds = r.retrySeconds; break;
         case Result::Status::Blocked: rep.outcome = Outcome::Blocked; break;
         case Result::Status::AuthRequired: rep.outcome = Outcome::AuthRequired; break;
+        case Result::Status::Replaced:
+            // r4: our reconnect named a session another viewer has taken
+            // since. Terminal: nothing reconnects (handshake halts).
+            note("auth.resume_refused reconnect=stopped");
+            rep.outcome = Outcome::Replaced;
+            break;
         default: rep.outcome = Outcome::Network; break;
         }
         return rep;
@@ -1255,6 +1281,8 @@ private:
     std::atomic<bool> halted_{false};
     std::atomic<uint32_t> pausedChannels_{0};
     bool authed_ = false;  // under m_
+    // r4: session_id of this attempt's last control AUTH (under m_).
+    std::optional<std::array<uint8_t, kSessionIdBytes>> resumeId_;
     Report terminal_;
     Outcome last_ = Outcome::Network;
     std::string hostKey_;

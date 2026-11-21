@@ -446,6 +446,41 @@ public:
         return result;
     }
 
+    // PR-C r4 (Pepper's r3 review, item 2): negotiateVideo once the session
+    // runs, on the connection a background reconnect made (a read-only view
+    // whose start-up negotiation failed, read_only_session.hpp). UI thread
+    // only, like the other sends on the live socket; nothing when no live
+    // connection is there or a reconnect runs. The worker never touches the
+    // live socket while no reconnect runs, so the exchange borrows it and
+    // hands it back (closed when the exchange failed: the next keepSession
+    // reconnects, and a "replaced" notice in place of the ACK is caught by
+    // that reconnect's AUTH, which names the old session).
+    VideoConfigResult negotiateVideoOnLive(const std::string& requestedCodec, bool clientH264, bool clientHevc,
+                                           uint16_t requestedBitrateMbps, bool clientAudio) {
+        std::shared_ptr<Async> a = async_;
+        if (!a) return negotiateVideo(requestedCodec, clientH264, clientHevc, requestedBitrateMbps, clientAudio);
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (a->stopping || a->connecting || a->s == INVALID_SOCKET) return {};
+            s_ = std::exchange(a->s, INVALID_SOCKET);
+        }
+        // The synchronous path (s_, close(), recvExact) for this one exchange.
+        async_.reset();
+        VideoConfigResult r = negotiateVideo(requestedCodec, clientH264, clientHevc, requestedBitrateMbps, clientAudio);
+        async_ = a;
+        std::lock_guard<std::mutex> g(a->m);
+        const bool lost = s_ == INVALID_SOCKET;  // negotiateVideo closed it (no ACK)
+        if (a->stopping) {
+            closeSocket(s_);
+        } else {
+            a->s = std::exchange(s_, INVALID_SOCKET);  // also when the Mac only refused the config
+        }
+        if (lost) {
+            a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+        }
+        return r;
+    }
+
     // The AUTH channel this connection proves (design §5). Control by
     // default; the launch screen check uses Ping.
     void setAuthChannel(jl::auth::Channel c) { authChannel_ = c; }

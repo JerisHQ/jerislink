@@ -570,7 +570,10 @@ final class UDPFrameSender: @unchecked Sendable {
     /// that request came in. With a session link, audio leaves only while
     /// that session is still the current one: never to the next viewer's
     /// IP and key at the old viewer's port.
-    func sendAudio(_ packet: Data, port: UInt16, generation: UInt64? = nil) -> Bool {
+    /// r4 (Pepper's r3 review, item 3): it is the session's (boot, generation),
+    /// so after a control service restart (generation from 1 again) audio
+    /// queued for the old session never matches the new one.
+    func sendAudio(_ packet: Data, port: UInt16, generation: UDPPeerSession.ID? = nil) -> Bool {
         guard streamOpen() else { return false }
         return sendTo(packet, port: port.bigEndian, audioGeneration: generation, checkGeneration: true).sent
     }
@@ -583,7 +586,7 @@ final class UDPFrameSender: @unchecked Sendable {
     /// The datagram as it leaves: to the session peer (sealed when the
     /// session is tagged), else to the fixed destination. `port` is
     /// network order; nil keeps the destination's. bytes: what went out.
-    private func sendTo(_ packet: Data, port: in_port_t? = nil, audioGeneration: UInt64? = nil,
+    private func sendTo(_ packet: Data, port: in_port_t? = nil, audioGeneration: UDPPeerSession.ID? = nil,
                         checkGeneration: Bool = false) -> (sent: Bool, bytes: Int) {
         var dest = destination
         if let port { dest.sin_port = port }
@@ -594,7 +597,7 @@ final class UDPFrameSender: @unchecked Sendable {
                 lock.lock(); sessionDrops &+= 1; lock.unlock()
                 return (false, 0)
             }
-            if checkGeneration, snap.session.generation != audioGeneration {
+            if checkGeneration, snap.session.id != audioGeneration {
                 lock.lock(); audioStaleDrops &+= 1; lock.unlock()
                 return (false, 0)
             }

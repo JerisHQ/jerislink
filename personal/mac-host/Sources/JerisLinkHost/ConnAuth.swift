@@ -171,15 +171,29 @@ enum ConnAuth {
         }
     }
 
+    /// r4 (Pepper's r3 review, item 1): a viewer reconnecting on its own
+    /// (not a new attempt from its launch screen) appends the session_id of
+    /// its last control AUTH: 72 bytes instead of 64. The host refuses the
+    /// reconnect (`.replaced`) while another viewer holds the session, so a
+    /// replaced viewer never takes it back, even if it missed the notice.
+    /// The id is not under mac_c: it only narrows what the host allows, and
+    /// stripping it is no worse than dropping the connection.
     struct Response: Equatable {
         var clientNonce: [UInt8]
         var mac: [UInt8]
+        var resume: [UInt8]? = nil
 
-        var payload: [UInt8] { clientNonce + mac }
+        static let size = 64
+        static let resumeSize = 64 + ConnAuth.sessionIDBytes
+
+        var payload: [UInt8] { clientNonce + mac + (resume ?? []) }
 
         static func decode(_ p: [UInt8]) -> Response? {
-            guard p.count == 64 else { return nil }
-            return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]))
+            switch p.count {
+            case size: return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]))
+            case resumeSize: return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]), resume: Array(p[64...]))
+            default: return nil
+            }
         }
     }
 

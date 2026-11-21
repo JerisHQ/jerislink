@@ -248,7 +248,7 @@ void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expec
     }
     uint8_t type = 0;
     Bytes p;
-    if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || p.size() != kResponseBytes) return;
+    if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return;
     seen.gotResponse = true;
     auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data());
     seen.macValid = constantTimeEqual(want.data(), p.data() + kNonceBytes, kMacBytes);
@@ -636,7 +636,7 @@ void oldAndTransitionTests() {
             Bytes p;
             while (hostRecv(s, 2600, type, p) == Io::Ok) {
                 seen.anyData = true;
-                if (type == kTypeResponse && p.size() == kResponseBytes) {
+                if (type == kTypeResponse && (p.size() == kResponseBytes || p.size() == kResumeResponseBytes)) {
                     bool zero = true;
                     for (size_t i = kNonceBytes; i < p.size(); ++i) zero = zero && p[i] == 0;
                     seen.probe = zero;
@@ -660,7 +660,7 @@ void oldAndTransitionTests() {
             const auto t0 = Clock::now();
             uint8_t type = 0;
             Bytes p;
-            if (hostRecv(s, 3000, type, p) == Io::Ok && type == kTypeResponse && p.size() == kResponseBytes) {
+            if (hostRecv(s, 3000, type, p) == Io::Ok && type == kTypeResponse && (p.size() == kResponseBytes || p.size() == kResumeResponseBytes)) {
                 afterMs = int(msSince(t0));
                 hostSend(s, kTypeResult, Bytes{5});
             }
@@ -766,7 +766,7 @@ void reviewFixTests() {
             hostSend(s, kTypeChallenge, challengeFor(sec, hn));
             uint8_t type = 0;
             Bytes p;
-            if (hostRecv(s, 15000, type, p) != Io::Ok || p.size() != kResponseBytes) return;
+            if (hostRecv(s, 15000, type, p) != Io::Ok || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return;
             seen.gotResponse = true;
             auto mh = *macHost(sec.key, hn.data(), p.data(), Channel::Control);
             hmacFaultsForTest() = 1;

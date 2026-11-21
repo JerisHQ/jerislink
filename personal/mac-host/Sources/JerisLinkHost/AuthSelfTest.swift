@@ -318,7 +318,7 @@ enum AuthSelfTest {
         }
 
         /// Connects, reads the CHALLENGE and answers it for `channel`.
-        func login(_ port: UInt16, password: String, channel: ConnAuth.Channel, replay: [UInt8]? = nil)
+        func login(_ port: UInt16, password: String, channel: ConnAuth.Channel, replay: [UInt8]? = nil, resume: [UInt8]? = nil)
             -> (client: MRC1Client?, result: ConnAuth.Result?, response: [UInt8]?, macOK: Bool) {
             guard let c = MRC1Client(port: port), let ch = c.receive(timeout: 2) else { return (nil, nil, nil, false) }
             guard ch.type == ConnAuth.MsgType.challenge, let challenge = ConnAuth.Challenge.decode(ch.payload),
@@ -327,7 +327,7 @@ enum AuthSelfTest {
             }
             let cn = ConnAuth.random(ConnAuth.nonceBytes)
             let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel, hostID: challenge.hostID)
-            let response = replay ?? ConnAuth.Response(clientNonce: cn, mac: mac).payload
+            let response = replay ?? ConnAuth.Response(clientNonce: cn, mac: mac, resume: resume).payload
             _ = c.send(type: ConnAuth.MsgType.response, payload: response)
             guard let r = c.receive(timeout: 3), r.type == ConnAuth.MsgType.result else { return (c, nil, response, false) }
             let result = ConnAuth.Result.decode(r.payload)
@@ -390,6 +390,28 @@ enum AuthSelfTest {
                        "replace: after the notice the old connection ends with FIN, not RST")
                 expect(pong(second.client), "replace: the new viewer's control channel works")
                 expect(broker.replaced == 1, "replace: one connection replaced")
+                // r4 (Pepper's r3 review, item 1): the old viewer missed the
+                // notice and reconnects on its own, naming its old session.
+                // The host refuses it (REPLACED, not counted) and the new
+                // viewer keeps the session.
+                if case .ok(_, let oldID)? = first.result, case .ok(_, let newID)? = second.result {
+                    let failsBefore = s.authFailures
+                    let back = login(p, password: password, channel: .control, resume: oldID)
+                    expect(back.result == .replaced && back.client?.receive(timeout: 2) == nil,
+                           "r4 resume: a replaced viewer's control reconnect gets REPLACED and is closed")
+                    let clip = login(p, password: password, channel: .clipboard, resume: oldID)
+                    expect(clip.result == .replaced, "r4 resume: its clipboard reconnect too")
+                    expect(s.authFailures == failsBefore && s.resumesRefused == 2 && broker.replaced == 1 && pong(second.client),
+                           "r4 resume: nothing counted, nothing kicked, the new viewer's session works")
+                    let own = login(p, password: password, channel: .control, resume: newID)
+                    if case .ok? = own.result { expect(pong(own.client), "r4 resume: the current viewer's own reconnect is let in") }
+                    else { expect(false, "r4 resume: the current viewer's own reconnect is let in") }
+                    let fresh = login(p, password: password, channel: .control)
+                    if case .ok? = fresh.result { expect(pong(fresh.client), "r4 resume: a new attempt (no resume id) still takes over") }
+                    else { expect(false, "r4 resume: a new attempt (no resume id) still takes over") }
+                } else {
+                    expect(false, "r4 resume: both logins ok")
+                }
                 s.stop()
             } else {
                 expect(false, "replace: listener starts")

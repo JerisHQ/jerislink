@@ -139,6 +139,8 @@ final class ControlServer: @unchecked Sendable {
     /// viewer's sessions on their next message; other viewers go on.
     private let admitPeerMessage: (@Sendable (String) -> Bool)?
     private(set) var authFailures: UInt64 = 0
+    /// r4: reconnects refused because another viewer holds the session.
+    private(set) var resumesRefused: UInt64 = 0
     /// PR-C: which viewer the UDP paths serve (the session link to the
     /// video service). Every admitted connection registers here; in password
     /// mode the control channel carries K_s and a new one replaces the old
@@ -437,6 +439,7 @@ final class ControlServer: @unchecked Sendable {
         // for; the connection is held to it.
         var authChannel: ConnAuth.Channel?
         var udpSessionKey: [UInt8]?
+        var authOK: AuthOK?
         if let authGate {
             // The policy this gate holds was replaced (ControlService.PolicyWatch):
             // nothing more is admitted under it.
@@ -447,6 +450,7 @@ final class ControlServer: @unchecked Sendable {
             if authGate.requiresPassword {
                 guard pending == nil, let ok = authenticate(fd, peer: peer, gate: authGate) else { return }
                 authChannel = ok.channel
+                authOK = ok
                 udpSessionKey = ok.channel == .control ? ok.sessionKey : nil
             } else {
                 guard admitWithoutPassword(fd, peer: peer, gate: authGate) else { return }
@@ -466,8 +470,22 @@ final class ControlServer: @unchecked Sendable {
             // channel then tells the viewer it was replaced, so it stops
             // reconnecting instead of taking the session back.
             let kick = KickHandle(fd)
-            let token = sessionBroker.begin(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
-                                            close: { kick.kick() })
+            // r4: the reconnect check again, now atomically with taking the
+            // session (an AUTH may have finished since `authenticate`).
+            guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
+                                                  authSession: authChannel == .control ? authOK?.sessionID : nil,
+                                                  resume: authOK?.resume, close: { kick.kick() }) else {
+                kick.finish()
+                lock.lock(); resumesRefused += 1; lock.unlock()
+                let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+                authLog.log("auth.resume_refused", peer: peer.ip,
+                            "auth.resume_refused peer=\(peer.ip) chan=\(authChannel?.name ?? "open") stage=admit sent=\(sent ? 1 : 0) counted=0")
+                if sent {
+                    Darwin.shutdown(fd, SHUT_WR)
+                    Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+                }
+                return
+            }
             defer {
                 sessionBroker.end(token)
                 kick.finish()
@@ -1271,7 +1289,7 @@ final class ControlServer: @unchecked Sendable {
             settleFailure(fd, ip: ip, gate: gate, reason: "bad_header", reply: nil)
             return nil
         }
-        guard length == 64 else {
+        guard length == ConnAuth.Response.size || length == ConnAuth.Response.resumeSize else {
             settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
             return nil
         }
@@ -1311,6 +1329,14 @@ final class ControlServer: @unchecked Sendable {
                           failureLog: gate.failureLog)
             return nil
         }
+        // r4 (Pepper's r3 review, item 1): a reconnect from a viewer that
+        // another viewer replaced. The password was right (nothing counted),
+        // but the session is not taken back: it is told it was replaced, and
+        // stops, even if it never read the notice on its old connection.
+        if let sessionBroker, sessionBroker.resumeRefused(response.resume) {
+            refuseResume(fd, ip: ip, channel: channel, resume: response.resume)
+            return nil
+        }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
         let macH = ConnAuth.macHost(key: secret.key, hostNonce: hostNonce, clientNonce: response.clientNonce, channel: channel)
         // r10: OK is the first frame of an admitted session: it asks too.
@@ -1319,7 +1345,20 @@ final class ControlServer: @unchecked Sendable {
         print("auth.ok peer=\(ip) chan=\(channel.name) session=\(ConnAuth.hex(sessionID))")
         let sessionKey = ConnAuth.sessionKey(key: secret.key, hostNonce: hostNonce,
                                              clientNonce: response.clientNonce, sessionID: sessionID)
-        return AuthOK(channel: channel, sessionKey: sessionKey)
+        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID, resume: response.resume)
+    }
+
+    /// r4: answers a refused reconnect (`.replaced`, the same status as the
+    /// notice) and logs it. Not a failure: no try is counted.
+    private func refuseResume(_ fd: Int32, ip: String, channel: ConnAuth.Channel, resume: [UInt8]?) {
+        lock.lock(); resumesRefused += 1; lock.unlock()
+        let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+        authLog.log("auth.resume_refused", peer: ip,
+                    "auth.resume_refused peer=\(ip) chan=\(channel.name) resume=\(resume.map(ConnAuth.hex) ?? "-") sent=\(sent ? 1 : 0) counted=0")
+        if sent {
+            Darwin.shutdown(fd, SHUT_WR)
+            Thread.sleep(forTimeInterval: KickHandle.noticeLinger)
+        }
     }
 
     /// An authenticated connection: its channel and its UDP session key
@@ -1327,6 +1366,9 @@ final class ControlServer: @unchecked Sendable {
     struct AuthOK {
         var channel: ConnAuth.Channel
         var sessionKey: [UInt8]
+        /// r4: the session_id sent in OK, and the one a reconnect named.
+        var sessionID: [UInt8]
+        var resume: [UInt8]?
     }
 
     /// No challenge, or a challenge whose answer came after a wait or the

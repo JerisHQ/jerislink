@@ -481,7 +481,7 @@ struct JerisLinkHostMain {
                 // r3 (Pepper's PR-C r2 review, item 5): a request belongs to the
                 // session it came in. Another viewer (or none) ends it; the
                 // new viewer's own 0x45 starts audio to its own port.
-                sessionState?.onChange { session in streamer.sessionChanged(to: session?.generation) }
+                sessionState?.onChange { session in streamer.sessionChanged(to: session?.id) }
                 audio = streamer
             }
             defer { audio?.shutdown() }

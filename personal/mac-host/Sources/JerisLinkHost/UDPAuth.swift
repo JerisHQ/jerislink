@@ -120,9 +120,21 @@ struct UDPPeerSession: Equatable, Sendable {
     var peerIP: String
     /// nil in transition mode (untagged datagrams, as 0.3).
     var sessionKey: [UInt8]?
+    /// r4 (Pepper's r3 review, item 3): a random number the control service
+    /// picks once when it starts. The generation starts again at 1 after a
+    /// restart; (boot, generation) is never reused.
+    var boot: UInt64 = 0
 
+    /// The session as audio and the UDP paths name it.
+    struct ID: Hashable, Sendable, CustomStringConvertible {
+        var boot: UInt64
+        var generation: UInt64
+        var description: String { "\(generation)/\(String(boot, radix: 16))" }
+    }
+
+    var id: ID { ID(boot: boot, generation: generation) }
     var tagged: Bool { sessionKey != nil }
-    var summary: String { "gen=\(generation) peer=\(peerIP) udp=\(tagged ? "tagged" : "untagged")" }
+    var summary: String { "gen=\(id) peer=\(peerIP) udp=\(tagged ? "tagged" : "untagged")" }
 }
 
 /// Thread-safe holder of the current session for the video service's UDP

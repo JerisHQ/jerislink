@@ -186,7 +186,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
     private var newSessionHandler: (() -> Void)?
     private var receiverReportHandler: ((ReceiverReport) -> Void)?
-    private var audioRequestHandler: ((Bool, UInt16, Bool, UInt64?) -> Void)?
+    private var audioRequestHandler: ((Bool, UInt16, Bool, UDPPeerSession.ID?) -> Void)?
     private var lastPeerAddress: sockaddr_in?
     private var lastCursorShape: RemoteCursorShape?
     private var cursorSequence: UInt32 = 0
@@ -198,7 +198,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// are sealed with the h2v tagger. No session: everything is dropped.
     private let udpSession: UDPSessionState?
     /// Receive loop only.
-    private var lastGeneration: UInt64?
+    private var lastGeneration: UDPPeerSession.ID?
     let badTags = BadTagLog(entry: "mrm1")
     private(set) var noSession: UInt64 = 0
 
@@ -361,7 +361,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     /// was already checked. r3 (Pepper's PR-C r2 review, item 5): the
     /// generation is the session the request came in (nil without a session
     /// link), so audio for it never goes to the next viewer.
-    func setAudioRequestHandler(_ handler: @escaping (Bool, UInt16, Bool, UInt64?) -> Void) {
+    func setAudioRequestHandler(_ handler: @escaping (Bool, UInt16, Bool, UDPPeerSession.ID?) -> Void) {
         lock.lock()
         audioRequestHandler = handler
         lock.unlock()
@@ -536,7 +536,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
 
             let peerIP = String(cString: inet_ntoa(peer.sin_addr))
             var tagged = false
-            var generationMoved: UInt64?
+            var generationMoved: UDPPeerSession.ID?
             if let udpSession {
                 // PR-C: only the session peer, and nothing with no session.
                 guard let snap = udpSession.snapshot else { noSession &+= 1; continue }
@@ -561,8 +561,8 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                 // sequence starts over and the viewer gets a fresh IDR.
                 // r3: noted here, applied only once the datagram passed the
                 // format and anti-replay checks below.
-                if lastGeneration != snap.session.generation {
-                    generationMoved = snap.session.generation
+                if lastGeneration != snap.session.id {
+                    generationMoved = snap.session.id
                 }
             } else if let allowedClientIP, peerIP != allowedClientIP {
                 rejected &+= 1

@@ -927,7 +927,7 @@ final class AuthFailureLog: @unchecked Sendable {
             all.append(rec)
             if all.count > Self.limit { all.removeFirst(all.count - Self.limit) }
             Self.write(all, url: url)
-            Self.countHour(at: rec.at, url: Self.countsURL(for: url))
+            Self.recordTime(at: rec.at, url: Self.countsURL(for: url))
         }
     }
 
@@ -947,41 +947,54 @@ final class AuthFailureLog: @unchecked Sendable {
 
     // r3 (Pepper's r2 review, item 6; design §4.4): the window shows how
     // many failures the last 24 hours had and the last address. The list
-    // above keeps only `limit` records, so failures are also counted per
-    // hour in a small sidecar file (the hour's start in seconds -> count),
-    // keeping the last 25 hours.
+    // above keeps only `limit` records, so failure times are also kept in a
+    // small sidecar file.
+    // r4 (Pepper's r3 review, item 4): each failure's own time, not hourly
+    // buckets (those missed up to an hour at the window's start). Times
+    // older than 24 hours are dropped on every write; at most `maxTimes`
+    // are kept (then the count is a lower bound and the window says so).
+    static let window: TimeInterval = 24 * 3600
+    static let maxTimes = 5000
+
     static func countsURL(for url: URL) -> URL {
-        url.deletingPathExtension().appendingPathExtension("hours.plist")
+        url.deletingPathExtension().appendingPathExtension("times.plist")
     }
 
-    static func hourKey(_ at: Date) -> Int { Int((at.timeIntervalSince1970 / 3600).rounded(.down)) * 3600 }
-
-    static func loadCounts(url: URL) -> [Int: Int] {
+    static func loadTimes(url: URL) -> [Double] {
         guard let data = try? Data(contentsOf: url),
-              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
-        else { return [:] }
-        var out: [Int: Int] = [:]
-        for (k, v) in raw { if let h = Int(k), let n = v as? Int, n > 0 { out[h] = n } }
-        return out
+              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [Any]
+        else { return [] }
+        return raw.compactMap { ($0 as? NSNumber)?.doubleValue }.filter { $0.isFinite }.sorted()
     }
 
-    private static func countHour(at: Date, url: URL) {
-        let hour = hourKey(at)
-        var counts = loadCounts(url: url).filter { $0.key > hour - 25 * 3600 }
-        counts[hour, default: 0] += 1
-        let raw = Dictionary(uniqueKeysWithValues: counts.map { (String($0.key), $0.value) })
-        guard let data = try? PropertyListSerialization.data(fromPropertyList: raw, format: .xml, options: 0) else { return }
+    /// The kept times after one more failure at `at`: sorted, none older
+    /// than 24 hours before the newest, at most `cap` (the newest).
+    static func pruned(_ times: [Double], adding at: Double, cap: Int = maxTimes) -> [Double] {
+        var all = times
+        let i = all.firstIndex { $0 > at } ?? all.endIndex
+        all.insert(at, at: i)
+        let newest = all.last ?? at
+        all.removeAll { $0 <= newest - window }
+        if all.count > cap { all.removeFirst(all.count - cap) }
+        return all
+    }
+
+    private static func recordTime(at: Date, url: URL) {
+        let times = pruned(loadTimes(url: url), adding: at.timeIntervalSince1970)
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: times, format: .binary, options: 0) else { return }
         writeAtomic(data, url: url)
     }
 
-    /// Failures in the 24 hours up to `now` (counted by whole hours: the
-    /// current hour and the 23 before it) and the last failing address.
-    static func summary(url: URL, now: Date = Date()) -> (last24h: Int, lastIP: String?, lastAt: Date?) {
-        let hour = hourKey(now)
-        let total = loadCounts(url: countsURL(for: url)).filter { $0.key > hour - 24 * 3600 && $0.key <= hour }
-            .reduce(0) { $0 + $1.value }
+    /// Failures in the 24 hours up to `now`, by each failure's own time, and
+    /// the last failing address. `capped`: more were kept than fit, so the
+    /// count is at least `last24h`.
+    static func summary(url: URL, now: Date = Date()) -> (last24h: Int, lastIP: String?, lastAt: Date?, capped: Bool) {
+        let t = now.timeIntervalSince1970
+        let times = loadTimes(url: countsURL(for: url))
+        let total = times.filter { $0 > t - window && $0 <= t }.count
+        let capped = times.count >= maxTimes && (times.first.map { $0 > t - window } ?? false)
         let last = load(url: url).last
-        return (total, last?.ip, last?.at)
+        return (total, last?.ip, last?.at, capped)
     }
 
     private static func write(_ records: [Record], url: URL) {

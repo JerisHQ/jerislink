@@ -284,8 +284,8 @@ enum ConnectionSettings {
 extension ConnectionSettings {
     /// r3 (Pepper's r2 review, item 6; design §4.4): 「最近 24 小時錯 N 次」
     /// and the last address.
-    static func failureSummaryText(last24h: Int, lastIP: String?, lastAt: Date?, format: DateFormatter) -> String {
-        let count = "最近 24 小時錯 \(last24h) 次"
+    static func failureSummaryText(last24h: Int, lastIP: String?, lastAt: Date?, format: DateFormatter, capped: Bool = false) -> String {
+        let count = "最近 24 小時錯\(capped ? "至少" : "") \(last24h) 次"
         guard let lastIP else { return count + "。" }
         return count + "；最後一個 IP：\(lastIP)" + (lastAt.map { "（\(format.string(from: $0))）" } ?? "") + "。"
     }
@@ -491,7 +491,7 @@ final class ConnectionSettingsWindow: NSObject, NSWindowDelegate {
 
         let summary = AuthFailureLog.summary(url: failureLogURL)
         failureSummary.stringValue = ConnectionSettings.failureSummaryText(
-            last24h: summary.last24h, lastIP: summary.lastIP, lastAt: summary.lastAt, format: Self.timeFormat)
+            last24h: summary.last24h, lastIP: summary.lastIP, lastAt: summary.lastAt, format: Self.timeFormat, capped: summary.capped)
         let failures = AuthFailureLog.load(url: failureLogURL)
         failuresView.string = failures.isEmpty ? "（冇紀錄）" : failures.map {
             "\(Self.timeFormat.string(from: $0.at))  \($0.ip)  \(ConnectionSettings.failureReasonText($0.reason))（第 \($0.failures) 次）"
@@ -736,6 +736,28 @@ enum ConnectionSettingsSelfTest {
                "failure summary: none yet")
         let s3 = AuthFailureLog.summary(url: dir.appendingPathComponent("none.plist"), now: now)
         expect(s3.last24h == 0 && s3.lastIP == nil, "failure summary: no file, zero")
+
+        // r4 (Pepper's r3 review, item 4): rolling 24 h by each failure's
+        // own time. `now` is 10 minutes past an hour: a failure 23 h 55 min
+        // ago fell in an hour bucket the r3 count left out.
+        let base = Date(timeIntervalSince1970: (1_800_000_000 / 3600) * 3600 + 600)
+        let fl3URL = dir.appendingPathComponent("auth-failures-3.plist")
+        let fl3 = AuthFailureLog(url: fl3URL)
+        fl3.record(ip: "100.64.2.1", reason: "wrong_password", failures: 1, at: base.addingTimeInterval(-(24 * 3600 + 300)))
+        fl3.record(ip: "100.64.2.2", reason: "wrong_password", failures: 2, at: base.addingTimeInterval(-(23 * 3600 + 55 * 60)))
+        fl3.record(ip: "100.64.2.3", reason: "wrong_password", failures: 3, at: base.addingTimeInterval(-300))
+        fl3.flush()
+        let r1 = AuthFailureLog.summary(url: fl3URL, now: base)
+        expect(r1.last24h == 2 && !r1.capped,
+               "r4 rolling 24 h: 23 h 55 min ago counted, 24 h 5 min ago not (\(r1.last24h))")
+        let r2 = AuthFailureLog.summary(url: fl3URL, now: base.addingTimeInterval(600))
+        expect(r2.last24h == 1, "r4 rolling 24 h: 10 min later the 23 h 55 min one has left the window (\(r2.last24h))")
+        expect(AuthFailureLog.loadTimes(url: AuthFailureLog.countsURL(for: fl3URL)).count == 2,
+               "r4 rolling 24 h: a time older than 24 h is not kept")
+        let kept = AuthFailureLog.pruned([1, 2, 3, 4], adding: 5, cap: 3)
+        expect(kept == [3, 4, 5], "r4 rolling 24 h: at the cap the oldest times go first")
+        expect(ConnectionSettings.failureSummaryText(last24h: 5000, lastIP: nil, lastAt: nil, format: DateFormatter(), capped: true)
+               == "最近 24 小時錯至少 5000 次。", "r4 rolling 24 h: a capped count says 至少")
 
         // r3 (item 6, design §4.3): whitelist and blacklist addresses are
         // tailnet addresses (100.64.0.0/10).

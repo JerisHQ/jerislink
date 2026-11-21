@@ -20,21 +20,25 @@ import Security
 /// Wire, server to client only, one frame per change and one on connect:
 ///
 ///     "JLS1" type(1) len(2, BE) body
-///     type 1 session: gen(8) ipLen(1) ip(ASCII) hasKey(1) [key(32)]
-///     type 0 none:    gen(8)
+///     type 1 session: gen(8) boot(8) ipLen(1) ip(ASCII) hasKey(1) [key(32)]
+///     type 0 none:    gen(8) boot(8)
+///
+/// r4: boot is the control service's random start number
+/// (UDPPeerSession.boot), so a session after a restart never has the same
+/// identity as one before it.
 enum SessionLinkWire {
     static let magic: [UInt8] = Array("JLS1".utf8)
     static let typeNone: UInt8 = 0
     static let typeSession: UInt8 = 1
-    static let maxBody = 8 + 1 + 15 + 1 + ConnAuth.keyBytes
+    static let maxBody = 8 + 8 + 1 + 15 + 1 + ConnAuth.keyBytes
 
     static var socketPath: String {
         if let path = ProcessInfo.processInfo.environment["JERISLINK_SESSION_SOCKET"], !path.isEmpty { return path }
         return SendWire.socketDirectory + "/session.sock"
     }
 
-    static func encode(_ s: UDPPeerSession?, generation: UInt64) -> [UInt8] {
-        var body = be64(generation)
+    static func encode(_ s: UDPPeerSession?, generation: UInt64, boot: UInt64? = nil) -> [UInt8] {
+        var body = be64(generation) + be64(boot ?? s?.boot ?? 0)
         let type: UInt8
         if let s, s.peerIP.utf8.count <= 15 {
             type = typeSession
@@ -52,31 +56,37 @@ enum SessionLinkWire {
         return magic + [type, UInt8(body.count >> 8), UInt8(body.count & 0xff)] + body
     }
 
-    /// One frame: its generation and the session (nil: none).
+    /// One frame: its generation, the session (nil: none) and the control
+    /// service's boot number.
     struct Frame: Equatable {
         var generation: UInt64
         var session: UDPPeerSession?
+        var boot: UInt64 = 0
     }
 
     /// nil: malformed (the client drops the link). r2: a "none" frame keeps
     /// its generation too, so an old one is refused like any other.
-    static func decode(type: UInt8, body: [UInt8]) -> Frame? {
-        guard body.count >= 8 else { return nil }
-        let gen = body[0..<8].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+    static func decode(type: UInt8, body all: [UInt8]) -> Frame? {
+        guard all.count >= 16 else { return nil }
+        let gen = all[0..<8].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        let boot = all[8..<16].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        let body = Array(all[16...])
         switch type {
         case typeNone:
-            return body.count == 8 ? Frame(generation: gen, session: nil) : nil
+            return body.isEmpty ? Frame(generation: gen, session: nil, boot: boot) : nil
         case typeSession:
-            guard body.count >= 10 else { return nil }
-            let ipLen = Int(body[8])
-            guard ipLen >= 7, ipLen <= 15, body.count >= 9 + ipLen + 1 else { return nil }
-            guard let ip = String(bytes: body[9..<(9 + ipLen)], encoding: .ascii), ListenConfig.isIPv4(ip) else { return nil }
-            let hasKey = body[9 + ipLen]
-            let rest = body.count - (10 + ipLen)
+            guard body.count >= 2 else { return nil }
+            let ipLen = Int(body[0])
+            guard ipLen >= 7, ipLen <= 15, body.count >= 1 + ipLen + 1 else { return nil }
+            guard let ip = String(bytes: body[1..<(1 + ipLen)], encoding: .ascii), ListenConfig.isIPv4(ip) else { return nil }
+            let hasKey = body[1 + ipLen]
+            let rest = body.count - (2 + ipLen)
             switch (hasKey, rest) {
-            case (0, 0): return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: nil))
+            case (0, 0):
+                return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: nil, boot: boot), boot: boot)
             case (1, ConnAuth.keyBytes):
-                return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: Array(body[(10 + ipLen)...])))
+                return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: Array(body[(2 + ipLen)...]),
+                                                                      boot: boot), boot: boot)
             default: return nil
             }
         default:
@@ -104,10 +114,15 @@ final class SessionBroker: @unchecked Sendable {
         var peerIP: String
         var channel: ConnAuth.Channel?
         var sessionKey: [UInt8]?
+        /// r4: the AUTH_RESULT session_id of this connection (password mode).
+        var authSession: [UInt8]?
         var close: @Sendable () -> Void
     }
 
     let passwordMode: Bool
+    /// r4 (Pepper's r3 review, item 3): picked once per start, never 0, so
+    /// (boot, generation) names one session even across restarts.
+    let boot: UInt64
     private let lock = NSLock()
     /// Held from a change through its listeners (taken before `lock`).
     private let orderLock = NSLock()
@@ -118,12 +133,21 @@ final class SessionBroker: @unchecked Sendable {
     private var listeners: [@Sendable (UDPPeerSession?, UInt64) -> Void] = []
     private let log: (String) -> Void
     private var replacedCount: UInt64 = 0
+    private var resumeRefusedCount: UInt64 = 0
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
+    /// r4: reconnects refused because another viewer holds the session.
+    var resumesRefused: UInt64 { lock.lock(); defer { lock.unlock() }; return resumeRefusedCount }
 
-    init(passwordMode: Bool, log: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
+    init(passwordMode: Bool, boot: UInt64? = nil, log: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
         self.passwordMode = passwordMode
+        self.boot = boot ?? Self.randomBoot()
         self.log = log
+    }
+
+    static func randomBoot() -> UInt64 {
+        let v = ConnAuth.random(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        return v == 0 ? 1 : v
     }
 
     /// The session and its generation as of now.
@@ -142,16 +166,46 @@ final class SessionBroker: @unchecked Sendable {
         lock.lock(); listeners.append(handler); lock.unlock()
     }
 
+    /// r4 (Pepper's r3 review, item 1): a viewer reconnecting on its own
+    /// names the control session it had (`resume`, the session_id of its
+    /// last control AUTH). While another control session is live, that
+    /// viewer was replaced, whether or not it heard the notice: refused.
+    /// No live control session, or its own: allowed (the new AUTH then
+    /// takes over as before).
+    func resumeRefused(_ resume: [UInt8]?) -> Bool {
+        guard passwordMode, let resume else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return refusedLocked(resume)
+    }
+
+    private func refusedLocked(_ resume: [UInt8]) -> Bool {
+        entries.contains { $0.channel == .control && $0.authSession != nil && $0.authSession != resume }
+    }
+
     /// One admitted connection. Password mode: only the control channel,
     /// with its K_s. Returns the token for `end`.
     func begin(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?,
                close: @escaping @Sendable () -> Void) -> UInt64 {
+        admit(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: nil, resume: nil, close: close)!
+    }
+
+    /// `begin` with the AUTH session_id and the session a reconnect names.
+    /// nil: refused (`resumeRefused`, checked again here under the lock so
+    /// no AUTH can come in between); nothing changed and nothing is kicked.
+    func admit(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
+               resume: [UInt8]?, close: @escaping @Sendable () -> Void) -> UInt64? {
         var kicked: [Entry] = []
         // r2 (Pepper's PR-C review, item 1): the change and its listeners
         // run under `orderLock`, so two changes never reach the listeners
         // (and the session link's serial send queue) in the other order.
         orderLock.lock()
         lock.lock()
+        if passwordMode, let resume, refusedLocked(resume) {
+            resumeRefusedCount &+= 1
+            lock.unlock()
+            orderLock.unlock()
+            return nil
+        }
         nextToken &+= 1
         let token = nextToken
         if passwordMode && channel == .control {
@@ -159,7 +213,8 @@ final class SessionBroker: @unchecked Sendable {
             kicked = entries.filter { $0.channel == .control || $0.peerIP != peerIP }
             entries.removeAll { e in kicked.contains { $0.token == e.token } }
         }
-        entries.append(Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey, close: close))
+        entries.append(Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
+                             authSession: authSession, close: close))
         replacedCount &+= UInt64(kicked.count)
         let change = recomputeLocked()
         lock.unlock()
@@ -197,7 +252,7 @@ final class SessionBroker: @unchecked Sendable {
         let same = wanted?.ip == announced?.peerIP && wanted?.key == announced?.sessionKey && (wanted == nil) == (announced == nil)
         if same { return nil }
         generation &+= 1
-        announced = wanted.map { UDPPeerSession(generation: generation, peerIP: $0.ip, sessionKey: $0.key) }
+        announced = wanted.map { UDPPeerSession(generation: generation, peerIP: $0.ip, sessionKey: $0.key, boot: boot) }
         return (announced, generation, listeners)
     }
 
@@ -292,13 +347,13 @@ final class SessionLinkServer: @unchecked Sendable {
             sendQueue.async { [self] in
                 lock.lock(); clients.insert(c); lock.unlock()
                 let (session, gen) = broker.current
-                if !SendWire.send(c, SessionLinkWire.encode(session, generation: gen)) { drop(c) }
+                if !SendWire.send(c, SessionLinkWire.encode(session, generation: gen, boot: broker.boot)) { drop(c) }
             }
         }
     }
 
     private func broadcast(_ session: UDPPeerSession?, _ gen: UInt64) {
-        let frame = SessionLinkWire.encode(session, generation: gen)
+        let frame = SessionLinkWire.encode(session, generation: gen, boot: broker.boot)
         sendQueue.async { [self] in
             lock.lock(); let open = clients; lock.unlock()
             for c in open where !SendWire.send(c, frame) { drop(c) }
@@ -425,7 +480,9 @@ final class SessionLinkClient: @unchecked Sendable {
     /// destination never comes back. The same generation again is fine (the
     /// state sent on connect can repeat a change). A new connection starts
     /// over: a restarted control service counts from 1, and the state was
-    /// cleared when the old link went down.
+    /// cleared when the old link went down. r4: the frame's boot number goes
+    /// into the session it announces, so a generation counted again after a
+    /// restart still names a different session (UDPPeerSession.ID).
     static func accept(_ frame: SessionLinkWire.Frame, after last: UInt64?) -> Bool {
         guard let last else { return true }
         return frame.generation >= last

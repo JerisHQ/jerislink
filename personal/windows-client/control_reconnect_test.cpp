@@ -24,11 +24,17 @@
 // r8: an up that ages out after the reconnect still goes before the next
 // key (at once when nothing else waits); a down the worker took but has not
 // sent is cancelled when its up is dropped.
+// PR-C r4: a reconnect that missed the "replaced" notice (none of it arrived,
+// its tail came > 250 ms late, or none was sent) names its old session and
+// the Mac refuses it, so the attempt halts and the session is not retaken.
+// PR-C r4: a read-only view negotiates late when its start-up could not, and
+// ends a NoChallenge pause on its own after a gap (read_only_session.hpp).
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
 // connection answers after 150 ms, before the transition probe would go.
 #include "control_channel.hpp"
+#include "read_only_session.hpp"
 #include "udp_plan.hpp"
 
 #include <atomic>
@@ -85,7 +91,7 @@ bool hostAuth(SOCKET s, const Secret& sec, Answer ans, int delayMs = kSlowAuthMs
     uint8_t type = 0;
     Bytes p;
     if (recvFrame(s, Clock::now() + std::chrono::seconds(10), type, p) != Io::Ok ||
-        type != kTypeResponse || p.size() != kResponseBytes) return false;
+        type != kTypeResponse || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return false;
     auto want = macClient(sec.key, hn.data(), p.data(), Channel::Control, sec.hostId.data());
     if (!want || !constantTimeEqual(want->data(), p.data() + kNonceBytes, kMacBytes)) return false;
     Bytes res;
@@ -1850,6 +1856,322 @@ void prcR3Tests() {
     control.stop();
     setCurrent(nullptr);
 }
+
+// r4 (Pepper's r3 review, item 1): the viewer reconnects without having
+// read the "replaced" notice (none of it arrived when its send failed, the
+// tail came more than 250 ms late, or the Mac never sent one). Its
+// reconnect names its old session; the Mac refuses it (REPLACED), so the
+// attempt halts there and nothing takes the session back.
+using SessionId = std::array<uint8_t, kSessionIdBytes>;
+
+// One host-side AUTH that hands out `give`. With `live` set (another viewer
+// holds the session), a reconnect naming any other session is refused.
+// Returns 1 (OK sent), 2 (REPLACED sent), 0 (no proof). `named` gets what
+// the viewer appended (empty: a plain 64-byte answer).
+int hostAuthSession(SOCKET s, const Secret& sec, const SessionId& give, const SessionId* live, Bytes& named) {
+    std::array<uint8_t, kNonceBytes> hn{};
+    const Bytes ch = challengeFor(sec, hn);
+    if (!sendAllBytes(s, frame(kTypeChallenge, ch.data(), ch.size()))) return 0;
+    uint8_t type = 0;
+    Bytes p;
+    if (recvFrame(s, Clock::now() + std::chrono::seconds(10), type, p) != Io::Ok || type != kTypeResponse ||
+        (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return 0;
+    auto want = macClient(sec.key, hn.data(), p.data(), Channel::Control, sec.hostId.data());
+    if (!want || !constantTimeEqual(want->data(), p.data() + kNonceBytes, kMacBytes)) return 0;
+    named.assign(p.begin() + kResponseBytes, p.end());
+    if (live && !named.empty() && !std::equal(named.begin(), named.end(), live->begin())) {
+        const Bytes r{6};
+        sendAllBytes(s, frame(kTypeResult, r.data(), r.size()));
+        return 2;
+    }
+    auto mh = *macHost(sec.key, hn.data(), p.data(), Channel::Control);
+    Bytes res{0};
+    res.insert(res.end(), mh.begin(), mh.end());
+    res.insert(res.end(), give.begin(), give.end());
+    return sendAllBytes(s, frame(kTypeResult, res.data(), res.size())) ? 1 : 0;
+}
+
+enum class Missed { NothingArrived, LateTail, NeverSent };
+
+void prcR4Case(Missed how, const char* label) {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+
+    const SessionId mine{1, 2, 3, 4, 5, 6, 7, 8}, other{9, 9, 9, 9, 9, 9, 9, 9};
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    int first = 0, again = -1;
+    Bytes firstNamed, againNamed;
+    std::atomic<bool> taken{false}, partSent{false}, closedByHost{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        first = hostAuthSession(s, sec, mine, nullptr, firstNamed);
+        while (!taken) Sleep(10);
+        // Another viewer authenticated (session `other`). This connection
+        // then misses its notice in one of three ways.
+        const Bytes all(notice, notice + sizeof(notice));
+        if (how == Missed::LateTail) {
+            partSent = sendAllBytes(s, Bytes(all.begin(), all.begin() + 4));
+        } else if (how == Missed::NeverSent) {
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+            s = INVALID_SOCKET;
+            closedByHost = true;
+        }
+        SOCKET s2 = l.accept(8000);
+        if (s2 != INVALID_SOCKET) {
+            again = hostAuthSession(s2, sec, other, &other, againNamed);
+            Sleep(300);
+            closesocket(s2);
+        }
+        if (s != INVALID_SOCKET) {
+            // The rest of the notice, long after the viewer gave up on it
+            // (or the whole notice, after the viewer's send already failed).
+            sendAllBytes(s, how == Missed::LateTail ? Bytes(all.begin() + 4, all.end()) : all);
+            closesocket(s);
+        }
+    });
+    control.keepSession();
+    for (int i = 0; i < 500 && (control.reconnectStats().connecting || control.reconnectStats().reconnects == 0); ++i) Sleep(10);
+    expect(first == 1 && firstNamed.empty() && control.reconnectStats().reconnects == 1,
+           std::string("prc r4 ") + label + ": first AUTH of the attempt names no session");
+
+    taken = true;
+    if (how == Missed::LateTail) {
+        for (int i = 0; i < 300 && !partSent; ++i) Sleep(5);
+        Sleep(20);  // 4 bytes in the viewer's receive buffer; the tail comes > 250 ms later
+    }
+    if (how == Missed::NeverSent) {
+        for (int i = 0; i < 300 && !closedByHost; ++i) Sleep(5);
+    } else {
+        control.setFailLiveSendsForTest(1);
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool sent = control.sendKey(true, 0x0041);
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        expect(!sent && terminals == 0 && waited < ControlChannel::kNoticeWaitMs + 200,
+               std::string("  ") + label + ": send failed, notice not read (" + std::to_string(waited) + " ms), not halted yet");
+    }
+    // The viewer reconnects on its own (read-only keepSession, or the
+    // queued key): that AUTH names `mine` and is refused.
+    for (int i = 0; i < 600 && terminals == 0; ++i) {
+        control.pollHostNotice();
+        control.keepSession();
+        Sleep(10);
+    }
+    host.join();
+    const bool namedMine = againNamed.size() == kSessionIdBytes && std::equal(againNamed.begin(), againNamed.end(), mine.begin());
+    expect(again == 2 && namedMine, std::string("  ") + label + ": the reconnect named its old session (72-byte answer) and got REPLACED");
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
+           std::string("  ") + label + ": viewer told once (Replaced), attempt halted");
+    expect(!control.keepSession() && !control.sendKey(true, 0x0042) && l.accept(500) == INVALID_SOCKET,
+           std::string("  ") + label + ": no further connection attempt (the session is not taken back)");
+    control.stop();
+    setCurrent(nullptr);
+}
+
+void prcR4Tests() {
+    prcR4Case(Missed::NothingArrived, "0 bytes of the notice arrived");
+    prcR4Case(Missed::LateTail, "notice tail > 250 ms late");
+    prcR4Case(Missed::NeverSent, "no notice at all");
+}
+
+// r4 (Pepper's r3 review, item 2): a read-only view (--no-control) gets its
+// session back on its own: the negotiation its start-up could not do, then
+// keep-alive and audio; and a new round after the NoChallenge retries ran
+// out (paused), which only a fresh key press starts in a view with input.
+void prcR4ReadOnlyTests() {
+    using jl::viewer::ReadOnlyRecovery;
+    {
+        ReadOnlyRecovery r(false);
+        expect(!r.wantNegotiate(false, 0) && r.wantNegotiate(true, 0),
+               "prc r4 read-only: start-up negotiation failed: negotiate once the connection is back");
+        r.negotiateFailed(0);
+        const bool gap1 = !r.wantNegotiate(true, 999) && r.wantNegotiate(true, 1000);
+        r.negotiateFailed(1000);
+        const bool gap2 = !r.wantNegotiate(true, 2999) && r.wantNegotiate(true, 3000);
+        for (int i = 0; i < 6; ++i) r.negotiateFailed(3000);
+        const bool capped = !r.wantNegotiate(true, 3000 + ReadOnlyRecovery::kNegotiateMaxGapMs - 1) &&
+                            r.wantNegotiate(true, 3000 + ReadOnlyRecovery::kNegotiateMaxGapMs);
+        r.negotiateOk();
+        expect(gap1 && gap2 && capped && !r.wantNegotiate(true, 1e9) && r.negotiateFailures() == 8,
+               "  failed tries back off 1 s, 2 s ... 8 s; none once negotiated");
+        expect(!ReadOnlyRecovery(true).wantNegotiate(true, 0), "  negotiated at start-up: nothing to do");
+    }
+    {
+        ReadOnlyRecovery r(true);
+        const bool first = !r.wantResume(false, 0) && !r.wantResume(true, 0) && !r.wantResume(true, 4999) &&
+                           r.wantResume(true, 5000) && r.resumes() == 1;
+        // Paused again right away: twice the gap.
+        const bool second = !r.wantResume(true, 5100) && !r.wantResume(true, 15099) && r.wantResume(true, 15100);
+        for (int i = 0; i < 8; ++i) {
+            r.wantResume(true, 0);
+            r.wantResume(true, 1e9);
+        }
+        const bool capped = r.resumeGapMs() == ReadOnlyRecovery::kResumeMaxGapMs;
+        r.sessionBack();
+        expect(first && second && capped && r.resumeGapMs() == ReadOnlyRecovery::kResumeFirstGapMs,
+               "  paused: a new round after 5 s, 10 s ... 60 s; back to 5 s once a round authenticates");
+    }
+
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+
+    // (a) No control connection at start (no negotiation). The background
+    // reconnect brings it back; the first late negotiation finds the Mac
+    // gone (no ACK), the next one, on the following reconnect, works and
+    // the connection stays up for the session.
+    {
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);  // as the viewer does after a failed start-up
+        bool auth1 = false, auth2 = false;
+        std::vector<std::pair<uint8_t, Bytes>> neg1, neg2;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, 50);
+            neg1 = readFrames(s, 1, 3000);
+            closesocket(s);  // no ACK
+            s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 50);
+            neg2 = readFrames(s, 1, 3000);
+            // ACK: status 0, h264, flags NACK|audio, 25 Mbps.
+            const Bytes ack{1, 0, 1, 0x20 | 0x80, 0, 25};
+            sendAllBytes(s, frame(0x41, ack.data(), ack.size()));
+            Sleep(800);
+            closesocket(s);
+        });
+        ReadOnlyRecovery ro(false);
+        VideoConfigResult got;
+        int lateTries = 0;
+        bool connectedAfter = false;
+        const auto t0 = Clock::now();
+        for (int i = 0; i < 800 && !ro.negotiated(); ++i) {
+            const double now = msSince(t0);
+            control.pollHostNotice();
+            control.keepSession();
+            if (ro.wantNegotiate(control.connected(), now)) {
+                ++lateTries;
+                got = control.negotiateVideoOnLive("h264", true, false, 25, true);
+                if (got.negotiated) {
+                    ro.negotiateOk();
+                    connectedAfter = control.connected();
+                } else {
+                    ro.negotiateFailed(now);
+                }
+            }
+            Sleep(10);
+        }
+        host.join();
+        const auto okReq = [](const std::vector<std::pair<uint8_t, Bytes>>& f) {
+            return f.size() == 1 && f[0].first == 0x40 && f[0].second.size() == 6 && f[0].second[1] == 1 &&
+                   (f[0].second[2] & 0x04) != 0;
+        };
+        expect(auth1 && okReq(neg1) && auth2 && okReq(neg2) && lateTries == 2,
+               "  (a) negotiated after the background reconnect (h264, audio wanted), again after a lost ACK");
+        const auto plan = jl::viewer::udpPlan(false, "tcp", got.hostSupportsNack, true, got.hostSupportsAudio);
+        expect(got.negotiated && got.codec == "h264" && got.hostSupportsAudio && got.hostSupportsNack && connectedAfter &&
+                   control.reconnectStats().reconnects == 2 && plan.channel && plan.keepAlive && plan.audio && !plan.input,
+               "  (a) the answer starts keep-alive and audio; the connection stays live after it");
+        expect(terminals == 0 && mayConnect(), "  (a) the session goes on (nothing halted)");
+        control.stop();
+        setCurrent(nullptr);
+    }
+
+    // (b) The NoChallenge retries run out in a read-only view: keepSession
+    // alone starts no round while paused; after the gap the recovery ends
+    // the pause and the next round authenticates.
+    {
+        clearKnownModesForTest();
+        std::atomic<int> terms{0};
+        std::atomic<int> lastO{-1};
+        auto c = makeClient(terms, lastO, "127.0.0.1:" + std::to_string(l.port));
+        setCurrent(c);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        bool auth1 = false, auth2 = false;
+        std::atomic<int> silent{0}, noiseConns{0};
+        std::atomic<bool> noiseDone{false};
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s == INVALID_SOCKET) return;
+            auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+            Sleep(200);
+            closesocket(s);
+            for (int i = 0; i < 1 + kNoChallengeRetries; ++i) {
+                s = l.accept(8000);
+                if (s == INVALID_SOCKET) return;
+                ++silent;
+                silentConn(s, sec, 2300);
+                closesocket(s);
+            }
+            while (!noiseDone) {
+                s = l.accept(50);
+                if (s != INVALID_SOCKET) { ++noiseConns; closesocket(s); }
+            }
+            s = l.accept(15000);
+            if (s == INVALID_SOCKET) return;
+            auth2 = hostAuth(s, sec, Answer::Ok, 100);
+            Sleep(300);
+            closesocket(s);
+        });
+        ReadOnlyRecovery ro(true, 1500);
+        const auto t0 = Clock::now();
+        // The viewer loop, every 250 ms (here 25 ms): resume when due, keepSession.
+        auto tick = [&] {
+            const auto rs = control.reconnectStats();
+            if (ro.wantResume(rs.pausedNow, msSince(t0))) control.resumeOnUserKey();
+            control.pollHostNotice();
+            control.keepSession();
+        };
+        for (int i = 0; i < 3000 && control.reconnectStats().paused == 0; ++i) {
+            control.pollHostNotice();
+            if (!control.reconnectStats().pausedNow) control.keepSession();
+            Sleep(10);
+        }
+        const auto mid = control.reconnectStats();
+        // Paused: keepSession alone does nothing for 1 s.
+        for (int i = 0; i < 40; ++i) {
+            control.keepSession();
+            Sleep(25);
+        }
+        noiseDone = true;
+        const auto quiet = control.reconnectStats();
+        for (int i = 0; i < 800 && control.reconnectStats().reconnects < 2; ++i) {
+            tick();
+            Sleep(25);
+        }
+        host.join();
+        const auto after = control.reconnectStats();
+        expect(auth1 && mid.paused == 1 && silent == 1 + kNoChallengeRetries && quiet.pausedNow && noiseConns == 0,
+               "  (b) retries spent: paused, and keepSession alone starts no round (" + std::to_string(noiseConns) + " connections)");
+        expect(auth2 && after.resumes == 1 && after.reconnects == 2 && !after.pausedNow && ro.resumes() == 1 &&
+                   terms == 0 && !c->halted(),
+               "  (b) after the gap the read-only recovery ends the pause; the next round authenticates");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+}
 }  // namespace
 
 int main() {
@@ -1866,6 +2188,8 @@ int main() {
     r9Tests();
     prcR2Tests();
     prcR3Tests();
+    prcR4Tests();
+    prcR4ReadOnlyTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
