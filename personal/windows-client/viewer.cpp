@@ -277,7 +277,7 @@ public:
             uint8_t p[64]{};
             sockaddr_in peer{};
             int plen = sizeof(peer);
-            const int n = recvfrom(s_, reinterpret_cast<char*>(p), sizeof(p), 0,
+            int n = recvfrom(s_, reinterpret_cast<char*>(p), sizeof(p), 0,
                                    reinterpret_cast<sockaddr*>(&peer), &plen);
             if (n == SOCKET_ERROR) {
                 const int e = WSAGetLastError();
