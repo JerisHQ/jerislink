@@ -184,6 +184,11 @@ public:
                          L"or use Retry without password if it no longer has one.";
             view_.offerNoPassword = true;
             break;
+        case Outcome::Replaced:
+            // Another viewer authenticated on the Mac: this one stopped and
+            // does not reconnect on its own (it would take the session back).
+            view_.text = L"Another viewer connected to this Mac and took over the session. Connect again to take it back.";
+            break;
         case Outcome::RaceUnanswered:
             // The Mac switched to a password during our check and did not
             // say what it counted. No automatic retry; it is not probed again.

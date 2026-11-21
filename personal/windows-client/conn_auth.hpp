@@ -295,7 +295,7 @@ struct Challenge {
 };
 
 struct Result {
-    enum class Status : uint8_t { Ok = 0, Fail = 1, Locked = 2, Blocked = 3, AuthRequired = 4, OpenIpOnly = 5 };
+    enum class Status : uint8_t { Ok = 0, Fail = 1, Locked = 2, Blocked = 3, AuthRequired = 4, OpenIpOnly = 5, Replaced = 6 };
     Status status = Status::Fail;
     std::array<uint8_t, kMacBytes> macH{};
     std::array<uint8_t, kSessionIdBytes> sessionId{};
@@ -324,6 +324,7 @@ struct Result {
         case 3: if (p.size() != 1) return std::nullopt; r.status = Status::Blocked; return r;
         case 4: if (p.size() != 1) return std::nullopt; r.status = Status::AuthRequired; return r;
         case 5: if (p.size() != 1) return std::nullopt; r.status = Status::OpenIpOnly; return r;
+        case 6: if (p.size() != 1) return std::nullopt; r.status = Status::Replaced; return r;
         default: return std::nullopt;
         }
     }
@@ -599,6 +600,7 @@ enum class Outcome {
     NoChallenge,   // a host known to want a password sent no challenge in 2 s: nothing sent, mode kept
                    // (ends the attempt only before any channel authenticated; see Client::handshake)
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
+    Replaced,      // another viewer authenticated on the Mac and took the session (host notice after AUTH)
     Network,       // connection closed / malformed: an ordinary reconnect
 };
 
@@ -617,6 +619,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::RaceUnanswered: return "race_unanswered";
     case Outcome::NoChallenge: return "no_challenge";
     case Outcome::Retry: return "retry";
+    case Outcome::Replaced: return "replaced";
     case Outcome::Network: return "network";
     }
     return "?";
@@ -628,7 +631,7 @@ inline bool isTerminal(Outcome o) {
     switch (o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
-    case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge:
+    case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge: case Outcome::Replaced:
         return true;
     default:
         return false;
@@ -867,6 +870,22 @@ public:
     }
     // Bit (1 << Channel) per channel paused since the last call.
     uint32_t takePausedChannels() { return pausedChannels_.exchange(0); }
+
+    // r2 (Pepper's PR-C review, item 2): the Mac told an authenticated
+    // channel that another viewer took the session. The attempt ends like
+    // any answer the user must act on: no channel reconnects on its own (a
+    // reconnect would AUTH again and take the session back), and the launch
+    // screen says why.
+    void hostReplaced(Channel ch) {
+        note(std::string("auth.replaced chan=") + channelName(ch) + " reconnect=stopped");
+        Report r;
+        r.outcome = Outcome::Replaced;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            last_ = r.outcome;
+        }
+        halt(r);
+    }
     // A channel of this attempt has authenticated (OK or open_ip_only).
     bool authenticatedOnce() const { std::lock_guard<std::mutex> g(m_); return authed_; }
 

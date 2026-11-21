@@ -20,6 +20,7 @@ enum UDPAuthSelfTest {
         sessionState(expect)
         wire(expect)
         broker(expect)
+        replayWindow(expect)
         mouseServer(expect)
         frameSender(expect)
         probe(expect)
@@ -119,17 +120,17 @@ enum UDPAuthSelfTest {
     // MARK: Wire
 
     private static func wire(_ expect: Expect) {
-        func roundTrip(_ s: UDPPeerSession?, gen: UInt64) -> UDPPeerSession?? {
+        func roundTrip(_ s: UDPPeerSession?, gen: UInt64) -> SessionLinkWire.Frame? {
             let f = SessionLinkWire.encode(s, generation: gen)
             guard f.count >= 7, Array(f[0..<4]) == SessionLinkWire.magic,
                   Int(f[5]) << 8 | Int(f[6]) == f.count - 7, f.count - 7 <= SessionLinkWire.maxBody else { return nil }
             return SessionLinkWire.decode(type: f[4], body: Array(f[7...]))
         }
         let tagged = UDPPeerSession(generation: 0x0102030405060708, peerIP: "100.100.200.255", sessionKey: key(4))
-        expect(roundTrip(tagged, gen: tagged.generation) == .some(tagged), "wire: tagged session round trip (longest IP)")
+        expect(roundTrip(tagged, gen: tagged.generation) == .init(generation: tagged.generation, session: tagged), "wire: tagged session round trip (longest IP)")
         let plain = UDPPeerSession(generation: 9, peerIP: "1.2.3.4", sessionKey: nil)
-        expect(roundTrip(plain, gen: 9) == .some(plain), "wire: untagged session round trip")
-        expect(roundTrip(nil, gen: 10) == .some(nil), "wire: no session")
+        expect(roundTrip(plain, gen: 9) == .init(generation: 9, session: plain), "wire: untagged session round trip")
+        expect(roundTrip(nil, gen: 10) == .init(generation: 10, session: nil), "wire: no session keeps its generation")
         let f = SessionLinkWire.encode(tagged, generation: tagged.generation)
         let body = Array(f[7...])
         expect(SessionLinkWire.decode(type: 1, body: Array(body.dropLast())) == nil, "wire: short key is malformed")
@@ -138,6 +139,14 @@ enum UDPAuthSelfTest {
         var badIP = body; badIP[9] = UInt8(ascii: "x")
         expect(SessionLinkWire.decode(type: 1, body: badIP) == nil, "wire: a non-IPv4 peer is malformed")
         expect(SessionLinkWire.decode(type: 0, body: Array(body.prefix(9))) == nil, "wire: none with a body is malformed")
+        // r2 (item 1): stale frames are refused, "none" included.
+        let g7 = SessionLinkWire.Frame(generation: 7, session: tagged)
+        let none6 = SessionLinkWire.Frame(generation: 6, session: nil)
+        expect(SessionLinkClient.accept(g7, after: nil) && SessionLinkClient.accept(g7, after: 7),
+               "wire: the first frame and a repeat of the same generation are taken")
+        expect(!SessionLinkClient.accept(none6, after: 7), "wire: an older none frame is refused")
+        expect(!SessionLinkClient.accept(.init(generation: 6, session: plain), after: 7), "wire: an older session frame is refused")
+        expect(SessionLinkClient.accept(.init(generation: 8, session: nil), after: 7), "wire: a newer none frame is taken")
     }
 
     // MARK: Broker
@@ -183,6 +192,26 @@ enum UDPAuthSelfTest {
         expect(t.current.0?.peerIP == a, "broker (transition): back to the viewer still connected")
         t.end(x); t.end(y)
         expect(t.current.0 == nil, "broker (transition): no connection, no session")
+
+        // r2 (item 1): concurrent begin/end from many threads: the listeners
+        // see every generation once, strictly in order.
+        final class Gens: @unchecked Sendable {
+            let lock = NSLock(); var list: [UInt64] = []
+            func add(_ g: UInt64) { lock.lock(); list.append(g); lock.unlock() }
+            var all: [UInt64] { lock.lock(); defer { lock.unlock() }; return list }
+        }
+        let gens = Gens()
+        let o = SessionBroker(passwordMode: true, log: { _ in })
+        o.onChange { _, g in gens.add(g); usleep(50) }
+        DispatchQueue.concurrentPerform(iterations: 8) { i in
+            for n in 0..<50 {
+                let t = o.begin(peerIP: "100.64.0.\(i + 1)", channel: .control, sessionKey: key(UInt8(n % 200)), close: {})
+                o.end(t)
+            }
+        }
+        let seen = gens.all
+        expect(!seen.isEmpty && zip(seen, seen.dropFirst()).allSatisfy { $0 < $1 } && seen.last == o.current.1,
+               "broker: concurrent changes reach the listeners in generation order (\(seen.count) changes)")
     }
 
     // MARK: Loopback UDP helpers
@@ -230,6 +259,35 @@ enum UDPAuthSelfTest {
 
     // MARK: Mouse UDP server on loopback
 
+    // r2 (Pepper's PR-C review, item 7): the 64-packet anti-replay window.
+    private static func replayWindow(_ expect: Expect) {
+        var w = SeqReplayWindow()
+        expect(w.check(100) == .newest, "window: first seq taken")
+        expect(w.check(100) == .duplicate, "window: same seq again is a duplicate")
+        expect(w.check(105) == .newest && w.check(101) == .late, "window: a reordered unseen seq is late (taken)")
+        w.mark(101)
+        expect(w.check(101) == .duplicate, "window: a late seq once marked is a duplicate")
+        expect(w.check(105 - 63) == .late && w.check(105 - 64) == .tooOld, "window: 63 behind is inside, 64 behind is too old")
+        expect(w.check(105 + 64) == .newest && w.check(106) == .late && w.check(105) == .tooOld,
+               "window: a jump of 64 leaves only the new newest seen")
+        expect(w.check(105 + 74) == .newest && w.check(105 + 64) == .duplicate && w.check(105 + 65) == .late,
+               "window: a jump of 10 keeps what was seen, shifted")
+        var wrap = SeqReplayWindow()
+        _ = wrap.check(UInt32.max - 1)
+        expect(wrap.check(2) == .newest && wrap.check(UInt32.max) == .late && wrap.check(UInt32.max - 1) == .duplicate,
+               "window: order and bitmap survive the UInt32 wrap")
+        var dense = SeqReplayWindow()
+        var seen = 0
+        for seq in (1...200).reversed().map(UInt32.init) {
+            switch dense.check(seq) {
+            case .newest: seen += 1
+            case .late: dense.mark(seq); seen += 1
+            default: break
+            }
+        }
+        expect(seen == 64, "window: 200 datagrams in reverse order: the newest and the 63 behind it taken, \(seen)")
+    }
+
     private static func mouseServer(_ expect: Expect) {
         let k = key(8)
         func ping(_ seq: UInt32) -> [UInt8] {
@@ -272,6 +330,22 @@ enum UDPAuthSelfTest {
         let stats = server.statsLine()
         expect(stats.contains("mouse_udp_bad_tag=4") && stats.contains("mouse_udp_no_session=1"),
                "mouse: drops counted (\(stats.split(separator: " ").filter { $0.contains("bad_tag") || $0.contains("no_session") }.joined(separator: " ")))")
+
+        // r2 item 7: a late datagram never seen is answered; seen again, or
+        // behind the 64-packet window, it is not.
+        sendUDP(viewer.fd, v2h.seal(ping(12)), to: port)
+        expect(receiveUDP(viewer.fd)?[5] == 0x44, "mouse window: newest seq 12 answered")
+        sendUDP(viewer.fd, v2h.seal(ping(9)), to: port)
+        expect(receiveUDP(viewer.fd)?[5] == 0x44, "mouse window: late unseen seq 9 answered (not dropped as stale)")
+        sendUDP(viewer.fd, v2h.seal(ping(9)), to: port)
+        expect(receiveUDP(viewer.fd) == nil, "mouse window: seq 9 again gets nothing (replay)")
+        sendUDP(viewer.fd, v2h.seal(ping(90)), to: port)
+        _ = receiveUDP(viewer.fd)
+        sendUDP(viewer.fd, v2h.seal(ping(11)), to: port)
+        expect(receiveUDP(viewer.fd) == nil, "mouse window: seq 11, 79 behind the newest, gets nothing")
+        let wstats = server.statsLine()
+        expect(wstats.contains("mouse_udp_late_ok=1") && wstats.contains("mouse_udp_replay=2"),
+               "mouse window: counted (\(wstats.split(separator: " ").filter { $0.contains("late_ok") || $0.contains("replay") || $0.contains("stale") }.joined(separator: " ")))")
 
         state.set(UDPPeerSession(generation: 2, peerIP: "127.0.0.1", sessionKey: key(10)))
         sendUDP(viewer.fd, v2h.seal(ping(7)), to: port)

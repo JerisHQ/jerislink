@@ -180,7 +180,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private var cursorDetector: CursorShapeDetector?
     private var fd: Int32 = -1
     private var stopping = false
-    private var lastSequence: UInt32?
+    private var replayWindow = SeqReplayWindow()
     private var lastPeerPort: UInt16?
     private var keyframeRequestHandler: (() -> Void)?
     private var nackHandler: ((UInt64, [UDPFrameSender.NackRange]) -> Void)?
@@ -209,6 +209,10 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     private(set) var forwarded: UInt64 = 0
     private(set) var rejected: UInt64 = 0
     private(set) var staleDropped: UInt64 = 0
+    /// r2 item 7: unseen late datagrams taken (NACK, receiver report...).
+    private(set) var lateAccepted: UInt64 = 0
+    /// r2 item 7: a seq already seen inside the window (replay or duplicate).
+    private(set) var replayDropped: UInt64 = 0
     private(set) var badPackets: UInt64 = 0
     private(set) var keyframeRequests: UInt64 = 0
     private(set) var cursorUpdates: UInt64 = 0
@@ -311,7 +315,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
         lock.lock()
         fd = s
         stopping = false
-        lastSequence = nil
+        replayWindow = SeqReplayWindow()
         lastPeerPort = nil
         lastPeerAddress = nil
         lastCursorShape = nil
@@ -381,7 +385,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
     }
 
     func statsLine() -> String {
-        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_no_session=\(noSession) mouse_udp_bad_tag=\(badTags.total) mouse_udp_stale=\(staleDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected) audio_requests_rx=\(audioRequestRx)"
+        return "mouse_udp_rx=\(received) mouse_udp_forwarded=\(forwarded) mouse_udp_rejected=\(rejected) mouse_udp_no_session=\(noSession) mouse_udp_bad_tag=\(badTags.total) mouse_udp_stale=\(staleDropped) mouse_udp_late_ok=\(lateAccepted) mouse_udp_replay=\(replayDropped) mouse_udp_bad=\(badPackets) keyframe_requests=\(keyframeRequests) cursor_updates=\(cursorUpdates) cursor_update_drops=\(cursorUpdateDrops) nack_rx=\(nackRx) ping_rx=\(pingRx) pong_drops=\(pongDrops) abr_reports_rx=\(receiverReportRx) abr_reports_rejected=\(receiverReportRejected) audio_requests_rx=\(audioRequestRx)"
     }
 
     /// Coalesce cursor-shape checks onto a separate queue. There is no periodic
@@ -572,7 +576,7 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             } else if lastPeerPort != peerPort {
                 presenceNewSession = true
                 lastPeerPort = peerPort
-                lastSequence = nil
+                replayWindow = SeqReplayWindow()
                 lock.lock()
                 lastPeerAddress = peer
                 lastCursorShape = nil
@@ -595,11 +599,30 @@ final class MouseMoveUDPServer: @unchecked Sendable {
                       UInt32(buffer[7]) << 16 |
                       UInt32(buffer[8]) << 8 |
                       UInt32(buffer[9])
-            if let last = lastSequence, !Self.isNewer(seq, than: last) {
+            // r2 (Pepper's PR-C review, item 7; design §5.1): a 64-packet
+            // anti-replay window. A seq seen before, or more than 63 behind
+            // the newest, is dropped. One that arrives late but was never
+            // seen is taken (a reordered NACK or receiver report still
+            // matters), except a pointer move or an audio request: those
+            // set state, so only the newest counts, as before.
+            switch replayWindow.check(seq) {
+            case .newest:
+                break
+            case .late:
+                if buffer[5] == 0x24 || buffer[5] == 0x45 {
+                    replayWindow.mark(seq)
+                    staleDropped &+= 1
+                    continue
+                }
+                replayWindow.mark(seq)
+                lateAccepted &+= 1
+            case .duplicate:
+                replayDropped &+= 1
+                continue
+            case .tooOld:
                 staleDropped &+= 1
                 continue
             }
-            lastSequence = seq
 
             switch buffer[5] {
             case 0x24:
@@ -716,5 +739,49 @@ final class MouseMoveUDPServer: @unchecked Sendable {
             ranges.append(UDPFrameSender.NackRange(start: start, count: len))
         }
         return (frameID, ranges)
+    }
+}
+
+/// r2 (Pepper's PR-C review, item 7; design §5.1 "seq 滑動窗口（64）"): the
+/// newest seq seen and a bitmap of the 64 before it (bit i = newest - i),
+/// RFC 4303 §3.4.3 style. Order survives the UInt32 wrap (isNewer).
+struct SeqReplayWindow: Equatable {
+    static let size: UInt32 = 64
+
+    enum Verdict: Equatable {
+        /// Newer than anything seen: the window moved to it.
+        case newest
+        /// Inside the window and not seen yet; `mark` records it.
+        case late
+        /// Inside the window and seen before.
+        case duplicate
+        /// Behind the window: cannot tell, dropped.
+        case tooOld
+    }
+
+    private(set) var highest: UInt32?
+    private(set) var bits: UInt64 = 0
+
+    mutating func check(_ seq: UInt32) -> Verdict {
+        guard let top = highest else {
+            highest = seq
+            bits = 1
+            return .newest
+        }
+        if MouseMoveUDPServer.isNewer(seq, than: top) {
+            let shift = seq &- top
+            bits = shift >= Self.size ? 1 : (bits << UInt64(shift)) | 1
+            highest = seq
+            return .newest
+        }
+        let back = top &- seq
+        guard back < Self.size else { return .tooOld }
+        return bits & (UInt64(1) << UInt64(back)) != 0 ? .duplicate : .late
+    }
+
+    mutating func mark(_ seq: UInt32) {
+        guard let top = highest else { return }
+        let back = top &- seq
+        if back < Self.size { bits |= UInt64(1) << UInt64(back) }
     }
 }

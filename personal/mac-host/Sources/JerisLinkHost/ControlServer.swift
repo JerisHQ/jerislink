@@ -146,6 +146,10 @@ final class ControlServer: @unchecked Sendable {
     private let sessionBroker: SessionBroker?
     /// Zero-MAC probes answered without counting (item 5, PR-C).
     private(set) var probesUncounted: UInt64 = 0
+    /// r2: 0.3.x viewers answered AUTH_REQUIRED without counting a try.
+    private(set) var oldViewersUncounted: UInt64 = 0
+    /// r2: repeated refusals (a viewer reconnecting in a loop) log once per 10 s.
+    let authLog = AuthLogThrottle()
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
@@ -456,10 +460,23 @@ final class ControlServer: @unchecked Sendable {
         // now that the whitelist replaces clientIP.
         let gateAdmitted = authenticated || (authGate != nil && !acceptProxy && peer.verified)
         if let sessionBroker, authGate != nil {
+            // r2 (Pepper's PR-C review, item 2): a newer AUTH ends this
+            // connection through `kick` (any thread). The read side shuts at
+            // once (input stops, the loop below returns); the control
+            // channel then tells the viewer it was replaced, so it stops
+            // reconnecting instead of taking the session back.
+            let kick = KickHandle(fd)
             let token = sessionBroker.begin(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
-                                            close: { Darwin.shutdown(fd, SHUT_RDWR) })
-            defer { sessionBroker.end(token) }
+                                            close: { kick.kick() })
+            defer {
+                sessionBroker.end(token)
+                kick.finish()
+            }
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
+            if kick.kicked && authChannel == .control {
+                let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+                print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
+            }
         } else {
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
         }
@@ -1231,8 +1248,12 @@ final class ControlServer: @unchecked Sendable {
         let isMRC1 = header[0] == 0x4d && header[1] == 0x52 && header[2] == 0x43 && header[3] == 0x31 && header[4] == 1
         guard isMRC1, type == ConnAuth.MsgType.response else {
             // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...) or noise.
-            print("auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16))")
-            settleFailure(fd, ip: ip, gate: gate, reason: "auth_required", reply: .authRequired)
+            // r2 (Pepper's PR-C review, item 8): no password was tried, so it
+            // is not counted. A 0.3.x viewer reconnects in a loop; counting
+            // each attempt locked its address out within seconds.
+            lock.lock(); oldViewersUncounted += 1; lock.unlock()
+            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.authRequired.payload)
+            authLog.log("auth.old_viewer", peer: ip, "auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16)) counted=0")
             return nil
         }
         guard length == 64 else {
@@ -1271,7 +1292,8 @@ final class ControlServer: @unchecked Sendable {
             return matched != nil
         }
         guard settlement == .ok, let channel = matched else {
-            finishFailure(fd, ip: ip, settlement: settlement, reason: "wrong_password", reply: nil)
+            finishFailure(fd, ip: ip, settlement: settlement, reason: "wrong_password", reply: nil,
+                          failureLog: gate.failureLog)
             return nil
         }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
@@ -1299,16 +1321,16 @@ final class ControlServer: @unchecked Sendable {
         switch admission {
         case .blocked:
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
-            print("auth.blocked peer=\(ip)\(note); connection closed")
+            authLog.log("auth.blocked", peer: ip, "auth.blocked peer=\(ip)\(note); connection closed")
         case .notAllowed:
             rejectedClients += 1
             print("Control reject peer=\(ip) expected=whitelist on \(bindIP):\(port)\(note); connection closed")
         case .locked(let retry, let stage):
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)\(note); connection closed")
+            authLog.log("auth.locked", peer: ip, "auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)\(note); connection closed")
         case .globalLocked(let retry):
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.global_locked peer=\(ip) retry_s=\(retry)\(note); connection closed")
+            authLog.log("auth.global_locked", peer: ip, "auth.global_locked peer=\(ip) retry_s=\(retry)\(note); connection closed")
         case .challenge:
             break
         }
@@ -1326,14 +1348,16 @@ final class ControlServer: @unchecked Sendable {
     /// A timeout, an old viewer or a malformed answer: settled like a wrong
     /// password, so the waits are checked again first.
     private func settleFailure(_ fd: Int32, ip: String, gate: AuthGate, reason: String, reply: ConnAuth.Result?) {
-        finishFailure(fd, ip: ip, settlement: gate.guardian.settle(ip) { false }, reason: reason, reply: reply)
+        finishFailure(fd, ip: ip, settlement: gate.guardian.settle(ip) { false }, reason: reason, reply: reply,
+                      failureLog: gate.failureLog)
     }
 
     /// Answers a failed settlement. `reply` overrides the plain FAIL
     /// (AUTH_REQUIRED for an old viewer); LOCKED and BLOCKED always win so
     /// the viewer learns the wait. The blacklist log says whether
     /// listen.plist was really written.
-    private func finishFailure(_ fd: Int32, ip: String, settlement: AuthGuard.Settlement, reason: String, reply: ConnAuth.Result?) {
+    private func finishFailure(_ fd: Int32, ip: String, settlement: AuthGuard.Settlement, reason: String, reply: ConnAuth.Result?,
+                               failureLog: AuthFailureLog?) {
         let r: AuthGuard.Failure
         switch settlement {
         case .ok:
@@ -1345,6 +1369,7 @@ final class ControlServer: @unchecked Sendable {
             r = failure
         }
         lock.lock(); authFailures += 1; lock.unlock()   // connections settle concurrently
+        failureLog?.record(ip: ip, reason: reason, failures: r.failures)   // r2 item 6: shown in 連線設定
         let result: ConnAuth.Result
         switch r.outcome {
         case .retry(let tries):
@@ -1377,7 +1402,7 @@ final class ControlServer: @unchecked Sendable {
         }
         if gate.guardian.isBlocked(peer.ip) {
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
-            print("auth.blocked peer=\(peer.ip); connection closed")
+            authLog.log("auth.blocked", peer: peer.ip, "auth.blocked peer=\(peer.ip); connection closed")
             return false
         }
         let whitelist = gate.guardian.whitelist

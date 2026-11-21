@@ -177,6 +177,11 @@ void wireTests() {
     r = Result::decode(Bytes{1, 3});
     expect(r && r->status == Result::Status::Fail && r->triesLeft == 3, "fail 3 tries decodes");
     expect(Result::decode(Bytes{5}) && Result::decode(Bytes{5})->status == Result::Status::OpenIpOnly, "open_ip_only decodes");
+    // r2 (Pepper's PR-C review, item 2): the host's "replaced" notice.
+    expect(Result::decode(Bytes{6}) && Result::decode(Bytes{6})->status == Result::Status::Replaced, "replaced decodes");
+    expect(!Result::decode(Bytes{6, 0}).has_value(), "replaced with a payload rejected");
+    expect(isTerminal(Outcome::Replaced) && std::string(outcomeName(Outcome::Replaced)) == "replaced",
+           "replaced: terminal, named");
     expect(!Result::decode(Bytes{9}).has_value(), "unknown status rejected");
 }
 

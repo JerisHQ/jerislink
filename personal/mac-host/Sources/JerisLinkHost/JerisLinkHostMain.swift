@@ -219,27 +219,9 @@ struct JerisLinkHostMain {
             }
             exit(0)
         }
-        // PR-C: the same password set / clear as 連線設定, for a Mac without
-        // a screen session (ssh). `set` reads one line from stdin; nothing is
-        // echoed or logged. Same rules, Keychain item and listen.plist write.
-        if rawArgs.count == 3, rawArgs[1] == "--connection-password", rawArgs[2] == "set" || rawArgs[2] == "clear" {
-            let url = ConnectionSettings.defaultURL
-            let store = KeychainSecretStore()
-            let outcome: ConnectionSettings.Outcome
-            if rawArgs[2] == "set" {
-                guard let line = readLine(strippingNewline: true), !line.isEmpty else {
-                    fputs("connection-password: no password on stdin\n", stderr)
-                    exit(2)
-                }
-                outcome = ConnectionSettings.setPassword(line, confirm: line, url: url, store: store)
-            } else {
-                outcome = ConnectionSettings.clearPassword(url: url, store: store)
-            }
-            switch outcome {
-            case .ok(let text): print("connection-password \(rawArgs[2]) ok: \(text)"); exit(0)
-            case .refused(let text): fputs("connection-password \(rawArgs[2]) refused: \(text)\n", stderr); exit(1)
-            }
-        }
+        // r2 (Pepper's PR-C review, item 4): the password is set and cleared
+        // only in 連線設定 (design §10); there is no command-line way. The
+        // code paths are covered by --self-test (ConnectionSettingsSelfTest).
         // PR-C: what the UDP tags cost on this Mac at 4K60 (default 50, 80, 150 Mbps).
         if rawArgs.count >= 2, rawArgs[1] == "--udp-tag-bench" {
             let rates = rawArgs.dropFirst(2).compactMap { Int($0) }

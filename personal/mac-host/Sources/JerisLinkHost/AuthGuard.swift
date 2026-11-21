@@ -859,12 +859,16 @@ final class AuthGate: @unchecked Sendable {
     let guardian: AuthGuard
     let secret: ConnSecret?
     let timeout: TimeInterval
+    /// r2 (Pepper's PR-C review, item 6): counted failures, for 連線設定.
+    let failureLog: AuthFailureLog?
 
-    init(policy: AuthPolicy, guardian: AuthGuard, secret: ConnSecret?, timeout: TimeInterval = ConnAuth.authTimeout) {
+    init(policy: AuthPolicy, guardian: AuthGuard, secret: ConnSecret?, timeout: TimeInterval = ConnAuth.authTimeout,
+         failureLog: AuthFailureLog? = nil) {
         self.policy = policy
         self.guardian = guardian
         self.secret = secret
         self.timeout = timeout
+        self.failureLog = failureLog
     }
 
     var requiresPassword: Bool {
@@ -881,12 +885,77 @@ final class AuthGate: @unchecked Sendable {
     var isRevoked: Bool { revokeLock.lock(); defer { revokeLock.unlock() }; return revoked }
 
     static func make(policy: AuthPolicy, secret: ConnSecret?, blocklist: BlocklistStore,
-                     journal: PendingBlockStore? = nil) -> AuthGate {
+                     journal: PendingBlockStore? = nil, failureLog: AuthFailureLog? = nil) -> AuthGate {
         let whitelist: [String]
         switch policy {
         case .password(let w), .transition(let w): whitelist = w
         case .refused: whitelist = []
         }
-        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist, journal: journal), secret: secret)
+        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist, journal: journal), secret: secret,
+                        failureLog: failureLog)
+    }
+}
+
+/// r2 (Pepper's PR-C review, item 6): the last counted auth failures, for
+/// the 連線設定 window (design §10 "最近 auth 失敗紀錄"). A small plist next
+/// to listen.plist (mode 0600), newest last, at most `limit` records. The
+/// control service writes it on a serial queue so a failed try never waits
+/// for the disk; the window only reads it. No password material is kept:
+/// time, address, reason and the failure count.
+final class AuthFailureLog: @unchecked Sendable {
+    struct Record: Equatable {
+        var at: Date
+        var ip: String
+        var reason: String
+        var failures: Int
+    }
+
+    static let limit = 20
+    static var defaultURL: URL {
+        ListenConfig.plistURL.deletingLastPathComponent().appendingPathComponent("auth-failures.plist")
+    }
+
+    let url: URL
+    private let queue = DispatchQueue(label: "jerislink.auth-failure-log")
+
+    init(url: URL) { self.url = url }
+
+    func record(ip: String, reason: String, failures: Int, at: Date = Date()) {
+        let rec = Record(at: at, ip: ip, reason: reason, failures: failures)
+        queue.async { [url] in
+            var all = Self.load(url: url)
+            all.append(rec)
+            if all.count > Self.limit { all.removeFirst(all.count - Self.limit) }
+            Self.write(all, url: url)
+        }
+    }
+
+    /// Waits for the queued writes (self-test).
+    func flush() { queue.sync {} }
+
+    static func load(url: URL) -> [Record] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [[String: Any]]
+        else { return [] }
+        return raw.compactMap { d in
+            guard let at = d["at"] as? Date, let ip = d["ip"] as? String, ListenConfig.isIPv4(ip),
+                  let reason = d["reason"] as? String, let failures = d["failures"] as? Int else { return nil }
+            return Record(at: at, ip: ip, reason: String(reason.prefix(40)), failures: failures)
+        }
+    }
+
+    private static func write(_ records: [Record], url: URL) {
+        let raw: [[String: Any]] = records.map { ["at": $0.at, "ip": $0.ip, "reason": $0.reason, "failures": $0.failures] }
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: raw, format: .xml, options: 0) else { return }
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).\(getpid()).\(UUID().uuidString.prefix(8))")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { return }
+        let ok = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return Darwin.write(fd, base, buf.count) == buf.count
+        }
+        close(fd)
+        if !ok || rename(tmp.path, url.path) != 0 { unlink(tmp.path) }
     }
 }

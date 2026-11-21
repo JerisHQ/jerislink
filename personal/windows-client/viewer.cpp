@@ -6129,9 +6129,17 @@ static int appMain(int argc, char** argv) {
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
         // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
         std::unique_ptr<jl::audio::AudioPlayer> audio;
-        if (o.controlEnabled) {
+        // r2 (Pepper's PR-C review, item 5): --no-control is a read-only
+        // view, not a session without control. The control connection is
+        // still made, authenticated and kept: the Mac sends video and audio
+        // only to the peer of an authenticated control session, and the UDP
+        // key K_s comes from its AUTH. What --no-control turns off is input:
+        // gControl stays null, so no key, mouse, scroll or force-quit is ever
+        // sent, and there is no mouse UDP, clipboard or file transfer.
+        {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
-            gControl = control.get();
+            gControl = o.controlEnabled ? control.get() : nullptr;
+            if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");
             // Startup negotiation may traverse a degraded Tailscale/DERP path.
             // Give the initial handshake enough headroom, then restore the
             // low-latency 100 ms control timeout immediately afterwards.
@@ -6216,7 +6224,8 @@ static int appMain(int argc, char** argv) {
                 logLine("video.negotiation=control-unavailable codec=h264 bitrate_mbps=25");
             }
             control->setIoTimeoutMs(100);
-
+        }
+        if (o.controlEnabled) {
             if (o.mouseMoveTransport == "udp") {
                 mouseMoveUdp = std::make_unique<MouseMoveUdpChannel>(o.bindIp, o.sourceIp, o.mouseUdpPort);
                 gMouseMoveUdp = mouseMoveUdp.get();
@@ -6253,17 +6262,9 @@ static int appMain(int argc, char** argv) {
             filePullSession->start();
             gFilePullSession = filePullSession.get();
         } else {
-            gControl = nullptr;
             gMouseMoveUdp = nullptr;
             logLine("control.disabled");
             logLine("clipboard.disabled");
-            if (o.codec == "hevc" && hevcSupported) effectiveCodec = "hevc";
-            else effectiveCodec = "h264";
-            effectiveBitrateMbps = o.bitrateMbps == 0
-                ? (effectiveCodec == "hevc" ? 18 : 25)
-                : o.bitrateMbps;
-            logLine("video.negotiation=disabled codec=" + effectiveCodec +
-                    " bitrate_mbps=" + std::to_string(effectiveBitrateMbps));
         }
 
         HWND hwnd = createViewerWindow(o.windowWidth, o.windowHeight);
@@ -6608,6 +6609,14 @@ static int appMain(int argc, char** argv) {
                 const auto pausedAc = jl::auth::current();
                 const uint32_t paused = pausedAc ? pausedAc->takePausedChannels() : 0;
                 if (paused) showChannelPaused(paused);
+                // r2: the Mac said another viewer took the session: halts the
+                // attempt (gAuthHalt, next iteration), no reconnect.
+                if (control) {
+                    control->pollHostNotice();
+                    // Read-only: no input ever asks for a reconnect, so the
+                    // session is brought back here when it dropped.
+                    if (!o.controlEnabled) control->keepSession();
+                }
             }
             phaseMarkMs = steadyMsNow();
             iterPhases.reset();

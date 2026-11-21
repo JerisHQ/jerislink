@@ -190,6 +190,9 @@ enum ConnAuth {
         case blocked
         case authRequired
         case openIPOnly
+        /// r2: sent once on an authenticated control connection, right before
+        /// the host closes it because another AUTH took the session (§5.2).
+        case replaced
 
         var payload: [UInt8] {
             switch self {
@@ -199,6 +202,7 @@ enum ConnAuth {
             case .blocked: return [3]
             case .authRequired: return [4]
             case .openIPOnly: return [5]
+            case .replaced: return [6]
             }
         }
 
@@ -211,6 +215,7 @@ enum ConnAuth {
             case (3, 1): return .blocked
             case (4, 1): return .authRequired
             case (5, 1): return .openIPOnly
+            case (6, 1): return .replaced
             default: return nil
             }
         }
@@ -330,9 +335,47 @@ final class KeychainSecretStore: ConnSecretStore {
 }
 
 final class MemorySecretStore: ConnSecretStore, @unchecked Sendable {
+    private let lock = NSLock()   // the settings self-test drives it from several threads
     private var secret: ConnSecret?
     init(_ secret: ConnSecret? = nil) { self.secret = secret }
-    func load() -> ConnSecret? { secret }
-    func save(_ secret: ConnSecret) -> Bool { self.secret = secret; return true }
-    @discardableResult func delete() -> Bool { secret = nil; return true }
+    func load() -> ConnSecret? { lock.lock(); defer { lock.unlock() }; return secret }
+    func save(_ secret: ConnSecret) -> Bool { lock.lock(); self.secret = secret; lock.unlock(); return true }
+    @discardableResult func delete() -> Bool { lock.lock(); secret = nil; lock.unlock(); return true }
+}
+
+/// r2 (Pepper's PR-C review, item 8): a viewer that reconnects in a loop
+/// (a 0.3.x viewer, a locked or blocked address) would log one refusal line
+/// per attempt, about 14 a second. Each event and peer logs at most once per
+/// `window`; the next line after it says how many were left out.
+final class AuthLogThrottle: @unchecked Sendable {
+    static let window: TimeInterval = 10
+    static let maxKeys = 1024
+    private let lock = NSLock()
+    private var last: [String: (at: TimeInterval, skipped: UInt64)] = [:]
+    private let now: () -> TimeInterval
+    private let write: (String) -> Void
+    private(set) var suppressed: UInt64 = 0
+
+    init(now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         write: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
+        self.now = now
+        self.write = write
+    }
+
+    func log(_ event: String, peer: String, _ line: String) {
+        let key = event + " " + peer
+        lock.lock()
+        let t = now()
+        if let e = last[key], t - e.at < Self.window {
+            last[key] = (e.at, e.skipped + 1)
+            suppressed &+= 1
+            lock.unlock()
+            return
+        }
+        let skipped = last[key]?.skipped ?? 0
+        if last.count >= Self.maxKeys { last = last.filter { t - $0.value.at < Self.window } }
+        last[key] = (t, 0)
+        lock.unlock()
+        write(skipped > 0 ? line + " suppressed=\(skipped)" : line)
+    }
 }

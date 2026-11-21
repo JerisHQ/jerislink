@@ -196,6 +196,27 @@ public:
         ++async_->stats.resumes;
         return true;
     }
+    // r2 (Pepper's PR-C review, item 5): a read-only view (--no-control)
+    // sends no input, and input is what normally asks the worker for a
+    // reconnect. Called every 250 ms by such a viewer: when the connection
+    // is gone and no attempt runs, start one (same gap as an input event),
+    // so the Mac keeps an authenticated session and keeps sending video.
+    // Nothing when the attempt halted (wrong password, replaced...) or the
+    // NoChallenge retries ran out (paused). True when it started one.
+    bool keepSession() {
+        if (!async_) return false;
+        std::lock_guard<std::mutex> g(async_->m);
+        Async& a = *async_;
+        if (a.stopping || a.connecting || a.paused || a.s != INVALID_SOCKET) return false;
+        if (!jl::auth::mayConnect()) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < a.nextTry) return false;
+        a.connecting = true;
+        a.wake = true;
+        a.cv.notify_all();
+        return true;
+    }
+
     // WM_KEYDOWN / WM_SYSKEYDOWN lParam: bit 30 is set on auto-repeat.
     static constexpr bool isFreshKeyDown(uint64_t lParam) { return (lParam & (uint64_t(1) << 30)) == 0; }
 
@@ -421,6 +442,50 @@ public:
         }
         return s_ != INVALID_SOCKET;
     }
+    // r2 (Pepper's PR-C review, item 2): UI thread only, every 250 ms and
+    // before each send on the live socket. After AUTH the Mac writes
+    // nothing on a control connection except, in password mode, one MRC1
+    // 0x04 status 6 ("replaced") right before it closes it because another
+    // viewer authenticated. Seen: the attempt halts, so no channel
+    // reconnects (a reconnect would AUTH and take the session back) and the
+    // launch screen says why. The Mac closed without it: the socket is
+    // closed here and the next input reconnects as before. Bytes that are
+    // not that notice are left alone. One zero-timeout select when idle.
+    bool pollHostNotice() {
+        std::shared_ptr<Async> a = async_;
+        if (!a) return false;
+        SOCKET s = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (a->connecting || a->stopping) return false;
+            s = a->s;
+        }
+        if (s == INVALID_SOCKET) return false;
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(s, &rd);
+        timeval tv{0, 0};
+        if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
+        uint8_t b[kHostNoticeBytes]{};
+        const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
+        const bool replaced = isReplacedNotice(b, n);
+        if (n > 0 && !replaced) return false;  // partial or other bytes: not ours to read
+        if (replaced) {
+            recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+            if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
+        }
+        std::lock_guard<std::mutex> g(a->m);
+        if (a->s == s) closeSocket(a->s);
+        return replaced;
+    }
+
+    static constexpr int kHostNoticeBytes = 9;
+    static bool isReplacedNotice(const uint8_t* b, int n) {
+        return n == kHostNoticeBytes && b[0] == 'M' && b[1] == 'R' && b[2] == 'C' && b[3] == '1' && b[4] == 1 &&
+               b[5] == jl::auth::kTypeResult && b[6] == 0 && b[7] == 1 &&
+               b[8] == uint8_t(jl::auth::Result::Status::Replaced);
+    }
+
     uint64_t sentEvents() const { return sentEvents_; }
     uint64_t failures() const { return failures_; }
 
@@ -1050,6 +1115,7 @@ private:
     // Never waits for TCP connect or AUTH, and never sends under the lock.
     bool sendQueued(std::vector<uint8_t> b) {
         std::shared_ptr<Async> a = async_;
+        pollHostNotice();  // r2: a "replaced" notice ends the attempt before this input goes anywhere
         SOCKET live = INVALID_SOCKET;
         std::vector<uint8_t> wire;
         Owed owed;

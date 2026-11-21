@@ -1688,6 +1688,85 @@ void r9Tests() {
     setCurrent(nullptr);
 }
 
+// Pepper's PR-C review r2, items 2 and 5. A read-only viewer (--no-control)
+// sends no input, so keepSession() is what makes (and re-makes) its
+// authenticated connection; and the Mac's "replaced" notice halts the
+// attempt so nothing reconnects and takes the session back.
+void prcR2Tests() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    expect(ControlChannel::isReplacedNotice(notice, ControlChannel::kHostNoticeBytes) &&
+               !ControlChannel::isReplacedNotice(notice, ControlChannel::kHostNoticeBytes - 1),
+           "prc r2: replaced notice recognised, a partial one not");
+
+    // (a) No input at all: keepSession connects and authenticates.
+    bool auth1 = false, auth2 = false;
+    std::atomic<bool> dropNow{false}, dropped{false}, sendNotice{false}, noticeSent{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        auth1 = hostAuth(s, sec, Answer::Ok, 100);
+        while (!dropNow) Sleep(10);
+        shutdown(s, SD_BOTH);
+        closesocket(s);  // the Mac dropped it without a notice
+        dropped = true;
+        SOCKET s2 = l.accept(8000);
+        if (s2 == INVALID_SOCKET) return;
+        auth2 = hostAuth(s2, sec, Answer::Ok, 100);
+        while (!sendNotice) Sleep(10);
+        const Bytes p{6};
+        noticeSent = sendAllBytes(s2, frame(kTypeResult, p.data(), p.size()));
+        Sleep(300);
+        closesocket(s2);
+    });
+    const bool started = control.keepSession();
+    for (int i = 0; i < 500 && (control.reconnectStats().connecting || control.reconnectStats().reconnects == 0); ++i) Sleep(10);
+    expect(started && auth1 && control.reconnectStats().reconnects == 1 && control.sentEvents() == 0,
+           "prc r2 read-only: keepSession made the authenticated session, no input sent");
+    expect(!control.keepSession(), "  connected: keepSession does nothing");
+
+    // (b) The Mac dropped the connection: the poll sees the close, and the
+    // next keepSession brings the session back.
+    dropNow = true;
+    for (int i = 0; i < 300 && !dropped; ++i) Sleep(10);
+    bool reStarted = false;
+    for (int i = 0; i < 300 && !reStarted; ++i) {
+        control.pollHostNotice();
+        reStarted = control.keepSession();
+        Sleep(10);
+    }
+    for (int i = 0; i < 500 && (control.reconnectStats().connecting || control.reconnectStats().reconnects < 2); ++i) Sleep(10);
+    expect(reStarted && auth2 && control.reconnectStats().reconnects == 2 && terminals == 0,
+           "  dropped: seen by the poll, keepSession reconnected");
+
+    // (c) Another viewer took the session: the notice halts the attempt.
+    sendNotice = true;
+    bool seen = false;
+    for (int i = 0; i < 300 && !seen; ++i) {
+        seen = control.pollHostNotice();
+        Sleep(10);
+    }
+    host.join();
+    expect(noticeSent && seen && terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
+           "prc r2 replaced: notice read, viewer told once (Replaced), attempt halted");
+    expect(!control.keepSession() && !control.sendKey(true, 0x0041), "  no reconnect: keepSession and input do nothing");
+    expect(l.accept(500) == INVALID_SOCKET, "  no further connection attempt");
+    control.stop();
+    setCurrent(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -1702,6 +1781,7 @@ int main() {
     r7Tests();
     r8Tests();
     r9Tests();
+    prcR2Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

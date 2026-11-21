@@ -363,6 +363,33 @@ enum AuthSelfTest {
         _ = pingChan.client?.send(type: 0x10, payload: [1, 0, 0])
         expect(!pong(pingChan.client), "e2e: KEY on a ping login closes the connection")
 
+        // r2 (item 2): with a session broker, a newer control AUTH tells the
+        // old control connection it was replaced, then closes it.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            if (try? s.start()) != nil {
+                let first = login(p, password: password, channel: .control)
+                expect(pong(first.client), "replace: first viewer's control channel works")
+                let second = login(p, password: password, channel: .control)
+                let notice = first.client?.receive(timeout: 2)
+                expect(notice?.type == ConnAuth.MsgType.result
+                       && notice.flatMap({ ConnAuth.Result.decode($0.payload) }) == .replaced
+                       && first.client?.receive(timeout: 2) == nil,
+                       "replace: the old control connection gets REPLACED (status 6), then closes")
+                expect(pong(second.client), "replace: the new viewer's control channel works")
+                expect(broker.replaced == 1, "replace: one connection replaced")
+                s.stop()
+            } else {
+                expect(false, "replace: listener starts")
+            }
+        }
+
         for (type, what) in [(UInt8(0x10), "KEY"), (0x60, "FORCE_QUIT"), (0x30, "CLIPBOARD_HELLO"), (0x50, "FILE_HELLO"), (0x01, "PING")] {
             guard case let (s, p)? = server(.password(whitelist: [me]), secret: secret) else { expect(false, "e2e: listener"); continue }
             let c = MRC1Client(port: p)
@@ -374,6 +401,38 @@ enum AuthSelfTest {
                    "e2e: \(what) before AUTH gets AUTH_REQUIRED and is closed")
             s.stop()
         }
+
+        // r2 (item 8): a 0.3.x viewer reconnecting in a loop is not counted
+        // and so never locks its address out.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            var answers = 0
+            for _ in 0..<12 {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                _ = c?.send(type: 0x01, payload: [1, 2, 3, 4])
+                if c?.receive(timeout: 2).flatMap({ ConnAuth.Result.decode($0.payload) }) == .authRequired { answers += 1 }
+            }
+            expect(answers == 12 && s.authFailures == 0 && s.oldViewersUncounted == 12,
+                   "e2e: 12 old-viewer attempts all get AUTH_REQUIRED, none counted")
+            if case .ok = login(p, password: password, channel: .control).result {
+                expect(true, "e2e: after them the right password still gets ok (not locked)")
+            } else {
+                expect(false, "e2e: after them the right password still gets ok (not locked)")
+            }
+            s.stop()
+        }
+
+        // r2 (item 8): refusal log lines are throttled per event and peer.
+        final class Lines: @unchecked Sendable { var t: TimeInterval = 50; var out: [String] = [] }
+        let l = Lines()
+        let throttle = AuthLogThrottle(now: { l.t }, write: { l.out.append($0) })
+        for _ in 0..<140 { throttle.log("auth.locked", peer: "100.64.0.5", "auth.locked peer=100.64.0.5") }
+        throttle.log("auth.locked", peer: "100.64.0.6", "auth.locked peer=100.64.0.6")
+        expect(l.out == ["auth.locked peer=100.64.0.5", "auth.locked peer=100.64.0.6"] && throttle.suppressed == 139,
+               "log: 140 refusals in 10 s log one line per peer")
+        l.t += 10
+        throttle.log("auth.locked", peer: "100.64.0.5", "auth.locked peer=100.64.0.5")
+        expect(l.out.last == "auth.locked peer=100.64.0.5 suppressed=139", "log: the next line after 10 s says how many were left out")
 
         if case let (s, p)? = server(.password(whitelist: [me]), secret: secret, timeout: 0.3) {
             let c = MRC1Client(port: p)

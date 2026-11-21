@@ -52,13 +52,20 @@ enum SessionLinkWire {
         return magic + [type, UInt8(body.count >> 8), UInt8(body.count & 0xff)] + body
     }
 
-    /// nil: malformed (the client drops the link). `.some(nil)`: no session.
-    static func decode(type: UInt8, body: [UInt8]) -> UDPPeerSession?? {
+    /// One frame: its generation and the session (nil: none).
+    struct Frame: Equatable {
+        var generation: UInt64
+        var session: UDPPeerSession?
+    }
+
+    /// nil: malformed (the client drops the link). r2: a "none" frame keeps
+    /// its generation too, so an old one is refused like any other.
+    static func decode(type: UInt8, body: [UInt8]) -> Frame? {
         guard body.count >= 8 else { return nil }
         let gen = body[0..<8].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
         switch type {
         case typeNone:
-            return body.count == 8 ? .some(nil) : nil
+            return body.count == 8 ? Frame(generation: gen, session: nil) : nil
         case typeSession:
             guard body.count >= 10 else { return nil }
             let ipLen = Int(body[8])
@@ -67,8 +74,9 @@ enum SessionLinkWire {
             let hasKey = body[9 + ipLen]
             let rest = body.count - (10 + ipLen)
             switch (hasKey, rest) {
-            case (0, 0): return .some(UDPPeerSession(generation: gen, peerIP: ip, sessionKey: nil))
-            case (1, ConnAuth.keyBytes): return .some(UDPPeerSession(generation: gen, peerIP: ip, sessionKey: Array(body[(10 + ipLen)...])))
+            case (0, 0): return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: nil))
+            case (1, ConnAuth.keyBytes):
+                return Frame(generation: gen, session: UDPPeerSession(generation: gen, peerIP: ip, sessionKey: Array(body[(10 + ipLen)...])))
             default: return nil
             }
         default:
@@ -101,6 +109,8 @@ final class SessionBroker: @unchecked Sendable {
 
     let passwordMode: Bool
     private let lock = NSLock()
+    /// Held from a change through its listeners (taken before `lock`).
+    private let orderLock = NSLock()
     private var entries: [Entry] = []
     private var nextToken: UInt64 = 0
     private var generation: UInt64 = 0
@@ -125,7 +135,9 @@ final class SessionBroker: @unchecked Sendable {
     /// The viewer the UDP paths serve now (the relay's blacklist check).
     var activePeerIP: String? { current.0?.peerIP }
 
-    /// Called with every change (and its generation), outside the lock.
+    /// Called with every change (and its generation), outside `lock` and
+    /// in generation order (under `orderLock`): a listener must not call
+    /// `begin` or `end`.
     func onChange(_ handler: @escaping @Sendable (UDPPeerSession?, UInt64) -> Void) {
         lock.lock(); listeners.append(handler); lock.unlock()
     }
@@ -135,6 +147,10 @@ final class SessionBroker: @unchecked Sendable {
     func begin(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?,
                close: @escaping @Sendable () -> Void) -> UInt64 {
         var kicked: [Entry] = []
+        // r2 (Pepper's PR-C review, item 1): the change and its listeners
+        // run under `orderLock`, so two changes never reach the listeners
+        // (and the session link's serial send queue) in the other order.
+        orderLock.lock()
         lock.lock()
         nextToken &+= 1
         let token = nextToken
@@ -147,20 +163,26 @@ final class SessionBroker: @unchecked Sendable {
         replacedCount &+= UInt64(kicked.count)
         let change = recomputeLocked()
         lock.unlock()
+        publish(change)
+        orderLock.unlock()
+        // After the new session is announced, so the old K_s is void before
+        // the old viewer hears it was replaced. Outside both locks: a close
+        // may end its connection (`end`) on this thread.
         for e in kicked {
             log("auth.replaced old_peer=\(e.peerIP) chan=\(e.channel?.name ?? "open") new_peer=\(peerIP); old connection closed")
             e.close()
         }
-        publish(change)
         return token
     }
 
     func end(_ token: UInt64) {
+        orderLock.lock()
         lock.lock()
         entries.removeAll { $0.token == token }
         let change = recomputeLocked()
         lock.unlock()
         publish(change)
+        orderLock.unlock()
     }
 
     /// The announced session from `entries`. Caller holds `lock`.
@@ -398,15 +420,67 @@ final class SessionLinkClient: @unchecked Sendable {
         return s
     }
 
+    /// r2 (Pepper's PR-C review, item 1): a frame older than the last one
+    /// on this connection is refused, "none" included, so an old K_s or
+    /// destination never comes back. The same generation again is fine (the
+    /// state sent on connect can repeat a change). A new connection starts
+    /// over: a restarted control service counts from 1, and the state was
+    /// cleared when the old link went down.
+    static func accept(_ frame: SessionLinkWire.Frame, after last: UInt64?) -> Bool {
+        guard let last else { return true }
+        return frame.generation >= last
+    }
+
     private func readLoop(_ s: Int32) {
         var none: [Int32] = []
+        var last: UInt64?
         while !isStopped {
             guard let head = SendWire.receive(s, 7, fds: &none), none.isEmpty,
                   Array(head[0..<4]) == SessionLinkWire.magic else { return }
             let len = Int(head[5]) << 8 | Int(head[6])
             guard len <= SessionLinkWire.maxBody, let body = SendWire.receive(s, len, fds: &none), none.isEmpty,
-                  let decoded = SessionLinkWire.decode(type: head[4], body: body) else { return }
-            state.set(decoded)
+                  let frame = SessionLinkWire.decode(type: head[4], body: body) else { return }
+            guard Self.accept(frame, after: last) else {
+                print("session.link_client stale gen=\(frame.generation) last=\(last ?? 0); ignored")
+                fflush(stdout)
+                continue
+            }
+            last = frame.generation
+            state.set(frame.session)
         }
+    }
+}
+
+/// r2 (Pepper's PR-C review, item 2): how SessionBroker ends a connection
+/// that a newer AUTH replaced. `kick` (any thread) shuts the read side, so
+/// the connection's loop sees EOF and takes no more input, and the handler
+/// can still write the "replaced" notice. A handler stuck writing to a
+/// viewer that stopped reading is cut off fully after `hardCloseAfter`.
+/// `finish` (the handler, before its fd is closed) makes a late kick a
+/// no-op, so a reused descriptor number is never touched.
+final class KickHandle: @unchecked Sendable {
+    static let hardCloseAfter: TimeInterval = 2
+    private let lock = NSLock()
+    private var fd: Int32
+    private var wasKicked = false
+
+    init(_ fd: Int32) { self.fd = fd }
+
+    var kicked: Bool { lock.lock(); defer { lock.unlock() }; return wasKicked }
+
+    func kick() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard fd >= 0, !wasKicked else { return }
+        wasKicked = true
+        Darwin.shutdown(fd, SHUT_RD)
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.hardCloseAfter) { [self] in
+            lock.lock(); defer { lock.unlock() }
+            if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) }
+        }
+    }
+
+    func finish() {
+        lock.lock(); fd = -1; lock.unlock()
     }
 }

@@ -253,7 +253,8 @@ extension ControlService {
             return (nil, snapshot)
         }
         log("auth.policy \(policy.summary)")
-        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist, journal: journal), snapshot)
+        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist, journal: journal,
+                              failureLog: AuthFailureLog(url: AuthFailureLog.defaultURL)), snapshot)
     }
 }
 
