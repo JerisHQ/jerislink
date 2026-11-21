@@ -77,6 +77,9 @@ final class ControlServer: @unchecked Sendable {
     /// viewer that went away would (nothing is written). Set before start();
     /// nil in the app.
     var failAuthOKForTest: (@Sendable (AuthOK) -> Bool)?
+    /// r8: how long a clipboard, file or ping AUTH waits for the takeover
+    /// its id names (`SessionBroker.awaitReservation`). Set before start().
+    var pendingWaitSeconds: TimeInterval = 5
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
@@ -444,6 +447,9 @@ final class ControlServer: @unchecked Sendable {
         var authChannel: ConnAuth.Channel?
         var udpSessionKey: [UInt8]?
         var authOK: AuthOK?
+        // r8 (Pepper's r7 review, item 1): the reservation a clipboard, file
+        // or ping AUTH names, taken as it authenticates.
+        var namedReservation: UInt64?
         if let authGate {
             // The policy this gate holds was replaced (ControlService.PolicyWatch):
             // nothing more is admitted under it.
@@ -455,6 +461,7 @@ final class ControlServer: @unchecked Sendable {
                 guard pending == nil, let ok = authenticate(fd, peer: peer, gate: authGate) else { return }
                 authChannel = ok.channel
                 authOK = ok
+                if ok.channel != .control { namedReservation = sessionBroker?.pendingReservation(ok.resume) }
                 udpSessionKey = ok.channel == .control ? ok.sessionKey : nil
             } else {
                 guard admitWithoutPassword(fd, peer: peer, gate: authGate) else { return }
@@ -512,16 +519,30 @@ final class ControlServer: @unchecked Sendable {
             // r7 (Pepper's r6 review): another channel naming a pending id
             // waits, with no OK sent and none of its messages read, until
             // that takeover is admitted. Discarded or lost: closed unused.
-            if let authOK, authChannel != .control,
-               sessionBroker.awaitPending(authOK.resume) == .dropped {
-                refuse(stage: "pending", lost: true)
-                return
+            // r8 (Pepper's r7 review): judged by the reservation it named
+            // when it authenticated, so a discard before the wait is a loss
+            // too; still pending at the deadline only closes the connection
+            // (no REPLACED), and the viewer reconnects.
+            if authChannel != .control, let r = namedReservation {
+                switch sessionBroker.awaitReservation(r, timeout: pendingWaitSeconds) {
+                case .admitted:
+                    break
+                case .dropped, .none:
+                    refuse(stage: "pending", lost: true)
+                    return
+                case .timedOut:
+                    kick.finish()
+                    authLog.log("auth.pending_timeout", peer: peer.ip,
+                                "auth.pending_timeout peer=\(peer.ip) chan=\(authChannel?.name ?? "open") counted=0; closed without REPLACED, the viewer reconnects")
+                    return
+                }
             }
             // r4: the reconnect check again, now atomically with taking the
             // session (an AUTH may have finished since `authenticate`).
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
                                                   authSession: authChannel == .control ? authOK?.sessionID : nil,
                                                   resume: authOK?.resume, reservation: reservation,
+                                                  waitedOn: authChannel != .control ? namedReservation : nil,
                                                   close: { kick.kick() }) else {
                 refuse(stage: "admit", lost: reservation != nil)
                 return
