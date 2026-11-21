@@ -377,17 +377,24 @@ enum AuthSelfTest {
                 let first = login(p, password: password, channel: .control)
                 expect(pong(first.client), "replace: first viewer's control channel works")
                 let second = login(p, password: password, channel: .control)
+                // r3 (item 1): the old viewer's input still in flight does
+                // not turn the close into a reset; it sees the notice, then FIN.
+                // r4: the input goes out before the viewer reads anything, as
+                // in the real case, so it reaches the host well inside the
+                // notice linger. Sent only after the FIN, a runner stalled
+                // past the linger would hit the closed socket and get an RST
+                // from the test itself.
+                let inputSent = first.client?.send(type: 0x10, payload: [1, 0, 0x41]) == true
                 let notice = first.client?.receive(timeout: 2)
                 expect(notice?.type == ConnAuth.MsgType.result
                        && notice.flatMap({ ConnAuth.Result.decode($0.payload) }) == .replaced
                        && first.client?.receive(timeout: 2) == nil,
                        "replace: the old control connection gets REPLACED (status 6), then closes")
-                // r3 (item 1): the old viewer's input still in flight does
-                // not turn the close into a reset; it sees the notice, then FIN.
-                _ = first.client?.send(type: 0x10, payload: [1, 0, 0x41])
-                let eof = first.client?.receive(timeout: 2) == nil
-                expect(eof && first.client?.sawEOF == true && first.client?.sawReset == false,
-                       "replace: after the notice the old connection ends with FIN, not RST")
+                let fin = inputSent && first.client?.sawEOF == true && first.client?.sawReset == false
+                if !fin {
+                    print("replace close info: input_sent=\(inputSent) eof=\(first.client?.sawEOF == true) reset=\(first.client?.sawReset == true)")
+                }
+                expect(fin, "replace: after the notice the old connection ends with FIN, not RST")
                 expect(pong(second.client), "replace: the new viewer's control channel works")
                 expect(broker.replaced == 1, "replace: one connection replaced")
                 // r4 (Pepper's r3 review, item 1): the old viewer missed the
