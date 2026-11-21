@@ -76,7 +76,7 @@ final class ControlServer: @unchecked Sendable {
     /// r6, self-test only: true makes this AUTH_OK fail as a send to a
     /// viewer that went away would (nothing is written). Set before start();
     /// nil in the app.
-    var failAuthOKForTest: (@Sendable (ConnAuth.Channel) -> Bool)?
+    var failAuthOKForTest: (@Sendable (AuthOK) -> Bool)?
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
@@ -508,6 +508,14 @@ final class ControlServer: @unchecked Sendable {
                     return
                 }
                 reservation = r
+            }
+            // r7 (Pepper's r6 review): another channel naming a pending id
+            // waits, with no OK sent and none of its messages read, until
+            // that takeover is admitted. Discarded or lost: closed unused.
+            if let authOK, authChannel != .control,
+               sessionBroker.awaitPending(authOK.resume) == .dropped {
+                refuse(stage: "pending", lost: true)
+                return
             }
             // r4: the reconnect check again, now atomically with taking the
             // session (an AUTH may have finished since `authenticate`).
@@ -1395,7 +1403,7 @@ final class ControlServer: @unchecked Sendable {
     /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
     /// the first frame of an admitted session: it asks too.
     private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
-        if let fail = failAuthOKForTest, fail(ok.channel) { return false }
+        if let fail = failAuthOKForTest, fail(ok) { return false }
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
                           payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload) == .sent else { return false }
         print("auth.ok peer=\(ip) chan=\(ok.channel.name) session=\(ConnAuth.hex(ok.sessionID))")

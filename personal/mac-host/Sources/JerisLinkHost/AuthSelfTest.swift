@@ -638,8 +638,8 @@ enum AuthSelfTest {
             // `failing` OKs fail, each held until all of them are pending at
             // once (two takeovers overlap for sure).
             let failing = R6Count(), arrived = R6Count()
-            s.failAuthOKForTest = { channel in
-                guard channel == .control, failing.value > 0 else { return false }
+            s.failAuthOKForTest = { ok in
+                guard ok.channel == .control, failing.value > 0 else { return false }
                 arrived.hit()
                 let until = Date().addingTimeInterval(2)
                 while arrived.value < failing.value && Date() < until { usleep(5_000) }
@@ -702,6 +702,177 @@ enum AuthSelfTest {
                 s.stop()
             } else {
                 expect(false, "prc r6: listener starts")
+            }
+        }
+
+        // PR-C r7 (Pepper's r6 review): a clipboard, file or ping AUTH naming
+        // a pending id waits (no OK, nothing read) until that takeover is
+        // admitted; discarded or lost, the channel is closed unused.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+            func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA), authSession: id(0xA1), resume: nil, close: {})
+            /// `awaitPending(resume)` on another thread; true once it waits.
+            func waiter(_ resume: [UInt8], _ out: R7Box, _ group: DispatchGroup) -> Bool {
+                DispatchQueue.global().async(group: group) { out.set(b.awaitPending(resume, timeout: 3)) }
+                let until = Date().addingTimeInterval(2)
+                while b.waitingForTest == 0 && Date() < until { usleep(2_000) }
+                return b.waitingForTest == 1
+            }
+            // Discarded (AUTH_OK not sent).
+            let w1 = R7Box(), g1 = DispatchGroup()
+            let r1 = b.reserve(authSession: id(0xC1), resume: nil)
+            let waited1 = waiter(id(0xC1), w1, g1)
+            let early1 = w1.value
+            if let r1 { b.discard(r1) }
+            let woke1 = g1.wait(timeout: .now() + 1) == .success
+            let clip1 = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xC1), close: {})
+            expect(tA != nil && waited1 && early1 == nil && woke1 && w1.value == .dropped && clip1 == nil,
+                   "prc r7 broker: a channel waiting on a pending id is let go as dropped when the takeover is discarded, and is not admitted")
+            // Lost to a newer takeover.
+            let w2 = R7Box(), g2 = DispatchGroup()
+            let rX = b.reserve(authSession: id(0xD1), resume: nil)
+            let rY = b.reserve(authSession: id(0xE1), resume: nil)
+            let waited2 = waiter(id(0xD1), w2, g2)
+            let tY = rY.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xE), authSession: id(0xE1), resume: nil,
+                                          reservation: $0, close: {}) }
+            usleep(100_000)
+            let stillWaiting = b.waitingForTest == 1 && w2.value == nil
+            let tX = rX.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xD), authSession: id(0xD1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let woke2 = g2.wait(timeout: .now() + 1) == .success
+            expect(waited2 && tY != nil && stillWaiting && tX == nil && woke2 && w2.value == .dropped,
+                   "prc r7 broker: a channel waiting on a takeover that loses to a newer one is let go as dropped")
+            // Admitted.
+            let w3 = R7Box(), g3 = DispatchGroup()
+            let rZ = b.reserve(authSession: id(0xF1), resume: nil)
+            let waited3 = waiter(id(0xF1), w3, g3)
+            let tZ = rZ.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xF), authSession: id(0xF1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let woke3 = g3.wait(timeout: .now() + 1) == .success
+            let clip3 = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xF1), close: {})
+            expect(waited3 && tZ != nil && woke3 && w3.value == .admitted && clip3 != nil && b.awaitPending(id(0xF1)) == .none,
+                   "prc r7 broker: a channel waiting on a takeover that is admitted goes on and is admitted")
+            for t in [tZ, clip3] { if let t { b.end(t) } }
+        }
+
+        // PR-C r7 end to end: a clipboard / file connection authenticated
+        // with a pending id while the takeover's OK is held.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let fake = FakeClipboard(text: nil)
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: fake, authGate: gate, sessionBroker: broker)
+            // The first control OK after `hold.arm()` is held until `go`, then
+            // fails while `failHeld` is set, else goes out.
+            let hold = R7Hold(), go = R6Count(), failHeld = R6Count()
+            s.failAuthOKForTest = { ok in
+                guard ok.channel == .control, hold.take(ok.sessionID) else { return false }
+                let until = Date().addingTimeInterval(3)
+                while go.value == 0 && Date() < until { usleep(2_000) }
+                return failHeld.value > 0
+            }
+            /// Connects and sends the RESPONSE for `channel`; the result is left unread.
+            func startAuth(_ channel: ConnAuth.Channel, resume: [UInt8]?) -> MRC1Client? {
+                guard let c = MRC1Client(port: p), let ch = c.receive(timeout: 2),
+                      let challenge = ConnAuth.Challenge.decode(ch.payload),
+                      let key = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations)
+                else { return nil }
+                let cn = ConnAuth.random(ConnAuth.nonceBytes)
+                let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel,
+                                             hostID: challenge.hostID, resume: resume)
+                guard c.send(type: ConnAuth.MsgType.response,
+                             payload: ConnAuth.Response(clientNonce: cn, mac: mac, resume: resume).payload) else { return nil }
+                return c
+            }
+            func heldID() -> [UInt8]? {
+                let until = Date().addingTimeInterval(2)
+                while hold.id == nil && Date() < until { usleep(2_000) }
+                return hold.id
+            }
+            func waitsNow() -> Bool {
+                let until = Date().addingTimeInterval(2)
+                while broker.waitingForTest == 0 && Date() < until { usleep(2_000) }
+                return broker.waitingForTest == 1
+            }
+            func result(_ c: MRC1Client?) -> ConnAuth.Result? {
+                c?.receive(timeout: 2).flatMap { ConnAuth.Result.decode($0.payload) }
+            }
+            /// REPLACED, then the host's FIN (what the viewer sends after it is dropped unread).
+            func closedUnused(_ c: MRC1Client?, sending messages: [(UInt8, [UInt8])]) -> Bool {
+                guard let c, result(c) == .replaced else { return false }
+                for (type, payload) in messages { _ = c.send(type: type, payload: payload) }
+                return c.receive(timeout: 2) == nil
+            }
+            func clipboardUntouched(_ base: FakeClipboard.Counts) -> Bool {
+                let now = fake.counts
+                return now.changeCountReads == base.changeCountReads && now.textReads == base.textReads
+                    && fake.writes.isEmpty && s.clipboardReceived == 0
+            }
+            if (try? s.start()) != nil {
+                let a = login(p, password: password, channel: .control)
+                if case .ok = a.result {
+                    let (sessionA, genA) = broker.current
+                    // 1. Clipboard waiting, then the takeover's OK fails.
+                    let base = fake.counts
+                    hold.arm(); failHeld.hit(); go.reset()
+                    let b = startAuth(.control, resume: nil)
+                    let clip = heldID().flatMap { startAuth(.clipboard, resume: $0) }
+                    let waited = waitsNow()
+                    go.hit()
+                    let bNoOK = result(b) == nil
+                    let clipClosed = closedUnused(clip, sending: [(0x30, []), (0x31, Array("r7 dropped".utf8))])
+                    let aHolds = broker.current.0 == sessionA && broker.current.1 == genA && pong(a.client)
+                    expect(waited && bNoOK && clipClosed && clipboardUntouched(base) && aHolds && broker.waitingForTest == 0,
+                           "prc r7 clipboard waiting, then the AUTH_OK send fails (e2e): the clipboard channel is closed, no clipboard data was handled, the live viewer stays")
+                    b?.close(); clip?.close()
+                    // 2. File waiting, then the takeover loses to a newer one.
+                    let files = s.fileSessions
+                    hold.arm(); failHeld.reset(); go.reset()
+                    let c = startAuth(.control, resume: nil)
+                    let file = heldID().flatMap { startAuth(.file, resume: $0) }
+                    let waited2 = waitsNow()
+                    let d = login(p, password: password, channel: .control)
+                    var dOK = false
+                    if case .ok? = d.result { dOK = true }
+                    usleep(100_000)
+                    let stillWaiting = broker.waitingForTest == 1
+                    go.hit()
+                    let fileClosed = closedUnused(file, sending: [(FileProto.MsgType.hello, [1, 0, 0, 0, 0])])
+                    expect(waited2 && dOK && stillWaiting && fileClosed && s.fileSessions == files && pong(d.client)
+                               && broker.waitingForTest == 0,
+                           "prc r7 file waiting, then the takeover loses to a newer one (e2e): the file channel is closed, no file session was started, the newer viewer holds the session")
+                    c?.close(); file?.close()
+                    // 3. Clipboard waiting, then the takeover is admitted.
+                    hold.arm(); failHeld.reset(); go.reset()
+                    let e = startAuth(.control, resume: nil)
+                    let clip3 = heldID().flatMap { startAuth(.clipboard, resume: $0) }
+                    let waited3 = waitsNow()
+                    let clipEarly = clip3?.receive(timeout: 0.2) == nil
+                    go.hit()
+                    var eOK = false, clipOK = false
+                    if case .ok? = result(e) { eOK = true }
+                    if case .ok? = result(clip3) { clipOK = true }
+                    // The clipboard session runs: a text sent on it reaches the pasteboard.
+                    _ = clip3?.send(type: 0x30, payload: [])
+                    _ = clip3?.send(type: 0x31, payload: Array("r7 admitted".utf8))
+                    let until = Date().addingTimeInterval(2)
+                    while !fake.writes.contains("r7 admitted") && Date() < until { usleep(5_000) }
+                    expect(waited3 && clipEarly && eOK && clipOK && fake.writes == ["r7 admitted"] && pong(e),
+                           "prc r7 (e2e): a clipboard channel waiting on the takeover gets its OK only once the takeover is admitted, then its clipboard data is handled")
+                    e?.close(); clip3?.close(); d.client?.close()
+                } else {
+                    expect(false, "prc r7 (e2e): first login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r7: listener starts")
             }
         }
 
@@ -2526,6 +2697,29 @@ final class R6Count: @unchecked Sendable {
     func hit() { lock.lock(); n += 1; lock.unlock() }
     func reset() { lock.lock(); n = 0; lock.unlock() }
     var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+}
+
+/// r7 self-test: one `awaitPending` result, from any thread.
+final class R7Box: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: SessionBroker.PendingWait?
+    func set(_ x: SessionBroker.PendingWait) { lock.lock(); v = x; lock.unlock() }
+    var value: SessionBroker.PendingWait? { lock.lock(); defer { lock.unlock() }; return v }
+}
+
+/// r7 self-test: picks the first control AUTH_OK after `arm` (its session id).
+final class R7Hold: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var held: [UInt8]?
+    func arm() { lock.lock(); armed = true; held = nil; lock.unlock() }
+    func take(_ sessionID: [UInt8]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard armed else { return false }
+        armed = false; held = sessionID
+        return true
+    }
+    var id: [UInt8]? { lock.lock(); defer { lock.unlock() }; return held }
 }
 
 final class R10Flag: @unchecked Sendable {

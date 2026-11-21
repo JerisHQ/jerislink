@@ -152,6 +152,13 @@ final class SessionBroker: @unchecked Sendable {
     /// The newest reservation admitted. An older one admitted later lost
     /// to a newer AUTH (reservation order is AUTH order).
     private var admittedReservation: UInt64 = 0
+    /// r7 (Pepper's r6 review): woken when a pending id is admitted or
+    /// dropped, for the other channels waiting on it (`awaitPending`).
+    /// Taken before `lock`, never under it.
+    private let pendingCond = NSCondition()
+    private var waiting = 0
+    /// r7 self-test: connections waiting in `awaitPending` now.
+    var waitingForTest: Int { lock.lock(); defer { lock.unlock() }; return waiting }
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
@@ -222,6 +229,51 @@ final class SessionBroker: @unchecked Sendable {
     /// as they were.
     func discard(_ reservation: UInt64) {
         lock.lock(); pendingIDs.removeValue(forKey: reservation); lock.unlock()
+        wakePending()
+    }
+
+    /// r7: how the wait of a clipboard, file or ping AUTH on a pending id
+    /// ended.
+    enum PendingWait: Equatable {
+        /// `resume` named no pending id: nothing to wait for.
+        case none
+        /// Its takeover was admitted; `admit` may let the channel in.
+        case admitted
+        /// Its takeover was discarded (OK not sent), lost to a newer AUTH,
+        /// or did not finish in time: the channel must close unused.
+        case dropped
+    }
+
+    /// r7 (Pepper's r6 review): a channel whose AUTH names a pending id
+    /// (password mode) waits here, before its OK and before any of its
+    /// messages are read, until that takeover is admitted or dropped. So no
+    /// clipboard or file data is handled for a control session that never
+    /// took over, and a dropped one leaves no channel open.
+    func awaitPending(_ resume: [UInt8]?, timeout: TimeInterval = 5) -> PendingWait {
+        guard passwordMode, let resume else { return .none }
+        func stillPending() -> Bool { pendingIDs.values.contains(resume) && !accepted.contains(resume) }
+        pendingCond.lock(); defer { pendingCond.unlock() }
+        lock.lock()
+        guard stillPending() else { lock.unlock(); return .none }
+        waiting += 1
+        lock.unlock()
+        let deadline = Date().addingTimeInterval(timeout)
+        var pending = true
+        while pending {
+            let now = Date()
+            if now >= deadline { break }
+            // Sliced, so a wake between the check and the wait is not missed
+            // for long.
+            pendingCond.wait(until: min(deadline, now.addingTimeInterval(0.05)))
+            lock.lock(); pending = stillPending(); lock.unlock()
+        }
+        lock.lock(); defer { lock.unlock() }
+        waiting -= 1
+        return !pending && accepted.contains(resume) ? .admitted : .dropped
+    }
+
+    private func wakePending() {
+        pendingCond.lock(); pendingCond.broadcast(); pendingCond.unlock()
     }
 
     /// One admitted connection. Password mode: only the control channel,
@@ -250,6 +302,7 @@ final class SessionBroker: @unchecked Sendable {
                 replacedCount &+= 1
                 lock.unlock()
                 orderLock.unlock()
+                wakePending()
                 log("auth.replaced chan=\(channel?.name ?? "open") peer=\(peerIP) stage=admit; a newer AUTH took the session first")
                 return nil
             }
@@ -258,6 +311,7 @@ final class SessionBroker: @unchecked Sendable {
             resumeRefusedCount &+= 1
             lock.unlock()
             orderLock.unlock()
+            if reservation != nil { wakePending() }
             return nil
         }
         if let reservation { admittedReservation = reservation }
@@ -282,6 +336,8 @@ final class SessionBroker: @unchecked Sendable {
         lock.unlock()
         publish(change)
         orderLock.unlock()
+        // r7: the channels waiting on this takeover's id may go on.
+        if reservation != nil { wakePending() }
         // After the new session is announced, so the old K_s is void before
         // the old viewer hears it was replaced. Outside both locks: a close
         // may end its connection (`end`) on this thread.
