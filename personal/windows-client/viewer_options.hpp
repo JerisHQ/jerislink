@@ -197,6 +197,20 @@ inline bool showLaunchScreen(const LaunchRequest& r, bool shiftHeld) {
     return r.hostSource != "cli";
 }
 
+// r5: the control port the arguments ask for (default 38400), for the
+// launch screen's ip:port key. Not a full parse: a bad value keeps the default.
+inline uint16_t controlPortArg(const std::vector<std::string>& args) {
+    uint16_t port = 38400;
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] != "--control-port") continue;
+        const std::string& v = args[i + 1];
+        if (v.empty() || v.size() > 5 || v.find_first_not_of("0123456789") != std::string::npos) continue;
+        const unsigned long n = std::stoul(v);
+        if (n > 0 && n <= 65535) port = static_cast<uint16_t>(n);
+    }
+    return port;
+}
+
 // After the launch screen the address typed there (saved as HostIp) is the
 // one to use, so --source-ip and --settings are dropped from the arguments.
 inline std::vector<std::string> argsAfterLaunchScreen(const std::vector<std::string>& args) {

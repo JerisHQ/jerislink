@@ -63,10 +63,12 @@ END
 // Launch screen (mockup A2): two columns. Left: app icon (painted), headline,
 // tagline, theme picker, ready state. Right: tabs "Host address" and "Join
 // with a code" (reserved, not built yet), the host field, Connect and the
-// Advanced settings row. Footer band from y = 238; keep kLaunchFooterTop in
+// Advanced settings row. v0.4.0 adds the connection password field (masked,
+// Show button) and "Remember password" (owner-drawn check box, off by
+// default) under the address. Footer band from y = 288; keep kLaunchFooterTop in
 // viewer.cpp in step. The icon, column divider, tab underline, row dividers
 // and the ready dot are painted in viewer.cpp (paintLaunchExtras).
-IDD_LAUNCH DIALOGEX 0, 0, 460, 262
+IDD_LAUNCH DIALOGEX 0, 0, 460, 312
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN
 CAPTION "JerisLink"
 FONT 9, "Segoe UI"
@@ -76,7 +78,7 @@ BEGIN
     LTEXT           "THEME", IDC_UI_SECTION_THEME, 18, 140, 150, 9, SS_NOPREFIX
     CONTROL         "Green", IDC_THEME_GREEN, "Button", BS_OWNERDRAW | WS_TABSTOP, 18, 152, 58, 16
     CONTROL         "Blue", IDC_THEME_BLUE, "Button", BS_OWNERDRAW | WS_TABSTOP, 80, 152, 58, 16
-    LTEXT           "READY TO CONNECT", IDC_LAUNCH_READY, 28, 218, 140, 9, SS_NOPREFIX
+    LTEXT           "READY TO CONNECT", IDC_LAUNCH_READY, 28, 268, 140, 9, SS_NOPREFIX
 
     LTEXT           "NEW SESSION", IDC_LAUNCH_EYEBROW, 196, 18, 250, 9, SS_NOPREFIX
     LTEXT           "Start a connection", IDC_UI_TITLE, 196, 29, 250, 16, SS_NOPREFIX
@@ -87,14 +89,19 @@ BEGIN
     LTEXT           "Mac host address", IDC_UI_LABEL_HOST, 196, 90, 250, 9, SS_NOPREFIX
     EDITTEXT        IDC_HOST_IP, 200, 105, 242, 10, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER
     LTEXT           "Enter your Mac's Tailscale IP address, or 127.0.0.1 for Tailcat.", IDC_UI_HINT_HOST, 196, 121, 250, 9, SS_NOPREFIX
-    LTEXT           "", IDC_LAUNCH_ERROR, 196, 133, 250, 18, SS_NOPREFIX
-    CONTROL         "Connect to Mac", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 154, 250, 20
-    CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 190, 250, 24
+    LTEXT           "Connection password", IDC_UI_LABEL_PASSWORD, 196, 136, 250, 9, SS_NOPREFIX
+    EDITTEXT        IDC_LAUNCH_PASSWORD, 200, 151, 188, 10, ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER
+    CONTROL         "Show", IDC_LAUNCH_SHOW_PW, "Button", BS_OWNERDRAW | WS_TABSTOP, 398, 148, 48, 16
+    CONTROL         "Remember password on this PC", IDC_LAUNCH_REMEMBER, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 169, 250, 12
+    LTEXT           "", IDC_LAUNCH_ERROR, 196, 184, 250, 18, SS_NOPREFIX
+    CONTROL         "Connect to Mac", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 204, 250, 20
+    CONTROL         "Retry without password", IDC_LAUNCH_NO_PASSWORD, "Button", BS_OWNERDRAW | WS_TABSTOP | NOT WS_VISIBLE, 196, 227, 250, 10
+    CONTROL         "Advanced settings", IDC_LAUNCH_ADVANCED, "Button", BS_OWNERDRAW | WS_TABSTOP, 196, 246, 250, 24
     LTEXT           "Joining a Mac with a pairing code is coming soon. For now, use the Mac's address on the Host address tab.", IDC_LAUNCH_CODE_NOTE, 196, 90, 250, 28, SS_NOPREFIX | NOT WS_VISIBLE
 
-    LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 246, 48, 9, SS_NOPREFIX
-    LTEXT           "", IDC_LAUNCH_BUILD, 70, 247, 110, 9, SS_NOPREFIX
-    RTEXT           "Private connection over your tailnet", IDC_LAUNCH_PRIVACY, 196, 246, 250, 9, SS_NOPREFIX
+    LTEXT           "JerisLink", IDC_LAUNCH_BRAND, 18, 296, 48, 9, SS_NOPREFIX
+    LTEXT           "", IDC_LAUNCH_BUILD, 70, 297, 110, 9, SS_NOPREFIX
+    RTEXT           "Private connection over your tailnet", IDC_LAUNCH_PRIVACY, 196, 296, 250, 9, SS_NOPREFIX
 END
 
 // Modeless "Connection info" window: the addresses in use (read-only; set on

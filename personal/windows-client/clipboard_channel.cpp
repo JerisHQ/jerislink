@@ -1,4 +1,5 @@
 #include "clipboard_channel.hpp"
+#include "conn_auth.hpp"
 
 #include <windows.h>
 #include <algorithm>
@@ -228,14 +229,42 @@ void ClipboardChannel::run() {
     std::string lastSent;
     std::string lastRemoteApplied;
     bool everConnected = false;
+    // r5: a background NoChallenge is retried on this channel only (0.5, 1,
+    // 2, 4 s); after that the clipboard pauses for the session. Video,
+    // audio and control are not touched.
+    jl::auth::NoChallengeRetry noChallenge(jl::auth::Channel::Clipboard);
+    const auto pauseFor = [this](int ms) {
+        for (int left = ms; left > 0 && !stopRequested_; left -= 50)
+            std::this_thread::sleep_for(std::chrono::milliseconds(left < 50 ? left : 50));
+    };
 
     while (!stopRequested_) {
         if (s == INVALID_SOCKET) {
-            s = connectSocket();
-            if (s == INVALID_SOCKET) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            bool authed = false;
+            {
+                // One connection at a time may answer a challenge, so
+                // background channels never spend tries together.
+                const auto slot = jl::auth::connectSlot();
+                if (jl::auth::mayConnect()) {
+                    const auto connectStart = jl::auth::Clock::now();
+                    s = connectSocket();
+                    // v0.4.0: AUTH for the clipboard channel before CLIPBOARD_HELLO.
+                    if (s != INVALID_SOCKET) {
+                        authed = jl::auth::gate(s, jl::auth::Channel::Clipboard, jl::auth::msSince(connectStart));
+                        if (!authed) closeSocket(s);
+                    }
+                }
+            }
+            if (!authed) {
+                const int wait = noChallenge.afterFailure();
+                if (wait < 0) {
+                    log("clipboard.paused reason=no_challenge");
+                    break;
+                }
+                pauseFor(wait > 0 ? wait : 500);
                 continue;
             }
+            noChallenge.reset();
             if (!sendPacket(s, kClipboardHello, {})) {
                 closeSocket(s);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));

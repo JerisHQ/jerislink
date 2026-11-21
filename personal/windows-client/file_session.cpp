@@ -1,4 +1,5 @@
 #include "file_session.hpp"
+#include "conn_auth.hpp"
 
 #include "file_proto.hpp"
 
@@ -196,9 +197,43 @@ bool FileSession::recvPacket(SOCKET s, uint8_t& type, std::vector<uint8_t>& payl
 
 void FileSession::run() {
     int backoffMs = kBackoffMinMs;
+    // r5: a background NoChallenge is retried on this channel only (0.5, 1,
+    // 2, 4 s); after that file transfer pauses for the session.
+    jl::auth::NoChallengeRetry noChallenge(jl::auth::Channel::File);
     while (!stopRequested_) {
-        SOCKET s = connectSocket();
+        if (!jl::auth::mayConnect()) {
+            // A connection-password answer is waiting for the user.
+            if (!sleepFor(backoffMs)) break;
+            continue;
+        }
+        SOCKET s = INVALID_SOCKET;
+        {
+            // One connection at a time may answer a challenge (conn_auth.hpp).
+            const auto slot = jl::auth::connectSlot();
+            if (jl::auth::mayConnect()) {
+                const auto connectStart = jl::auth::Clock::now();
+                s = connectSocket();
+                // v0.4.0: AUTH for the file channel before FILE_HELLO.
+                if (s != INVALID_SOCKET && !jl::auth::gate(s, jl::auth::Channel::File, jl::auth::msSince(connectStart))) {
+                    closeSocket(s);
+                    s = INVALID_SOCKET;
+                }
+            }
+        }
         Outcome outcome = Outcome::ConnectFailed;
+        if (s == INVALID_SOCKET) {
+            const int wait = noChallenge.afterFailure();
+            if (wait < 0) {
+                log("file.paused reason=no_challenge");
+                break;
+            }
+            if (wait > 0) {
+                if (!sleepFor(wait)) break;
+                continue;
+            }
+        } else {
+            noChallenge.reset();
+        }
         if (s != INVALID_SOCKET) {
             using namespace jl::file;
             // r3: the long-lived pull session also shows the Mac's NOTICEs.
