@@ -24,6 +24,7 @@
 namespace {
 
 using namespace jl::auth;
+namespace udptag = jl::udptag;
 
 int gPass = 0;
 int gFail = 0;

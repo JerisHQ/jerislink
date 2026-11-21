@@ -211,7 +211,6 @@ struct JerisLinkHostMain {
             let bundle = JerisLinkBundle.selfTest()
             exit(peer == 0 && listen == 0 && control == 0 && nack == 0 && abr == 0 && logs == 0 && audio == 0 && display == 0 && presence == 0 && video == 0 && files == 0 && auth == 0 && udpAuth == 0 && connSettings == 0 && bundle == 0 ? 0 : 1)
         }
-        // PR-C: what the UDP tags cost on this Mac at 4K60 (default 50, 80, 150 Mbps).
         // PR-C: the 連線設定 window on its own (also a button in the launcher).
         if rawArgs.count == 2, rawArgs[1] == "--connection-settings" {
             await MainActor.run {
@@ -220,6 +219,28 @@ struct JerisLinkHostMain {
             }
             exit(0)
         }
+        // PR-C: the same password set / clear as 連線設定, for a Mac without
+        // a screen session (ssh). `set` reads one line from stdin; nothing is
+        // echoed or logged. Same rules, Keychain item and listen.plist write.
+        if rawArgs.count == 3, rawArgs[1] == "--connection-password", rawArgs[2] == "set" || rawArgs[2] == "clear" {
+            let url = ConnectionSettings.defaultURL
+            let store = KeychainSecretStore()
+            let outcome: ConnectionSettings.Outcome
+            if rawArgs[2] == "set" {
+                guard let line = readLine(strippingNewline: true), !line.isEmpty else {
+                    fputs("connection-password: no password on stdin\n", stderr)
+                    exit(2)
+                }
+                outcome = ConnectionSettings.setPassword(line, confirm: line, url: url, store: store)
+            } else {
+                outcome = ConnectionSettings.clearPassword(url: url, store: store)
+            }
+            switch outcome {
+            case .ok(let text): print("connection-password \(rawArgs[2]) ok: \(text)"); exit(0)
+            case .refused(let text): fputs("connection-password \(rawArgs[2]) refused: \(text)\n", stderr); exit(1)
+            }
+        }
+        // PR-C: what the UDP tags cost on this Mac at 4K60 (default 50, 80, 150 Mbps).
         if rawArgs.count >= 2, rawArgs[1] == "--udp-tag-bench" {
             let rates = rawArgs.dropFirst(2).compactMap { Int($0) }
             exit(UDPAuthSelfTest.bench(mbps: rates.isEmpty ? [50, 80, 150] : rates))
