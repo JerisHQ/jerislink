@@ -7,10 +7,13 @@ import Foundation
 /// `ListenEndpoint`, so the screen and the input can never point at different
 /// interfaces. Phase 1 knows two modes:
 /// - `loopback`: 127.0.0.1 only (local tests, SSH port forwards);
-/// - `tailnet`: this Mac's tailnet address, one allowed viewer.
+/// - `tailnet`: this Mac's tailnet address.
 ///
-/// Source of truth: `listen.plist` (keys `mode`, `clientIP`, optional
-/// `bindIP`). Without it, `network.conf` (JERISLINK_BIND_IP and
+/// Source of truth: `listen.plist` (keys `mode`, optional `clientIP` and
+/// `bindIP`). v0.4.0 PR-C: tailnet mode needs a viewer `clientIP`, an
+/// `allowedIPs` whitelist or a password; the video service serves the
+/// control service's live session (SessionLink), so `clientIP` is only
+/// the 0.3 whitelist and may be empty (`""`). Without it, `network.conf` (JERISLINK_BIND_IP and
 /// JERISLINK_CLIENT_IP) is read as before, so existing installs keep working.
 /// When listen.plist exists it wins, and its mode never falls back to another
 /// interface: if the address is gone the services wait for it.
@@ -25,7 +28,7 @@ struct ListenEndpoint: Equatable {
     var clientIP: String
     var source: String
 
-    var summary: String { "mode=\(mode.rawValue) bind=\(bindIP) client=\(clientIP) source=\(source)" }
+    var summary: String { "mode=\(mode.rawValue) bind=\(bindIP) client=\(clientIP.isEmpty ? "session" : clientIP) source=\(source)" }
 }
 
 enum ListenResolution: Equatable {
@@ -128,7 +131,7 @@ enum ListenConfig {
         let rawMode = (plist["mode"] as? String)?.lowercased() ?? ""
         guard let mode = ListenMode(rawValue: rawMode), mode == started.mode else { return true }
         if mode == .tailnet {
-            if plist["clientIP"] as? String != started.clientIP { return true }
+            if (plist["clientIP"] as? String ?? "") != started.clientIP { return true }
             if let bindIP = plist["bindIP"] as? String, !bindIP.isEmpty, bindIP != started.bindIP { return true }
         }
         return false
@@ -174,8 +177,21 @@ enum ListenConfig {
             return .ready(ListenEndpoint(mode: .loopback, bindIP: loopbackIP, clientIP: loopbackIP,
                                          source: "listen.plist"))
         case .tailnet:
-            guard let clientIP = plist["clientIP"] as? String, isTailnetIPv4(clientIP) else {
-                return .notConfigured("listen.plist tailnet mode needs clientIP in 100.64.0.0/10")
+            let clientIP: String
+            if let raw = plist["clientIP"] as? String, !raw.isEmpty {
+                guard isTailnetIPv4(raw) else {
+                    return .notConfigured("listen.plist tailnet mode needs clientIP in 100.64.0.0/10")
+                }
+                clientIP = raw
+            } else {
+                // PR-C: no fixed viewer; the whitelist or the password
+                // decides who gets in (AuthPolicy), the session who is served.
+                let whitelist = (plist["allowedIPs"] as? [Any])?.isEmpty == false
+                let password = plist["passwordSet"] as? Bool == true
+                guard whitelist || password else {
+                    return .notConfigured("listen.plist tailnet mode needs clientIP in 100.64.0.0/10, allowedIPs or a password")
+                }
+                clientIP = ""
             }
             if let bindIP = plist["bindIP"] as? String, !bindIP.isEmpty {
                 guard isTailnetIPv4(bindIP) else {
@@ -291,7 +307,7 @@ enum ListenConfig {
         if let plist = readPlist() {
             switch ListenMode(rawValue: (plist["mode"] as? String)?.lowercased() ?? "") {
             case .loopback: return loopbackIP
-            case .tailnet: return plist["clientIP"] as? String
+            case .tailnet: return (plist["clientIP"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             case nil: return nil
             }
         }
@@ -598,6 +614,18 @@ enum ListenConfigSelfTest {
                                     conf: noConf, local: mac)
                == .notConfigured("listen.plist bindIP 192.168.1.20 is not a tailnet address"),
                "tailnet mode rejects a LAN bind address")
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet"], conf: legacy, local: mac)
+               == .notConfigured("listen.plist tailnet mode needs clientIP in 100.64.0.0/10, allowedIPs or a password"),
+               "PR-C: tailnet mode with no viewer, whitelist or password is not configured")
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "allowedIPs": ["100.64.0.20", "100.64.0.21"]], conf: noConf, local: mac)
+               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "", source: "listen.plist")),
+               "PR-C: a whitelist without clientIP is enough")
+        expect(ListenConfig.resolve(plist: ["mode": "tailnet", "clientIP": "", "passwordSet": true], conf: noConf, local: mac)
+               == .ready(ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "", source: "listen.plist")),
+               "PR-C: a password without clientIP is enough")
+        expect(!ListenConfig.targetDiffers(plist: ["mode": "tailnet", "allowedIPs": ["100.64.0.20"]],
+                                           from: ListenEndpoint(mode: .tailnet, bindIP: "100.64.0.10", clientIP: "", source: "listen.plist")),
+               "PR-C: no clientIP matches an endpoint started without one")
         expect(ListenConfig.resolve(plist: ["mode": "loopback", "clientIP": "100.64.0.20"], conf: legacy, local: offline)
                == .ready(ListenEndpoint(mode: .loopback, bindIP: "127.0.0.1", clientIP: "127.0.0.1", source: "listen.plist")),
                "loopback mode binds and allows 127.0.0.1 only")

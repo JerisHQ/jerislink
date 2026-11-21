@@ -79,8 +79,15 @@ enum ConnAuth {
         return out
     }
 
-    static func macClient(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel, hostID: [UInt8]) -> [UInt8] {
-        hmac(key, [Array("jl-c".utf8), hostNonce, clientNonce, [channel.rawValue], hostID])
+    /// r5 (Pepper's r4 review, item 2): a reconnect's resume id (the session
+    /// it names) is covered too, appended after host_id, so the host knows
+    /// the viewer that proved K is the one naming that session. Without a
+    /// resume id the value is unchanged (the vectors still hold).
+    static func macClient(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel, hostID: [UInt8],
+                          resume: [UInt8]? = nil) -> [UInt8] {
+        var parts: [[UInt8]] = [Array("jl-c".utf8), hostNonce, clientNonce, [channel.rawValue], hostID]
+        if let resume { parts.append(resume) }
+        return hmac(key, parts)
     }
 
     static func macHost(key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], channel: Channel) -> [UInt8] {
@@ -112,10 +119,12 @@ enum ConnAuth {
     }
 
     /// The channel whose mac_c matches, or nil. Always computes all four.
-    static func matchChannel(mac: [UInt8], key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], hostID: [UInt8]) -> Channel? {
+    static func matchChannel(mac: [UInt8], key: [UInt8], hostNonce: [UInt8], clientNonce: [UInt8], hostID: [UInt8],
+                             resume: [UInt8]? = nil) -> Channel? {
         var found: Channel?
         for channel in Channel.allCases {
-            let want = macClient(key: key, hostNonce: hostNonce, clientNonce: clientNonce, channel: channel, hostID: hostID)
+            let want = macClient(key: key, hostNonce: hostNonce, clientNonce: clientNonce, channel: channel, hostID: hostID,
+                                 resume: resume)
             if constantTimeEqual(want, mac) && found == nil { found = channel }
         }
         return found
@@ -171,15 +180,30 @@ enum ConnAuth {
         }
     }
 
+    /// r4 (Pepper's r3 review, item 1): a viewer reconnecting on its own
+    /// (not a new attempt from its launch screen) appends the session_id of
+    /// its last control AUTH: 72 bytes instead of 64. The host refuses the
+    /// reconnect (`.replaced`) while another viewer holds the session, so a
+    /// replaced viewer never takes it back, even if it missed the notice.
+    /// r5 (Pepper's r4 review, item 2): the id is under mac_c
+    /// (`macClient(resume:)`), so it cannot be added, stripped or changed
+    /// without K: the host checks the reconnect's identity, not just its key.
     struct Response: Equatable {
         var clientNonce: [UInt8]
         var mac: [UInt8]
+        var resume: [UInt8]? = nil
 
-        var payload: [UInt8] { clientNonce + mac }
+        static let size = 64
+        static let resumeSize = 64 + ConnAuth.sessionIDBytes
+
+        var payload: [UInt8] { clientNonce + mac + (resume ?? []) }
 
         static func decode(_ p: [UInt8]) -> Response? {
-            guard p.count == 64 else { return nil }
-            return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]))
+            switch p.count {
+            case size: return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]))
+            case resumeSize: return Response(clientNonce: Array(p[0..<32]), mac: Array(p[32..<64]), resume: Array(p[64...]))
+            default: return nil
+            }
         }
     }
 
@@ -190,6 +214,9 @@ enum ConnAuth {
         case blocked
         case authRequired
         case openIPOnly
+        /// r2: sent once on an authenticated control connection, right before
+        /// the host closes it because another AUTH took the session (§5.2).
+        case replaced
 
         var payload: [UInt8] {
             switch self {
@@ -199,6 +226,7 @@ enum ConnAuth {
             case .blocked: return [3]
             case .authRequired: return [4]
             case .openIPOnly: return [5]
+            case .replaced: return [6]
             }
         }
 
@@ -211,6 +239,7 @@ enum ConnAuth {
             case (3, 1): return .blocked
             case (4, 1): return .authRequired
             case (5, 1): return .openIPOnly
+            case (6, 1): return .replaced
             default: return nil
             }
         }
@@ -330,9 +359,60 @@ final class KeychainSecretStore: ConnSecretStore {
 }
 
 final class MemorySecretStore: ConnSecretStore, @unchecked Sendable {
+    private let lock = NSLock()   // the settings self-test drives it from several threads
     private var secret: ConnSecret?
     init(_ secret: ConnSecret? = nil) { self.secret = secret }
-    func load() -> ConnSecret? { secret }
-    func save(_ secret: ConnSecret) -> Bool { self.secret = secret; return true }
-    @discardableResult func delete() -> Bool { secret = nil; return true }
+    func load() -> ConnSecret? { lock.lock(); defer { lock.unlock() }; return secret }
+    func save(_ secret: ConnSecret) -> Bool { lock.lock(); self.secret = secret; lock.unlock(); return true }
+    @discardableResult func delete() -> Bool { lock.lock(); secret = nil; lock.unlock(); return true }
+}
+
+/// r2 (Pepper's PR-C review, item 8): a viewer that reconnects in a loop
+/// (a 0.3.x viewer, a locked or blocked address) would log one refusal line
+/// per attempt, about 14 a second. Each event and peer logs at most once per
+/// `window`; the next line after it says how many were left out.
+final class AuthLogThrottle: @unchecked Sendable {
+    static let window: TimeInterval = 10
+    static let maxKeys = 1024
+    private let lock = NSLock()
+    private var last: [String: (at: TimeInterval, skipped: UInt64)] = [:]
+    private let now: () -> TimeInterval
+    private let write: (String) -> Void
+    private(set) var suppressed: UInt64 = 0
+
+    init(now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         write: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
+        self.now = now
+        self.write = write
+    }
+
+    /// r3 (Pepper's r2 review, item 4): the table never holds more than
+    /// `maxKeys` entries, even when every key is younger than `window`.
+    /// A new key that finds the table full (after dropping expired keys)
+    /// shares one overflow key, so a flood of peers costs at most one line
+    /// per window plus a count.
+    static let overflowKey = "auth.overflow *"
+
+    var keyCount: Int { lock.lock(); defer { lock.unlock() }; return last.count }
+
+    func log(_ event: String, peer: String, _ line: String) {
+        var key = event + " " + peer
+        lock.lock()
+        let t = now()
+        if last[key] == nil, last.count >= Self.maxKeys - 1 {
+            last = last.filter { t - $0.value.at < Self.window }
+            if last.count >= Self.maxKeys - 1 { key = Self.overflowKey }
+        }
+        if let e = last[key], t - e.at < Self.window {
+            last[key] = (e.at, e.skipped + 1)
+            suppressed &+= 1
+            lock.unlock()
+            return
+        }
+        let skipped = last[key]?.skipped ?? 0
+        last[key] = (t, 0)
+        lock.unlock()
+        let out = key == Self.overflowKey ? "auth.overflow keys=\(Self.maxKeys) first=\(line)" : line
+        write(skipped > 0 ? out + " suppressed=\(skipped)" : out)
+    }
 }

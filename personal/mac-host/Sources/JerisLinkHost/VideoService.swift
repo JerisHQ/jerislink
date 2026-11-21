@@ -106,8 +106,12 @@ enum VideoService {
         o.h264Profile = "constrained-high"
         o.captureQueueDepth = settings.captureQueueDepth
         o.bindIP = bindIP
-        o.clientIP = clientIP
-        o.controlClientIP = clientIP
+        // PR-C: the viewer comes from the control service over the session
+        // link (any whitelisted viewer, or the password session), so
+        // clientIP may be empty; 0.0.0.0 only fills the sender's default.
+        o.sessionLink = true
+        o.clientIP = clientIP.isEmpty ? "0.0.0.0" : clientIP
+        o.controlClientIP = clientIP.isEmpty ? nil : clientIP
         o.clientPort = 38402
         o.packetBytes = 1200
         o.udpPaceMbps = settings.pacing.mbps

@@ -73,6 +73,10 @@ final class ControlServer: @unchecked Sendable {
     /// so a test can land a block between handling a request and its reply.
     /// Set before start(); nil in the app.
     var beforeCheckedSend: (@Sendable (UInt8) -> Void)?
+    /// r6, self-test only: true makes this AUTH_OK fail as a send to a
+    /// viewer that went away would (nothing is written). Set before start();
+    /// nil in the app.
+    var failAuthOKForTest: (@Sendable (AuthOK) -> Bool)?
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
@@ -139,6 +143,19 @@ final class ControlServer: @unchecked Sendable {
     /// viewer's sessions on their next message; other viewers go on.
     private let admitPeerMessage: (@Sendable (String) -> Bool)?
     private(set) var authFailures: UInt64 = 0
+    /// r4: reconnects refused because another viewer holds the session.
+    private(set) var resumesRefused: UInt64 = 0
+    /// PR-C: which viewer the UDP paths serve (the session link to the
+    /// video service). Every admitted connection registers here; in password
+    /// mode the control channel carries K_s and a new one replaces the old
+    /// session. nil: legacy listeners and the loopback relay.
+    private let sessionBroker: SessionBroker?
+    /// Zero-MAC probes answered without counting (item 5, PR-C).
+    private(set) var probesUncounted: UInt64 = 0
+    /// r2: 0.3.x viewers answered AUTH_REQUIRED without counting a try.
+    private(set) var oldViewersUncounted: UInt64 = 0
+    /// r2: repeated refusals (a viewer reconnecting in a loop) log once per 10 s.
+    let authLog = AuthLogThrottle()
 
     init(bindIP: String, allowedClientIP: String?, port: UInt16, inject: Bool,
          settingsClientIP: @escaping () -> String? = { ListenConfig.configuredClientIP() },
@@ -158,6 +175,7 @@ final class ControlServer: @unchecked Sendable {
          admitConnection: (@Sendable () -> Bool)? = nil,
          admitMessage: (@Sendable () -> Bool)? = nil,
          admitPeerMessage: (@Sendable (String) -> Bool)? = nil,
+         sessionBroker: SessionBroker? = nil,
          frontmostApp: @escaping () -> String? = { FrontmostApp.bundleID() }) {
         self.bindIP = bindIP
         self.clipboard = clipboard
@@ -167,6 +185,7 @@ final class ControlServer: @unchecked Sendable {
         self.admitConnection = admitConnection
         self.admitMessage = admitMessage
         self.admitPeerMessage = admitPeerMessage
+        self.sessionBroker = sessionBroker
         self.frontmostApp = frontmostApp
         self.announceInputSessions = announceInputSessions
         self.allowFileSessions = allowFileSessions
@@ -423,6 +442,8 @@ final class ControlServer: @unchecked Sendable {
         // checks run. `authChannel` is the channel the viewer authenticated
         // for; the connection is held to it.
         var authChannel: ConnAuth.Channel?
+        var udpSessionKey: [UInt8]?
+        var authOK: AuthOK?
         if let authGate {
             // The policy this gate holds was replaced (ControlService.PolicyWatch):
             // nothing more is admitted under it.
@@ -431,13 +452,118 @@ final class ControlServer: @unchecked Sendable {
                 return
             }
             if authGate.requiresPassword {
-                guard pending == nil, let channel = authenticate(fd, peer: peer, gate: authGate) else { return }
-                authChannel = channel
+                guard pending == nil, let ok = authenticate(fd, peer: peer, gate: authGate) else { return }
+                authChannel = ok.channel
+                authOK = ok
+                udpSessionKey = ok.channel == .control ? ok.sessionKey : nil
             } else {
                 guard admitWithoutPassword(fd, peer: peer, gate: authGate) else { return }
             }
         }
         let authenticated = authChannel != nil
+        // The gate let this connection in: a password-authenticated viewer,
+        // or in transition mode a whitelisted address seen on the real
+        // socket (the direct listener reads no PROXY header). Either is a
+        // configured viewer for VIDEO_CONFIG_SET and the sensitive messages,
+        // now that the whitelist replaces clientIP.
+        let gateAdmitted = authenticated || (authGate != nil && !acceptProxy && peer.verified)
+        if let sessionBroker, authGate != nil {
+            // r2 (Pepper's PR-C review, item 2): a newer AUTH ends this
+            // connection through `kick` (any thread). The loop below returns
+            // at once and takes no more input (r4: a control connection is
+            // woken through `wakeFD`, other channels shut the read side); the
+            // control channel then tells the viewer it was replaced, so it stops
+            // reconnecting instead of taking the session back.
+            let kick = KickHandle(fd, wake: authChannel == .control)
+            /// REPLACED and close: a refused reconnect, or (r6) a takeover
+            /// that lost to a newer one while its OK went out.
+            func refuse(stage: String, lost: Bool) {
+                kick.finish()
+                if !lost { lock.lock(); resumesRefused += 1; lock.unlock() }
+                let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+                let what = lost ? "auth.replaced_late" : "auth.resume_refused"
+                authLog.log(what, peer: peer.ip,
+                            "\(what) peer=\(peer.ip) chan=\(authChannel?.name ?? "open") stage=\(stage) sent=\(sent ? 1 : 0) counted=0")
+                if sent {
+                    Darwin.shutdown(fd, SHUT_WR)
+                    KickHandle.drainAfterNotice(fd)
+                }
+            }
+            // r6 (Pepper's r5 review): a password-mode control AUTH takes
+            // over only after its OK went out. Until then its id is pending
+            // (`reserve`): a clipboard or file AUTH naming it right after OK is
+            // let in (r5 item 2), but the live viewer, its video and the ids
+            // it may reconnect with stay as they are. OK not sent: the
+            // pending id is dropped and nothing else changes.
+            var reservation: UInt64?
+            if let authOK, authChannel == .control, sessionBroker.passwordMode {
+                guard let r = sessionBroker.reserve(authSession: authOK.sessionID, resume: authOK.resume) else {
+                    refuse(stage: "reserve", lost: false)
+                    return
+                }
+                guard sendAuthOK(fd, peerIP: peer.ip, authOK) else {
+                    sessionBroker.discard(r)
+                    kick.finish()
+                    print("auth.ok_unsent peer=\(peer.ip) chan=control; pending session dropped, live viewer kept")
+                    return
+                }
+                reservation = r
+            }
+            // r7 (Pepper's r6 review): another channel naming a pending id
+            // waits, with no OK sent and none of its messages read, until
+            // that takeover is admitted. Discarded or lost: closed unused.
+            if let authOK, authChannel != .control,
+               sessionBroker.awaitPending(authOK.resume) == .dropped {
+                refuse(stage: "pending", lost: true)
+                return
+            }
+            // r4: the reconnect check again, now atomically with taking the
+            // session (an AUTH may have finished since `authenticate`).
+            guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
+                                                  authSession: authChannel == .control ? authOK?.sessionID : nil,
+                                                  resume: authOK?.resume, reservation: reservation,
+                                                  close: { kick.kick() }) else {
+                refuse(stage: "admit", lost: reservation != nil)
+                return
+            }
+            // Other channels: OK once the connection is in the broker. A
+            // failed OK only ends this connection (it holds no session id).
+            if reservation == nil, let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) {
+                sessionBroker.end(token)
+                kick.finish()
+                return
+            }
+            defer {
+                sessionBroker.end(token)
+                kick.finish()
+            }
+            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted,
+                          wake: kick.wakeFD)
+            if kick.kicked && authChannel == .control {
+                let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+                print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
+                // r3 (Pepper's r2 review, item 1): FIN after the notice, then
+                // keep the socket open a moment instead of closing it at once.
+                // A close with input still unread on our side sends an RST,
+                // and Windows may throw away a notice the viewer has not read
+                // yet; the viewer would then reconnect and take the session back.
+                // r4: the viewer's input is read and dropped until it closes
+                // (at most `noticeLinger`), so nothing is left unread at close.
+                if sent {
+                    Darwin.shutdown(fd, SHUT_WR)
+                    KickHandle.drainAfterNotice(fd)
+                }
+            }
+        } else {
+            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) { return }
+            serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted)
+        }
+    }
+
+    /// The message loop of one admitted connection.
+    private func serveAdmitted(_ fd: Int32, peer: ControlPeer, pending: [UInt8]?,
+                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool, wake: Int32 = -1) {
+        let authenticated = gateAdmitted
         // A connection is an input session only once it sends its first key
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
         // are. One bool test per message, one helper message per session edge.
@@ -453,7 +579,7 @@ final class ControlServer: @unchecked Sendable {
         var connectionMessages = 0
         while true {
             let next: [UInt8]?
-            if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8) }
+            if let firstHeader { next = firstHeader } else { next = recvExact(fd, count: 8, wake: wake) }
             firstHeader = nil
             guard let header = next else { return }
             guard header[0] == 0x4d, header[1] == 0x52, header[2] == 0x43, header[3] == 0x31, header[4] == 1 else {
@@ -462,7 +588,7 @@ final class ControlServer: @unchecked Sendable {
             }
             let type = header[5]
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
-            guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length) else { return }
+            guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length, wake: wake) else { return }
             if let admitMessage, !admitMessage() {
                 rejectedClients += 1
                 print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
@@ -1165,7 +1291,13 @@ final class ControlServer: @unchecked Sendable {
     /// answer is settled by `AuthGuard.settle`, which checks the waits again
     /// under the same lock, so a challenge sent before a wait or a blacklist
     /// entry cannot get OK afterwards. Never logs nonces, K or MACs.
-    private func authenticate(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> ConnAuth.Channel? {
+    ///
+    /// PR-C: an all-zero MAC is a v0.4 viewer's transition probe that
+    /// crossed a late CHALLENGE (conn_auth.hpp afterProbeRace), not a
+    /// password: it is answered FAIL with the tries left as they are, after
+    /// the same admission check, and never counted. A real MAC is all zero
+    /// with probability 2^-256.
+    private func authenticate(_ fd: Int32, peer: ControlPeer, gate: AuthGate) -> AuthOK? {
         guard let secret = gate.secret else { return nil }
         let ip = peer.ip
         let admission = gate.guardian.admit(ip)
@@ -1192,13 +1324,23 @@ final class ControlServer: @unchecked Sendable {
         let type = header[5]
         let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
         let isMRC1 = header[0] == 0x4d && header[1] == 0x52 && header[2] == 0x43 && header[3] == 0x31 && header[4] == 1
-        guard isMRC1, type == ConnAuth.MsgType.response else {
-            // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...) or noise.
-            print("auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16))")
-            settleFailure(fd, ip: ip, gate: gate, reason: "auth_required", reply: .authRequired)
+        if isMRC1, type != ConnAuth.MsgType.response, Self.isLegacyFirstHeader(type: type, length: length) {
+            // A 0.3.x viewer (PING, KEY, CLIPBOARD_HELLO, FILE_HELLO...).
+            // r2 (Pepper's PR-C review, item 8): no password was tried, so it
+            // is not counted. A 0.3.x viewer reconnects in a loop; counting
+            // each attempt locked its address out within seconds.
+            // r3 (item 4): only a header that a real 0.3.x viewer sends, with
+            // its exact length, is exempt. Anything else is counted below.
+            lock.lock(); oldViewersUncounted += 1; lock.unlock()
+            _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.authRequired.payload)
+            authLog.log("auth.old_viewer", peer: ip, "auth.old_viewer peer=\(ip) type=0x\(String(type, radix: 16)) counted=0")
             return nil
         }
-        guard length == 64 else {
+        guard isMRC1, type == ConnAuth.MsgType.response else {
+            settleFailure(fd, ip: ip, gate: gate, reason: "bad_header", reply: nil)
+            return nil
+        }
+        guard length == ConnAuth.Response.size || length == ConnAuth.Response.resumeSize else {
             settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
             return nil
         }
@@ -1216,23 +1358,81 @@ final class ControlServer: @unchecked Sendable {
             settleFailure(fd, ip: ip, gate: gate, reason: "bad_response", reply: nil)
             return nil
         }
+        if response.mac.allSatisfy({ $0 == 0 }) {
+            switch gate.guardian.probe(ip) {
+            case .refused(let admission):
+                refuse(fd, ip: ip, admission: admission, afterChallenge: true)
+            case .triesLeft(let tries):
+                lock.lock(); probesUncounted += 1; lock.unlock()
+                _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.fail(triesLeft: tries).payload)
+                authLog.log("auth.probe_race", peer: ip, "auth.probe_race peer=\(ip) tries=\(tries) counted=0")
+            }
+            return nil
+        }
         var matched: ConnAuth.Channel?
         let settlement = gate.guardian.settle(ip) {
             matched = ConnAuth.matchChannel(mac: response.mac, key: secret.key, hostNonce: hostNonce,
-                                            clientNonce: response.clientNonce, hostID: secret.hostID)
+                                            clientNonce: response.clientNonce, hostID: secret.hostID,
+                                            resume: response.resume)
             return matched != nil
         }
         guard settlement == .ok, let channel = matched else {
-            finishFailure(fd, ip: ip, settlement: settlement, reason: "wrong_password", reply: nil)
+            finishFailure(fd, ip: ip, settlement: settlement, reason: "wrong_password", reply: nil,
+                          failureLog: gate.failureLog)
+            return nil
+        }
+        // r4 (Pepper's r3 review, item 1): a reconnect from a viewer that
+        // another viewer replaced. The password was right (nothing counted),
+        // but the session is not taken back: it is told it was replaced, and
+        // stops, even if it never read the notice on its old connection.
+        if let sessionBroker, sessionBroker.resumeRefused(response.resume) {
+            refuseResume(fd, ip: ip, channel: channel, resume: response.resume)
             return nil
         }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
         let macH = ConnAuth.macHost(key: secret.key, hostNonce: hostNonce, clientNonce: response.clientNonce, channel: channel)
-        // r10: OK is the first frame of an admitted session: it asks too.
+        let sessionKey = ConnAuth.sessionKey(key: secret.key, hostNonce: hostNonce,
+                                             clientNonce: response.clientNonce, sessionID: sessionID)
+        // r5 (Pepper's r4 review, item 2): OK is not sent here. The caller
+        // sends it (`sendAuthOK`) once the session broker has taken this
+        // session, so a viewer never holds a session id the host does not
+        // know yet (its next channel's AUTH would name it and be refused).
+        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID, resume: response.resume, macH: macH)
+    }
+
+    /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
+    /// the first frame of an admitted session: it asks too.
+    private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
+        if let fail = failAuthOKForTest, fail(ok) { return false }
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
-                          payload: ConnAuth.Result.ok(macH: macH, sessionID: sessionID).payload) == .sent else { return nil }
-        print("auth.ok peer=\(ip) chan=\(channel.name) session=\(ConnAuth.hex(sessionID))")
-        return channel
+                          payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload) == .sent else { return false }
+        print("auth.ok peer=\(ip) chan=\(ok.channel.name) session=\(ConnAuth.hex(ok.sessionID))")
+        return true
+    }
+
+    /// r4: answers a refused reconnect (`.replaced`, the same status as the
+    /// notice) and logs it. Not a failure: no try is counted.
+    private func refuseResume(_ fd: Int32, ip: String, channel: ConnAuth.Channel, resume: [UInt8]?) {
+        lock.lock(); resumesRefused += 1; lock.unlock()
+        let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
+        authLog.log("auth.resume_refused", peer: ip,
+                    "auth.resume_refused peer=\(ip) chan=\(channel.name) resume=\(resume.map(ConnAuth.hex) ?? "-") sent=\(sent ? 1 : 0) counted=0")
+        if sent {
+            Darwin.shutdown(fd, SHUT_WR)
+            KickHandle.drainAfterNotice(fd)
+        }
+    }
+
+    /// An authenticated connection: its channel and its UDP session key
+    /// (K_s, design §5.1; used for the control channel only).
+    struct AuthOK {
+        var channel: ConnAuth.Channel
+        var sessionKey: [UInt8]
+        /// r4: the session_id sent in OK, and the one a reconnect named.
+        var sessionID: [UInt8]
+        var resume: [UInt8]?
+        /// r5: mac_h for the OK that `sendAuthOK` sends.
+        var macH: [UInt8]
     }
 
     /// No challenge, or a challenge whose answer came after a wait or the
@@ -1242,16 +1442,16 @@ final class ControlServer: @unchecked Sendable {
         switch admission {
         case .blocked:
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
-            print("auth.blocked peer=\(ip)\(note); connection closed")
+            authLog.log("auth.blocked", peer: ip, "auth.blocked peer=\(ip)\(note); connection closed")
         case .notAllowed:
             rejectedClients += 1
             print("Control reject peer=\(ip) expected=whitelist on \(bindIP):\(port)\(note); connection closed")
         case .locked(let retry, let stage):
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)\(note); connection closed")
+            authLog.log("auth.locked", peer: ip, "auth.locked peer=\(ip) retry_s=\(retry) stage=\(stage)\(note); connection closed")
         case .globalLocked(let retry):
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.locked(retrySeconds: retry).payload)
-            print("auth.global_locked peer=\(ip) retry_s=\(retry)\(note); connection closed")
+            authLog.log("auth.global_locked", peer: ip, "auth.global_locked peer=\(ip) retry_s=\(retry)\(note); connection closed")
         case .challenge:
             break
         }
@@ -1261,22 +1461,24 @@ final class ControlServer: @unchecked Sendable {
     /// password was tried, so nothing is counted.
     private func noteNoResponse(ip: String, outcome: RecvOutcome) {
         switch outcome {
-        case .error(let code): print("auth.no_response peer=\(ip) reason=read_error errno=\(code) counted=0")
-        default: print("auth.no_response peer=\(ip) reason=closed counted=0")
+        case .error(let code): authLog.log("auth.no_response", peer: ip, "auth.no_response peer=\(ip) reason=read_error errno=\(code) counted=0")
+        default: authLog.log("auth.no_response", peer: ip, "auth.no_response peer=\(ip) reason=closed counted=0")
         }
     }
 
     /// A timeout, an old viewer or a malformed answer: settled like a wrong
     /// password, so the waits are checked again first.
     private func settleFailure(_ fd: Int32, ip: String, gate: AuthGate, reason: String, reply: ConnAuth.Result?) {
-        finishFailure(fd, ip: ip, settlement: gate.guardian.settle(ip) { false }, reason: reason, reply: reply)
+        finishFailure(fd, ip: ip, settlement: gate.guardian.settle(ip) { false }, reason: reason, reply: reply,
+                      failureLog: gate.failureLog)
     }
 
     /// Answers a failed settlement. `reply` overrides the plain FAIL
     /// (AUTH_REQUIRED for an old viewer); LOCKED and BLOCKED always win so
     /// the viewer learns the wait. The blacklist log says whether
     /// listen.plist was really written.
-    private func finishFailure(_ fd: Int32, ip: String, settlement: AuthGuard.Settlement, reason: String, reply: ConnAuth.Result?) {
+    private func finishFailure(_ fd: Int32, ip: String, settlement: AuthGuard.Settlement, reason: String, reply: ConnAuth.Result?,
+                               failureLog: AuthFailureLog?) {
         let r: AuthGuard.Failure
         switch settlement {
         case .ok:
@@ -1288,6 +1490,7 @@ final class ControlServer: @unchecked Sendable {
             r = failure
         }
         lock.lock(); authFailures += 1; lock.unlock()   // connections settle concurrently
+        failureLog?.record(ip: ip, reason: reason, failures: r.failures)   // r2 item 6: shown in 連線設定
         let result: ConnAuth.Result
         switch r.outcome {
         case .retry(let tries):
@@ -1320,7 +1523,7 @@ final class ControlServer: @unchecked Sendable {
         }
         if gate.guardian.isBlocked(peer.ip) {
             _ = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.blocked.payload)
-            print("auth.blocked peer=\(peer.ip); connection closed")
+            authLog.log("auth.blocked", peer: peer.ip, "auth.blocked peer=\(peer.ip); connection closed")
             return false
         }
         let whitelist = gate.guardian.whitelist
@@ -1330,6 +1533,24 @@ final class ControlServer: @unchecked Sendable {
             return false
         }
         return true
+    }
+
+    /// r3 (Pepper's r2 review, item 4): the first header a real 0.3.x viewer
+    /// sends, with that message's exact payload length. Only these skip the
+    /// failure count when a password is required.
+    static func isLegacyFirstHeader(type: UInt8, length: Int) -> Bool {
+        switch type {
+        case 0x01: return length == 4                    // PING
+        case 0x10: return length == 3                    // KEY
+        case 0x20, 0x22, 0x23, 0x24: return length == 4  // mouse move / scroll
+        case 0x21: return length == 2                    // MOUSE_BUTTON
+        case 0x25: return length == 3                    // MOUSE_BUTTON_EXT
+        case 0x30: return length == 0                    // CLIPBOARD_HELLO
+        case 0x40: return length == 6                    // VIDEO_CONFIG_SET v1
+        case FileProto.MsgType.hello: return length == 3 // FILE_HELLO
+        case 0x60: return length == 0                    // FORCE_QUIT_OPEN
+        default: return false
+        }
     }
 
     /// The connection stays on the channel it authenticated for: a MAC for
@@ -1385,11 +1606,23 @@ final class ControlServer: @unchecked Sendable {
     /// r12: viewer sockets are O_NONBLOCK, so a read with nothing there
     /// waits in poll(POLLIN) with no timeout, as the blocking recv did
     /// before: `stop()`'s shutdown still wakes it (recv then sees EOF).
-    private func recvExact(_ fd: Int32, count: Int) -> [UInt8]? {
+    /// r4: with `wake` (a kicked control connection, `KickHandle.wakeFD`) it
+    /// also returns nil once that fd is readable, checked before every read
+    /// so a viewer that keeps sending cannot hold the loop.
+    private func recvExact(_ fd: Int32, count: Int, wake: Int32 = -1) -> [UInt8]? {
         if count == 0 { return [] }
         var out = [UInt8](repeating: 0, count: count)
         var offset = 0
         while offset < count {
+            if wake >= 0 {
+                var pfds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                            pollfd(fd: wake, events: Int16(POLLIN), revents: 0)]
+                if Darwin.poll(&pfds, 2, -1) < 0 {
+                    if errno == EINTR { continue }
+                    return nil
+                }
+                if pfds[1].revents != 0 { return nil }
+            }
             let n = out.withUnsafeMutableBytes { raw -> Int in
                 Darwin.recv(fd, raw.baseAddress!.advanced(by: offset), count - offset, 0)
             }
@@ -1398,6 +1631,7 @@ final class ControlServer: @unchecked Sendable {
             let e = errno
             if e == EINTR { continue }
             guard e == EAGAIN else { return nil }
+            if wake >= 0 { continue }   // r4: the poll above waits on both
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             if Darwin.poll(&pfd, 1, -1) < 0 && errno != EINTR { return nil }
         }

@@ -67,6 +67,8 @@
 #include <utility>
 #include <vector>
 
+#include "udp_tag.hpp"
+
 #ifdef _MSC_VER
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -91,6 +93,11 @@ constexpr size_t kMacBytes = 32;
 constexpr size_t kSessionIdBytes = 8;
 constexpr size_t kChallengeBytes = kNonceBytes + kSaltBytes + 4 + 1 + kHostIdBytes;  // 69
 constexpr size_t kResponseBytes = kNonceBytes + kMacBytes;                          // 64
+// r4 (Pepper's r3 review, item 1): a channel reconnecting on its own, after
+// a control AUTH of this attempt, appends that AUTH's session_id. The host
+// answers REPLACED while another viewer holds the session, so a viewer that
+// missed the "replaced" notice still never takes the session back.
+constexpr size_t kResumeResponseBytes = kResponseBytes + kSessionIdBytes;           // 72
 
 constexpr uint8_t kTypeResponse = 0x03;
 constexpr uint8_t kTypeResult = 0x04;
@@ -222,11 +229,19 @@ inline bool hmacSha256(const uint8_t* key, size_t keyLen, std::initializer_list<
     return ok;
 }
 
-inline std::optional<Mac> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId) {
+// PR-C r5 (Pepper's r4 review, item 2): a reconnect's resume session id
+// (the 8 bytes after mac_c in a 72-byte RESPONSE) is under mac_c too, so
+// nobody on the path can add, change or strip it. nullptr: no resume id.
+inline std::optional<Mac> macClient(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce, Channel ch, const uint8_t* hostId,
+                                    const uint8_t* resume = nullptr) {
     const uint8_t label[4] = {'j', 'l', '-', 'c'};
     const uint8_t c = uint8_t(ch);
     Mac out;
-    if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}}, out)) return std::nullopt;
+    const bool ok = resume
+        ? hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes},
+                                          {resume, kSessionIdBytes}}, out)
+        : hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}, {hostId, kHostIdBytes}}, out);
+    if (!ok) return std::nullopt;
     return out;
 }
 
@@ -236,6 +251,29 @@ inline std::optional<Mac> macHost(const Key& k, const uint8_t* hostNonce, const 
     Mac out;
     if (!hmacSha256(k.data(), k.size(), {{label, 4}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {&c, 1}}, out)) return std::nullopt;
     return out;
+}
+
+// K_s for the UDP tags (design §5.1), from the control channel's AUTH.
+inline std::optional<udptag::SessionKey> sessionKey(const Key& k, const uint8_t* hostNonce, const uint8_t* clientNonce,
+                                                    const uint8_t* sessionId) {
+    const uint8_t label[6] = {'j', 'l', '-', 'u', 'd', 'p'};
+    Mac out;
+    if (!hmacSha256(k.data(), k.size(), {{label, 6}, {hostNonce, kNonceBytes}, {clientNonce, kNonceBytes}, {sessionId, kSessionIdBytes}}, out)) return std::nullopt;
+    udptag::SessionKey ks{};
+    std::memcpy(ks.data(), out.data(), ks.size());
+    wipe(out.data(), out.size());
+    return ks;
+}
+
+// The first 8 bytes of HMAC(K_s, "v2h"/"h2v" | packet): the vectors' udp_tag.
+inline std::optional<std::array<uint8_t, udptag::kTagBytes>> udpTag(const udptag::SessionKey& ks, bool hostToViewer,
+                                                                    const uint8_t* p, size_t n) {
+    const uint8_t* dir = reinterpret_cast<const uint8_t*>(hostToViewer ? "h2v" : "v2h");
+    Mac out;
+    if (!hmacSha256(ks.data(), ks.size(), {{dir, 3}, {p, n}}, out)) return std::nullopt;
+    std::array<uint8_t, udptag::kTagBytes> t{};
+    std::memcpy(t.data(), out.data(), t.size());
+    return t;
 }
 
 inline bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t n) {
@@ -270,7 +308,7 @@ struct Challenge {
 };
 
 struct Result {
-    enum class Status : uint8_t { Ok = 0, Fail = 1, Locked = 2, Blocked = 3, AuthRequired = 4, OpenIpOnly = 5 };
+    enum class Status : uint8_t { Ok = 0, Fail = 1, Locked = 2, Blocked = 3, AuthRequired = 4, OpenIpOnly = 5, Replaced = 6 };
     Status status = Status::Fail;
     std::array<uint8_t, kMacBytes> macH{};
     std::array<uint8_t, kSessionIdBytes> sessionId{};
@@ -299,6 +337,7 @@ struct Result {
         case 3: if (p.size() != 1) return std::nullopt; r.status = Status::Blocked; return r;
         case 4: if (p.size() != 1) return std::nullopt; r.status = Status::AuthRequired; return r;
         case 5: if (p.size() != 1) return std::nullopt; r.status = Status::OpenIpOnly; return r;
+        case 6: if (p.size() != 1) return std::nullopt; r.status = Status::Replaced; return r;
         default: return std::nullopt;
         }
     }
@@ -574,6 +613,7 @@ enum class Outcome {
     NoChallenge,   // a host known to want a password sent no challenge in 2 s: nothing sent, mode kept
                    // (ends the attempt only before any channel authenticated; see Client::handshake)
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
+    Replaced,      // another viewer authenticated on the Mac and took the session (host notice after AUTH)
     Network,       // connection closed / malformed: an ordinary reconnect
 };
 
@@ -592,6 +632,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::RaceUnanswered: return "race_unanswered";
     case Outcome::NoChallenge: return "no_challenge";
     case Outcome::Retry: return "retry";
+    case Outcome::Replaced: return "replaced";
     case Outcome::Network: return "network";
     }
     return "?";
@@ -603,7 +644,7 @@ inline bool isTerminal(Outcome o) {
     switch (o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
-    case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge:
+    case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge: case Outcome::Replaced:
         return true;
     default:
         return false;
@@ -842,6 +883,22 @@ public:
     }
     // Bit (1 << Channel) per channel paused since the last call.
     uint32_t takePausedChannels() { return pausedChannels_.exchange(0); }
+
+    // r2 (Pepper's PR-C review, item 2): the Mac told an authenticated
+    // channel that another viewer took the session. The attempt ends like
+    // any answer the user must act on: no channel reconnects on its own (a
+    // reconnect would AUTH again and take the session back), and the launch
+    // screen says why.
+    void hostReplaced(Channel ch) {
+        note(std::string("auth.replaced chan=") + channelName(ch) + " reconnect=stopped");
+        Report r;
+        r.outcome = Outcome::Replaced;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            last_ = r.outcome;
+        }
+        halt(r);
+    }
     // A channel of this attempt has authenticated (OK or open_ip_only).
     bool authenticatedOnce() const { std::lock_guard<std::mutex> g(m_); return authed_; }
 
@@ -913,6 +970,11 @@ private:
                 // Only the answer to our probe on a host that sent no challenge.
                 if (!probed) { rep.outcome = Outcome::Network; return rep; }
                 setMode(Mode::Transition);
+                // No password: UDP stays untagged, as in 0.3.
+                if (ch == Channel::Control) {
+                    udptag::publishOpen();
+                    note("udp.session mode=open");
+                }
                 rep.outcome = Outcome::Open;
                 return rep;
             }
@@ -933,9 +995,21 @@ private:
         std::optional<Key> key = keyFor(*ch5, fromStore);
         if (!key) { rep.outcome = Outcome::NeedPassword; return rep; }
 
-        uint8_t resp[kResponseBytes]{};
+        uint8_t resp[kResumeResponseBytes]{};
         if (!randomBytes(resp, kNonceBytes)) { rep.outcome = Outcome::Network; return rep; }
-        auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data());
+        // r4: only a reconnect within this attempt names the session; the
+        // first AUTH of an attempt from the launch screen never does.
+        size_t respBytes = kResponseBytes;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            if (resumeId_) {
+                std::memcpy(resp + kResponseBytes, resumeId_->data(), kSessionIdBytes);
+                respBytes = kResumeResponseBytes;
+            }
+        }
+        // r5: the resume id, when named, is signed with the rest.
+        auto macC = macClient(*key, ch5->hostNonce.data(), resp, ch, ch5->hostId.data(),
+                              respBytes == kResumeResponseBytes ? resp + kResponseBytes : nullptr);
         if (!macC) {
             // Never answer with a MAC CNG did not produce; closing without
             // an answer costs no try on the host.
@@ -944,7 +1018,8 @@ private:
             return rep;
         }
         std::memcpy(resp + kNonceBytes, macC->data(), kMacBytes);
-        if (!sendAllBytes(s, frame(kTypeResponse, resp, sizeof(resp)))) { rep.outcome = Outcome::Network; return rep; }
+        if (!sendAllBytes(s, frame(kTypeResponse, resp, respBytes))) { rep.outcome = Outcome::Network; return rep; }
+        if (respBytes == kResumeResponseBytes) note(std::string("auth.resume chan=") + channelName(ch));
 
         io = rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
         if (io != Io::Ok || type != kTypeResult) { rep.outcome = Outcome::Network; return rep; }
@@ -966,6 +1041,19 @@ private:
                 return rep;
             }
             accept(*ch5, *key, fromStore);
+            if (ch == Channel::Control) {
+                {
+                    std::lock_guard<std::mutex> g(m_);
+                    resumeId_ = res->sessionId;
+                }
+                // PR-C: this control session's K_s tags every UDP datagram
+                // from now on; the host switches to it at the same time.
+                auto ks = sessionKey(*key, ch5->hostNonce.data(), resp, res->sessionId.data());
+                const bool keyed = ks && udptag::publishKey(*ks);
+                if (ks) wipe(ks->data(), ks->size());
+                if (!keyed) udptag::publishPending();
+                note(std::string("udp.session mode=") + (keyed ? "keyed" : "pending reason=hmac_failed"));
+            }
             rep.outcome = Outcome::Ok;
             return rep;
         }
@@ -1054,6 +1142,12 @@ private:
         case Result::Status::Locked: rep.outcome = Outcome::Locked; rep.retrySeconds = r.retrySeconds; break;
         case Result::Status::Blocked: rep.outcome = Outcome::Blocked; break;
         case Result::Status::AuthRequired: rep.outcome = Outcome::AuthRequired; break;
+        case Result::Status::Replaced:
+            // r4: our reconnect named a session another viewer has taken
+            // since. Terminal: nothing reconnects (handshake halts).
+            note("auth.resume_refused reconnect=stopped");
+            rep.outcome = Outcome::Replaced;
+            break;
         default: rep.outcome = Outcome::Network; break;
         }
         return rep;
@@ -1158,6 +1252,9 @@ private:
             mode_ = m;
         }
         rememberMode(hostKey_, m);
+        // A host that wants a password: no untagged UDP is taken from now
+        // until the control channel brings K_s (a key already there stays).
+        if (m == Mode::Password && udptag::current()->mode == udptag::Mode::Open) udptag::publishPending();
     }
 
     void halt(const Report& r) {
@@ -1194,6 +1291,8 @@ private:
     std::atomic<bool> halted_{false};
     std::atomic<uint32_t> pausedChannels_{0};
     bool authed_ = false;  // under m_
+    // r4: session_id of this attempt's last control AUTH (under m_).
+    std::optional<std::array<uint8_t, kSessionIdBytes>> resumeId_;
     Report terminal_;
     Outcome last_ = Outcome::Network;
     std::string hostKey_;

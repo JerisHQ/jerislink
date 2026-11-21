@@ -513,6 +513,23 @@ final class AuthGuard: @unchecked Sendable {
         return .released
     }
 
+    enum ProbeAnswer: Equatable {
+        case triesLeft(UInt8)
+        case refused(Admission)
+    }
+
+    /// PR-C item 5: a zero-MAC transition probe that crossed a CHALLENGE.
+    /// The admission is checked again (a wait or block that started since
+    /// the challenge still wins), and the answer is the tries left now.
+    /// Nothing is recorded: the probe is not a password.
+    func probe(_ ip: String) -> ProbeAnswer {
+        lock.lock(); defer { lock.unlock() }
+        let admission = admitLocked(ip)
+        guard admission == .challenge else { return .refused(admission) }
+        let failures = peers[ip]?.failures ?? 0
+        return .triesLeft(UInt8(Self.failuresPerStage - failures % Self.failuresPerStage))
+    }
+
     func failures(_ ip: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         return peers[ip]?.failures ?? 0
@@ -783,8 +800,10 @@ struct AuthConfigSnapshot: Equatable, Sendable {
 /// First start of v0.4.0 (design §9): a listen.plist with `clientIP` gets
 /// `allowedIPs = [clientIP]`, `allowedIPsSource = clientIP` and
 /// `passwordSet = false`; the file as it was is kept as
-/// `listen.plist.pre-0.4`. `clientIP` itself stays: the UDP video and mouse
-/// paths still use it until PR-C. While `allowedIPsSource` is `clientIP`
+/// `listen.plist.pre-0.4`. `clientIP` itself stays (0.3 hosts reading the
+/// file still need it); since PR-C the UDP paths follow the session, not
+/// clientIP, and the host app's 連線設定 removes it with the source key
+/// when it saves a whitelist. While `allowedIPsSource` is `clientIP`
 /// the whitelist follows `clientIP`; whoever edits `allowedIPs` by hand or
 /// in the host app removes that key.
 enum ListenMigration {
@@ -840,12 +859,16 @@ final class AuthGate: @unchecked Sendable {
     let guardian: AuthGuard
     let secret: ConnSecret?
     let timeout: TimeInterval
+    /// r2 (Pepper's PR-C review, item 6): counted failures, for 連線設定.
+    let failureLog: AuthFailureLog?
 
-    init(policy: AuthPolicy, guardian: AuthGuard, secret: ConnSecret?, timeout: TimeInterval = ConnAuth.authTimeout) {
+    init(policy: AuthPolicy, guardian: AuthGuard, secret: ConnSecret?, timeout: TimeInterval = ConnAuth.authTimeout,
+         failureLog: AuthFailureLog? = nil) {
         self.policy = policy
         self.guardian = guardian
         self.secret = secret
         self.timeout = timeout
+        self.failureLog = failureLog
     }
 
     var requiresPassword: Bool {
@@ -862,12 +885,134 @@ final class AuthGate: @unchecked Sendable {
     var isRevoked: Bool { revokeLock.lock(); defer { revokeLock.unlock() }; return revoked }
 
     static func make(policy: AuthPolicy, secret: ConnSecret?, blocklist: BlocklistStore,
-                     journal: PendingBlockStore? = nil) -> AuthGate {
+                     journal: PendingBlockStore? = nil, failureLog: AuthFailureLog? = nil) -> AuthGate {
         let whitelist: [String]
         switch policy {
         case .password(let w), .transition(let w): whitelist = w
         case .refused: whitelist = []
         }
-        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist, journal: journal), secret: secret)
+        return AuthGate(policy: policy, guardian: AuthGuard(whitelist: whitelist, blocklist: blocklist, journal: journal), secret: secret,
+                        failureLog: failureLog)
+    }
+}
+
+/// r2 (Pepper's PR-C review, item 6): the last counted auth failures, for
+/// the 連線設定 window (design §10 "最近 auth 失敗紀錄"). A small plist next
+/// to listen.plist (mode 0600), newest last, at most `limit` records. The
+/// control service writes it on a serial queue so a failed try never waits
+/// for the disk; the window only reads it. No password material is kept:
+/// time, address, reason and the failure count.
+final class AuthFailureLog: @unchecked Sendable {
+    struct Record: Equatable {
+        var at: Date
+        var ip: String
+        var reason: String
+        var failures: Int
+    }
+
+    static let limit = 20
+    static var defaultURL: URL {
+        ListenConfig.plistURL.deletingLastPathComponent().appendingPathComponent("auth-failures.plist")
+    }
+
+    let url: URL
+    private let queue = DispatchQueue(label: "jerislink.auth-failure-log")
+
+    init(url: URL) { self.url = url }
+
+    func record(ip: String, reason: String, failures: Int, at: Date = Date()) {
+        let rec = Record(at: at, ip: ip, reason: reason, failures: failures)
+        queue.async { [url] in
+            var all = Self.load(url: url)
+            all.append(rec)
+            if all.count > Self.limit { all.removeFirst(all.count - Self.limit) }
+            Self.write(all, url: url)
+            Self.recordTime(at: rec.at, url: Self.countsURL(for: url))
+        }
+    }
+
+    /// Waits for the queued writes (self-test).
+    func flush() { queue.sync {} }
+
+    static func load(url: URL) -> [Record] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [[String: Any]]
+        else { return [] }
+        return raw.compactMap { d in
+            guard let at = d["at"] as? Date, let ip = d["ip"] as? String, ListenConfig.isIPv4(ip),
+                  let reason = d["reason"] as? String, let failures = d["failures"] as? Int else { return nil }
+            return Record(at: at, ip: ip, reason: String(reason.prefix(40)), failures: failures)
+        }
+    }
+
+    // r3 (Pepper's r2 review, item 6; design §4.4): the window shows how
+    // many failures the last 24 hours had and the last address. The list
+    // above keeps only `limit` records, so failure times are also kept in a
+    // small sidecar file.
+    // r4 (Pepper's r3 review, item 4): each failure's own time, not hourly
+    // buckets (those missed up to an hour at the window's start). Times
+    // older than 24 hours are dropped on every write; at most `maxTimes`
+    // are kept (then the count is a lower bound and the window says so).
+    static let window: TimeInterval = 24 * 3600
+    static let maxTimes = 5000
+
+    static func countsURL(for url: URL) -> URL {
+        url.deletingPathExtension().appendingPathExtension("times.plist")
+    }
+
+    static func loadTimes(url: URL) -> [Double] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [Any]
+        else { return [] }
+        return raw.compactMap { ($0 as? NSNumber)?.doubleValue }.filter { $0.isFinite }.sorted()
+    }
+
+    /// The kept times after one more failure at `at`: sorted, none older
+    /// than 24 hours before the newest, at most `cap` (the newest).
+    static func pruned(_ times: [Double], adding at: Double, cap: Int = maxTimes) -> [Double] {
+        var all = times
+        let i = all.firstIndex { $0 > at } ?? all.endIndex
+        all.insert(at, at: i)
+        let newest = all.last ?? at
+        all.removeAll { $0 <= newest - window }
+        if all.count > cap { all.removeFirst(all.count - cap) }
+        return all
+    }
+
+    private static func recordTime(at: Date, url: URL) {
+        let times = pruned(loadTimes(url: url), adding: at.timeIntervalSince1970)
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: times, format: .binary, options: 0) else { return }
+        writeAtomic(data, url: url)
+    }
+
+    /// Failures in the 24 hours up to `now`, by each failure's own time, and
+    /// the last failing address. `capped`: more were kept than fit, so the
+    /// count is at least `last24h`.
+    static func summary(url: URL, now: Date = Date()) -> (last24h: Int, lastIP: String?, lastAt: Date?, capped: Bool) {
+        let t = now.timeIntervalSince1970
+        let times = loadTimes(url: countsURL(for: url))
+        let total = times.filter { $0 > t - window && $0 <= t }.count
+        let capped = times.count >= maxTimes && (times.first.map { $0 > t - window } ?? false)
+        let last = load(url: url).last
+        return (total, last?.ip, last?.at, capped)
+    }
+
+    private static func write(_ records: [Record], url: URL) {
+        let raw: [[String: Any]] = records.map { ["at": $0.at, "ip": $0.ip, "reason": $0.reason, "failures": $0.failures] }
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: raw, format: .xml, options: 0) else { return }
+        writeAtomic(data, url: url)
+    }
+
+    private static func writeAtomic(_ data: Data, url: URL) {
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).\(getpid()).\(UUID().uuidString.prefix(8))")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { return }
+        let ok = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return Darwin.write(fd, base, buf.count) == buf.count
+        }
+        close(fd)
+        if !ok || rename(tmp.path, url.path) != 0 { unlink(tmp.path) }
     }
 }

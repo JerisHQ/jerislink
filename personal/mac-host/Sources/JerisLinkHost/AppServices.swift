@@ -214,6 +214,10 @@ enum JerisLinkLauncher {
             lines.append("Allow JerisLink in System Settings > General > Login Items & Extensions so its background services can run.")
         }
         lines.append("Screen Recording for JerisLink: \(screenRecording ? "allowed" : "not allowed yet")")
+        let conn = ConnectionSettings.state(url: ConnectionSettings.defaultURL)
+        if conn.hasPlist && !conn.passwordSet {
+            lines.append("⚠️ No connection password is set: viewers on the whitelist connect without one. Set it in 連線設定.")
+        }
         lines.append("Accessibility for JerisLink Input Helper is asked for by the helper itself the first time it runs.")
         if let sendService { lines.append(sendService) }
         if !errors.isEmpty {
@@ -229,6 +233,7 @@ enum JerisLinkLauncher {
         alert.messageText = "JerisLink"
         alert.informativeText = lines.joined(separator: "\n")
         alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "連線設定…")
         if needsApproval {
             alert.addButton(withTitle: "Open Login Items Settings")
         } else if !screenRecording {
@@ -236,7 +241,11 @@ enum JerisLinkLauncher {
         }
         app.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        guard response == .alertSecondButtonReturn else { return }
+        if response == .alertSecondButtonReturn {
+            ConnectionSettingsWindow().runModal()
+            return
+        }
+        guard response == .alertThirdButtonReturn else { return }
         if needsApproval {
             SMAppService.openSystemSettingsLoginItems()
         } else if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {

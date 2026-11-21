@@ -105,6 +105,23 @@ enum AuthSelfTest {
             let ok = ConnAuth.Result.ok(macH: b("mac_h"), sessionID: sid)
             expect(ok.payload == b("result_ok_payload") && ConnAuth.Result.decode(ok.payload) == ok, "vector \(name): RESULT ok payload")
         }
+        // PR-C r5 (Pepper's r4 review, item 2): the resume id is under mac_c.
+        // The same fixed inputs and hex as the viewer's conn_auth_test.
+        do {
+            let k = [UInt8](repeating: 0x11, count: 32), hn = [UInt8](repeating: 0x22, count: 32)
+            let cn = [UInt8](repeating: 0x33, count: 32), hid = [UInt8](repeating: 0x44, count: 16)
+            let resume: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
+            let plain = ConnAuth.macClient(key: k, hostNonce: hn, clientNonce: cn, channel: .control, hostID: hid)
+            let signed = ConnAuth.macClient(key: k, hostNonce: hn, clientNonce: cn, channel: .control, hostID: hid, resume: resume)
+            expect(ConnAuth.hex(plain) == "f80179160e285469a687e3e15aa31a4b9d4c1839d172211f97629a2194cb93bc",
+                   "prc r5 vector: mac_c without a resume id (unchanged)")
+            expect(ConnAuth.hex(signed) == "d683830f256aebbd4193876e4db47cce29fc0c36e54da8f81c0510136e1a43d5",
+                   "prc r5 vector: mac_c covers the resume id")
+            expect(ConnAuth.matchChannel(mac: signed, key: k, hostNonce: hn, clientNonce: cn, hostID: hid, resume: resume) == .control
+                   && ConnAuth.matchChannel(mac: signed, key: k, hostNonce: hn, clientNonce: cn, hostID: hid) == nil
+                   && ConnAuth.matchChannel(mac: plain, key: k, hostNonce: hn, clientNonce: cn, hostID: hid, resume: resume) == nil,
+                   "prc r5 vector: the host matches mac_c only with the id it was signed with")
+        }
     }
 
     // MARK: Password rules
@@ -318,7 +335,8 @@ enum AuthSelfTest {
         }
 
         /// Connects, reads the CHALLENGE and answers it for `channel`.
-        func login(_ port: UInt16, password: String, channel: ConnAuth.Channel, replay: [UInt8]? = nil)
+        func login(_ port: UInt16, password: String, channel: ConnAuth.Channel, replay: [UInt8]? = nil, resume: [UInt8]? = nil,
+                   macResume: [UInt8]?? = .none)
             -> (client: MRC1Client?, result: ConnAuth.Result?, response: [UInt8]?, macOK: Bool) {
             guard let c = MRC1Client(port: port), let ch = c.receive(timeout: 2) else { return (nil, nil, nil, false) }
             guard ch.type == ConnAuth.MsgType.challenge, let challenge = ConnAuth.Challenge.decode(ch.payload),
@@ -326,8 +344,12 @@ enum AuthSelfTest {
                 return (c, ch.type == ConnAuth.MsgType.result ? ConnAuth.Result.decode(ch.payload) : nil, nil, false)
             }
             let cn = ConnAuth.random(ConnAuth.nonceBytes)
-            let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel, hostID: challenge.hostID)
-            let response = replay ?? ConnAuth.Response(clientNonce: cn, mac: mac).payload
+            // r5: mac_c covers the resume id. `macResume` signs another one
+            // (.some(nil): none), as a forged or stripped id would.
+            let signed: [UInt8]? = macResume ?? resume
+            let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel,
+                                         hostID: challenge.hostID, resume: signed)
+            let response = replay ?? ConnAuth.Response(clientNonce: cn, mac: mac, resume: resume).payload
             _ = c.send(type: ConnAuth.MsgType.response, payload: response)
             guard let r = c.receive(timeout: 3), r.type == ConnAuth.MsgType.result else { return (c, nil, response, false) }
             let result = ConnAuth.Result.decode(r.payload)
@@ -363,15 +385,586 @@ enum AuthSelfTest {
         _ = pingChan.client?.send(type: 0x10, payload: [1, 0, 0])
         expect(!pong(pingChan.client), "e2e: KEY on a ping login closes the connection")
 
+        // r2 (item 2): with a session broker, a newer control AUTH tells the
+        // old control connection it was replaced, then closes it.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            if (try? s.start()) != nil {
+                let first = login(p, password: password, channel: .control)
+                expect(pong(first.client), "replace: first viewer's control channel works")
+                let second = login(p, password: password, channel: .control)
+                // r3 (item 1): the old viewer's input still in flight does
+                // not turn the close into a reset; it sees the notice, then FIN.
+                // r4: the input goes out right after the replacing AUTH,
+                // before the viewer reads anything, as from a viewer still
+                // moving the mouse. With the old read-side shutdown macOS
+                // answered it with an RST and the notice was never written
+                // (`auth.replaced_notice sent=0` on the CI runner).
+                var inputSent = true
+                for i in 0..<20 where first.client?.send(type: 0x10, payload: [1, 0, UInt8(0x41 + i)]) != true {
+                    inputSent = false
+                }
+                let notice = first.client?.receive(timeout: 2)
+                expect(notice?.type == ConnAuth.MsgType.result
+                       && notice.flatMap({ ConnAuth.Result.decode($0.payload) }) == .replaced
+                       && first.client?.receive(timeout: 2) == nil,
+                       "replace: the old control connection gets REPLACED (status 6), then closes")
+                let fin = inputSent && first.client?.sawEOF == true && first.client?.sawReset == false
+                if !fin {
+                    print("replace close info: input_sent=\(inputSent) eof=\(first.client?.sawEOF == true) reset=\(first.client?.sawReset == true)")
+                }
+                expect(fin, "replace: after the notice the old connection ends with FIN, not RST")
+                expect(pong(second.client), "replace: the new viewer's control channel works")
+                expect(broker.replaced == 1, "replace: one connection replaced")
+                // r4 (Pepper's r3 review, item 1): the old viewer missed the
+                // notice and reconnects on its own, naming its old session.
+                // The host refuses it (REPLACED, not counted) and the new
+                // viewer keeps the session.
+                if case .ok(_, let oldID)? = first.result, case .ok(_, let newID)? = second.result {
+                    let failsBefore = s.authFailures
+                    let back = login(p, password: password, channel: .control, resume: oldID)
+                    expect(back.result == .replaced && back.client?.receive(timeout: 2) == nil,
+                           "r4 resume: a replaced viewer's control reconnect gets REPLACED and is closed")
+                    let clip = login(p, password: password, channel: .clipboard, resume: oldID)
+                    expect(clip.result == .replaced, "r4 resume: its clipboard reconnect too")
+                    expect(s.authFailures == failsBefore && s.resumesRefused == 2 && broker.replaced == 1 && pong(second.client),
+                           "r4 resume: nothing counted, nothing kicked, the new viewer's session works")
+                    let own = login(p, password: password, channel: .control, resume: newID)
+                    if case .ok? = own.result { expect(pong(own.client), "r4 resume: the current viewer's own reconnect is let in") }
+                    else { expect(false, "r4 resume: the current viewer's own reconnect is let in") }
+                    let fresh = login(p, password: password, channel: .control)
+                    if case .ok? = fresh.result { expect(pong(fresh.client), "r4 resume: a new attempt (no resume id) still takes over") }
+                    else { expect(false, "r4 resume: a new attempt (no resume id) still takes over") }
+                } else {
+                    expect(false, "r4 resume: both logins ok")
+                }
+                s.stop()
+            } else {
+                expect(false, "replace: listener starts")
+            }
+        }
+
+        // PR-C r5 (Pepper's r4 review, items 1 and 2).
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            func sessionGone() -> Bool {
+                let until = Date().addingTimeInterval(3)
+                while Date() < until {
+                    if broker.current.0 == nil { return true }
+                    usleep(10_000)
+                }
+                return false
+            }
+            if (try? s.start()) != nil {
+                // Item 1: A is replaced by B, then B goes offline. A missed the
+                // notice and reconnects on its own: still refused.
+                let a = login(p, password: password, channel: .control)
+                let b = login(p, password: password, channel: .control)
+                if case .ok(_, let idA)? = a.result, case .ok(_, let idB)? = b.result {
+                    _ = a.client?.receive(timeout: 2)  // the notice A may or may not read
+                    b.client?.close()
+                    expect(sessionGone(), "prc r5 replaced: the new viewer went offline (no live session)")
+                    let failsBefore = s.authFailures
+                    let back = login(p, password: password, channel: .control, resume: idA)
+                    expect(back.result == .replaced && back.client?.receive(timeout: 2) == nil,
+                           "prc r5 replaced: after the new viewer left, the old viewer's control reconnect still gets REPLACED")
+                    let clip = login(p, password: password, channel: .clipboard, resume: idA)
+                    let file = login(p, password: password, channel: .file, resume: idA)
+                    expect(clip.result == .replaced && file.result == .replaced,
+                           "prc r5 replaced: its clipboard and file reconnects too")
+                    expect(broker.current.0 == nil && s.authFailures == failsBefore,
+                           "prc r5 replaced: no session taken over, nothing counted")
+                    // B's own reconnect still works (it is the newest session).
+                    let bBack = login(p, password: password, channel: .control, resume: idB)
+                    if case .ok? = bBack.result { expect(pong(bBack.client), "prc r5 replaced: the newest viewer's own reconnect is let in") }
+                    else { expect(false, "prc r5 replaced: the newest viewer's own reconnect is let in") }
+                    bBack.client?.close()
+                    _ = sessionGone()
+                    // Only a new attempt from the user (no resume id) takes over.
+                    let fresh = login(p, password: password, channel: .control)
+                    if case .ok? = fresh.result { expect(pong(fresh.client), "prc r5 replaced: a new attempt (no resume id) takes over") }
+                    else { expect(false, "prc r5 replaced: a new attempt (no resume id) takes over") }
+                    fresh.client?.close()
+                    _ = sessionGone()
+                } else {
+                    expect(false, "prc r5 replaced: both logins ok")
+                }
+
+                // Item 2: a normal control reconnect, then the other channels
+                // at once (no wait) with the new id: all let in. The OK comes
+                // after the broker took the session, so there is no gap.
+                let c1 = login(p, password: password, channel: .control)
+                if case .ok(_, let id1)? = c1.result {
+                    c1.client?.close()
+                    var allOK = true
+                    var prev = id1
+                    for round in 0..<20 {
+                        let ctl = login(p, password: password, channel: .control, resume: prev)
+                        guard case .ok(_, let id)? = ctl.result else {
+                            expect(false, "prc r5 order: control reconnect \(round) ok"); allOK = false; break
+                        }
+                        let clip = login(p, password: password, channel: .clipboard, resume: id)
+                        let file = login(p, password: password, channel: .file, resume: id)
+                        let ping = login(p, password: password, channel: .ping, resume: id)
+                        var each = true
+                        for r in [clip.result, file.result, ping.result] { if case .ok? = r {} else { each = false } }
+                        if !each || !pong(ctl.client) {
+                            print("prc r5 order round=\(round) clip=\(String(describing: clip.result)) file=\(String(describing: file.result)) ping=\(String(describing: ping.result))")
+                            allOK = false
+                        }
+                        // An older channel of the same viewer still names the
+                        // id before (it reconnected first): let in too.
+                        let older = login(p, password: password, channel: .clipboard, resume: prev)
+                        if case .ok? = older.result {} else { allOK = false }
+                        for c in [clip.client, file.client, ping.client, older.client, ctl.client] { c?.close() }
+                        prev = id
+                    }
+                    expect(allOK, "prc r5 order: after each of 20 control reconnects, clipboard/file/ping AUTH with the new id at once get ok")
+                    expect(s.resumesRefused == 3, "prc r5 order: no reconnect of the current viewer refused (only the 3 above)")
+                } else {
+                    expect(false, "prc r5 order: first login ok")
+                }
+
+                // Item 2: the resume id is under mac_c.
+                let d = login(p, password: password, channel: .control)
+                if case .ok(_, let idD)? = d.result {
+                    let failsBefore = s.authFailures
+                    let unsigned = login(p, password: password, channel: .control, resume: idD, macResume: .some(nil))
+                    expect(unsigned.result == .fail(triesLeft: 4) && s.authFailures == failsBefore + 1,
+                           "prc r5 hmac: a resume id added outside mac_c fails (counted as a wrong proof)")
+                    var other = idD
+                    other[0] ^= 0x01
+                    let changed = login(p, password: password, channel: .control, resume: other, macResume: .some(idD))
+                    expect(changed.result == .fail(triesLeft: 3), "prc r5 hmac: a changed resume id fails")
+                    let stripped = login(p, password: password, channel: .control, resume: nil, macResume: .some(idD))
+                    expect(stripped.result == .fail(triesLeft: 2), "prc r5 hmac: a stripped resume id fails")
+                    expect(pong(d.client), "prc r5 hmac: the session holder is untouched")
+                    let signed = login(p, password: password, channel: .control, resume: idD)
+                    if case .ok? = signed.result { expect(true, "prc r5 hmac: the signed resume id gets ok") }
+                    else { expect(false, "prc r5 hmac: the signed resume id gets ok") }
+                } else {
+                    expect(false, "prc r5 hmac: login ok")
+                }
+                s.stop()
+            } else {
+                expect(false, "prc r5: listener starts")
+            }
+        }
+        // Item 1 (broker): the accepted ids.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            let idA: [UInt8] = [1, 1, 1, 1, 1, 1, 1, 1], idB: [UInt8] = [2, 2, 2, 2, 2, 2, 2, 2]
+            let idB2: [UInt8] = [4, 4, 4, 4, 4, 4, 4, 4]
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 1, count: 32), authSession: idA,
+                             resume: nil, close: {})
+            let tB = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 2, count: 32), authSession: idB,
+                             resume: nil, close: {})
+            if let tB { b.end(tB) }
+            if let tA { b.end(tA) }
+            expect(b.current.0 == nil && b.resumeRefused(idA) && !b.resumeRefused(idB),
+                   "prc r5 broker: with nobody connected, the replaced id is refused and the newest is not")
+            let tB2 = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 3, count: 32), authSession: idB2,
+                              resume: idB, close: {})
+            expect(tB2 != nil && !b.resumeRefused(idB2) && !b.resumeRefused(idB) && b.resumeRefused(idA),
+                   "prc r5 broker: the same viewer's reconnect keeps its previous id valid for its other channels")
+            if let tB2 { b.end(tB2) }
+        }
+
+        // PR-C r6 (Pepper's r5 review): a control takeover is pending until
+        // its AUTH_OK went out; a failed OK leaves the live viewer untouched.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+            let keyA = [UInt8](repeating: 0xA, count: 32), keyE = [UInt8](repeating: 0xE, count: 32)
+            let closedA = R6Count()
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: keyA, authSession: id(0xA1), resume: nil,
+                             close: { closedA.hit() })
+            let genA = b.current.1
+            func aUntouched() -> Bool {
+                let (now, gen) = b.current
+                return tA != nil && closedA.value == 0 && gen == genA && now?.sessionKey == keyA && !b.resumeRefused(id(0xA1))
+            }
+            // Single failed send.
+            let r1 = b.reserve(authSession: id(0xC1), resume: id(0xA1))
+            expect(r1 != nil && !b.resumeRefused(id(0xC1)) && aUntouched(),
+                   "prc r6 broker: a pending takeover's id is let in for its other channels; the live viewer keeps the session meanwhile")
+            if let r1 { b.discard(r1) }
+            expect(aUntouched() && b.resumeRefused(id(0xC1)),
+                   "prc r6 single failed send: the live viewer is not kicked, its session and id stay; the unsent id is refused")
+            // Two takeovers overlap and both sends fail (either order).
+            let r2 = b.reserve(authSession: id(0xC2), resume: nil)
+            let r3 = b.reserve(authSession: id(0xC3), resume: id(0xA1))
+            if let r3 { b.discard(r3) }
+            if let r2 { b.discard(r2) }
+            expect(r2 != nil && r3 != nil && aUntouched() && b.resumeRefused(id(0xC2)) && b.resumeRefused(id(0xC3)) &&
+                       b.replaced == 0,
+                   "prc r6 overlapping failed sends: the live viewer stays connected and no id that never went out becomes valid")
+            // Overlapping takeovers whose OKs went out: the newer AUTH wins
+            // whichever is admitted first.
+            let r4 = b.reserve(authSession: id(0xD1), resume: nil)
+            let r5 = b.reserve(authSession: id(0xE1), resume: nil)
+            let tE = r5.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: keyE, authSession: id(0xE1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let tD = r4.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 0xD, count: 32),
+                                          authSession: id(0xD1), resume: nil, reservation: $0, close: {}) }
+            expect(tE != nil && tD == nil && closedA.value == 1 && b.current.0?.sessionKey == keyE &&
+                       b.resumeRefused(id(0xD1)) && b.resumeRefused(id(0xA1)) && !b.resumeRefused(id(0xE1)),
+                   "prc r6 broker: of two takeovers whose OK went out, the newer AUTH holds the session; the older one admitted late is refused")
+            if let tE { b.end(tE) }
+        }
+
+        // PR-C r6 end to end: the control AUTH_OK of a takeover fails (once,
+        // then twice at the same time); the viewer holding the session stays.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            // `failing` OKs fail, each held until all of them are pending at
+            // once (two takeovers overlap for sure).
+            let failing = R6Count(), arrived = R6Count()
+            s.failAuthOKForTest = { ok in
+                guard ok.channel == .control, failing.value > 0 else { return false }
+                arrived.hit()
+                let until = Date().addingTimeInterval(2)
+                while arrived.value < failing.value && Date() < until { usleep(5_000) }
+                return true
+            }
+            /// `n` control logins whose RESPONSEs all go out before any result is read.
+            func loginsAtOnce(_ n: Int) -> [ConnAuth.Result?] {
+                var open: [(MRC1Client, ConnAuth.Challenge, [UInt8])] = []
+                for _ in 0..<n {
+                    guard let c = MRC1Client(port: p), let ch = c.receive(timeout: 2),
+                          let challenge = ConnAuth.Challenge.decode(ch.payload),
+                          let key = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations)
+                    else { return [] }
+                    open.append((c, challenge, key))
+                }
+                for (c, challenge, key) in open {
+                    let cn = ConnAuth.random(ConnAuth.nonceBytes)
+                    let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: .control,
+                                                 hostID: challenge.hostID, resume: nil)
+                    _ = c.send(type: ConnAuth.MsgType.response, payload: ConnAuth.Response(clientNonce: cn, mac: mac, resume: nil).payload)
+                }
+                defer { open.forEach { $0.0.close() } }
+                return open.map { o in o.0.receive(timeout: 3).flatMap { ConnAuth.Result.decode($0.payload) } }
+            }
+            if (try? s.start()) != nil {
+                let a = login(p, password: password, channel: .control)
+                if case .ok(_, let idA)? = a.result {
+                    let (sessionA, genA) = broker.current
+                    func aHolds() -> Bool {
+                        let (now, gen) = broker.current
+                        return gen == genA && now == sessionA && pong(a.client) && broker.replaced == 0
+                    }
+                    failing.hit()
+                    let one = loginsAtOnce(1)
+                    expect(one.count == 1 && one[0] == nil && arrived.value == 1 && aHolds(),
+                           "prc r6 single failed send (e2e): no OK, and the viewer holding the session is still connected (PING answered, same session)")
+                    arrived.reset()
+                    failing.hit()
+                    let two = loginsAtOnce(2)
+                    expect(two.count == 2 && two.allSatisfy { $0 == nil } && arrived.value == 2 && aHolds(),
+                           "prc r6 overlapping failed sends (e2e): both pending at once, neither gets OK, the viewer holding the session is still connected")
+                    let clip = login(p, password: password, channel: .clipboard, resume: idA)
+                    if case .ok? = clip.result { expect(true, "prc r6 (e2e): the live viewer's id is still let in for its other channels") }
+                    else { expect(false, "prc r6 (e2e): the live viewer's id is still let in for its other channels") }
+                    clip.client?.close()
+                    failing.reset()
+                    let fresh = login(p, password: password, channel: .control)
+                    let notice = a.client?.receive(timeout: 2)
+                    if case .ok? = fresh.result {
+                        expect(pong(fresh.client) && notice.map { ConnAuth.Result.decode($0.payload) == .replaced } == true,
+                               "prc r6 (e2e): once OK goes out, the takeover holds the session and the old viewer is told it was replaced")
+                    } else {
+                        expect(false, "prc r6 (e2e): once OK goes out, the takeover holds the session and the old viewer is told it was replaced")
+                    }
+                    fresh.client?.close()
+                } else {
+                    expect(false, "prc r6 (e2e): first login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r6: listener starts")
+            }
+        }
+
+        // PR-C r7 (Pepper's r6 review): a clipboard, file or ping AUTH naming
+        // a pending id waits (no OK, nothing read) until that takeover is
+        // admitted; discarded or lost, the channel is closed unused.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+            func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA), authSession: id(0xA1), resume: nil, close: {})
+            /// `awaitPending(resume)` on another thread; true once it waits.
+            func waiter(_ resume: [UInt8], _ out: R7Box, _ group: DispatchGroup) -> Bool {
+                DispatchQueue.global().async(group: group) { out.set(b.awaitPending(resume, timeout: 3)) }
+                let until = Date().addingTimeInterval(2)
+                while b.waitingForTest == 0 && Date() < until { usleep(2_000) }
+                return b.waitingForTest == 1
+            }
+            // Discarded (AUTH_OK not sent).
+            let w1 = R7Box(), g1 = DispatchGroup()
+            let r1 = b.reserve(authSession: id(0xC1), resume: nil)
+            let waited1 = waiter(id(0xC1), w1, g1)
+            let early1 = w1.value
+            if let r1 { b.discard(r1) }
+            let woke1 = g1.wait(timeout: .now() + 1) == .success
+            let clip1 = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xC1), close: {})
+            expect(tA != nil && waited1 && early1 == nil && woke1 && w1.value == .dropped && clip1 == nil,
+                   "prc r7 broker: a channel waiting on a pending id is let go as dropped when the takeover is discarded, and is not admitted")
+            // Lost to a newer takeover.
+            let w2 = R7Box(), g2 = DispatchGroup()
+            let rX = b.reserve(authSession: id(0xD1), resume: nil)
+            let rY = b.reserve(authSession: id(0xE1), resume: nil)
+            let waited2 = waiter(id(0xD1), w2, g2)
+            let tY = rY.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xE), authSession: id(0xE1), resume: nil,
+                                          reservation: $0, close: {}) }
+            usleep(100_000)
+            let stillWaiting = b.waitingForTest == 1 && w2.value == nil
+            let tX = rX.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xD), authSession: id(0xD1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let woke2 = g2.wait(timeout: .now() + 1) == .success
+            expect(waited2 && tY != nil && stillWaiting && tX == nil && woke2 && w2.value == .dropped,
+                   "prc r7 broker: a channel waiting on a takeover that loses to a newer one is let go as dropped")
+            // Admitted.
+            let w3 = R7Box(), g3 = DispatchGroup()
+            let rZ = b.reserve(authSession: id(0xF1), resume: nil)
+            let waited3 = waiter(id(0xF1), w3, g3)
+            let tZ = rZ.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: key(0xF), authSession: id(0xF1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let woke3 = g3.wait(timeout: .now() + 1) == .success
+            let clip3 = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xF1), close: {})
+            expect(waited3 && tZ != nil && woke3 && w3.value == .admitted && clip3 != nil && b.awaitPending(id(0xF1)) == .none,
+                   "prc r7 broker: a channel waiting on a takeover that is admitted goes on and is admitted")
+            for t in [tZ, clip3] { if let t { b.end(t) } }
+        }
+
+        // PR-C r7 end to end: a clipboard / file connection authenticated
+        // with a pending id while the takeover's OK is held.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let fake = FakeClipboard(text: nil)
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: fake, authGate: gate, sessionBroker: broker)
+            // The first control OK after `hold.arm()` is held until `go`, then
+            // fails while `failHeld` is set, else goes out.
+            let hold = R7Hold(), go = R6Count(), failHeld = R6Count()
+            s.failAuthOKForTest = { ok in
+                guard ok.channel == .control, hold.take(ok.sessionID) else { return false }
+                let until = Date().addingTimeInterval(3)
+                while go.value == 0 && Date() < until { usleep(2_000) }
+                return failHeld.value > 0
+            }
+            /// Connects and sends the RESPONSE for `channel`; the result is left unread.
+            func startAuth(_ channel: ConnAuth.Channel, resume: [UInt8]?) -> MRC1Client? {
+                guard let c = MRC1Client(port: p), let ch = c.receive(timeout: 2),
+                      let challenge = ConnAuth.Challenge.decode(ch.payload),
+                      let key = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations)
+                else { return nil }
+                let cn = ConnAuth.random(ConnAuth.nonceBytes)
+                let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel,
+                                             hostID: challenge.hostID, resume: resume)
+                guard c.send(type: ConnAuth.MsgType.response,
+                             payload: ConnAuth.Response(clientNonce: cn, mac: mac, resume: resume).payload) else { return nil }
+                return c
+            }
+            func heldID() -> [UInt8]? {
+                let until = Date().addingTimeInterval(2)
+                while hold.id == nil && Date() < until { usleep(2_000) }
+                return hold.id
+            }
+            func waitsNow() -> Bool {
+                let until = Date().addingTimeInterval(2)
+                while broker.waitingForTest == 0 && Date() < until { usleep(2_000) }
+                return broker.waitingForTest == 1
+            }
+            func result(_ c: MRC1Client?) -> ConnAuth.Result? {
+                c?.receive(timeout: 2).flatMap { ConnAuth.Result.decode($0.payload) }
+            }
+            /// REPLACED, then the host's FIN (what the viewer sends after it is dropped unread).
+            func closedUnused(_ c: MRC1Client?, sending messages: [(UInt8, [UInt8])]) -> Bool {
+                guard let c, result(c) == .replaced else { return false }
+                for (type, payload) in messages { _ = c.send(type: type, payload: payload) }
+                return c.receive(timeout: 2) == nil
+            }
+            func clipboardUntouched(_ base: FakeClipboard.Counts) -> Bool {
+                let now = fake.counts
+                return now.changeCountReads == base.changeCountReads && now.textReads == base.textReads
+                    && fake.writes.isEmpty && s.clipboardReceived == 0
+            }
+            if (try? s.start()) != nil {
+                let a = login(p, password: password, channel: .control)
+                if case .ok = a.result {
+                    let (sessionA, genA) = broker.current
+                    // 1. Clipboard waiting, then the takeover's OK fails.
+                    let base = fake.counts
+                    hold.arm(); failHeld.hit(); go.reset()
+                    let b = startAuth(.control, resume: nil)
+                    let clip = heldID().flatMap { startAuth(.clipboard, resume: $0) }
+                    let waited = waitsNow()
+                    go.hit()
+                    let bNoOK = result(b) == nil
+                    let clipClosed = closedUnused(clip, sending: [(0x30, []), (0x31, Array("r7 dropped".utf8))])
+                    let aHolds = broker.current.0 == sessionA && broker.current.1 == genA && pong(a.client)
+                    expect(waited && bNoOK && clipClosed && clipboardUntouched(base) && aHolds && broker.waitingForTest == 0,
+                           "prc r7 clipboard waiting, then the AUTH_OK send fails (e2e): the clipboard channel is closed, no clipboard data was handled, the live viewer stays")
+                    b?.close(); clip?.close()
+                    // 2. File waiting, then the takeover loses to a newer one.
+                    let files = s.fileSessions
+                    hold.arm(); failHeld.reset(); go.reset()
+                    let c = startAuth(.control, resume: nil)
+                    let file = heldID().flatMap { startAuth(.file, resume: $0) }
+                    let waited2 = waitsNow()
+                    let d = login(p, password: password, channel: .control)
+                    var dOK = false
+                    if case .ok? = d.result { dOK = true }
+                    usleep(100_000)
+                    let stillWaiting = broker.waitingForTest == 1
+                    go.hit()
+                    let fileClosed = closedUnused(file, sending: [(FileProto.MsgType.hello, [1, 0, 0, 0, 0])])
+                    expect(waited2 && dOK && stillWaiting && fileClosed && s.fileSessions == files && pong(d.client)
+                               && broker.waitingForTest == 0,
+                           "prc r7 file waiting, then the takeover loses to a newer one (e2e): the file channel is closed, no file session was started, the newer viewer holds the session")
+                    c?.close(); file?.close()
+                    // 3. Clipboard waiting, then the takeover is admitted.
+                    hold.arm(); failHeld.reset(); go.reset()
+                    let e = startAuth(.control, resume: nil)
+                    let clip3 = heldID().flatMap { startAuth(.clipboard, resume: $0) }
+                    let waited3 = waitsNow()
+                    let clipEarly = clip3?.receive(timeout: 0.2) == nil
+                    go.hit()
+                    var eOK = false, clipOK = false
+                    if case .ok? = result(e) { eOK = true }
+                    if case .ok? = result(clip3) { clipOK = true }
+                    // The clipboard session runs: a text sent on it reaches the pasteboard.
+                    _ = clip3?.send(type: 0x30, payload: [])
+                    _ = clip3?.send(type: 0x31, payload: Array("r7 admitted".utf8))
+                    let until = Date().addingTimeInterval(2)
+                    while !fake.writes.contains("r7 admitted") && Date() < until { usleep(5_000) }
+                    expect(waited3 && clipEarly && eOK && clipOK && fake.writes == ["r7 admitted"] && pong(e),
+                           "prc r7 (e2e): a clipboard channel waiting on the takeover gets its OK only once the takeover is admitted, then its clipboard data is handled")
+                    e?.close(); clip3?.close(); d.client?.close()
+                } else {
+                    expect(false, "prc r7 (e2e): first login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r7: listener starts")
+            }
+        }
+
         for (type, what) in [(UInt8(0x10), "KEY"), (0x60, "FORCE_QUIT"), (0x30, "CLIPBOARD_HELLO"), (0x50, "FILE_HELLO"), (0x01, "PING")] {
             guard case let (s, p)? = server(.password(whitelist: [me]), secret: secret) else { expect(false, "e2e: listener"); continue }
             let c = MRC1Client(port: p)
             let ch = c?.receive(timeout: 2)
-            _ = c?.send(type: type, payload: type == 0x01 ? [1, 2, 3, 4] : [0, 0, 0])
+            // r3 (item 4): each first message as a real 0.3.x viewer sends it;
+            // FORCE_QUIT_OPEN and CLIPBOARD_HELLO carry no payload.
+            let legacy: [UInt8] = type == 0x01 ? [1, 2, 3, 4] : (type == 0x60 || type == 0x30) ? [] : [0, 0, 0]
+            _ = c?.send(type: type, payload: legacy)
             let r = c?.receive(timeout: 2)
             expect(ch?.type == ConnAuth.MsgType.challenge && r?.type == ConnAuth.MsgType.result
                    && r.flatMap({ ConnAuth.Result.decode($0.payload) }) == .authRequired && c?.receive(timeout: 1) == nil,
                    "e2e: \(what) before AUTH gets AUTH_REQUIRED and is closed")
+            s.stop()
+        }
+
+        // r2 (item 8): a 0.3.x viewer reconnecting in a loop is not counted
+        // and so never locks its address out.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            var answers = 0
+            for _ in 0..<12 {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                _ = c?.send(type: 0x01, payload: [1, 2, 3, 4])
+                if c?.receive(timeout: 2).flatMap({ ConnAuth.Result.decode($0.payload) }) == .authRequired { answers += 1 }
+            }
+            expect(answers == 12 && s.authFailures == 0 && s.oldViewersUncounted == 12,
+                   "e2e: 12 old-viewer attempts all get AUTH_REQUIRED, none counted")
+            if case .ok = login(p, password: password, channel: .control).result {
+                expect(true, "e2e: after them the right password still gets ok (not locked)")
+            } else {
+                expect(false, "e2e: after them the right password still gets ok (not locked)")
+            }
+            s.stop()
+        }
+
+        // r2 (item 8): refusal log lines are throttled per event and peer.
+        final class Lines: @unchecked Sendable { var t: TimeInterval = 50; var out: [String] = [] }
+        let l = Lines()
+        let throttle = AuthLogThrottle(now: { l.t }, write: { l.out.append($0) })
+        for _ in 0..<140 { throttle.log("auth.locked", peer: "100.64.0.5", "auth.locked peer=100.64.0.5") }
+        throttle.log("auth.locked", peer: "100.64.0.6", "auth.locked peer=100.64.0.6")
+        expect(l.out == ["auth.locked peer=100.64.0.5", "auth.locked peer=100.64.0.6"] && throttle.suppressed == 139,
+               "log: 140 refusals in 10 s log one line per peer")
+        l.t += 10
+        throttle.log("auth.locked", peer: "100.64.0.5", "auth.locked peer=100.64.0.5")
+        expect(l.out.last == "auth.locked peer=100.64.0.5 suppressed=139", "log: the next line after 10 s says how many were left out")
+
+        // r3 (item 4): the throttle table stays at 1024 keys even when 3000
+        // peers arrive within one window; new peers share one overflow line.
+        let flood = Lines()
+        let capped = AuthLogThrottle(now: { flood.t }, write: { flood.out.append($0) })
+        for i in 0..<3000 { capped.log("auth.no_response", peer: "100.64.\(i / 256).\(i % 256)", "auth.no_response peer=\(i)") }
+        let overflowLines = flood.out.filter { $0.hasPrefix("auth.overflow ") }.count
+        expect(capped.keyCount <= AuthLogThrottle.maxKeys && flood.out.count == AuthLogThrottle.maxKeys && overflowLines == 1,
+               "log: 3000 peers in 10 s keep the table at \(AuthLogThrottle.maxKeys) keys (\(capped.keyCount)) with one overflow line")
+        flood.t += 10
+        capped.log("auth.no_response", peer: "100.99.0.1", "auth.no_response peer=late")
+        expect(capped.keyCount <= AuthLogThrottle.maxKeys && flood.out.last == "auth.no_response peer=late",
+               "log: after 10 s expired keys make room again")
+
+        // r3 (item 4): only a real 0.3.x header is exempt. A wrong length
+        // for PING, an unknown type or non-MRC1 bytes count a failure.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            var fails: [ConnAuth.Result?] = []
+            for raw in [[0x4d, 0x52, 0x43, 0x31, 1, 0x01, 0, 2, 9, 9] as [UInt8],
+                        [0x4d, 0x52, 0x43, 0x31, 1, 0x7e, 0, 0],
+                        Array("GET / HTTP/1.1\r\n\r\n".utf8)] {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                _ = c?.sendRaw(raw)
+                fails.append(c?.receive(timeout: 2).flatMap { ConnAuth.Result.decode($0.payload) })
+                c?.close()
+            }
+            expect(fails == [.fail(triesLeft: 4), .fail(triesLeft: 3), .fail(triesLeft: 2)]
+                   && s.authFailures == 3 && s.oldViewersUncounted == 0,
+                   "e2e: malformed headers are counted, not exempt as old viewers (\(fails))")
+            s.stop()
+        }
+
+        // r3 (item 4): a viewer that closes before answering, in a loop,
+        // logs one auth.no_response line per window.
+        if case let (s, p)? = server(.password(whitelist: [me]), secret: secret) {
+            for _ in 0..<6 {
+                let c = MRC1Client(port: p)
+                _ = c?.receive(timeout: 2)
+                c?.close()
+            }
+            expect(settle { s.authLog.suppressed >= 5 } && s.authFailures == 0,
+                   "e2e: 6 closes before answering log one no_response line (suppressed=\(s.authLog.suppressed))")
             s.stop()
         }
 
@@ -2097,6 +2690,38 @@ extension AuthSelfTest {
 }
 
 /// r10 self-test: set once, from any thread.
+/// r6 self-test: a thread-safe count.
+final class R6Count: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func hit() { lock.lock(); n += 1; lock.unlock() }
+    func reset() { lock.lock(); n = 0; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+}
+
+/// r7 self-test: one `awaitPending` result, from any thread.
+final class R7Box: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: SessionBroker.PendingWait?
+    func set(_ x: SessionBroker.PendingWait) { lock.lock(); v = x; lock.unlock() }
+    var value: SessionBroker.PendingWait? { lock.lock(); defer { lock.unlock() }; return v }
+}
+
+/// r7 self-test: picks the first control AUTH_OK after `arm` (its session id).
+final class R7Hold: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var held: [UInt8]?
+    func arm() { lock.lock(); armed = true; held = nil; lock.unlock() }
+    func take(_ sessionID: [UInt8]) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard armed else { return false }
+        armed = false; held = sessionID
+        return true
+    }
+    var id: [UInt8]? { lock.lock(); defer { lock.unlock() }; return held }
+}
+
 final class R10Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var v: UInt64?

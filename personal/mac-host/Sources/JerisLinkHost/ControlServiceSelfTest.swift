@@ -1347,6 +1347,8 @@ final class MRC1Client {
     private var fd: Int32
     /// r9: the host closed the connection (a read saw EOF).
     private(set) var sawEOF = false
+    /// r3: that close was a reset (RST), not a FIN.
+    private(set) var sawReset = false
 
     /// `receiveBuffer` (r9): a small SO_RCVBUF, set before connecting, so a
     /// test viewer that stops reading holds the host's sends back.
@@ -1424,6 +1426,7 @@ final class MRC1Client {
             let n = out.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: off), count - off, 0) }
             // r10: a reset (the host's SO_LINGER 0 close) is a close too.
             if n == 0 || (n < 0 && errno == ECONNRESET) { sawEOF = true }
+            if n < 0 && errno == ECONNRESET { sawReset = true }
             if n <= 0 { return nil }
             off += n
         }
