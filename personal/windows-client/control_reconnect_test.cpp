@@ -2342,11 +2342,53 @@ void prcR5DiscardNoticeTest() {
     setCurrent(nullptr);
 }
 
+// PR-C r6 (Pepper's r5 review, side note): stop() while the worker is
+// half way through reading the ACK (3 of its 8 header bytes arrived, the
+// rest never does) ends the read at once and joins the worker.
+void prcR6StopMidAckTest() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    std::atomic<bool> started{false}, partSent{false}, release{false};
+    control.setBeforeRenegotiateForTest([&] { started = true; });
+    std::vector<std::pair<uint8_t, Bytes>> req;
+    std::thread host([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        hostAuth(s, sec, Answer::Ok, 50);
+        req = readFrames(s, 1, 3000);
+        const uint8_t head[3] = {'M', 'R', 'C'};
+        partSent = sendAllBytes(s, Bytes(head, head + sizeof(head)));
+        while (!release) Sleep(10);  // the rest of the ACK never comes
+        closesocket(s);
+    });
+    control.keepSession();
+    for (int i = 0; i < 500 && !partSent; ++i) Sleep(10);
+    Sleep(100);  // the worker holds 3 bytes and waits for the other 5
+    const double joinMs = control.stop();
+    release = true;
+    host.join();
+    expect(started && partSent && req.size() == 1 && joinMs >= 0 && joinMs < 300 && terminals == 0,
+           "prc r6 renegotiate: stop() half way through the ACK joins at once (" + std::to_string(joinMs) + " ms)");
+    setCurrent(nullptr);
+}
+
 void prcR5Tests() {
     prcR5RenegotiateTest();
     prcR5ReplacedInsteadOfAckTest();
     prcR5StopDuringRenegotiateTest();
     prcR5DiscardNoticeTest();
+    prcR6StopMidAckTest();
 }
 }  // namespace
 

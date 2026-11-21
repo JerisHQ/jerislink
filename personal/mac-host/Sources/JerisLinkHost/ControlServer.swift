@@ -73,6 +73,10 @@ final class ControlServer: @unchecked Sendable {
     /// so a test can land a block between handling a request and its reply.
     /// Set before start(); nil in the app.
     var beforeCheckedSend: (@Sendable (UInt8) -> Void)?
+    /// r6, self-test only: true makes this AUTH_OK fail as a send to a
+    /// viewer that went away would (nothing is written). Set before start();
+    /// nil in the app.
+    var failAuthOKForTest: (@Sendable (ConnAuth.Channel) -> Bool)?
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
@@ -471,28 +475,53 @@ final class ControlServer: @unchecked Sendable {
             // control channel then tells the viewer it was replaced, so it stops
             // reconnecting instead of taking the session back.
             let kick = KickHandle(fd, wake: authChannel == .control)
-            // r4: the reconnect check again, now atomically with taking the
-            // session (an AUTH may have finished since `authenticate`).
-            guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
-                                                  authSession: authChannel == .control ? authOK?.sessionID : nil,
-                                                  resume: authOK?.resume, close: { kick.kick() }) else {
+            /// REPLACED and close: a refused reconnect, or (r6) a takeover
+            /// that lost to a newer one while its OK went out.
+            func refuse(stage: String, lost: Bool) {
                 kick.finish()
-                lock.lock(); resumesRefused += 1; lock.unlock()
+                if !lost { lock.lock(); resumesRefused += 1; lock.unlock() }
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
-                authLog.log("auth.resume_refused", peer: peer.ip,
-                            "auth.resume_refused peer=\(peer.ip) chan=\(authChannel?.name ?? "open") stage=admit sent=\(sent ? 1 : 0) counted=0")
+                let what = lost ? "auth.replaced_late" : "auth.resume_refused"
+                authLog.log(what, peer: peer.ip,
+                            "\(what) peer=\(peer.ip) chan=\(authChannel?.name ?? "open") stage=\(stage) sent=\(sent ? 1 : 0) counted=0")
                 if sent {
                     Darwin.shutdown(fd, SHUT_WR)
                     KickHandle.drainAfterNotice(fd)
                 }
+            }
+            // r6 (Pepper's r5 review): a password-mode control AUTH takes
+            // over only after its OK went out. Until then its id is pending
+            // (`reserve`): a clipboard or file AUTH naming it right after OK is
+            // let in (r5 item 2), but the live viewer, its video and the ids
+            // it may reconnect with stay as they are. OK not sent: the
+            // pending id is dropped and nothing else changes.
+            var reservation: UInt64?
+            if let authOK, authChannel == .control, sessionBroker.passwordMode {
+                guard let r = sessionBroker.reserve(authSession: authOK.sessionID, resume: authOK.resume) else {
+                    refuse(stage: "reserve", lost: false)
+                    return
+                }
+                guard sendAuthOK(fd, peerIP: peer.ip, authOK) else {
+                    sessionBroker.discard(r)
+                    kick.finish()
+                    print("auth.ok_unsent peer=\(peer.ip) chan=control; pending session dropped, live viewer kept")
+                    return
+                }
+                reservation = r
+            }
+            // r4: the reconnect check again, now atomically with taking the
+            // session (an AUTH may have finished since `authenticate`).
+            guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
+                                                  authSession: authChannel == .control ? authOK?.sessionID : nil,
+                                                  resume: authOK?.resume, reservation: reservation,
+                                                  close: { kick.kick() }) else {
+                refuse(stage: "admit", lost: reservation != nil)
                 return
             }
-            // r5 (Pepper's r4 review, item 2): OK only now, with the session in
-            // the broker. Before r5 OK went first, and a clipboard or file
-            // AUTH naming the new id in that gap was refused as REPLACED.
-            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) {
-                // The viewer never learned this session id: undo it.
-                sessionBroker.end(token, abandoned: true)
+            // Other channels: OK once the connection is in the broker. A
+            // failed OK only ends this connection (it holds no session id).
+            if reservation == nil, let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) {
+                sessionBroker.end(token)
                 kick.finish()
                 return
             }
@@ -1366,6 +1395,7 @@ final class ControlServer: @unchecked Sendable {
     /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
     /// the first frame of an admitted session: it asks too.
     private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
+        if let fail = failAuthOKForTest, fail(ok.channel) { return false }
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
                           payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload) == .sent else { return false }
         print("auth.ok peer=\(ip) chan=\(ok.channel.name) session=\(ConnAuth.hex(ok.sessionID))")

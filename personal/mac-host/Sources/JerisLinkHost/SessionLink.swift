@@ -117,9 +117,6 @@ final class SessionBroker: @unchecked Sendable {
         /// r4: the AUTH_RESULT session_id of this connection (password mode).
         var authSession: [UInt8]?
         var close: @Sendable () -> Void
-        /// r5: what `accepted` was before this control connection set it, so
-        /// an admit whose AUTH_OK never reached the viewer can be undone.
-        var acceptedBefore: [[UInt8]]? = nil
     }
 
     let passwordMode: Bool
@@ -145,6 +142,16 @@ final class SessionBroker: @unchecked Sendable {
     /// named it (the same viewer reconnecting; another of its channels may
     /// still name the older id). Empty: no control AUTH since this start.
     private var accepted: [[UInt8]] = []
+    /// r6 (Pepper's r5 review): control AUTHs whose AUTH_OK is on its way,
+    /// by reservation. Their ids already count for `resumeRefused` (the
+    /// viewer's other channels may name one right after OK), but nothing
+    /// else changes until `admit(reservation:)`: the live viewer keeps the
+    /// session, and `discard` (OK not sent) leaves no trace.
+    private var pendingIDs: [UInt64: [UInt8]] = [:]
+    private var nextReservation: UInt64 = 0
+    /// The newest reservation admitted. An older one admitted later lost
+    /// to a newer AUTH (reservation order is AUTH order).
+    private var admittedReservation: UInt64 = 0
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
@@ -192,7 +199,29 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        !accepted.isEmpty && !accepted.contains(resume)
+        !accepted.isEmpty && !accepted.contains(resume) && !pendingIDs.values.contains(resume)
+    }
+
+    /// r6: a control AUTH (password mode) before its AUTH_OK goes out. nil:
+    /// refused (`resumeRefused`). Otherwise the reservation for
+    /// `admit(reservation:)` once OK was sent, or `discard` if it was not.
+    /// Nothing is kicked and the session does not change here.
+    func reserve(authSession: [UInt8], resume: [UInt8]?) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        if passwordMode, let resume, refusedLocked(resume) {
+            resumeRefusedCount &+= 1
+            return nil
+        }
+        nextReservation &+= 1
+        pendingIDs[nextReservation] = authSession
+        return nextReservation
+    }
+
+    /// r6: the AUTH_OK of `reservation` was not sent. Its id is dropped;
+    /// the live viewer, the session and the ids a reconnect may name stay
+    /// as they were.
+    func discard(_ reservation: UInt64) {
+        lock.lock(); pendingIDs.removeValue(forKey: reservation); lock.unlock()
     }
 
     /// One admitted connection. Password mode: only the control channel,
@@ -204,21 +233,34 @@ final class SessionBroker: @unchecked Sendable {
 
     /// `begin` with the AUTH session_id and the session a reconnect names.
     /// nil: refused (`resumeRefused`, checked again here under the lock so
-    /// no AUTH can come in between); nothing changed and nothing is kicked.
+    /// no AUTH can come in between), or (r6) `reservation` lost to a newer
+    /// control AUTH; nothing changed and nothing is kicked. `reservation`:
+    /// from `reserve`, after this connection's AUTH_OK went out.
     func admit(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
-               resume: [UInt8]?, close: @escaping @Sendable () -> Void) -> UInt64? {
+               resume: [UInt8]?, reservation: UInt64? = nil, close: @escaping @Sendable () -> Void) -> UInt64? {
         var kicked: [Entry] = []
         // r2 (Pepper's PR-C review, item 1): the change and its listeners
         // run under `orderLock`, so two changes never reach the listeners
         // (and the session link's serial send queue) in the other order.
         orderLock.lock()
         lock.lock()
+        if let reservation {
+            let held = pendingIDs.removeValue(forKey: reservation)
+            if held == nil || reservation < admittedReservation {
+                replacedCount &+= 1
+                lock.unlock()
+                orderLock.unlock()
+                log("auth.replaced chan=\(channel?.name ?? "open") peer=\(peerIP) stage=admit; a newer AUTH took the session first")
+                return nil
+            }
+        }
         if passwordMode, let resume, refusedLocked(resume) {
             resumeRefusedCount &+= 1
             lock.unlock()
             orderLock.unlock()
             return nil
         }
+        if let reservation { admittedReservation = reservation }
         nextToken &+= 1
         let token = nextToken
         if passwordMode && channel == .control {
@@ -226,12 +268,11 @@ final class SessionBroker: @unchecked Sendable {
             kicked = entries.filter { $0.channel == .control || $0.peerIP != peerIP }
             entries.removeAll { e in kicked.contains { $0.token == e.token } }
         }
-        var entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
+        let entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
                           authSession: authSession, close: close)
         if passwordMode && channel == .control, let authSession {
             // r5: the newest session; the one before it stays valid only for
             // the same viewer's own reconnect (which named it).
-            entry.acceptedBefore = accepted
             let chained = resume != nil && accepted.first == resume
             accepted = chained ? [authSession, resume!] : [authSession]
         }
@@ -251,16 +292,9 @@ final class SessionBroker: @unchecked Sendable {
         return token
     }
 
-    /// `abandoned` (r5): the viewer never got this connection's AUTH_OK, so it
-    /// does not know the session id: the ids a reconnect may name go back to
-    /// what they were, unless a newer control AUTH has set them since.
-    func end(_ token: UInt64, abandoned: Bool = false) {
+    func end(_ token: UInt64) {
         orderLock.lock()
         lock.lock()
-        if abandoned, let e = entries.first(where: { $0.token == token }), let before = e.acceptedBefore,
-           let id = e.authSession, accepted.first == id {
-            accepted = before
-        }
         entries.removeAll { $0.token == token }
         let change = recomputeLocked()
         lock.unlock()

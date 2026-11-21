@@ -562,12 +562,11 @@ enum AuthSelfTest {
                 expect(false, "prc r5: listener starts")
             }
         }
-        // Item 1 (broker): the accepted ids, and an admit whose OK was never
-        // sent undone.
+        // Item 1 (broker): the accepted ids.
         do {
             let b = SessionBroker(passwordMode: true, log: { _ in })
             let idA: [UInt8] = [1, 1, 1, 1, 1, 1, 1, 1], idB: [UInt8] = [2, 2, 2, 2, 2, 2, 2, 2]
-            let idB2: [UInt8] = [4, 4, 4, 4, 4, 4, 4, 4], idC: [UInt8] = [5, 5, 5, 5, 5, 5, 5, 5]
+            let idB2: [UInt8] = [4, 4, 4, 4, 4, 4, 4, 4]
             let tA = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 1, count: 32), authSession: idA,
                              resume: nil, close: {})
             let tB = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 2, count: 32), authSession: idB,
@@ -580,12 +579,130 @@ enum AuthSelfTest {
                               resume: idB, close: {})
             expect(tB2 != nil && !b.resumeRefused(idB2) && !b.resumeRefused(idB) && b.resumeRefused(idA),
                    "prc r5 broker: the same viewer's reconnect keeps its previous id valid for its other channels")
-            let tC = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 4, count: 32), authSession: idC,
-                             resume: nil, close: {})
-            if let tC { b.end(tC, abandoned: true) }
-            expect(!b.resumeRefused(idB2) && b.resumeRefused(idC),
-                   "prc r5 broker: an admit whose OK never went out is undone (the ids before it are valid again)")
             if let tB2 { b.end(tB2) }
+        }
+
+        // PR-C r6 (Pepper's r5 review): a control takeover is pending until
+        // its AUTH_OK went out; a failed OK leaves the live viewer untouched.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+            let keyA = [UInt8](repeating: 0xA, count: 32), keyE = [UInt8](repeating: 0xE, count: 32)
+            let closedA = R6Count()
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: keyA, authSession: id(0xA1), resume: nil,
+                             close: { closedA.hit() })
+            let genA = b.current.1
+            func aUntouched() -> Bool {
+                let (now, gen) = b.current
+                return tA != nil && closedA.value == 0 && gen == genA && now?.sessionKey == keyA && !b.resumeRefused(id(0xA1))
+            }
+            // Single failed send.
+            let r1 = b.reserve(authSession: id(0xC1), resume: id(0xA1))
+            expect(r1 != nil && !b.resumeRefused(id(0xC1)) && aUntouched(),
+                   "prc r6 broker: a pending takeover's id is let in for its other channels; the live viewer keeps the session meanwhile")
+            if let r1 { b.discard(r1) }
+            expect(aUntouched() && b.resumeRefused(id(0xC1)),
+                   "prc r6 single failed send: the live viewer is not kicked, its session and id stay; the unsent id is refused")
+            // Two takeovers overlap and both sends fail (either order).
+            let r2 = b.reserve(authSession: id(0xC2), resume: nil)
+            let r3 = b.reserve(authSession: id(0xC3), resume: id(0xA1))
+            if let r3 { b.discard(r3) }
+            if let r2 { b.discard(r2) }
+            expect(r2 != nil && r3 != nil && aUntouched() && b.resumeRefused(id(0xC2)) && b.resumeRefused(id(0xC3)) &&
+                       b.replaced == 0,
+                   "prc r6 overlapping failed sends: the live viewer stays connected and no id that never went out becomes valid")
+            // Overlapping takeovers whose OKs went out: the newer AUTH wins
+            // whichever is admitted first.
+            let r4 = b.reserve(authSession: id(0xD1), resume: nil)
+            let r5 = b.reserve(authSession: id(0xE1), resume: nil)
+            let tE = r5.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: keyE, authSession: id(0xE1), resume: nil,
+                                          reservation: $0, close: {}) }
+            let tD = r4.flatMap { b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 0xD, count: 32),
+                                          authSession: id(0xD1), resume: nil, reservation: $0, close: {}) }
+            expect(tE != nil && tD == nil && closedA.value == 1 && b.current.0?.sessionKey == keyE &&
+                       b.resumeRefused(id(0xD1)) && b.resumeRefused(id(0xA1)) && !b.resumeRefused(id(0xE1)),
+                   "prc r6 broker: of two takeovers whose OK went out, the newer AUTH holds the session; the older one admitted late is refused")
+            if let tE { b.end(tE) }
+        }
+
+        // PR-C r6 end to end: the control AUTH_OK of a takeover fails (once,
+        // then twice at the same time); the viewer holding the session stays.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            // `failing` OKs fail, each held until all of them are pending at
+            // once (two takeovers overlap for sure).
+            let failing = R6Count(), arrived = R6Count()
+            s.failAuthOKForTest = { channel in
+                guard channel == .control, failing.value > 0 else { return false }
+                arrived.hit()
+                let until = Date().addingTimeInterval(2)
+                while arrived.value < failing.value && Date() < until { usleep(5_000) }
+                return true
+            }
+            /// `n` control logins whose RESPONSEs all go out before any result is read.
+            func loginsAtOnce(_ n: Int) -> [ConnAuth.Result?] {
+                var open: [(MRC1Client, ConnAuth.Challenge, [UInt8])] = []
+                for _ in 0..<n {
+                    guard let c = MRC1Client(port: p), let ch = c.receive(timeout: 2),
+                          let challenge = ConnAuth.Challenge.decode(ch.payload),
+                          let key = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations)
+                    else { return [] }
+                    open.append((c, challenge, key))
+                }
+                for (c, challenge, key) in open {
+                    let cn = ConnAuth.random(ConnAuth.nonceBytes)
+                    let mac = ConnAuth.macClient(key: key, hostNonce: challenge.hostNonce, clientNonce: cn, channel: .control,
+                                                 hostID: challenge.hostID, resume: nil)
+                    _ = c.send(type: ConnAuth.MsgType.response, payload: ConnAuth.Response(clientNonce: cn, mac: mac, resume: nil).payload)
+                }
+                defer { open.forEach { $0.0.close() } }
+                return open.map { o in o.0.receive(timeout: 3).flatMap { ConnAuth.Result.decode($0.payload) } }
+            }
+            if (try? s.start()) != nil {
+                let a = login(p, password: password, channel: .control)
+                if case .ok(_, let idA)? = a.result {
+                    let (sessionA, genA) = broker.current
+                    func aHolds() -> Bool {
+                        let (now, gen) = broker.current
+                        return gen == genA && now == sessionA && pong(a.client) && broker.replaced == 0
+                    }
+                    failing.hit()
+                    let one = loginsAtOnce(1)
+                    expect(one.count == 1 && one[0] == nil && arrived.value == 1 && aHolds(),
+                           "prc r6 single failed send (e2e): no OK, and the viewer holding the session is still connected (PING answered, same session)")
+                    arrived.reset()
+                    failing.hit()
+                    let two = loginsAtOnce(2)
+                    expect(two.count == 2 && two.allSatisfy { $0 == nil } && arrived.value == 2 && aHolds(),
+                           "prc r6 overlapping failed sends (e2e): both pending at once, neither gets OK, the viewer holding the session is still connected")
+                    let clip = login(p, password: password, channel: .clipboard, resume: idA)
+                    if case .ok? = clip.result { expect(true, "prc r6 (e2e): the live viewer's id is still let in for its other channels") }
+                    else { expect(false, "prc r6 (e2e): the live viewer's id is still let in for its other channels") }
+                    clip.client?.close()
+                    failing.reset()
+                    let fresh = login(p, password: password, channel: .control)
+                    let notice = a.client?.receive(timeout: 2)
+                    if case .ok? = fresh.result {
+                        expect(pong(fresh.client) && notice.map { ConnAuth.Result.decode($0.payload) == .replaced } == true,
+                               "prc r6 (e2e): once OK goes out, the takeover holds the session and the old viewer is told it was replaced")
+                    } else {
+                        expect(false, "prc r6 (e2e): once OK goes out, the takeover holds the session and the old viewer is told it was replaced")
+                    }
+                    fresh.client?.close()
+                } else {
+                    expect(false, "prc r6 (e2e): first login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r6: listener starts")
+            }
         }
 
         for (type, what) in [(UInt8(0x10), "KEY"), (0x60, "FORCE_QUIT"), (0x30, "CLIPBOARD_HELLO"), (0x50, "FILE_HELLO"), (0x01, "PING")] {
@@ -2402,6 +2519,15 @@ extension AuthSelfTest {
 }
 
 /// r10 self-test: set once, from any thread.
+/// r6 self-test: a thread-safe count.
+final class R6Count: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func hit() { lock.lock(); n += 1; lock.unlock() }
+    func reset() { lock.lock(); n = 0; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+}
+
 final class R10Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var v: UInt64?
