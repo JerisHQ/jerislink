@@ -822,12 +822,15 @@ enum AuthSelfTest {
                     let clip = login(p, password: password, channel: .clipboard, resume: idA)
                     let file = login(p, password: password, channel: .file, resume: idA)
                     _ = clip.client?.send(type: 0x30, payload: [])
-                    _ = file.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0, 0, 0])
+                    _ = file.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0])   // FILE_HELLO is 3 bytes
                     let fileAck = file.client?.receive(timeout: 2)?.type == FileProto.MsgType.helloAck
                     // Both channels work before the takeover (Mac -> viewer and viewer -> Mac).
                     _ = clip.client?.send(type: 0x31, payload: Array("r10 before".utf8))
                     var until = Date().addingTimeInterval(2)
                     while !fake.writes.contains("r10 before") && Date() < until { usleep(5_000) }
+                    // Let the clipboard loop poll after the write, so the next copy is a change it sees.
+                    let polls = fake.counts.changeCountReads
+                    _ = settle { fake.counts.changeCountReads >= polls + 2 }
                     fake.localCopy("r10 mac before")
                     var sawBefore = false
                     until = Date().addingTimeInterval(2)
@@ -844,7 +847,7 @@ enum AuthSelfTest {
                     let clipEnd = drain(clip.client, 3)
                     let fileEnd = drain(file.client, 3)
                     let leaked = clipEnd.payloads.contains(Array("r10 mac after".utf8))
-                    print("prc r10 same-ip info: worked_before=\(workedBefore) b_ok=\(bOK) clip_closed=\(clipEnd.closed) clip_frames_after=\(clipEnd.payloads.count) leaked=\(leaked) file_closed=\(fileEnd.closed) file_frames_after=\(fileEnd.payloads.count) writes=\(fake.writes)")
+                    print("prc r10 same-ip info: worked_before=\(workedBefore) file_ack=\(fileAck) mac_copy_before=\(sawBefore) b_ok=\(bOK) clip_closed=\(clipEnd.closed) clip_frames_after=\(clipEnd.payloads.count) leaked=\(leaked) file_closed=\(fileEnd.closed) file_frames_after=\(fileEnd.payloads.count) writes=\(fake.writes)")
                     expect(workedBefore && bOK && clipEnd.closed && fileEnd.closed && !leaked
                                && !fake.writes.contains("r10 stale") && broker.current.0 != nil && pong(b.client),
                            "prc r10 same-IP takeover (e2e): the old viewer's open clipboard and file channels are cut: both closed, the Mac copy made after it does not reach the old viewer, its clipboard text is not applied")
