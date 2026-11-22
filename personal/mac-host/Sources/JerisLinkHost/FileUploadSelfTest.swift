@@ -262,9 +262,9 @@ extension FileUploadSelfTest {
         expect(opened.count == 9 && Set(opened.all) == [primary], "send: Finder opens the folder after every send (\(opened.count))")
         let revealed = DispatchSemaphore(value: 0)
         let hit = OpenedFolders()
-        folder.reveal(transfer: 2) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        folder.reveal(transfer: 2, done: { ok in if ok { hit.add(primary) }; revealed.signal() })
         _ = revealed.wait(timeout: .now() + 3)
-        folder.reveal(transfer: 999) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        folder.reveal(transfer: 999, done: { ok in if ok { hit.add(primary) }; revealed.signal() })
         _ = revealed.wait(timeout: .now() + 3)
         expect(hit.count == 2 && opened.count == 11, "send: REVEAL opens the folder for a known and an unknown transfer")
 
