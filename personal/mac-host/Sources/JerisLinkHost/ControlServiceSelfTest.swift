@@ -953,7 +953,7 @@ enum ControlServiceSelfTest {
         let opened = OpenedFolders()
         let folder = FileSendFolder(primary: base.appendingPathComponent("Downloads/JerisLink", isDirectory: true),
                                     fallback: base.appendingPathComponent("JerisLink Received", isDirectory: true),
-                                    openFolder: { opened.add($0) })
+                                    onMain: FileSendFolder.inline, openFolder: { opened.add($0) })
         let staging = base.appendingPathComponent("staging", isDirectory: true)
         let board = FakeClipboard(text: "before-send")
         let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),
@@ -1347,6 +1347,8 @@ final class MRC1Client {
     private var fd: Int32
     /// r9: the host closed the connection (a read saw EOF).
     private(set) var sawEOF = false
+    /// r3: that close was a reset (RST), not a FIN.
+    private(set) var sawReset = false
 
     /// `receiveBuffer` (r9): a small SO_RCVBUF, set before connecting, so a
     /// test viewer that stops reading holds the host's sends back.
@@ -1424,6 +1426,7 @@ final class MRC1Client {
             let n = out.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: off), count - off, 0) }
             // r10: a reset (the host's SO_LINGER 0 close) is a close too.
             if n == 0 || (n < 0 && errno == ECONNRESET) { sawEOF = true }
+            if n < 0 && errno == ECONNRESET { sawReset = true }
             if n <= 0 { return nil }
             off += n
         }
@@ -1443,6 +1446,22 @@ final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
     private var written: [String] = []
 
     init(text: String?) { self.text = text }
+
+    /// r13: called inside a gated write, before its check (like a write
+    /// queued on the main thread that runs later); "text" or "files".
+    var landHook: (@Sendable (String) -> Void)?
+
+    func writeText(_ value: String, when live: () -> Bool) -> Int? {
+        landHook?("text")
+        guard live() else { return nil }
+        return writeText(value)
+    }
+
+    func writeFileURLs(_ value: [URL], when live: () -> Bool) -> Int? {
+        landHook?("files")
+        guard live() else { return nil }
+        return writeFileURLs(value)
+    }
 
     var counts: Counts { lock.lock(); defer { lock.unlock() }; return c }
     var writes: [String] { lock.lock(); defer { lock.unlock() }; return written }

@@ -19,6 +19,8 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include "control_channel.hpp"
+#include "udp_plan.hpp"
+#include "read_only_session.hpp"
 #include "auth_ui.hpp"
 #include <cstdlib>
 #include <utility>
@@ -42,6 +44,7 @@
 #include "send_to_win.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
+#include "udp_tag.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -152,19 +155,35 @@ public:
         if (event_ != WSA_INVALID_EVENT) WSACloseEvent(event_);
     }
 
+    // PR-C: every MRM1 datagram goes out through here, sealed with the
+    // control session's K_s when the host has a password (udp_tag.hpp).
+    // Sends come from the window, receive and video threads.
+    int sendDatagram(const uint8_t* p, size_t n) {
+        std::lock_guard<std::mutex> g(txM_);
+        return tx_.send(p, n, [&](const uint8_t* b, int len) {
+            return sendto(s_, reinterpret_cast<const char*>(b), len, 0,
+                          reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        });
+    }
+
     // Signalled when an MRM1 datagram (pong, cursor shape) is waiting.
     HANDLE readEvent() const { return event_ == WSA_INVALID_EVENT ? nullptr : event_; }
 
+    // r3 (item 2): a read-only view keeps the channel for video and audio
+    // but sends no pointer moves.
+    void setInputEnabled(bool on) { inputEnabled_ = on; }
+    bool inputEnabled() const { return inputEnabled_; }
+
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
+        if (!inputEnabled_) { ++inputBlocked_; return false; }
         const uint32_t seq = ++sequence_;
         uint8_t p[14]{
             'M','R','M','1', 1, 0x24,
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
             uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)
         };
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++sent_; return true; }
         ++dropped_;
         return false;
@@ -186,8 +205,7 @@ public:
             'M','R','M','1', 1, 0x40,
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)
         };
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++keyframeRequestsSent_; return true; }
         ++keyframeRequestDrops_;
         return false;
@@ -197,8 +215,7 @@ public:
     bool sendNack(uint64_t fid, const std::vector<jl::NackRange>& ranges) {
         if (s_ == INVALID_SOCKET || ranges.empty()) return false;
         const auto p = jl::encodeNack(++sequence_, fid, ranges);
-        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p.data(), p.size());
         if (n == static_cast<int>(p.size())) { ++nackSent_; return true; }
         ++nackDrops_;
         return false;
@@ -213,8 +230,7 @@ public:
         uint8_t p[18]{'M','R','M','1', 1, 0x43,
                       uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)};
         for (int i = 0; i < 8; ++i) p[10 + i] = uint8_t(t >> (56 - 8 * i));
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++pingSent_; return true; }
         return false;
     }
@@ -230,8 +246,7 @@ public:
                       uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
                       uint8_t(enable ? (jl::audio::kRequestEnable | jl::audio::kRequestOpus) : 0x00),
                       uint8_t(port >> 8), uint8_t(port)};
-        const int n = sendto(s_, reinterpret_cast<const char*>(p), sizeof(p), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p, sizeof(p));
         if (n == sizeof(p)) { ++audioRequestsSent_; return true; }
         ++audioRequestDrops_;
         return false;
@@ -244,8 +259,7 @@ public:
     bool sendReceiverReport(const jl::ReceiverReport& r) {
         if (s_ == INVALID_SOCKET) return false;
         const auto p = jl::encodeReceiverReport(++sequence_, r);
-        const int n = sendto(s_, reinterpret_cast<const char*>(p.data()), static_cast<int>(p.size()), 0,
-                             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        const int n = sendDatagram(p.data(), p.size());
         if (n == static_cast<int>(p.size())) { ++reportSent_; return true; }
         ++reportDrops_;
         return false;
@@ -271,13 +285,22 @@ public:
             uint8_t p[64]{};
             sockaddr_in peer{};
             int plen = sizeof(peer);
-            const int n = recvfrom(s_, reinterpret_cast<char*>(p), sizeof(p), 0,
+            int n = recvfrom(s_, reinterpret_cast<char*>(p), sizeof(p), 0,
                                    reinterpret_cast<sockaddr*>(&peer), &plen);
             if (n == SOCKET_ERROR) {
                 const int e = WSAGetLastError();
                 if (e == WSAEWOULDBLOCK) break;
                 ++cursorRxBad_;
                 break;
+            }
+            if (peer.sin_addr.s_addr == remote_.sin_addr.s_addr && peer.sin_port == remote_.sin_port) {
+                // PR-C: tag first; a datagram that fails it is never parsed.
+                const auto v = rx_.open(p, n);
+                if (v != jl::udptag::Verdict::Ok) {
+                    ++udpTagDrops_;
+                    dropLog_.note("mrm1", v, [](const std::string& m) { logLine(m); });
+                    continue;
+                }
             }
             if (peer.sin_addr.s_addr == remote_.sin_addr.s_addr &&
                 peer.sin_port == remote_.sin_port &&
@@ -326,8 +349,17 @@ public:
     uint64_t cursorRx() const { return cursorRx_; }
     uint64_t cursorRxBad() const { return cursorRxBad_; }
     uint64_t cursorRxStale() const { return cursorRxStale_; }
+    uint64_t udpTagDrops() const { return udpTagDrops_; }
+    uint64_t inputBlocked() const { return inputBlocked_; }
 
 private:
+    std::mutex txM_;
+    jl::udptag::View tx_;  // under txM_
+    jl::udptag::View rx_;  // receive loop thread only
+    jl::udptag::DropLog dropLog_;
+    uint64_t udpTagDrops_ = 0;
+    bool inputEnabled_ = true;  // UI thread only
+    uint64_t inputBlocked_ = 0;
     SOCKET s_ = INVALID_SOCKET;
     WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
@@ -676,7 +708,9 @@ static LRESULT CALLBACK ViewerKeyboardHook(int code, WPARAM wParam, LPARAM lPara
 }
 
 static bool sendAbsolutePointer(HWND hwnd, POINT p) {
-    if ((!gControl && !gMouseMoveUdp) || gRemoteWidth == 0 || gRemoteHeight == 0) return false;
+    // r3: a read-only view has the MRM1 channel but sends no pointer moves.
+    const bool udpInput = gMouseMoveUdp && gMouseMoveUdp->inputEnabled();
+    if ((!gControl && !udpInput) || gRemoteWidth == 0 || gRemoteHeight == 0) return false;
     RECT client{};
     GetClientRect(hwnd, &client);
     const int cw = std::max<LONG>(1, client.right - client.left);
@@ -697,7 +731,7 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
     // A click that waits for a control reconnect is queued with this.
     if (gControl) gControl->notePointer(qx, qy);
-    if (gMouseMoveUdp) return gMouseMoveUdp->sendNormalized(qx, qy);
+    if (udpInput) return gMouseMoveUdp->sendNormalized(qx, qy);
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
@@ -5329,10 +5363,18 @@ static constexpr UINT_PTR kLaunchAuthTimer = 0x4A41;
 // Before a session: AUTH on the ping channel, then one PING (design §7). The
 // Client stays current for the session, so every channel reuses K without
 // running PBKDF2 again. A typed password is wiped once K is derived.
-static jl::auth::Report authPreflight(const Options& o, std::wstring password, bool remember) {
+// r15 (Pepper's r14 review, item 1): `intent` says who asked for this
+// attempt. Both callers are the user's own Connect (the launch screen's
+// button, or the user starting the viewer with an address; a relaunch always
+// goes back to the launch screen). That allows one control AUTH without the
+// "auto" flag; every control AUTH after it, the startup retries below and
+// the background reconnects included, carries the flag and never takes over.
+static jl::auth::Report authPreflight(const Options& o, std::wstring password, bool remember,
+                                      jl::auth::LoginIntent intent) {
     jl::auth::Client::Options co;
     co.password = std::move(password);
     co.remember = remember;
+    co.intent = intent;
     // What this host answered before (password or not) carries over to
     // this attempt: a host known to want a password is not probed again.
     co.hostKey = o.sourceIp + ":" + std::to_string(o.controlPort);
@@ -5340,6 +5382,10 @@ static jl::auth::Report authPreflight(const Options& o, std::wstring password, b
     auto client = std::make_shared<jl::auth::Client>(std::move(co));
     jl::auth::wipe(password);
     jl::auth::setCurrent(client);
+    // PR-C: UDP tags follow this attempt. A host known to want a password
+    // takes no untagged UDP until the control channel brings K_s.
+    if (client->mode() == jl::auth::HostMode::Password) jl::udptag::publishPending();
+    else jl::udptag::publishOpen();
     jl::auth::Report rep;
     rep.outcome = jl::auth::Outcome::Network;
     WSADATA wsa{};
@@ -5652,7 +5698,7 @@ static void launchConnect(HWND dlg, const std::string& noPasswordFor = {}) {
     logLine(std::string("launch.auth_check password=") + (password.empty() ? "empty" : "typed") +
             " remember=" + (remember ? "on" : "off"));
     std::thread([dlg, opts = request.options, password = std::move(password), remember]() mutable {
-        const auto rep = authPreflight(opts, std::move(password), remember);
+        const auto rep = authPreflight(opts, std::move(password), remember, jl::auth::LoginIntent::UserConnect);
         jl::auth::wipe(password);
         PostMessageW(dlg, WM_MR_AUTH_PREFLIGHT, static_cast<WPARAM>(rep.outcome), 0);
     }).detach();
@@ -5979,7 +6025,7 @@ static int appMain(int argc, char** argv) {
             if (gLaunchPreflightDone) break;
             // Address from the command line: no password typed, so only a
             // remembered one can answer a Mac that wants it.
-            const auto rep = authPreflight(request.options, std::wstring(), false);
+            const auto rep = authPreflight(request.options, std::wstring(), false, jl::auth::LoginIntent::UserConnect);
             if (!jl::auth::isTerminal(rep.outcome)) break;
             launch.note.clear();
             launch.authAnswer = rep;
@@ -6033,6 +6079,7 @@ static int appMain(int argc, char** argv) {
     bool hostSupportsNack = false;
     bool hostSupportsAbr = false;
     bool hostSupportsAudio = false;
+    bool videoNegotiatedAtStart = false;  // r4: a read-only view negotiates later otherwise
     gRemoteWidth = o.width;
     gRemoteHeight = o.height;
     gScrollScale = o.scrollScale;
@@ -6104,9 +6151,17 @@ static int appMain(int argc, char** argv) {
         std::unique_ptr<MouseMoveUdpChannel> mouseMoveUdp;
         // Declared after mouseMoveUdp so it is destroyed (threads joined) first.
         std::unique_ptr<jl::audio::AudioPlayer> audio;
-        if (o.controlEnabled) {
+        // r2 (Pepper's PR-C review, item 5): --no-control is a read-only
+        // view, not a session without control. The control connection is
+        // still made, authenticated and kept: the Mac sends video and audio
+        // only to the peer of an authenticated control session, and the UDP
+        // key K_s comes from its AUTH. What --no-control turns off is input:
+        // gControl stays null, so no key, mouse, scroll or force-quit is ever
+        // sent, and there is no mouse UDP, clipboard or file transfer.
+        {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
-            gControl = control.get();
+            gControl = o.controlEnabled ? control.get() : nullptr;
+            if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");
             // Startup negotiation may traverse a degraded Tailscale/DERP path.
             // Give the initial handshake enough headroom, then restore the
             // low-latency 100 ms control timeout immediately afterwards.
@@ -6132,6 +6187,7 @@ static int appMain(int argc, char** argv) {
                 const auto videoConfig = control->negotiateVideo(
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
                 if (videoConfig.negotiated) {
+                    videoNegotiatedAtStart = true;
                     effectiveCodec = videoConfig.codec;
                     hostSupportsNack = videoConfig.hostSupportsNack;
                     hostSupportsAbr = videoConfig.hostSupportsAbr;
@@ -6191,10 +6247,18 @@ static int appMain(int argc, char** argv) {
                 logLine("video.negotiation=control-unavailable codec=h264 bitrate_mbps=25");
             }
             control->setIoTimeoutMs(100);
-
-            if (o.mouseMoveTransport == "udp") {
-                mouseMoveUdp = std::make_unique<MouseMoveUdpChannel>(o.bindIp, o.sourceIp, o.mouseUdpPort);
-                gMouseMoveUdp = mouseMoveUdp.get();
+        }
+        // r3 (Pepper's r2 review, item 2): a read-only view (--no-control)
+        // opens the MRM1 channel too, for the keep-alive, keyframe requests,
+        // NACKs and the audio request; only its pointer moves are off.
+        const jl::viewer::UdpPlan chanPlan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, false, false, false);
+        if (chanPlan.channel) {
+            mouseMoveUdp = std::make_unique<MouseMoveUdpChannel>(o.bindIp, o.sourceIp, o.mouseUdpPort);
+            mouseMoveUdp->setInputEnabled(chanPlan.input);
+            gMouseMoveUdp = mouseMoveUdp.get();
+        }
+        if (o.controlEnabled) {
+            if (chanPlan.input) {
                 logLine("mouse.move_transport=udp remote=" + o.sourceIp + ":" + std::to_string(o.mouseUdpPort));
             } else {
                 gMouseMoveUdp = nullptr;
@@ -6228,17 +6292,9 @@ static int appMain(int argc, char** argv) {
             filePullSession->start();
             gFilePullSession = filePullSession.get();
         } else {
-            gControl = nullptr;
-            gMouseMoveUdp = nullptr;
+            logLine("mrm1.read_only remote=" + o.sourceIp + ":" + std::to_string(o.mouseUdpPort) + " input=off");
             logLine("control.disabled");
             logLine("clipboard.disabled");
-            if (o.codec == "hevc" && hevcSupported) effectiveCodec = "hevc";
-            else effectiveCodec = "h264";
-            effectiveBitrateMbps = o.bitrateMbps == 0
-                ? (effectiveCodec == "hevc" ? 18 : 25)
-                : o.bitrateMbps;
-            logLine("video.negotiation=disabled codec=" + effectiveCodec +
-                    " bitrate_mbps=" + std::to_string(effectiveBitrateMbps));
         }
 
         HWND hwnd = createViewerWindow(o.windowWidth, o.windowHeight);
@@ -6270,6 +6326,18 @@ static int appMain(int argc, char** argv) {
         // From here a lost control connection (and its AUTH) is re-made off
         // the UI thread, so input never stalls video presentation.
         if (control) control->setBackgroundReconnect(true);
+        // PR-C r5 (Pepper's r4 review, item 3): a read-only view negotiates
+        // the video configuration again on every new control session, on the
+        // reconnect worker (never the UI thread). It asks for what the
+        // session already runs, so the Mac keeps the stream as it is; the
+        // loop below applies what the ACK says now (audio).
+        if (control && !o.controlEnabled) {
+            const bool hevcNow = effectiveCodec == "hevc";
+            const uint16_t bitrateNow = videoNegotiatedAtStart ? effectiveBitrateMbps : o.bitrateMbps;
+            control->setRenegotiateOnReconnect(effectiveCodec, h264Supported, hevcNow, bitrateNow, o.audio == "on");
+            logLine("video.renegotiate_on_reconnect codec=" + effectiveCodec +
+                    " bitrate_mbps=" + std::to_string(bitrateNow));
+        }
         // Hand tests only: JERISLINK_TEST_FLUSH_HOLD_MS (1-5000) holds each
         // event the reconnect worker took from the queue for that long
         // before its focus check and send, so a focus loss can be made to
@@ -6314,7 +6382,12 @@ static int appMain(int argc, char** argv) {
         // Audio: the host said it can (ACK flag 0x80) and the MRM1 channel is
         // up. The player has its own socket and threads; the loop below only
         // repeats the MRM1 0x45 request naming that socket's port every second.
-        if (o.audio == "on" && hostSupportsAudio && mouseMoveUdp) {
+        // r3 (item 2): also in a read-only view (udp_plan.hpp).
+        jl::viewer::UdpPlan mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
+                                                           o.audio == "on", hostSupportsAudio);
+        // r4 (item 2): also run by a read-only view that negotiates later.
+        auto startAudio = [&] {
+            if (audio || !mrm1Plan.audio || !mouseMoveUdp) return;
             audio = std::make_unique<jl::audio::AudioPlayer>([](const std::string& m) { logLine(m); });
             std::string audioErr;
             if (audio->start(o.bindIp, o.sourceIp, audioErr)) {
@@ -6327,7 +6400,17 @@ static int appMain(int argc, char** argv) {
                 logLine("audio.start_failed reason=" + audioErr);
                 audio.reset();
             }
-        }
+        };
+        // r5 (item 3): a renegotiation whose ACK no longer offers audio.
+        auto stopAudio = [&] {
+            if (!audio) return;
+            if (mouseMoveUdp) mouseMoveUdp->sendAudioRequest(false, 0);
+            audio->stop();
+            gAudio = nullptr;
+            audio.reset();
+            logLine("audio.stopped reason=host_audio_off");
+        };
+        startAudio();
         logLine(std::string("audio=") + (audio ? "on" : "off") +
                 " requested=" + o.audio +
                 " host_audio=" + (hostSupportsAudio ? "yes" : "no") +
@@ -6481,7 +6564,9 @@ static int appMain(int argc, char** argv) {
         // Keep-alives and packet handling, shared by the main loop and the
         // session timer that runs while Windows holds a modal loop.
         auto sendKeepAlives = [&](std::chrono::steady_clock::time_point now) {
-            if (hostSupportsNack && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
+            // r3 (item 2): a read-only view pings even without NACK support;
+            // the ping keeps its presence up on the Mac.
+            if (mrm1Plan.keepAlive && mouseMoveUdp && now - lastPing >= std::chrono::seconds(1)) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
             }
@@ -6491,12 +6576,26 @@ static int appMain(int argc, char** argv) {
                 lastAudioRequest = now;
             }
         };
-        // Returns false for a datagram from another address (dropped).
+        jl::udptag::View videoTag;
+        jl::udptag::DropLog videoTagLog;
+        uint64_t videoTagDrops = 0;
+        // Returns false for a datagram from another address or with a bad
+        // tag (dropped).
         auto onDatagram = [&](int n, const sockaddr_in& peer,
                               std::chrono::steady_clock::time_point now) {
             const auto packetGapMs = gotAny
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacket).count()
                 : 0;
+            // PR-C: a datagram without a good tag is dropped before it counts
+            // as a sign of life or reaches the receiver.
+            if (peer.sin_addr.s_addr == allowed.s_addr) {
+                const auto v = videoTag.open(buf.data(), n);
+                if (v != jl::udptag::Verdict::Ok) {
+                    ++videoTagDrops;
+                    videoTagLog.note("mr02", v, [](const std::string& m) { logLine(m); });
+                    return false;
+                }
+            }
             if (!gotAny) firstPacket = now;
             gotAny = true;
             lastPacket = now;
@@ -6545,6 +6644,9 @@ static int appMain(int argc, char** argv) {
         overlayShow(false, "session-start", 4000);
 
         double nextPausedCheckMs = 0;
+        // r4 (item 2): a read-only view gets its session back on its own.
+        jl::viewer::ReadOnlyRecovery readOnly;
+        uint64_t readOnlyReconnects = 0;
         gLoopStartTick = GetTickCount();
         gLoopStarted = true;
         gLoopResponsiveMs = steadyMsNow();
@@ -6569,6 +6671,60 @@ static int appMain(int argc, char** argv) {
                 const auto pausedAc = jl::auth::current();
                 const uint32_t paused = pausedAc ? pausedAc->takePausedChannels() : 0;
                 if (paused) showChannelPaused(paused);
+                // r2: the Mac said another viewer took the session: halts the
+                // attempt (gAuthHalt, next iteration), no reconnect.
+                if (control) {
+                    control->pollHostNotice();
+                    // Read-only: no input ever asks for a reconnect, so the
+                    // session is brought back here when it dropped.
+                    if (!o.controlEnabled) {
+                        // r4 (item 2): also the negotiation the start-up
+                        // could not do, and a new round after a pause.
+                        const double nowMs = steadyMsNow();
+                        const auto rs = control->reconnectStats();
+                        if (rs.reconnects != readOnlyReconnects) {
+                            readOnlyReconnects = rs.reconnects;
+                            readOnly.sessionBack();
+                        }
+                        // r14 (Pepper's r13 review, item 4): the automatic
+                        // retries stop after kAutoRetryCapMs down in total;
+                        // the attempt ends and the launch screen says so.
+                        if (readOnly.retryExpired(rs.live, nowMs) && jl::auth::mayConnect()) {
+                            logLine("control.read_only_retry_stopped down_ms=" + std::to_string(int(readOnly.downMs(nowMs))));
+                            if (auto c = jl::auth::current()) c->autoRetryStopped(readOnly.downMs(nowMs));
+                        } else {
+                            if (readOnly.wantResume(rs.pausedNow, nowMs) && control->resumeOnUserKey()) {
+                                logLine("control.read_only_resume round=" + std::to_string(readOnly.resumes()) +
+                                        " next_gap_ms=" + std::to_string(int(readOnly.resumeGapMs())));
+                            }
+                            control->keepSession();
+                        }
+                        // r5 (Pepper's r4 review, item 3): the worker
+                        // renegotiated on a new control session; apply what
+                        // the Mac offers now. Nothing here waits.
+                        if (const auto vc = control->takeRenegotiated()) {
+                            if (vc->negotiated && vc->codec == effectiveCodec) {
+                                hostSupportsAudio = vc->hostSupportsAudio;
+                                // NACK stays as the start set it: the
+                                // receiver was built for that.
+                                mrm1Plan = jl::viewer::udpPlan(o.controlEnabled, o.mouseMoveTransport, hostSupportsNack,
+                                                               o.audio == "on", hostSupportsAudio);
+                                if (mrm1Plan.audio) startAudio();
+                                else stopAudio();
+                                logLine(std::string("video.renegotiated codec=") + vc->codec +
+                                        " bitrate_mbps=" + std::to_string(vc->bitrateMbps) +
+                                        " restarted=" + (vc->streamRestarted ? "yes" : "no") +
+                                        " host_audio=" + (vc->hostSupportsAudio ? "yes" : "no") +
+                                        " keepalive=" + (mrm1Plan.keepAlive ? "on" : "off") +
+                                        " audio=" + (audio ? "on" : "off") +
+                                        " reconnects=" + std::to_string(rs.reconnects));
+                            } else {
+                                logLine(std::string("video.renegotiate_refused negotiated=") + (vc->negotiated ? "yes" : "no") +
+                                        " codec=" + vc->codec + " running=" + effectiveCodec + " audio=unchanged");
+                            }
+                        }
+                    }
+                }
             }
             phaseMarkMs = steadyMsNow();
             iterPhases.reset();
@@ -6926,12 +7082,15 @@ static int appMain(int argc, char** argv) {
                 << " control_paused_drops=" << (control ? control->reconnectStats().pausedDrops : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
+                << " mouse_udp_input_blocked=" << (mouseMoveUdp ? mouseMoveUdp->inputBlocked() : 0)
                 << " keyframe_req_tx=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSent() : 0)
                 << " keyframe_req_suppressed=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestsSuppressed() : 0)
                 << " keyframe_req_drops=" << (mouseMoveUdp ? mouseMoveUdp->keyframeRequestDrops() : 0)
                 << " cursor_state_rx=" << (mouseMoveUdp ? mouseMoveUdp->cursorRx() : 0)
                 << " cursor_state_bad=" << (mouseMoveUdp ? mouseMoveUdp->cursorRxBad() : 0)
                 << " cursor_state_stale=" << (mouseMoveUdp ? mouseMoveUdp->cursorRxStale() : 0)
+                << " udp_tag_drops_video=" << videoTagDrops
+                << " udp_tag_drops_mrm1=" << (mouseMoveUdp ? mouseMoveUdp->udpTagDrops() : 0)
                 << " clipboard_tx=" << (clipboard ? clipboard->sent() : 0)
                 << " clipboard_rx=" << (clipboard ? clipboard->received() : 0)
                 << " clipboard_reconnects=" << (clipboard ? clipboard->reconnects() : 0)
@@ -6963,6 +7122,7 @@ static int appMain(int argc, char** argv) {
                 << " audio_played_ms=" << audioStats.jb.framesPlayed / 48
                 << " audio_silence_ms=" << audioStats.jb.framesSilence / 48
                 << " audio_rx_bad_peer=" << audioStats.rxBadPeer
+                << " audio_rx_bad_tag=" << audioStats.rxBadTag
                 << " audio_rx_malformed=" << audioStats.rxMalformed
                 << " audio_device_opens=" << audioStats.deviceOpens
                 << " audio_device_errors=" << audioStats.deviceErrors

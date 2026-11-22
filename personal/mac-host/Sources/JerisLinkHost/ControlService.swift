@@ -38,6 +38,7 @@ enum ControlService {
     static func startServers(bindIP: String, clientIP: String, port: UInt16, relayPort: UInt16,
                              inject: Bool, helper: InputHelperClient,
                              gate: AuthGate? = nil,
+                             broker: SessionBroker? = nil,
                              admit: (@Sendable () -> Bool)? = nil,
                              admitMessage: (@Sendable () -> Bool)? = nil) throws -> [ControlServer] {
         var servers: [ControlServer] = []
@@ -47,11 +48,15 @@ enum ControlService {
         // asks the guard first; the direct listener's new connections ask
         // it in the gate already.
         // r7 (B5): the relay carries the moves of one viewer, the UDP
-        // client the video service accepts (clientIP), so its connections
-        // and messages also ask the guard's blacklist for that address,
-        // blocks restored from the pending journal included.
+        // client the video service accepts, so its connections and messages
+        // also ask the guard's blacklist for that address, blocks restored
+        // from the pending journal included. PR-C: that viewer is the
+        // session peer (SessionBroker), not clientIP; with no session the
+        // relay carries nothing.
         let held = lockdownCheck(gate)
-        let relayHeld = lockdownCheck(gate, viewerIP: clientIP)
+        let relayViewer: @Sendable () -> String?
+        if let broker { relayViewer = { broker.activePeerIP } } else { relayViewer = { clientIP } }
+        let relayHeld = lockdownCheck(gate, viewerIP: relayViewer)
         let messageOK: @Sendable () -> Bool = { !held() && (admitMessage?() ?? true) }
         let relayMessageOK: @Sendable () -> Bool = { !relayHeld() && (admitMessage?() ?? true) }
         let relayAdmit: @Sendable () -> Bool = { !relayHeld() && (admit?() ?? true) }
@@ -60,21 +65,23 @@ enum ControlService {
             // gate; without one (legacy callers) the 0.3 single-IP check.
             let direct = ControlServer(bindIP: bindIP, allowedClientIP: gate == nil ? clientIP : nil,
                                        port: port, inject: inject,
-                                       settingsClientIP: { clientIP }, acceptProxy: false,
+                                       settingsClientIP: { clientIP.isEmpty ? nil : clientIP }, acceptProxy: false,
                                        inputHelper: helper, allowFileSessions: true, authGate: gate,
                                        admitConnection: admit, admitMessage: messageOK,
-                                       admitPeerMessage: peerCheck(gate))
+                                       admitPeerMessage: peerCheck(gate), sessionBroker: broker)
             try direct.start()
             servers.append(direct)
             let relayIsDirect = bindIP == ListenConfig.loopbackIP && relayPort == port
-            // Password mode: the relay carries UDP mouse input that is only
-            // IP-checked (MouseMoveUDPServer), so it stays closed until PR-C
-            // binds that input to an authenticated session.
-            let relayAllowed = !(gate?.requiresPassword ?? false)
+            // Password mode: the relay carries UDP mouse input only when it
+            // is bound to the authenticated session (PR-C: the video service
+            // takes MRM1 input only with a valid tag under the session key
+            // announced over the session link). Without that link the relay
+            // stays closed, as before.
+            let relayAllowed = !(gate?.requiresPassword ?? false) || broker != nil
             if relayPort != 0 && !relayIsDirect && relayAllowed {
                 let relay = ControlServer(bindIP: ListenConfig.loopbackIP, allowedClientIP: ListenConfig.loopbackIP,
                                           port: relayPort, inject: inject,
-                                          settingsClientIP: { clientIP }, acceptProxy: false,
+                                          settingsClientIP: { clientIP.isEmpty ? nil : clientIP }, acceptProxy: false,
                                           inputHelper: helper, announceInputSessions: false,
                                           allowSensitiveControl: false, relayMouseOnly: true,
                                           admitConnection: relayAdmit, admitMessage: relayMessageOK)
@@ -92,14 +99,27 @@ enum ControlService {
     /// does not read) and, with `viewerIP` (r7, the mouse relay), while
     /// that address is on the blacklist. Logs at most once a second; the
     /// listeners log each refused connection or message themselves.
-    static func lockdownCheck(_ gate: AuthGate?, viewerIP: String? = nil) -> @Sendable () -> Bool {
+    static func lockdownCheck(_ gate: AuthGate?, viewerIP: (@Sendable () -> String?)? = nil) -> @Sendable () -> Bool {
         guard let guardian = gate?.guardian else { return { false } }
         let throttle = OncePerInterval(1)
         return {
-            let why = viewerIP.map { guardian.inputRefusal($0) } ?? guardian.lockdownReason()
+            let why: String?
+            var entry = "open_connection"
+            if let viewerIP {
+                if let ip = viewerIP() {
+                    why = guardian.inputRefusal(ip)
+                    entry = "relay peer=\(ip)"
+                } else {
+                    // PR-C: no session, no viewer to move the mouse for.
+                    why = guardian.lockdownReason() ?? "no_session"
+                    entry = "relay"
+                }
+            } else {
+                why = guardian.lockdownReason()
+            }
             guard let why else { return false }
             if throttle.due() {
-                log("auth.lockdown_hold reason=\(why) entry=\(viewerIP.map { "relay peer=\($0)" } ?? "open_connection"); refused or closed")
+                log("auth.lockdown_hold reason=\(why) entry=\(entry); refused or closed")
             }
             return true
         }
@@ -164,13 +184,19 @@ enum ControlService {
             watch.start()
             while true { try? await Task.sleep(for: .seconds(3600)) }
         }
-        if gate?.requiresPassword == true && o.relayPort != 0 {
-            log("relay off: password mode (UDP mouse input waits for session binding, PR-C)")
+        // PR-C: the video service serves only the viewer this broker
+        // announces over the session link.
+        let broker = SessionBroker(passwordMode: gate?.requiresPassword == true) { log($0) }
+        let sessionLink = SessionLinkServer(broker: broker)
+        do { try sessionLink.start() } catch {
+            // Without the link the video service sends nothing: say so.
+            log("session.link_socket=off (\(error.localizedDescription)); no video, audio or UDP input until it works")
         }
         do {
             running = try startServers(bindIP: endpoint.bindIP, clientIP: endpoint.clientIP,
                                        port: o.controlPort, relayPort: o.relayPort,
                                        inject: o.controlInject, helper: InputHelperClient(), gate: gate,
+                                       broker: broker,
                                        admit: { watch.admitNew() },
                                        admitMessage: { watch.stillCurrent() })
         } catch {
@@ -227,7 +253,8 @@ extension ControlService {
             return (nil, snapshot)
         }
         log("auth.policy \(policy.summary)")
-        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist, journal: journal), snapshot)
+        return (AuthGate.make(policy: policy, secret: secret, blocklist: blocklist, journal: journal,
+                              failureLog: AuthFailureLog(url: AuthFailureLog.defaultURL)), snapshot)
     }
 }
 

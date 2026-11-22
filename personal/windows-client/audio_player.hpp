@@ -35,6 +35,8 @@
 #include <avrt.h>
 #include <wrl/client.h>
 
+#include "udp_tag.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -50,6 +52,7 @@ namespace jl::audio {
 struct PlayerStats {
     JitterStats jb;
     uint64_t rxBadPeer = 0;
+    uint64_t rxBadTag = 0;   // PR-C: no tag, wrong tag, or no session yet
     uint64_t rxMalformed = 0;
     uint64_t deviceOpens = 0;
     uint64_t deviceErrors = 0;
@@ -201,6 +204,7 @@ public:
             s.jb = jb_.stats();
         }
         s.rxBadPeer = rxBadPeer_;
+        s.rxBadTag = rxBadTag_;
         s.rxMalformed = rxMalformed_;
         {
             std::lock_guard<std::mutex> lk(reasonMu_);
@@ -237,8 +241,16 @@ private:
                                    reinterpret_cast<sockaddr*>(&from), &flen);
             if (n == SOCKET_ERROR) continue;  // timeout (checks stop_) or ICMP noise
             if (from.sin_addr.s_addr != peer_.s_addr) { ++rxBadPeer_; continue; }
+            // PR-C: tag first (udp_tag.hpp); a bad datagram is never parsed.
+            int len = n;
+            const auto v = tagView_.open(buf, len);
+            if (v != jl::udptag::Verdict::Ok) {
+                ++rxBadTag_;
+                tagLog_.note("mra1", v, log_);
+                continue;
+            }
             Mra1Packet p;
-            if (!parseMra1(buf, size_t(n), p)) { ++rxMalformed_; continue; }
+            if (!parseMra1(buf, size_t(len), p)) { ++rxMalformed_; continue; }
             const uint64_t at = nowUs();
             std::lock_guard<std::mutex> lk(mu_);
             jb_.push(p, at);
@@ -473,6 +485,9 @@ private:
     }
 
     LogFn log_;
+    jl::udptag::View tagView_;       // net thread only
+    jl::udptag::DropLog tagLog_;     // net thread only
+    std::atomic<uint64_t> rxBadTag_{0};
     SOCKET s_ = INVALID_SOCKET;
     in_addr peer_{};
     uint16_t port_ = 0;

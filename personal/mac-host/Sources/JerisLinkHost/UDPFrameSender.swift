@@ -143,6 +143,14 @@ final class UDPFrameSender: @unchecked Sendable {
     /// packet. While it says no nothing goes to the viewer; counted here.
     private var streamAllowed: @Sendable () -> Bool = { true }
     private var streamHeld: UInt64 = 0
+    /// PR-C: the session the video service serves (session link). When set,
+    /// packets go to its peer IP, sealed with its h2v tagger in password
+    /// mode; with no session nothing is sent (counted in session_drops).
+    /// When nil (bench, self-tests, no link) the fixed clientIP is used.
+    private var udpSession: UDPSessionState?
+    private var sessionDrops: UInt64 = 0
+    /// r3 item 5: audio for a session that is no longer the current one.
+    private var audioStaleDrops: UInt64 = 0
     private var maxPacketsPerFrame: UInt64 = 0
     private var maxFrameBytes: UInt64 = 0
     private var keyFrames: UInt64 = 0
@@ -509,7 +517,8 @@ final class UDPFrameSender: @unchecked Sendable {
         let start = data.startIndex + packetIndex * payloadCapacity
         let end = min(start + payloadCapacity, data.endIndex)
         let payload = data.subdata(in: start..<end)
-        var packet = Data(capacity: 20 + payload.count)
+        // + tag room: sealing in place never reallocates.
+        var packet = Data(capacity: 20 + payload.count + UDPTag.bytes)
         packet.append(contentsOf: [0x4d, 0x52, 0x30, 0x32]) // MR02
         packet.append(1) // protocol version
         var flags: UInt8 = keyFrame ? 0x01 : 0x00
@@ -557,44 +566,75 @@ final class UDPFrameSender: @unchecked Sendable {
     /// MRA1 audio: same socket as the video, to the viewer IP at `port`
     /// (the port its MRM1 0x45 request named). Not paced and not counted in
     /// the video stats; AudioStreamer keeps its own counters.
-    func sendAudio(_ packet: Data, port: UInt16) -> Bool {
+    /// r3 (Pepper's PR-C r2 review, item 5): `generation` is the session
+    /// that request came in. With a session link, audio leaves only while
+    /// that session is still the current one: never to the next viewer's
+    /// IP and key at the old viewer's port.
+    /// r4 (Pepper's r3 review, item 3): it is the session's (boot, generation),
+    /// so after a control service restart (generation from 1 again) audio
+    /// queued for the old session never matches the new one.
+    func sendAudio(_ packet: Data, port: UInt16, generation: UDPPeerSession.ID? = nil) -> Bool {
         guard streamOpen() else { return false }
+        return sendTo(packet, port: port.bigEndian, audioGeneration: generation, checkGeneration: true).sent
+    }
+
+    /// PR-C: binds this sender to the session link (JerisLinkHostMain).
+    func setSession(_ state: UDPSessionState) {
+        lock.lock(); udpSession = state; lock.unlock()
+    }
+
+    /// The datagram as it leaves: to the session peer (sealed when the
+    /// session is tagged), else to the fixed destination. `port` is
+    /// network order; nil keeps the destination's. bytes: what went out.
+    private func sendTo(_ packet: Data, port: in_port_t? = nil, audioGeneration: UDPPeerSession.ID? = nil,
+                        checkGeneration: Bool = false) -> (sent: Bool, bytes: Int) {
         var dest = destination
-        dest.sin_port = port.bigEndian
-        let result: ssize_t = packet.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return -1 }
+        if let port { dest.sin_port = port }
+        lock.lock(); let state = udpSession; lock.unlock()
+        var sendTagger: UDPTagger?
+        if let state {
+            guard let snap = state.snapshot else {
+                lock.lock(); sessionDrops &+= 1; lock.unlock()
+                return (false, 0)
+            }
+            if checkGeneration, snap.session.id != audioGeneration {
+                lock.lock(); audioStaleDrops &+= 1; lock.unlock()
+                return (false, 0)
+            }
+            dest.sin_addr = snap.address
+            sendTagger = snap.send
+        }
+        return packet.withUnsafeBytes { raw -> (Bool, Int) in
+            guard raw.baseAddress != nil else { return (false, 0) }
             return withUnsafePointer(to: &dest) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    Darwin.sendto(socketFD, base, packet.count, 0, sa,
-                                  socklen_t(MemoryLayout<sockaddr_in>.size))
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa -> (Bool, Int) in
+                    let len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                    if let sendTagger {
+                        return sendTagger.withSealed(raw) { sealed in
+                            let r = Darwin.sendto(socketFD, sealed.baseAddress!, sealed.count, 0, sa, len)
+                            return (r == sealed.count, sealed.count)
+                        }
+                    }
+                    let r = Darwin.sendto(socketFD, raw.baseAddress!, raw.count, 0, sa, len)
+                    return (r == raw.count, raw.count)
                 }
             }
         }
-        return result == packet.count
     }
 
     /// Send one packet and count it. Returns false on a send error.
     private func sendCounted(_ packet: Data) -> Bool {
-        var dest = destination
-        let result: ssize_t = packet.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return -1 }
-            return withUnsafePointer(to: &dest) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    Darwin.sendto(socketFD, base, packet.count, 0, sa,
-                                  socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
+        let (ok, bytes) = sendTo(packet)
         let sentNanos = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         defer { lock.unlock() }
-        if result == packet.count {
+        if ok {
             sentPackets &+= 1
-            sentBytes &+= UInt64(packet.count)
-            recordBurst(at: sentNanos, bytes: packet.count)
+            sentBytes &+= UInt64(bytes)
+            recordBurst(at: sentNanos, bytes: bytes)
             return true
         }
-        sendErrors &+= 1
+        if bytes > 0 { sendErrors &+= 1 }
         return false
     }
 
@@ -658,6 +698,7 @@ final class UDPFrameSender: @unchecked Sendable {
             + "nack_bytes=\(nackBytes) nack_miss=\(nackMiss) nack_over_budget=\(nackOverBudget) nack_pace_waits=\(nackPaceWaits) "
             + "cache_frames=\(cache.entries.count) cache_bytes=\(cache.bytes) cache_resets=\(cache.resets)"
             + (streamHeld > 0 ? " stream_held=\(streamHeld)" : "")
+            + (udpSession != nil ? " session_drops=\(sessionDrops) audio_stale_drops=\(audioStaleDrops)" : "")
             + (statsSuffix.map { " " + $0() } ?? "")
     }
 

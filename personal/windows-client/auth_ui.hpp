@@ -184,6 +184,19 @@ public:
                          L"or use Retry without password if it no longer has one.";
             view_.offerNoPassword = true;
             break;
+        case Outcome::Replaced:
+            // Another viewer authenticated on the Mac: this one stopped and
+            // does not reconnect on its own (it would take the session back).
+            // r14: also our own reconnect, refused while another device is
+            // connected. Only this manual connect takes over.
+            view_.text = L"Another device is connected to this Mac. This viewer stopped reconnecting on its own. "
+                         L"Connect again to take over the session.";
+            break;
+        case Outcome::RetryCapped:
+            // r14: the automatic retries ran for their whole budget.
+            view_.text = L"The connection to this Mac was lost and could not be restored within 2 minutes. "
+                         L"Connect again to retry.";
+            break;
         case Outcome::RaceUnanswered:
             // The Mac switched to a password during our check and did not
             // say what it counted. No automatic retry; it is not probed again.

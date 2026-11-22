@@ -230,7 +230,7 @@ extension FileUploadSelfTest {
 
         // Downloads allowed: a folder and files, clash numbering, quarantine.
         let opened = OpenedFolders()
-        let folder = FileSendFolder(primary: primary, fallback: fallback, openFolder: { opened.add($0) })
+        let folder = FileSendFolder(primary: primary, fallback: fallback, onMain: FileSendFolder.inline, openFolder: { opened.add($0) })
         let r = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: folder)
         let one = dropOne(r, 1, "report.pdf", [1, 2, 3])
         expect(one.first == .reply(transfer: 1, status: FileProto.Status.ok) &&
@@ -262,16 +262,16 @@ extension FileUploadSelfTest {
         expect(opened.count == 9 && Set(opened.all) == [primary], "send: Finder opens the folder after every send (\(opened.count))")
         let revealed = DispatchSemaphore(value: 0)
         let hit = OpenedFolders()
-        folder.reveal(transfer: 2) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        folder.reveal(transfer: 2, done: { ok in if ok { hit.add(primary) }; revealed.signal() })
         _ = revealed.wait(timeout: .now() + 3)
-        folder.reveal(transfer: 999) { ok in if ok { hit.add(primary) }; revealed.signal() }
+        folder.reveal(transfer: 999, done: { ok in if ok { hit.add(primary) }; revealed.signal() })
         _ = revealed.wait(timeout: .now() + 3)
         expect(hit.count == 2 && opened.count == 11, "send: REVEAL opens the folder for a known and an unknown transfer")
 
         // Downloads refused: the home fallback, which needs no permission.
         let deniedOpened = OpenedFolders()
         let denied = FileSendFolder(primary: base.appendingPathComponent("Downloads/Refused", isDirectory: true), fallback: fallback,
-                                    primaryOpener: { _ in (-1, EPERM) }, openFolder: { deniedOpened.add($0) })
+                                    primaryOpener: { _ in (-1, EPERM) }, onMain: FileSendFolder.inline, openFolder: { deniedOpened.add($0) })
         let r2 = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: denied)
         let out2 = dropOne(r2, 1, "a.txt", [1])
         expect(out2.last == .result(transfer: 1, status: FileProto.Status.ok, filesOK: 1) &&
@@ -285,7 +285,7 @@ extension FileUploadSelfTest {
                                       _ = release.wait(timeout: .now() + 5); release.signal()  // once released, stays released
                                       return FileSendFolder.folderOpener(p)
                                   },
-                                  openFolder: { _ in })
+                                  onMain: FileSendFolder.inline, openFolder: { _ in })
         let r3 = FileUploadReceiver(root: staging, clipboard: board, freeSpace: { _ in 1 << 40 }, sendFolder: slow)
         let t0 = Date()
         let pend = feed(r3, [.offer(transfer: 1, purpose: FileProto.Purpose.send, entries: 1, total: 1), entry(1, 0, "b.txt", size: 1)]).sent

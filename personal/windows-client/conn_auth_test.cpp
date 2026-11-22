@@ -24,6 +24,7 @@
 namespace {
 
 using namespace jl::auth;
+namespace udptag = jl::udptag;
 
 int gPass = 0;
 int gFail = 0;
@@ -97,6 +98,7 @@ void vectorTests(const char* path) {
     size_t p = all.find("\"vectors\"");
     expect(p != std::string::npos, "vectors array present");
     int count = 0;
+    int udpVectors = 0;
     while (p != std::string::npos) {
         size_t a = all.find('{', p);
         if (a == std::string::npos) break;
@@ -141,11 +143,55 @@ void vectorTests(const char* path) {
         bad[0] ^= 1;
         auto mhBad = *macHost(bad, hn.data(), cn.data(), ch);
         expect(!constantTimeEqual(mhBad.data(), mh.data(), kMacBytes), "vector '" + name + "': wrong K fails mac_h");
+        // PR-C: K_s and the UDP tags, where the vector has them.
+        if (!jsonField(v, "session_key").empty()) {
+            const Bytes sid = unhex(jsonField(v, "session_id"));
+            auto ks = sessionKey(*k, hn.data(), cn.data(), sid.data());
+            expect(ks && hex(ks->data(), ks->size()) == jsonField(v, "session_key"), "vector '" + name + "': session_key");
+            if (ks) {
+                const Bytes pv = unhex(jsonField(v, "udp_v2h_packet"));
+                const Bytes ph = unhex(jsonField(v, "udp_h2v_packet"));
+                auto tv = udpTag(*ks, false, pv.data(), pv.size());
+                auto th = udpTag(*ks, true, ph.data(), ph.size());
+                expect(tv && hex(tv->data(), tv->size()) == jsonField(v, "udp_v2h_tag"), "vector '" + name + "': udp v2h tag");
+                expect(th && hex(th->data(), th->size()) == jsonField(v, "udp_h2v_tag"), "vector '" + name + "': udp h2v tag");
+                // The reusable CNG tagger the viewer sends and checks with
+                // gives the same bytes.
+                uint8_t t1[8], t2[8];
+                expect(udptag::Tagger(*ks, false).tag(pv.data(), pv.size(), t1) && hex(t1, 8) == jsonField(v, "udp_v2h_tag") &&
+                           udptag::Tagger(*ks, true).tag(ph.data(), ph.size(), t2) && hex(t2, 8) == jsonField(v, "udp_h2v_tag"),
+                       "vector '" + name + "': Tagger matches udp_tag");
+                ++udpVectors;
+            }
+        }
     }
+    expect(udpVectors >= 1, "at least 1 vector with UDP tags (" + std::to_string(udpVectors) + ")");
     expect(count >= 3, "at least 3 vectors read (" + std::to_string(count) + ")");
 }
 
 void wireTests() {
+    // PR-C r5 (Pepper's r4 review, item 2): the resume id is under mac_c.
+    // Fixed inputs; the same hex is checked by the Mac self-test (AuthSelfTest
+    // crypto, "prc r5 vector") and was computed independently (Perl
+    // Digest::SHA hmac_sha256 over "jl-c"|hn|cn|1|hid[|resume]).
+    {
+        Key k{};
+        k.fill(0x11);
+        std::array<uint8_t, kNonceBytes> hn{}, cn{};
+        hn.fill(0x22);
+        cn.fill(0x33);
+        std::array<uint8_t, kHostIdBytes> hid{};
+        hid.fill(0x44);
+        const uint8_t resume[kSessionIdBytes] = {1, 2, 3, 4, 5, 6, 7, 8};
+        const auto plain = macClient(k, hn.data(), cn.data(), Channel::Control, hid.data());
+        const auto signedResume = macClient(k, hn.data(), cn.data(), Channel::Control, hid.data(), resume);
+        expect(plain && hex(plain->data(), plain->size()) == "f80179160e285469a687e3e15aa31a4b9d4c1839d172211f97629a2194cb93bc",
+               "prc r5 vector: mac_c without a resume id (unchanged)");
+        expect(signedResume && hex(signedResume->data(), signedResume->size()) ==
+                                   "d683830f256aebbd4193876e4db47cce29fc0c36e54da8f81c0510136e1a43d5",
+               "prc r5 vector: mac_c covers the resume id");
+    }
+
     expect(!Challenge::decode(Bytes(68)).has_value(), "challenge of 68 bytes rejected");
     expect(!Result::decode(Bytes{1}).has_value(), "fail without tries rejected");
     auto r = Result::decode(Bytes{2, 0, 0, 1, 44});
@@ -153,6 +199,11 @@ void wireTests() {
     r = Result::decode(Bytes{1, 3});
     expect(r && r->status == Result::Status::Fail && r->triesLeft == 3, "fail 3 tries decodes");
     expect(Result::decode(Bytes{5}) && Result::decode(Bytes{5})->status == Result::Status::OpenIpOnly, "open_ip_only decodes");
+    // r2 (Pepper's PR-C review, item 2): the host's "replaced" notice.
+    expect(Result::decode(Bytes{6}) && Result::decode(Bytes{6})->status == Result::Status::Replaced, "replaced decodes");
+    expect(!Result::decode(Bytes{6, 0}).has_value(), "replaced with a payload rejected");
+    expect(isTerminal(Outcome::Replaced) && std::string(outcomeName(Outcome::Replaced)) == "replaced",
+           "replaced: terminal, named");
     expect(!Result::decode(Bytes{9}).has_value(), "unknown status rejected");
 }
 
@@ -219,9 +270,10 @@ void hostWithPassword(SOCKET s, const Secret& sec, HostAnswer ans, Channel expec
     }
     uint8_t type = 0;
     Bytes p;
-    if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || p.size() != kResponseBytes) return;
+    if (hostRecv(s, 15000, type, p) != Io::Ok || type != kTypeResponse || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return;
     seen.gotResponse = true;
-    auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data());
+    auto want = *macClient(sec.key, hn.data(), p.data(), expectChan, sec.hostId.data(),
+                            p.size() == kResumeResponseBytes ? p.data() + kResponseBytes : nullptr);  // r5
     seen.macValid = constantTimeEqual(want.data(), p.data() + kNonceBytes, kMacBytes);
     {
         bool zero = true;
@@ -607,7 +659,7 @@ void oldAndTransitionTests() {
             Bytes p;
             while (hostRecv(s, 2600, type, p) == Io::Ok) {
                 seen.anyData = true;
-                if (type == kTypeResponse && p.size() == kResponseBytes) {
+                if (type == kTypeResponse && (p.size() == kResponseBytes || p.size() == kResumeResponseBytes)) {
                     bool zero = true;
                     for (size_t i = kNonceBytes; i < p.size(); ++i) zero = zero && p[i] == 0;
                     seen.probe = zero;
@@ -631,7 +683,7 @@ void oldAndTransitionTests() {
             const auto t0 = Clock::now();
             uint8_t type = 0;
             Bytes p;
-            if (hostRecv(s, 3000, type, p) == Io::Ok && type == kTypeResponse && p.size() == kResponseBytes) {
+            if (hostRecv(s, 3000, type, p) == Io::Ok && type == kTypeResponse && (p.size() == kResponseBytes || p.size() == kResumeResponseBytes)) {
                 afterMs = int(msSince(t0));
                 hostSend(s, kTypeResult, Bytes{5});
             }
@@ -737,7 +789,7 @@ void reviewFixTests() {
             hostSend(s, kTypeChallenge, challengeFor(sec, hn));
             uint8_t type = 0;
             Bytes p;
-            if (hostRecv(s, 15000, type, p) != Io::Ok || p.size() != kResponseBytes) return;
+            if (hostRecv(s, 15000, type, p) != Io::Ok || (p.size() != kResponseBytes && p.size() != kResumeResponseBytes)) return;
             seen.gotResponse = true;
             auto mh = *macHost(sec.key, hn.data(), p.data(), Channel::Control);
             hmacFaultsForTest() = 1;
@@ -1285,6 +1337,121 @@ void r3Tests() {
     }
 }
 
+// PR-C: seal and check, every drop case, the three session states, and
+// the cost of one tag at 1200 bytes (the 4K60 numbers in the report).
+void udpTagTests() {
+    using namespace jl::udptag;
+    SessionKey k{}, k2{};
+    for (size_t i = 0; i < k.size(); ++i) { k[i] = uint8_t(i + 1); k2[i] = uint8_t(0xA0 + i); }
+    Tagger hv(k, true), vh(k, false), hvOld(k2, true);
+    expect(hv.ok() && vh.ok() && hvOld.ok(), "udp: CNG reusable HMAC taggers set up");
+    // A 30-byte MR02-like datagram from the host.
+    uint8_t pkt[30];
+    std::memcpy(pkt, "MR02", 4);
+    pkt[4] = 2;
+    for (int i = 5; i < 30; ++i) pkt[i] = uint8_t(i * 7);
+    uint8_t sealed[64];
+    const size_t n = hv.seal(pkt, sizeof(pkt), sealed);
+    expect(n == sizeof(pkt) + kTagBytes && (sealed[4] & kFlag), "udp: seal sets the flag and appends 8 bytes");
+    expect(hv.verify(sealed, n), "udp: a sealed datagram verifies");
+    {
+        auto t = udpTag(k, true, sealed, sizeof(pkt));
+        expect(t && std::memcmp(t->data(), sealed + sizeof(pkt), kTagBytes) == 0, "udp: seal's tag is udp_tag of the flagged bytes");
+    }
+    auto bad = [&](const char* what, auto mutate, const Tagger& t) {
+        uint8_t c[64];
+        std::memcpy(c, sealed, n);
+        size_t m = n;
+        mutate(c, m);
+        expect(!t.verify(c, m), std::string("udp: dropped: ") + what);
+    };
+    bad("no tag", [&](uint8_t* c, size_t& m) { std::memcpy(c, pkt, sizeof(pkt)); m = sizeof(pkt); }, hv);
+    bad("zero tag", [&](uint8_t* c, size_t& m) { std::memset(c + m - 8, 0, 8); }, hv);
+    bad("wrong tag", [&](uint8_t* c, size_t& m) { c[m - 1] ^= 1; }, hv);
+    bad("payload changed", [&](uint8_t* c, size_t&) { c[12] ^= 0x40; }, hv);
+    bad("flag cleared", [&](uint8_t* c, size_t&) { c[4] &= 0x7F; }, hv);
+    bad("truncated", [&](uint8_t* c, size_t& m) { m -= 1; }, hv);
+    bad("too short", [&](uint8_t*, size_t& m) { m = 10; }, hv);
+    bad("old session key", [](uint8_t*, size_t&) {}, hvOld);
+    bad("reflected direction (h2v checked as v2h)", [](uint8_t*, size_t&) {}, vh);
+
+    // States as the viewer sees them.
+    View view;
+    auto openCopy = [&](const uint8_t* src, size_t len, int& outLen) {
+        static uint8_t c[64];
+        std::memcpy(c, src, len);
+        outLen = int(len);
+        return view.open(c, outLen);
+    };
+    int len = 0;
+    publishOpen();
+    expect(openCopy(pkt, sizeof(pkt), len) == Verdict::Ok && len == int(sizeof(pkt)), "udp: open mode takes untagged (0.3 behaviour)");
+    expect(openCopy(sealed, n, len) == Verdict::TaggedInOpen, "udp: open mode drops a tagged datagram");
+    publishPending();
+    expect(openCopy(pkt, sizeof(pkt), len) == Verdict::Pending && openCopy(sealed, n, len) == Verdict::Pending,
+           "udp: pending (password host, no control session yet) drops everything");
+    expect(publishKey(k), "udp: key published");
+    expect(openCopy(sealed, n, len) == Verdict::Ok && len == int(sizeof(pkt)), "udp: keyed takes a good tag, strips it");
+    {
+        uint8_t c[64];
+        std::memcpy(c, sealed, n);
+        int l = int(n);
+        expect(view.open(c, l) == Verdict::Ok && c[4] == 2 && std::memcmp(c, pkt, sizeof(pkt)) == 0,
+               "udp: after open the parser sees the 0.3 datagram (flag cleared)");
+    }
+    expect(openCopy(pkt, sizeof(pkt), len) == Verdict::NoTag, "udp: keyed drops untagged");
+    {
+        uint8_t c[64];
+        const size_t m = hvOld.seal(pkt, sizeof(pkt), c);
+        int l = int(m);
+        expect(view.open(c, l) == Verdict::BadTag, "udp: keyed drops an old session's tag");
+    }
+    // Send side: sealed v2h, the host's view of it verifies, h2v does not.
+    uint8_t out[64];
+    int outLen = 0;
+    const uint8_t mouse[14] = {'M', 'R', 'M', '1', 1, 0x24, 0, 0, 0, 1, 0x10, 0, 0x20, 0};
+    const int r = view.send(mouse, sizeof(mouse), [&](const uint8_t* b, int l) { std::memcpy(out, b, size_t(l)); outLen = l; return l; });
+    expect(r == int(sizeof(mouse)) && outLen == int(sizeof(mouse) + kTagBytes) && vh.verify(out, size_t(outLen)) &&
+               !hv.verify(out, size_t(outLen)),
+           "udp: keyed send is sealed v2h (not valid as h2v)");
+    // A new control session: the old key stops working at once.
+    expect(publishKey(k2), "udp: new session key published");
+    expect(openCopy(sealed, n, len) == Verdict::BadTag, "udp: after a reconnect the old key's datagrams are dropped");
+    publishOpen();
+    outLen = 0;
+    view.send(mouse, sizeof(mouse), [&](const uint8_t* b, int l) { std::memcpy(out, b, size_t(l)); outLen = l; return l; });
+    expect(outLen == int(sizeof(mouse)) && std::memcmp(out, mouse, sizeof(mouse)) == 0, "udp: open mode sends untagged");
+
+    // Drop log: one line per 10 s.
+    DropLog dl;
+    int lines = 0;
+    for (int i = 0; i < 500; ++i) dl.note("mr02", Verdict::BadTag, [&](const std::string&) { ++lines; });
+    expect(lines == 1 && dl.total() == 500, "udp: 500 drops log one line");
+
+    // Cost at 1200 bytes (MR02 packet), for the 4K60 numbers.
+    uint8_t big[1200];
+    for (size_t i = 0; i < sizeof(big); ++i) big[i] = uint8_t(i);
+    std::memcpy(big, "MR02", 4);
+    uint8_t bigSealed[1208];
+    const size_t bn = hv.seal(big, sizeof(big), bigSealed);
+    const int iters = 200000;
+    auto t0 = Clock::now();
+    bool allOk = true;
+    for (int i = 0; i < iters; ++i) allOk &= hv.verify(bigSealed, bn);
+    const double verifyNs = std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / iters;
+    t0 = Clock::now();
+    for (int i = 0; i < iters; ++i) vh.seal(big, sizeof(big), bigSealed);
+    const double sealNs = std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / iters;
+    expect(allOk, "udp: bench verifies every time");
+    std::printf("BENCH udp_tag verify_1208B_ns=%.0f seal_1200B_ns=%.0f\n", verifyNs, sealNs);
+    for (int mbps : {50, 80, 150}) {
+        const double pps = mbps * 1e6 / 8.0 / 1180.0;
+        std::printf("BENCH udp_tag 4k60 mbps=%d pps=%.0f core_pct=%.2f us_per_frame=%.0f\n", mbps, pps,
+                    pps * verifyNs / 1e9 * 100.0, pps / 60.0 * verifyNs / 1000.0);
+    }
+    publishOpen();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1302,6 +1469,7 @@ int main(int argc, char** argv) {
     reviewFixTests();
     r3Tests();
     r5BackgroundNoChallengeTests();
+    udpTagTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
