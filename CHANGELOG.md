@@ -62,7 +62,7 @@ Windows viewer:
 
 Packaging:
 
-- MSIX sideload test packages (GitHub `msix` workflow) are signed with a fixed test certificate when it is configured.
+- MSIX sideload test packages (GitHub `msix` workflow) are signed with a fixed test certificate when it is configured, otherwise with a throwaway one.
 - Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0` (GitHub `msix` workflow), and the build id `0.3.0 · <sha>`.
 
 ## v0.2.0
