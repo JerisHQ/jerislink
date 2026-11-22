@@ -959,6 +959,9 @@ enum AuthSelfTest {
             if let first { r.abandon(first) }
             let refusedAfterLost = r.resumeRefused(before)
             let retry = r.admit(peerIP: me, channel: .control, sessionKey: key(0x62), authSession: id(0x62), resume: before, close: {})
+            // r11: "in" means its AUTH_OK went out (ControlServer calls `confirm`
+            // then); until that, a retry naming the pre-restart id is still let in.
+            if let retry { r.confirm(retry) }
             expect(first != nil && !refusedAfterLost && retry != nil && r.current.0?.sessionKey == key(0x62)
                        && r.resumeRefused(before) && !r.resumeRefused(id(0x62)) && !r.channelAdmitted(id(0x61)),
                    "prc r10 broker: after a restart the first reconnect's AUTH_OK fails: its retry with the same id is let in (not REPLACED); once it is in, the old id is refused again")
