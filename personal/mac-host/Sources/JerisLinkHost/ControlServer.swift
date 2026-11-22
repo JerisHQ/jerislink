@@ -14,6 +14,11 @@ final class ControlServer: @unchecked Sendable {
     private var clientFDs: Set<Int32> = []
     /// Sockets set to close with RST (resetPeer); `lock`.
     private var resetFDs: Set<Int32> = []
+    /// r10 (Pepper's r9 review, blocker 1): clipboard, file and ping sockets
+    /// whose session a takeover revoked; `lock`. No frame goes out on them
+    /// any more (`sendChecked` refuses and resets), and the clipboard loop
+    /// stops at its next turn, not only when it reads the shut read side.
+    private var revokedChannelFDs: Set<Int32> = []
     private var stopping = false
     private var inputHelper: InputHelperClient?
     private let videoSettings = VideoSettingsController()
@@ -80,6 +85,12 @@ final class ControlServer: @unchecked Sendable {
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
+    /// r10 (Pepper's r9 review, item 3): how long AUTH_OK may wait for the
+    /// viewer's window (monotonic clock). Before r10 an admitted frame had
+    /// no time limit, so a viewer that never read held the thread forever.
+    /// The policy and block checks still run on every wake. A var only so
+    /// the self-test can shorten it.
+    var authOKSendSeconds: TimeInterval = ControlServer.handshakeSendSeconds
     /// Cmd+V to Finder while a transfer runs (FinderPasteGate).
     private var pasteGate = FinderPasteGate()
     /// The frontmost Mac app (a fake in the self-test).
@@ -484,7 +495,11 @@ final class ControlServer: @unchecked Sendable {
             // and gets in once its control channel took over.
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
                                                   authSession: authChannel == .control ? authOK?.sessionID : nil,
-                                                  resume: authOK?.resume, close: { kick.kick() }) else {
+                                                  resume: authOK?.resume, close: { [weak self, isControl = authChannel == .control] in
+                                                      // r10: a channel's session was revoked: no more frames out.
+                                                      if !isControl { self?.markChannelRevoked(fd) }
+                                                      kick.kick()
+                                                  }) else {
                 kick.finish()
                 if authChannel == .control {
                     // r4: the reconnect check again, atomically with taking
@@ -515,6 +530,7 @@ final class ControlServer: @unchecked Sendable {
             defer {
                 sessionBroker.end(token)
                 kick.finish()
+                lock.lock(); revokedChannelFDs.remove(fd); lock.unlock()
             }
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted,
                           wake: kick.wakeFD)
@@ -1011,6 +1027,16 @@ final class ControlServer: @unchecked Sendable {
     /// before an inbound message is handled. One stat while listen.plist is
     /// unchanged.
     /// r8: and `admitPeerMessage` for this session's peer.
+    /// r10: see `revokedChannelFDs`.
+    private func markChannelRevoked(_ fd: Int32) {
+        lock.lock(); revokedChannelFDs.insert(fd); lock.unlock()
+    }
+
+    private func channelRevoked(_ fd: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revokedChannelFDs.contains(fd)
+    }
+
     private func sessionRevoked(_ kind: String, peerIP: String) -> Bool {
         if let admitMessage, !admitMessage() {
             rejectedClients += 1
@@ -1037,6 +1063,8 @@ final class ControlServer: @unchecked Sendable {
             if shouldStop { return }
             // r5 (B3): no clipboard read or write once the policy moved.
             if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
+            // r10: a takeover revoked this viewer's session.
+            if channelRevoked(fd) { resetPeer(fd); return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -1386,7 +1414,11 @@ final class ControlServer: @unchecked Sendable {
     private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
         if let fail = failAuthOKForTest, fail(ok) { return false }
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
-                          payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload) == .sent else { return false }
+                          payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload,
+                          limit: authOKSendSeconds) == .sent else {
+            print("auth.ok_send_failed peer=\(ip) chan=\(ok.channel.name) limit_s=\(authOKSendSeconds)")
+            return false
+        }
         print("auth.ok peer=\(ip) chan=\(ok.channel.name) session=\(ConnAuth.hex(ok.sessionID))")
         return true
     }
@@ -1626,12 +1658,14 @@ final class ControlServer: @unchecked Sendable {
     /// (`sessionRevoked`) right before the frame, and again after every wait
     /// for the viewer's window, so a viewer that stopped reading cannot hold
     /// the thread past a block. A refusal resets the socket (`resetPeer`).
+    /// r10: `limit` (seconds, monotonic) also bounds the wait for the
+    /// window; nil keeps the checks with no time limit.
     private func sendChecked(_ fd: Int32, peerIP: String, kind: String, type: UInt8,
-                             payload: [UInt8]) -> CheckedSend {
+                             payload: [UInt8], limit: TimeInterval? = nil) -> CheckedSend {
         beforeCheckedSend?(type)
         var refused = false
-        let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP) {
-            if self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
+        let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP, limit: limit) {
+            if self.channelRevoked(fd) || self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
             return refused
         }
         if refused { resetPeer(fd); return .refused }
@@ -1715,12 +1749,14 @@ final class ControlServer: @unchecked Sendable {
     /// first (an admitted viewer, via sendChecked), and only then is the
     /// rest written; EAGAIN or a short write goes back to poll. Without
     /// `revoked` (handshake frames) the wait ends after
-    /// `handshakeSendSeconds`.
+    /// `handshakeSendSeconds`. r10: `limit` sets the wait's length, with or
+    /// without `revoked`; `revoked` is still asked first on every wake.
     private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8], peerIP: String? = nil,
-                            revoked: (() -> Bool)? = nil) -> Bool {
+                            limit: TimeInterval? = nil, revoked: (() -> Bool)? = nil) -> Bool {
         let length = UInt16(payload.count)
         let bytes: [UInt8] = [0x4d, 0x52, 0x43, 0x31, 1, type, UInt8(length >> 8), UInt8(length & 0xff)] + payload
-        let deadline = revoked == nil ? ProcessInfo.processInfo.systemUptime + Self.handshakeSendSeconds : .infinity
+        let now = ProcessInfo.processInfo.systemUptime
+        let deadline = limit.map { now + $0 } ?? (revoked == nil ? now + Self.handshakeSendSeconds : .infinity)
         var offset = 0
         while offset < bytes.count {
             var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)

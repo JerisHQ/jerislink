@@ -116,6 +116,15 @@ final class SessionBroker: @unchecked Sendable {
         var sessionKey: [UInt8]?
         /// r4: the AUTH_RESULT session_id of this connection (password mode).
         var authSession: [UInt8]?
+        /// r10 (Pepper's r9 review, blocker 1): the control session this
+        /// connection belongs to: its own id for a control AUTH, the id it
+        /// named for a clipboard, file or ping AUTH. nil when it came in
+        /// with no ids (`begin`). A takeover closes every connection whose
+        /// session no longer counts, whatever its address.
+        var owner: [UInt8]?
+        /// r10 (blocker 2): this control AUTH was the first one since this
+        /// start (the host restarted), so `abandon` puts that state back.
+        var firstControl = false
         var close: @Sendable () -> Void
     }
 
@@ -252,19 +261,31 @@ final class SessionBroker: @unchecked Sendable {
         }
         nextToken &+= 1
         let token = nextToken
-        if passwordMode && channel == .control {
-            // §5.2: one viewer at a time; the newest AUTH wins.
-            kicked = entries.filter { $0.channel == .control || $0.peerIP != peerIP }
-            entries.removeAll { e in kicked.contains { $0.token == e.token } }
-        }
-        let entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
-                          authSession: authSession, close: close)
+        let owner: [UInt8]? = checkIDs ? (channel == .control ? authSession : resume) : nil
+        var entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
+                          authSession: authSession, owner: owner, close: close)
         if passwordMode && channel == .control, let authSession {
             // r5: the newest session; the one before it stays valid only for
             // the same viewer's own reconnect (which named it).
             let chained = resume != nil && accepted.first == resume
+            entry.firstControl = !sawControl
             accepted = chained ? [authSession, resume!] : [authSession]
             sawControl = true
+        }
+        if passwordMode && channel == .control {
+            // §5.2: one viewer at a time; the newest AUTH wins. r10 (Pepper's
+            // r9 review, blocker 1): judged by session, not only by address:
+            // a clipboard, file or ping connection whose session no longer
+            // counts closes too, even from the same IP (a new viewer on the
+            // same machine, or behind the same NAT). The same viewer's own
+            // reconnect keeps its channels (their id is still accepted).
+            let current = accepted
+            kicked = entries.filter { e in
+                if e.channel == .control || e.peerIP != peerIP { return true }
+                guard let o = e.owner else { return false }
+                return !current.contains(o)
+            }
+            entries.removeAll { e in kicked.contains { $0.token == e.token } }
         }
         entries.append(entry)
         replacedCount &+= UInt64(kicked.count)
@@ -287,11 +308,20 @@ final class SessionBroker: @unchecked Sendable {
     /// come in on it and nothing of it is left half taken over. The viewer
     /// it kicked stays replaced (Morris accepted that cost); the new viewer
     /// reconnects (with the id it had before, still valid when it chained).
+    /// r10 (Pepper's r9 review, blocker 2): when it was the first control
+    /// AUTH since this start (the host restarted) and nothing newer came in,
+    /// the broker goes back to "no control AUTH yet", so the viewer's retry
+    /// with the id it had before the restart is let in, not told REPLACED.
     func abandon(_ token: UInt64) {
         orderLock.lock()
         lock.lock()
         if let e = entries.first(where: { $0.token == token }), let id = e.authSession {
-            accepted.removeAll { $0 == id }
+            if e.firstControl && accepted == [id] {
+                accepted = []
+                sawControl = false
+            } else {
+                accepted.removeAll { $0 == id }
+            }
         }
         entries.removeAll { $0.token == token }
         let change = recomputeLocked()
