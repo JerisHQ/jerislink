@@ -2390,6 +2390,110 @@ void prcR5Tests() {
     prcR5DiscardNoticeTest();
     prcR6StopMidAckTest();
 }
+
+// PR-C r9 (Morris's simpler design): the Mac takes the session over as
+// soon as the password is right, before AUTH_OK goes out. When that OK is
+// lost (the connection ends with no result), the viewer is not halted: it
+// reconnects and gets in, with no id the first time and with the id it had
+// on its own reconnect. Once replaced (REPLACED notice), it never
+// reconnects on its own.
+// Reads the RESPONSE of one AUTH, then closes with no result (the Mac
+// took over, but its AUTH_OK did not go out). `named`: the id it carried.
+bool hostAuthOkLost(SOCKET s, const Secret& sec, Bytes& named) {
+    std::array<uint8_t, kNonceBytes> hn{};
+    const Bytes ch = challengeFor(sec, hn);
+    bool ok = sendAllBytes(s, frame(kTypeChallenge, ch.data(), ch.size()));
+    uint8_t type = 0;
+    Bytes p;
+    ok = ok && recvFrame(s, Clock::now() + std::chrono::seconds(10), type, p) == Io::Ok && type == kTypeResponse &&
+         (p.size() == kResponseBytes || p.size() == kResumeResponseBytes);
+    if (ok) named.assign(p.begin() + kResponseBytes, p.end());
+    shutdown(s, SD_BOTH);
+    closesocket(s);
+    return ok;
+}
+
+void prcR9OkLostTest() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+
+    const SessionId mine{1, 2, 3, 4, 5, 6, 7, 8}, mine2{2, 3, 4, 5, 6, 7, 8, 9};
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    bool lost1 = false, lost2 = false;
+    int ok1 = 0, ok2 = 0;
+    Bytes named1, named2, named3, named4;
+    std::atomic<int> stage{0};
+    std::atomic<bool> dropNow{false}, noticeNow{false};
+    std::thread host([&] {
+        SOCKET s1 = l.accept(5000);
+        if (s1 == INVALID_SOCKET) return;
+        lost1 = hostAuthOkLost(s1, sec, named1);
+        SOCKET s2 = l.accept(8000);
+        if (s2 == INVALID_SOCKET) return;
+        ok1 = hostAuthSession(s2, sec, mine, nullptr, named2);
+        stage = 1;
+        while (!dropNow) Sleep(10);
+        // The connection drops; the viewer's own reconnect takes over again
+        // and that OK is lost too.
+        shutdown(s2, SD_BOTH);
+        closesocket(s2);
+        SOCKET s3 = l.accept(8000);
+        if (s3 == INVALID_SOCKET) return;
+        lost2 = hostAuthOkLost(s3, sec, named3);
+        SOCKET s4 = l.accept(8000);
+        if (s4 == INVALID_SOCKET) return;
+        ok2 = hostAuthSession(s4, sec, mine2, nullptr, named4);
+        stage = 2;
+        while (!noticeNow) Sleep(10);
+        // Another viewer took over: the REPLACED notice, then the close.
+        sendAllBytes(s4, Bytes(notice, notice + sizeof(notice)));
+        Sleep(300);
+        closesocket(s4);
+    });
+    auto drive = [&](int until) {
+        for (int i = 0; i < 1000 && stage < until && terminals == 0; ++i) {
+            control.pollHostNotice();
+            control.keepSession();
+            Sleep(10);
+        }
+        for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+    };
+    drive(1);
+    expect(lost1 && named1.empty() && ok1 == 1 && named2.empty() && terminals == 0 && mayConnect(),
+           "prc r9 OK lost: the takeover's AUTH_OK never came (connection closed), the viewer is not halted and its reconnect gets in");
+    dropNow = true;
+    drive(2);
+    const bool carried = named3.size() == kSessionIdBytes && std::equal(named3.begin(), named3.end(), mine.begin()) &&
+                         named4.size() == kSessionIdBytes && std::equal(named4.begin(), named4.end(), mine.begin());
+    expect(lost2 && ok2 == 1 && carried && terminals == 0 && mayConnect(),
+           "prc r9 OK lost: on its own reconnect the lost OK is retried with the id it had, and gets in");
+    noticeNow = true;
+    for (int i = 0; i < 300 && terminals == 0; ++i) {
+        control.pollHostNotice();
+        control.keepSession();
+        Sleep(10);
+    }
+    host.join();
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect() && !control.keepSession() &&
+               l.accept(500) == INVALID_SOCKET,
+           "prc r9 replaced: the replaced viewer is told once (Replaced) and does not reconnect on its own");
+    control.stop();
+    setCurrent(nullptr);
+}
+
+void prcR9Tests() {
+    prcR9OkLostTest();
+}
 }  // namespace
 
 int main() {
@@ -2409,6 +2513,7 @@ int main() {
     prcR4Tests();
     prcR4ReadOnlyTests();
     prcR5Tests();
+    prcR9Tests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

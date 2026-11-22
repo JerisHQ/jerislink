@@ -140,41 +140,11 @@ final class SessionBroker: @unchecked Sendable {
     /// over has gone too: only a new attempt (no resume id) starts over.
     /// Holds the newest session, plus the one before it when the newest
     /// named it (the same viewer reconnecting; another of its channels may
-    /// still name the older id). Empty: no control AUTH since this start.
+    /// still name the older id).
     private var accepted: [[UInt8]] = []
-    /// r6 (Pepper's r5 review): control AUTHs whose AUTH_OK is on its way,
-    /// by reservation. Their ids already count for `resumeRefused` (the
-    /// viewer's other channels may name one right after OK), but nothing
-    /// else changes until `admit(reservation:)`: the live viewer keeps the
-    /// session, and `discard` (OK not sent) leaves no trace.
-    private var pendingIDs: [UInt64: [UInt8]] = [:]
-    private var nextReservation: UInt64 = 0
-    /// The newest reservation admitted. An older one admitted later lost
-    /// to a newer AUTH (reservation order is AUTH order).
-    private var admittedReservation: UInt64 = 0
-    /// r7 (Pepper's r6 review): woken when a pending id is admitted or
-    /// dropped, for the other channels waiting on it (`awaitPending`).
-    /// Taken before `lock`, never under it.
-    private let pendingCond = NSCondition()
-    private var waiting = 0
-    /// r7 self-test: connections waiting in `awaitPending` now.
-    var waitingForTest: Int { lock.lock(); defer { lock.unlock() }; return waiting }
-    /// r8 (Pepper's r7 review, item 1): how each reservation ended, and the
-    /// reservation behind each id. Kept after the reservation ends, so a
-    /// channel naming an id is judged by that reservation's own outcome
-    /// whenever it asks: a discard before it waits no longer looks like "no
-    /// pending id" (which, right after a host start, let it in).
-    enum ReservationEnd: Equatable { case admitted, discarded, lost }
-    private var reservationOf: [[UInt8]: UInt64] = [:]
-    private var reservationID: [UInt64: [UInt8]] = [:]
-    private var ended: [UInt64: ReservationEnd] = [:]
-    private var endedOrder: [UInt64] = []
-    /// An ended reservation was forgotten (more than `keptEnded`).
-    private var forgotEnded = false
-    static let keptEnded = 1024
-    /// r8 self-test only: runs when a wait reached its deadline with the
-    /// takeover still pending, before the result is decided. nil in the app.
-    var atDeadlineForTest: (@Sendable (UInt64) -> Void)?
+    /// r9: a control AUTH was admitted since this start. Until then a
+    /// control reconnect naming any id is let in (the host restarted).
+    private var sawControl = false
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
@@ -207,14 +177,15 @@ final class SessionBroker: @unchecked Sendable {
         lock.lock(); listeners.append(handler); lock.unlock()
     }
 
-    /// r4 (Pepper's r3 review, item 1): a viewer reconnecting on its own
-    /// names the control session it had (`resume`, the session_id of its
-    /// last control AUTH). r5 (Pepper's r4 review, item 1): refused unless it
-    /// names the newest control session (or the one that session replaced on
-    /// the same viewer's own reconnect), whether or not the viewer holding the
-    /// newest session is still connected. A replaced viewer, notice or not,
-    /// stays replaced until the user starts a new attempt. No control AUTH
-    /// since this start: allowed.
+    /// r4 (Pepper's r3 review, item 1): a viewer reconnecting its control
+    /// channel names the control session it had (`resume`, the session_id of
+    /// its last control AUTH). r5 (Pepper's r4 review, item 1): refused
+    /// unless it names the newest control session (or the one that session
+    /// replaced on the same viewer's own reconnect), whether or not the viewer
+    /// holding the newest session is still connected. A replaced viewer,
+    /// notice or not, stays replaced until the user starts a new attempt. No
+    /// control AUTH since this start: allowed. r9: control channel only; the
+    /// other channels are judged by `channelAdmitted`.
     func resumeRefused(_ resume: [UInt8]?) -> Bool {
         guard passwordMode, let resume else { return false }
         lock.lock(); defer { lock.unlock() }
@@ -222,180 +193,63 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        // r8: an id from a reservation is judged by how that reservation
-        // ended: pending is let in (to wait), discarded or lost is refused.
-        if let r = reservationOf[resume] {
-            switch ended[r] {
-            case nil: return false
-            case .discarded?, .lost?: return true
-            case .admitted?: break
-            }
-        }
-        // No control AUTH since this start: allowed, unless an ended
-        // reservation was forgotten (the id may be one of those).
-        if accepted.isEmpty { return forgotEnded }
-        return !accepted.contains(resume)
+        sawControl && !accepted.contains(resume)
     }
 
-    /// r8: under `lock`. Records how `reservation` ended; the oldest ended
-    /// ones are forgotten past `keptEnded`.
-    private func endLocked(_ reservation: UInt64, _ how: ReservationEnd) {
-        guard ended[reservation] == nil, reservationID[reservation] != nil else { return }
-        ended[reservation] = how
-        endedOrder.append(reservation)
-        while endedOrder.count > Self.keptEnded {
-            let old = endedOrder.removeFirst()
-            ended.removeValue(forKey: old)
-            if let id = reservationID.removeValue(forKey: old), reservationOf[id] == old {
-                reservationOf.removeValue(forKey: id)
-            }
-            forgotEnded = true
-        }
-    }
-
-    /// r6: a control AUTH (password mode) before its AUTH_OK goes out. nil:
-    /// refused (`resumeRefused`). Otherwise the reservation for
-    /// `admit(reservation:)` once OK was sent, or `discard` if it was not.
-    /// Nothing is kicked and the session does not change here.
-    func reserve(authSession: [UInt8], resume: [UInt8]?) -> UInt64? {
+    /// r9 (Morris's simpler design): a clipboard, file or ping AUTH (password
+    /// mode) is let in only when it names a control session that took over
+    /// and still counts (`accepted`). No id, an id that never took over (its
+    /// AUTH_OK failed) or one that was replaced: refused at once, no waiting.
+    func channelAdmitted(_ resume: [UInt8]?) -> Bool {
+        guard passwordMode else { return true }
+        guard let resume else { return false }
         lock.lock(); defer { lock.unlock() }
-        if passwordMode, let resume, refusedLocked(resume) {
-            resumeRefusedCount &+= 1
-            return nil
-        }
-        nextReservation &+= 1
-        pendingIDs[nextReservation] = authSession
-        reservationOf[authSession] = nextReservation
-        reservationID[nextReservation] = authSession
-        return nextReservation
+        return accepted.contains(resume)
     }
 
-    /// r6: the AUTH_OK of `reservation` was not sent. Its id is dropped;
-    /// the live viewer, the session and the ids a reconnect may name stay
-    /// as they were.
-    func discard(_ reservation: UInt64) {
-        lock.lock()
-        if pendingIDs.removeValue(forKey: reservation) != nil { endLocked(reservation, .discarded) }
-        lock.unlock()
-        wakePending()
-    }
-
-    /// r7: how the wait of a clipboard, file or ping AUTH on a pending id
-    /// ended.
-    enum PendingWait: Equatable {
-        /// `resume` named no reservation: nothing to wait for.
-        case none
-        /// Its takeover was admitted; `admit` may let the channel in.
-        case admitted
-        /// Its takeover was discarded (OK not sent) or lost to a newer AUTH:
-        /// the channel must close unused (REPLACED).
-        case dropped
-        /// r8 (Pepper's r7 review, item 2): still pending at the deadline.
-        /// Not a loss: the channel closes without REPLACED and the viewer
-        /// reconnects as after any dropped connection.
-        case timedOut
-    }
-
-    /// r8 (Pepper's r7 review, item 1): the reservation `resume` names, in
-    /// any state (pending or ended), taken when the channel authenticates.
-    /// nil: not a reservation's id (or transition mode).
-    func pendingReservation(_ resume: [UInt8]?) -> UInt64? {
-        guard passwordMode, let resume else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        return reservationOf[resume]
-    }
-
-    /// r7: `awaitReservation` for the reservation `resume` names; `.none`
-    /// when it names none.
-    func awaitPending(_ resume: [UInt8]?, timeout: TimeInterval = 5) -> PendingWait {
-        guard let r = pendingReservation(resume) else { return .none }
-        return awaitReservation(r, timeout: timeout)
-    }
-
-    /// r7 (Pepper's r6 review): a channel whose AUTH names a pending
-    /// reservation (password mode) waits here, before its OK and before any
-    /// of its messages are read, until that takeover ends. So no clipboard or
-    /// file data is handled for a control session that never took over, and
-    /// a dropped one leaves no channel open. r8: the result is that
-    /// reservation's own outcome, read under `lock` after the wait, so an
-    /// admit landing at the deadline counts; still pending is `.timedOut`.
-    func awaitReservation(_ reservation: UInt64, timeout: TimeInterval = 5) -> PendingWait {
-        func pendingLocked() -> Bool { pendingIDs[reservation] != nil }
-        pendingCond.lock()
-        lock.lock()
-        var pending = pendingLocked()
-        if pending { waiting += 1 }
-        let counted = pending
-        lock.unlock()
-        let deadline = Date().addingTimeInterval(timeout)
-        while pending {
-            let now = Date()
-            if now >= deadline { break }
-            // Sliced, so a wake between the check and the wait is not missed
-            // for long.
-            pendingCond.wait(until: min(deadline, now.addingTimeInterval(0.05)))
-            lock.lock(); pending = pendingLocked(); lock.unlock()
-        }
-        pendingCond.unlock()
-        if pending, let hook = atDeadlineForTest { hook(reservation) }
-        lock.lock(); defer { lock.unlock() }
-        if counted { waiting -= 1 }
-        switch ended[reservation] {
-        case .admitted?: return .admitted
-        case .discarded?, .lost?: return .dropped
-        case nil: return pendingLocked() ? .timedOut : .dropped
-        }
-    }
-
-    private func wakePending() {
-        pendingCond.lock(); pendingCond.broadcast(); pendingCond.unlock()
-    }
-
-    /// One admitted connection. Password mode: only the control channel,
-    /// with its K_s. Returns the token for `end`.
+    /// One admitted connection with no AUTH ids (transition mode, and the
+    /// broker self-test). Password mode: only the control channel, with its
+    /// K_s, becomes the session. Returns the token for `end`.
     func begin(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?,
                close: @escaping @Sendable () -> Void) -> UInt64 {
-        admit(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: nil, resume: nil, close: close)!
+        take(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: nil, resume: nil,
+             checkIDs: false, close: close)!
     }
 
     /// `begin` with the AUTH session_id and the session a reconnect names.
-    /// nil: refused (`resumeRefused`, checked again here under the lock so
-    /// no AUTH can come in between), or (r6) `reservation` lost to a newer
-    /// control AUTH; nothing changed and nothing is kicked. `reservation`:
-    /// from `reserve`, after this connection's AUTH_OK went out.
+    /// r9: a password-mode control AUTH takes over here, before its AUTH_OK
+    /// goes out: the old viewer is kicked and the UDP session switches at
+    /// once. nil: refused, nothing changed and nothing kicked. Control:
+    /// `resumeRefused`, checked again under the lock so no AUTH can come in
+    /// between. Other channels: `channelAdmitted`, likewise.
     func admit(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
-               resume: [UInt8]?, reservation: UInt64? = nil, waitedOn: UInt64? = nil,
-               close: @escaping @Sendable () -> Void) -> UInt64? {
+               resume: [UInt8]?, close: @escaping @Sendable () -> Void) -> UInt64? {
+        take(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: authSession, resume: resume,
+             checkIDs: true, close: close)
+    }
+
+    private func take(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
+                      resume: [UInt8]?, checkIDs: Bool, close: @escaping @Sendable () -> Void) -> UInt64? {
         var kicked: [Entry] = []
         // r2 (Pepper's PR-C review, item 1): the change and its listeners
         // run under `orderLock`, so two changes never reach the listeners
         // (and the session link's serial send queue) in the other order.
         orderLock.lock()
         lock.lock()
-        if let reservation {
-            let held = pendingIDs.removeValue(forKey: reservation)
-            if held == nil || reservation < admittedReservation {
-                endLocked(reservation, .lost)
-                replacedCount &+= 1
+        if passwordMode && checkIDs {
+            let refused: Bool
+            if channel == .control {
+                refused = resume.map(refusedLocked) ?? false
+            } else {
+                refused = resume.map { !accepted.contains($0) } ?? true
+            }
+            if refused {
+                resumeRefusedCount &+= 1
                 lock.unlock()
                 orderLock.unlock()
-                wakePending()
-                log("auth.replaced chan=\(channel?.name ?? "open") peer=\(peerIP) stage=admit; a newer AUTH took the session first")
                 return nil
             }
         }
-        // r8: a channel that waited on a reservation goes in only if that
-        // reservation was admitted (and its id is still valid).
-        let waitedLost = waitedOn.map { ended[$0] != .admitted } ?? false
-        if passwordMode, let resume, waitedLost || refusedLocked(resume) {
-            if let reservation { endLocked(reservation, .lost) }
-            resumeRefusedCount &+= 1
-            lock.unlock()
-            orderLock.unlock()
-            if reservation != nil { wakePending() }
-            return nil
-        }
-        if let reservation { admittedReservation = reservation; endLocked(reservation, .admitted) }
         nextToken &+= 1
         let token = nextToken
         if passwordMode && channel == .control {
@@ -410,6 +264,7 @@ final class SessionBroker: @unchecked Sendable {
             // the same viewer's own reconnect (which named it).
             let chained = resume != nil && accepted.first == resume
             accepted = chained ? [authSession, resume!] : [authSession]
+            sawControl = true
         }
         entries.append(entry)
         replacedCount &+= UInt64(kicked.count)
@@ -417,8 +272,6 @@ final class SessionBroker: @unchecked Sendable {
         lock.unlock()
         publish(change)
         orderLock.unlock()
-        // r7: the channels waiting on this takeover's id may go on.
-        if reservation != nil { wakePending() }
         // After the new session is announced, so the old K_s is void before
         // the old viewer hears it was replaced. Outside both locks: a close
         // may end its connection (`end`) on this thread.
@@ -427,6 +280,24 @@ final class SessionBroker: @unchecked Sendable {
             e.close()
         }
         return token
+    }
+
+    /// r9: the AUTH_OK of an admitted control AUTH did not go out. Its
+    /// connection ends and its session id stops counting, so no channel can
+    /// come in on it and nothing of it is left half taken over. The viewer
+    /// it kicked stays replaced (Morris accepted that cost); the new viewer
+    /// reconnects (with the id it had before, still valid when it chained).
+    func abandon(_ token: UInt64) {
+        orderLock.lock()
+        lock.lock()
+        if let e = entries.first(where: { $0.token == token }), let id = e.authSession {
+            accepted.removeAll { $0 == id }
+        }
+        entries.removeAll { $0.token == token }
+        let change = recomputeLocked()
+        lock.unlock()
+        publish(change)
+        orderLock.unlock()
     }
 
     func end(_ token: UInt64) {
