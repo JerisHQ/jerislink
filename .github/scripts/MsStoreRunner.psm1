@@ -157,6 +157,7 @@ function Get-StorePackage {
     Expand-Archive (Join-Path $work 'upload.zip') (Join-Path $work 'upload')
     $msix = @(Get-ChildItem (Join-Path $work 'upload') -Filter *.msix)
     if ($msix.Count -ne 1) { throw "expected one .msix inside the .msixupload, found $($msix.Count)" }
+    Write-Host "Package: $($upload.FullName) contains $($msix[0].Name) ($($msix[0].Length) bytes)"
     Copy-Item -LiteralPath $msix[0].FullName (Join-Path $work 'pkg.zip')
     Expand-Archive (Join-Path $work 'pkg.zip') (Join-Path $work 'pkg')
     [xml]$m = Get-Content (Join-Path $work 'pkg\AppxManifest.xml')

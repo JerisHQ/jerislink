@@ -147,12 +147,20 @@ jobs:
           $r = Invoke-Cli { msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
           Write-Host "--- v0.3.0 command, exit $($r.Code) ---`n$($r.Out)"
           if ($r.Out -notmatch "Unrecognized command or argument '--inputFile'") { throw "v0.3.0 command did not fail on --inputFile" }
+          if ($r.Code -eq 0) { throw "v0.3.0 command exited 0" }
 
           # 3. `reconfigure --reset` still cannot run here, and leaves the credential behind.
           $r = Invoke-Cli { msstore reconfigure --reset }
           Write-Host "--- reconfigure --reset, exit $($r.Code) ---`n$($r.Out)"
           if ($r.Out -notmatch 'non-interactive mode') { throw "reconfigure --reset no longer fails in CI; recheck the cleanup" }
+          if ($r.Code -eq 0) { throw "reconfigure --reset exited 0" }
           if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "expected reconfigure --reset to leave the credential in place" }
+
+          # Every assertion above passed. Steps 2 and 3 are expected CLI failures and
+          # leave $LASTEXITCODE at 1; the pwsh step wrapper ends with
+          # `exit $LASTEXITCODE`, which would fail this step after a passing check.
+          Write-Host "dry run: all assertions passed"
+          exit 0
 
       - name: Forget the credentials (the cleanup msstore-publish.yml runs)
         if: always()
