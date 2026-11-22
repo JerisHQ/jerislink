@@ -799,8 +799,17 @@ enum AuthSelfTest {
                                 secret: secret, timeout: 2)
             let broker = SessionBroker(passwordMode: true, log: { _ in })
             let fake = FakeClipboard(text: nil)
+            // File sessions on (as in the app), so the old viewer's file channel really opens.
+            let r10Dir = FileManager.default.temporaryDirectory.appendingPathComponent("jl-prc-r10-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: r10Dir) }
+            let r10Folder = FileSendFolder(primary: r10Dir.appendingPathComponent("send", isDirectory: true),
+                                           fallback: r10Dir.appendingPathComponent("received", isDirectory: true),
+                                           openFolder: { _ in })
             let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
                                   settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  allowFileSessions: true,
+                                  fileStagingRoot: r10Dir.appendingPathComponent("staging", isDirectory: true),
+                                  fileSendFolder: r10Folder,
                                   clipboard: fake, authGate: gate, sessionBroker: broker)
             let stall = R10AuthOKStall()
             s.sendHook = stall.send
