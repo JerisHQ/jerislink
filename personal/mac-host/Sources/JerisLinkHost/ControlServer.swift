@@ -571,10 +571,12 @@ final class ControlServer: @unchecked Sendable {
         // END is sent only for a started session. The relay listener has no
         // lifecycle and forwards as before.
         let sessionID = Self.sessionIDs.next()
-        // r12: the control channel's own replies are covered by the check
-        // per message below; once void it gets the REPLACED notice, so its
-        // socket is not reset under it. Ping replies are checked as they go.
-        let replyLife = authChannel == .control ? nil : life
+        // r13 (Pepper's r12 review, item 2): every reply on this line (PONG,
+        // video ACK, ...) asks the epoch right before each socket write. A
+        // control line refused that way is not reset: it gets the REPLACED
+        // notice after this loop (its own path, `sendPacket` with no check).
+        let replyLife = life
+        let keepForNotice = authChannel == .control
         var sessionStarted = false
         defer { if sessionStarted { endInputSession(sessionID) } }
         var firstHeader: [UInt8]? = pending
@@ -610,7 +612,8 @@ final class ControlServer: @unchecked Sendable {
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {
                 guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: ConnAuth.MsgType.result,
-                                  payload: ConnAuth.Result.openIPOnly.payload, life: replyLife) == .sent else { return }
+                                  payload: ConnAuth.Result.openIPOnly.payload, life: replyLife,
+                                  keepForNotice: keepForNotice) == .sent else { return }
                 continue
             }
             messages += 1
@@ -654,7 +657,8 @@ final class ControlServer: @unchecked Sendable {
                 return
             case 0x01: // PING
                 if payload.count == 4 {
-                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload, life: replyLife) == .sent else { return }
+                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload, life: replyLife,
+                                      keepForNotice: keepForNotice) == .sent else { return }
                 }
             case 0x40: // VIDEO_CONFIG_SET v1
                 let clientIP = settingsClientIP()
@@ -670,7 +674,8 @@ final class ControlServer: @unchecked Sendable {
                 }
                 // r10: the ACK asks again; a block that landed while the
                 // settings were applied gets no reply.
-                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload, life: replyLife) == .sent else { return }
+                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload, life: replyLife,
+                                  keepForNotice: keepForNotice) == .sent else { return }
                 print("Video config ACK status=\(ack.status) codec=\(ack.codec) bitrate_mbps=\(ack.bitrateMbps) flags=0x\(String(ack.flags, radix: 16)) remote_size=\(ack.framebufferWidth)x\(ack.framebufferHeight)")
             case 0x10: // KEY
                 if payload.count == 3 {
@@ -834,7 +839,13 @@ final class ControlServer: @unchecked Sendable {
     /// carry no file names (D15): only open/closed and counts.
     private func handleFileSession(_ fd: Int32, peerCaps: UInt16, peerIP: String, life: KickHandle? = nil) {
         fileSessions += 1
-        let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard, sendFolder: fileSendFolder)
+        // r13 (Pepper's r12 review, item 1): the landing points ask the epoch
+        // themselves: each send-folder rename (`live`) and the pasteboard
+        // write (the gated clipboard, checked inside its main-thread block).
+        let landing: ClipboardBackend = life.map { SessionGatedClipboard(clipboard, life: $0) as ClipboardBackend } ?? clipboard
+        let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: landing, sendFolder: fileSendFolder,
+                                          live: { !(life?.isRevoked ?? false) })
+        if let hook = beforeSessionEffectForTest { receiver.beforeLandForTest = { hook("land:" + $0) } }
         let announcer: FileAnnouncer? = (peerCaps & FileProto.Caps.announce) != 0 ? FileAnnouncer() : nil
         // A copy made before the session opened is not announced: the viewer
         // connecting must not replace what the Windows clipboard holds.
@@ -883,6 +894,12 @@ final class ControlServer: @unchecked Sendable {
         var reason = "peer_closed"
         // F5b: Finder pushes go to the newest session; one at a time.
         let pushSession = pushBroker.register(peerCaps: peerCaps)
+        // r13 (Pepper's r12 review, item 3): a takeover aborts this
+        // session's push job (waiting or running) as it kicks the connection.
+        if let life {
+            let broker = pushBroker
+            life.onKick { broker.abort(session: pushSession) }
+        }
         var push: PushSender?
         func endPush() {
             guard let p = push else { return }
@@ -939,8 +956,8 @@ final class ControlServer: @unchecked Sendable {
                 guard sendAll(p.abandon()) else { reason = "send_failed"; return }
                 endPush()
             }
-            if push == nil, let job = pushBroker.take(session: pushSession) {
-                let p = PushSender(job: job)
+            if push == nil, let job = pushBroker.take(session: pushSession, live: { !(life?.isRevoked ?? false) }) {
+                let p = PushSender(job: job, live: { !(life?.isRevoked ?? false) })
                 push = p
                 guard sendAll(p.start()) else { reason = "send_failed"; return }
             }
@@ -1024,6 +1041,8 @@ final class ControlServer: @unchecked Sendable {
                         beforeSessionEffectForTest?("file")
                         return receiver.handle(msg)
                     }) else { reason = "replaced"; return }
+                    // r13: taken over while the step ran: send nothing of it.
+                    if life.isRevoked { reason = "replaced"; return }
                     step = s
                 } else {
                     step = receiver.handle(msg)
@@ -1699,14 +1718,20 @@ final class ControlServer: @unchecked Sendable {
     /// r11 (Pepper's r10 review, item 1): `life` is the connection's own
     /// handle, never a descriptor number. r12: it reads the broker epoch.
     private func sendChecked(_ fd: Int32, peerIP: String, kind: String, type: UInt8,
-                             payload: [UInt8], limit: TimeInterval? = nil, life: KickHandle? = nil) -> CheckedSend {
+                             payload: [UInt8], limit: TimeInterval? = nil, life: KickHandle? = nil,
+                             keepForNotice: Bool = false) -> CheckedSend {
         beforeCheckedSend?(type)
         var refused = false
         let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP, limit: limit) {
             if life?.isRevoked == true || self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
             return refused
         }
-        if refused { resetPeer(fd); return .refused }
+        if refused {
+            // r13: a control line a takeover voided is closed after its
+            // REPLACED notice instead of reset.
+            if !(keepForNotice && life?.isRevoked == true) { resetPeer(fd) }
+            return .refused
+        }
         return ok ? .sent : .failed
     }
 

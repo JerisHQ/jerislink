@@ -74,7 +74,9 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
     private var sessions: [(id: UInt64, caps: UInt16, heard: Double)] = []
     private var nextSession: UInt64 = 0
     private var pending: (session: UInt64, job: PushJob)?
-    private var running: PushJob?
+    private var running: (session: UInt64, job: PushJob)?
+    /// r13: sessions a takeover voided; never offered a job again.
+    private var aborted: Set<UInt64> = []
     private let now: () -> Double
 
     /// A session heard from within this long is live. The viewer PINGs
@@ -105,6 +107,7 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
 
     func unregister(_ id: UInt64) {
         lock.lock()
+        aborted.remove(id)
         sessions.removeAll { $0.id == id }
         let orphan = pending?.session == id ? pending?.job : nil
         if orphan != nil { pending = nil }
@@ -156,19 +159,51 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         return .failed
     }
 
-    /// The session's poll: its job, if one waits.
-    func take(session id: UInt64) -> PushJob? {
-        lock.lock(); defer { lock.unlock() }
-        guard let p = pending, p.session == id else { return nil }
+    /// The session's poll: its job, if one waits. r13 (Pepper's r12
+    /// review, item 3): `live` is asked under the lock, as the job is
+    /// claimed: a session a takeover voided claims nothing, and the job it
+    /// was offered is aborted (the helper hears not_connected at once).
+    func take(session id: UInt64, live: () -> Bool = { true }) -> PushJob? {
+        lock.lock()
+        guard let p = pending, p.session == id else { lock.unlock(); return nil }
+        guard !aborted.contains(id), live() else {
+            pending = nil
+            aborted.insert(id)
+            lock.unlock()
+            print("file.push_route=aborted reason=replaced")
+            p.job.answer(.notConnected)
+            p.job.release()
+            return nil
+        }
         pending = nil
-        running = p.job
+        running = (id, p.job)
+        lock.unlock()
         return p.job
+    }
+
+    /// r13: a takeover voided session `id` (its connection was kicked).
+    /// It gets no new job, a job waiting for it is aborted, and a job it
+    /// runs is answered not_connected and abandoned, so an accept that
+    /// arrives later changes nothing.
+    func abort(session id: UInt64) {
+        lock.lock()
+        aborted.insert(id)
+        sessions.removeAll { $0.id == id }
+        let waiting = pending?.session == id ? pending?.job : nil
+        if waiting != nil { pending = nil }
+        let run = running?.session == id ? running?.job : nil
+        lock.unlock()
+        if waiting != nil || run != nil { print("file.push_route=aborted reason=replaced") }
+        waiting?.answer(.notConnected)
+        waiting?.release()
+        run?.answer(.notConnected)
+        run?.abandon()
     }
 
     /// The session is done with `job` (any ending).
     func finished(_ job: PushJob) {
         lock.lock()
-        if running === job { running = nil }
+        if running?.job === job { running = nil }
         lock.unlock()
         job.release()
     }
@@ -182,6 +217,9 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         lock.lock(); defer { lock.unlock() }
         return pending == nil && running == nil
     }
+
+    /// r13 (self-test): the job a session runs.
+    var runningJob: PushJob? { lock.lock(); defer { lock.unlock() }; return running?.job }
 }
 
 /// Serves one push on its session thread. Not thread-safe.
@@ -197,6 +235,9 @@ final class PushSender {
     private var index: UInt32 = .max
     private var next: UInt64 = 0
     private var hasher = SHA256()
+    /// r13: whether this session's epoch still counts; asked when the
+    /// viewer's REPLY would mark the push accepted.
+    private let live: () -> Bool
 
     /// Largest REQUEST served in one go; the viewer asks for 1 MiB.
     static let maxRequest: UInt32 = 4 << 20
@@ -212,9 +253,10 @@ final class PushSender {
         return 0x8000_0000 | (counter << 1)
     }
 
-    init(job: PushJob, transfer: UInt32 = PushSender.newTransfer()) {
+    init(job: PushJob, transfer: UInt32 = PushSender.newTransfer(), live: @escaping () -> Bool = { true }) {
         self.job = job
         self.transfer = transfer
+        self.live = live
     }
 
     func start() -> [Message] {
@@ -230,6 +272,8 @@ final class PushSender {
 
     /// REPLY from the viewer. Not ok ends the push.
     func reply(_ status: UInt8) {
+        // r13: an accept read just before a takeover does not count after it.
+        guard live() else { end("replaced", answer: .notConnected); return }
         if status == FileProto.Status.ok {
             accepted = true
             job.answer(.ok)

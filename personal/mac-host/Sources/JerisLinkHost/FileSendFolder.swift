@@ -89,10 +89,14 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     /// Moves each top-level item from `fromFD` into `destFD`, never replacing
     /// anything: "name", then "name 2", "name 3", ... Returns how many moved;
     /// stops at the first item that cannot be moved.
-    static func moveAll(_ names: [String], from fromFD: Int32, to destFD: Int32) -> (moved: Int, renamed: Int, error: Int32) {
+    /// r13: `live` is asked right before each item's rename; false stops
+    /// (ECANCELED) with nothing more moved.
+    static func moveAll(_ names: [String], from fromFD: Int32, to destFD: Int32,
+                        live: () -> Bool = { true }) -> (moved: Int, renamed: Int, error: Int32) {
         var moved = 0
         var renamed = 0
         for name in names {
+            guard live() else { return (moved, renamed, ECANCELED) }
             var n = 1
             while true {
                 let target = n == 1 ? name : FilePathSafety.clashName(name, attempt: n)

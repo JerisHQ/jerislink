@@ -1447,6 +1447,22 @@ final class FakeClipboard: ClipboardBackend, @unchecked Sendable {
 
     init(text: String?) { self.text = text }
 
+    /// r13: called inside a gated write, before its check (like a write
+    /// queued on the main thread that runs later); "text" or "files".
+    var landHook: (@Sendable (String) -> Void)?
+
+    func writeText(_ value: String, when live: () -> Bool) -> Int? {
+        landHook?("text")
+        guard live() else { return nil }
+        return writeText(value)
+    }
+
+    func writeFileURLs(_ value: [URL], when live: () -> Bool) -> Int? {
+        landHook?("files")
+        guard live() else { return nil }
+        return writeFileURLs(value)
+    }
+
     var counts: Counts { lock.lock(); defer { lock.unlock() }; return c }
     var writes: [String] { lock.lock(); defer { lock.unlock() }; return written }
 

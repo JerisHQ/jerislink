@@ -90,6 +90,13 @@ final class FileUploadReceiver {
     private let clipboard: ClipboardBackend
     private let freeSpace: (URL) -> UInt64?
     private let sendFolder: FileSendFolder
+    /// r13 (Pepper's r12 review, item 1): asked again at each landing
+    /// point (every send-folder rename; the pasteboard write checks its own
+    /// gate inside the main-thread block). False: the session was taken
+    /// over while this step ran, so nothing more lands and no RESULT goes.
+    private let live: () -> Bool
+    /// r13 (self-test): called right before a landing point ("send").
+    var beforeLandForTest: ((String) -> Void)?
     private var state = State.idle
     /// A transfer this side ended (failed or cancelled): the sender may still
     /// have DATA in flight for it, which is dropped instead of closing.
@@ -106,11 +113,12 @@ final class FileUploadReceiver {
 
     init(root: URL = FileUploadReceiver.defaultRoot, clipboard: ClipboardBackend,
          freeSpace: @escaping (URL) -> UInt64? = FileUploadReceiver.availableBytes,
-         sendFolder: FileSendFolder = .shared) {
+         sendFolder: FileSendFolder = .shared, live: @escaping () -> Bool = { true }) {
         self.root = root
         self.clipboard = clipboard
         self.freeSpace = freeSpace
         self.sendFolder = sendFolder
+        self.live = live
         Self.sweepOnce(root)
     }
 
@@ -320,7 +328,10 @@ final class FileUploadReceiver {
         if tr.purpose == FileProto.Purpose.send { return finishSend(tr, tops: tops) }
         let filesDir = tr.dir.appendingPathComponent("files", isDirectory: true)
         let urls = tops.map { filesDir.appendingPathComponent($0) }
-        guard clipboard.writeFileURLs(urls) != nil else { return [failMessage(tr, "pasteboard")] }
+        guard clipboard.writeFileURLs(urls) != nil else {
+            if !live() { return voided(tr) }
+            return [failMessage(tr, "pasteboard")]
+        }
         let ok = tr.filesOK
         closeFDs(tr)
         Self.keep(tr.dir)
@@ -333,7 +344,9 @@ final class FileUploadReceiver {
     /// Send: move the items into the folder, drop the staging, open Finder.
     private func finishSend(_ tr: Transfer, tops: [String]) -> [Message] {
         guard let url = tr.destURL, tr.destFD >= 0 else { return [failMessage(tr, "dest")] }
-        let (moved, renamed, err) = FileSendFolder.moveAll(tops, from: tr.filesFD, to: tr.destFD)
+        beforeLandForTest?("send")
+        let (moved, renamed, err) = FileSendFolder.moveAll(tops, from: tr.filesFD, to: tr.destFD, live: live)
+        if moved == 0 && !live() { return voided(tr) }
         guard moved == tops.count else {
             // Items already moved stay; the rest go with the staging folder.
             print("file.send_move=failed transfer=\(tr.id) moved=\(moved) of=\(tops.count) errno=\(err)")
@@ -351,6 +364,17 @@ final class FileUploadReceiver {
 
     /// REVEAL (0x5C): open the folder a send went to (no reply).
     func reveal(_ t: UInt32) { sendFolder.reveal(transfer: t) }
+
+    /// r13: a takeover came in at a landing point: the staging goes,
+    /// nothing is sent (the connection is closing).
+    private func voided(_ tr: Transfer) -> [Message] {
+        failed += 1
+        print("file.upload=failed transfer=\(tr.id) reason=replaced files_ok=\(tr.filesOK)")
+        discard(tr)
+        state = .idle
+        ended = tr.id
+        return []
+    }
 
     private func fail(_ tr: Transfer, _ why: String) -> Step {
         Step(send: [failMessage(tr, why)])

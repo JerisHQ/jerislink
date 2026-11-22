@@ -40,6 +40,11 @@ protocol ClipboardBackend: AnyObject, Sendable {
     /// Replace the contents with file URLs (a Windows->Mac paste); returns the
     /// new change count, or nil. May hop to the main thread.
     func writeFileURLs(_ urls: [URL]) -> Int?
+    /// r13 (Pepper's r12 review, item 1): the same writes, but `live` is
+    /// asked where the write happens (inside the main-thread block), so a
+    /// write queued before a takeover and run after it does not land.
+    func writeText(_ text: String, when live: () -> Bool) -> Int?
+    func writeFileURLs(_ urls: [URL], when live: () -> Bool) -> Int?
     /// The change count of this host's own last file-URL write, so the text
     /// clipboard session does not send the staging path back to Windows.
     func ownFileWriteChangeCount() -> Int?
@@ -50,6 +55,8 @@ protocol ClipboardBackend: AnyObject, Sendable {
 
 extension ClipboardBackend {
     func readFileURLs() -> [URL]? { nil }
+    func writeText(_ text: String, when live: () -> Bool) -> Int? { live() ? writeText(text) : nil }
+    func writeFileURLs(_ urls: [URL], when live: () -> Bool) -> Int? { live() ? writeFileURLs(urls) : nil }
 }
 
 /// `NSPasteboard.general`. `changeCount` is read on the calling thread: it is
@@ -68,8 +75,11 @@ final class SystemClipboard: ClipboardBackend, @unchecked Sendable {
         MainThreadHops.sync { NSPasteboard.general.string(forType: .string) }
     }
 
-    func writeText(_ text: String) -> Int? {
+    func writeText(_ text: String) -> Int? { writeText(text, when: { true }) }
+
+    func writeText(_ text: String, when live: () -> Bool) -> Int? {
         MainThreadHops.sync {
+            guard live() else { return nil }
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             guard pasteboard.setString(text, forType: .string) else { return nil }
@@ -80,8 +90,11 @@ final class SystemClipboard: ClipboardBackend, @unchecked Sendable {
     private let markLock = NSLock()
     private var fileMark: Int?
 
-    func writeFileURLs(_ urls: [URL]) -> Int? {
+    func writeFileURLs(_ urls: [URL]) -> Int? { writeFileURLs(urls, when: { true }) }
+
+    func writeFileURLs(_ urls: [URL], when live: () -> Bool) -> Int? {
         MainThreadHops.sync {
+            guard live() else { return nil }
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             guard pasteboard.writeObjects(urls as [NSURL]) else { return nil }

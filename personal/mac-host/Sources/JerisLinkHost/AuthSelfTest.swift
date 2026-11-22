@@ -48,6 +48,7 @@ enum AuthSelfTest {
         r12NonBlockingFailClosed(expect)
         r12KernelWait(expect)
         prcR12(expect)
+        prcR13(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -621,6 +622,214 @@ enum AuthSelfTest {
             }
         } else {
             expect(false, "prc r12 restart (e2e): loopback port (not skipped)")
+        }
+
+        // PR-C r13 (Pepper's r12 review, item 1): a stall at the final
+        // landing point, after FILE_END passed its check (hash, commit);
+        // a takeover; then the release. A send stalls right before the
+        // send-folder move, a paste inside the pasteboard write (where the
+        // main-thread block runs). Nothing may land.
+        for purpose in [FileProto.Purpose.send, FileProto.Purpose.paste] {
+            let what = purpose == FileProto.Purpose.send ? "send-folder move" : "pasteboard write"
+            guard let p = Self.loopbackPort(expect, "prc r13 landing (\(what), e2e)") else { continue }
+            let fake = FakeClipboard(text: nil)
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("jl-prc-r13-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                        fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                        openFolder: { _ in })
+            let s = server(p, clipboard: fake, root: dir, folder: folder)
+            let hold = R11Hold()
+            s.beforeSessionEffectForTest = { kind in if kind == "land:send" { hold.pass() } }
+            fake.landHook = { kind in if kind == "files" { hold.pass() } }
+            guard (try? s.start()) != nil else { expect(false, "prc r13 landing (\(what)): listener starts"); continue }
+            defer { s.stop() }
+            let a = login(p, .control)
+            guard let idA = okID(a) else { expect(false, "prc r13 landing (\(what)): A login ok"); a.client?.close(); continue }
+            typealias M = FileProto.Message
+            let file = login(p, .file, resume: idA)
+            _ = file.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0])
+            let ack = file.client?.receive(timeout: 2)?.type == FileProto.MsgType.helloAck
+            let body = [UInt8](repeating: 0x7E, count: 4096)
+            func put(_ m: M) { _ = file.client?.send(type: m.type, payload: m.encode() ?? []) }
+            put(.offer(transfer: 41, purpose: purpose, entries: 1, total: UInt64(body.count)))
+            put(FileUploadSelfTest.entry(41, 0, "r13.bin", size: body.count))
+            let reply = file.client?.receive(timeout: 3).flatMap { FileProto.decode(type: $0.type, payload: $0.payload) }
+            for m in FileUploadSelfTest.chunks(41, 0, body) { put(m) }
+            hold.arm()
+            put(.fileEnd(transfer: 41, index: 0, sha256: FileUploadSelfTest.sha(body)))
+            let held = hold.waitEntered()
+            let b = login(p, .control)
+            let idB = okID(b)
+            hold.release()
+            var results: [M] = []
+            let until = Date().addingTimeInterval(3)
+            while Date() < until, let c = file.client, !c.sawEOF {
+                if let m = c.receive(timeout: 0.2), m.type == FileProto.MsgType.result,
+                   let r = FileProto.decode(type: m.type, payload: m.payload) { results.append(r) }
+            }
+            let fileClosed = file.client.map { $0.sawEOF || $0.hostClosed() } ?? true
+            let fm = FileManager.default
+            let landed = ((try? fm.contentsOfDirectory(atPath: folder.primary.path)) ?? [])
+                + ((try? fm.contentsOfDirectory(atPath: folder.fallback.path)) ?? [])
+            let staging = FileUploadSelfTest.transferDirs(dir.appendingPathComponent("staging", isDirectory: true))
+            print("prc r13 landing info: purpose=\(purpose) ack=\(ack) reply=\(String(describing: reply)) held=\(held) results=\(results.count) closed=\(fileClosed) landed=\(landed) pasteboard=\(fake.fileURLs.count) staging=\(staging.count)")
+            expect(ack && reply == .reply(transfer: 41, status: FileProto.Status.ok) && held && idB != nil && fileClosed
+                       && results.isEmpty && landed.isEmpty && fake.fileURLs.isEmpty && staging.isEmpty,
+                   "prc r13 landing (e2e): stalled at the \(what) after FILE_END passed its check, a takeover, then the release: nothing lands, no RESULT, no staging left")
+            file.client?.close(); a.client?.close(); b.client?.close()
+        }
+
+        // r13 item 1, text: the pasteboard write of a clipboard text is
+        // already queued (held inside the backend's write, before its own
+        // check) when a takeover comes in.
+        if let p = Self.loopbackPort(expect, "prc r13 queued clipboard write (e2e)") {
+            let fake = FakeClipboard(text: nil)
+            let s = server(p, clipboard: fake)
+            let hold = R11Hold()
+            fake.landHook = { kind in if kind == "text" { hold.pass() } }
+            if (try? s.start()) != nil {
+                let a = login(p, .control)
+                if let idA = okID(a) {
+                    let clip = login(p, .clipboard, resume: idA)
+                    _ = clip.client?.send(type: 0x30, payload: [])
+                    hold.arm()
+                    _ = clip.client?.send(type: 0x31, payload: Array("r13 queued".utf8))
+                    let held = hold.waitEntered()
+                    let b = login(p, .control)
+                    let idB = okID(b)
+                    hold.release()
+                    let end = drain(clip.client, 3)
+                    expect(held && idB != nil && end.closed && !fake.writes.contains("r13 queued") && Self.pong(b.client),
+                           "prc r13 queued clipboard write (e2e): a text write already queued for the pasteboard when the takeover came in is checked where it lands and dropped; the new viewer works")
+                    clip.client?.close(); b.client?.close()
+                } else {
+                    expect(false, "prc r13 queued clipboard write: A login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r13 queued clipboard write: listener starts")
+            }
+        }
+
+        // r13 item 2: a PONG held at its socket write while a takeover comes
+        // in. The control line's replies ask the epoch right before each
+        // write (as the video ACK does); REPLACED goes by its own path.
+        if let p = Self.loopbackPort(expect, "prc r13 control replies (e2e)") {
+            let s = server(p, clipboard: FakeClipboard(text: nil))
+            let hold = R11Hold()
+            s.beforeCheckedSend = { type in if type == 0x02 { hold.pass() } }
+            if (try? s.start()) != nil {
+                let a = login(p, .control)
+                if okID(a) != nil, let ac = a.client {
+                    hold.arm()
+                    _ = ac.send(type: 0x01, payload: [1, 2, 3, 4])
+                    let held = hold.waitEntered()
+                    let b = login(p, .control)
+                    let idB = okID(b)
+                    hold.release()
+                    var frames: [(type: UInt8, payload: [UInt8])] = []
+                    let until = Date().addingTimeInterval(3)
+                    while Date() < until && !ac.sawEOF {
+                        if let m = ac.receive(timeout: 0.2) { frames.append(m) }
+                    }
+                    let pong = frames.contains { $0.type == 0x02 }
+                    let replaced = frames.contains { $0.type == ConnAuth.MsgType.result && ConnAuth.Result.decode($0.payload) == .replaced }
+                    print("prc r13 control replies info: held=\(held) frames=\(frames.map { $0.type }) b_ok=\(idB != nil)")
+                    expect(held && idB != nil && !pong && replaced && Self.pong(b.client),
+                           "prc r13 control replies (e2e): a PONG held at its socket write while a takeover came in is not sent; the old control line still gets REPLACED (its own path); the new viewer's PONG works")
+                    b.client?.close()
+                } else {
+                    expect(false, "prc r13 control replies: A login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r13 control replies: listener starts")
+            }
+        }
+    }
+
+    // MARK: PR-C r13 (Pepper's r12 review, items 3 and 4)
+
+    private static func prcR13(_ expect: Expect) {
+        let me = ListenConfig.loopbackIP
+        func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+        func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+
+        // Item 3: a push job waiting for a file session when a takeover
+        // voids it is not claimed; it is aborted.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x31), authSession: id(0x31), resume: nil, close: {})
+            let life = KickHandle(-1)
+            let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x31), close: {})
+            if let tF { life.bind { b.live(tF) } }
+            let pb = PushBroker()
+            let sF = pb.register(peerCaps: FileProto.Caps.pushService)
+            let job = PushJob(files: [])
+            let queued = pb.offer(job) == nil
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x32), authSession: id(0x32), resume: nil, close: {})
+            let claimed = pb.take(session: sF, live: { !life.isRevoked })
+            let answer = job.wait(seconds: 1)
+            expect(tF != nil && queued && claimed == nil && answer == .notConnected && pb.isIdle,
+                   "prc r13 push claim: a job offered to a file session that a takeover then voided is not claimed; it is aborted (not_connected)")
+            pb.unregister(sF)
+        }
+        // Item 3: a push the old session already runs: the takeover's kick
+        // aborts it, and an accept read before the takeover changes nothing.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x41), authSession: id(0x41), resume: nil, close: {})
+            let life = KickHandle(-1)
+            let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x41),
+                             close: { life.kick() })
+            if let tF { life.bind { b.live(tF) } }
+            let pb = PushBroker()
+            let sF = pb.register(peerCaps: FileProto.Caps.pushService)
+            life.onKick { pb.abort(session: sF) }
+            let job = PushJob(files: [])
+            let queued = pb.offer(job) == nil
+            let taken = pb.take(session: sF, live: { !life.isRevoked })
+            let sender = taken.map { PushSender(job: $0, live: { !life.isRevoked }) }
+            _ = sender?.start()
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x42), authSession: id(0x42), resume: nil, close: {})
+            b.flushClosesForTest()
+            sender?.reply(FileProto.Status.ok)
+            let answer = job.wait(seconds: 1)
+            let next = pb.offer(PushJob(files: []))
+            expect(tF != nil && queued && taken != nil && sender?.accepted == false && sender?.ended == true
+                       && answer == .notConnected && job.isAbandoned && next == .notConnected,
+                   "prc r13 push accept: a takeover aborts the push the old file session runs (not_connected, abandoned); its viewer's accept read before it is not marked accepted; the voided session gets no new job")
+            if let taken { pb.finished(taken) }
+            pb.unregister(sF)
+        }
+
+        // Item 4: a replaced id stays refused by age, never pushed out by
+        // count: 5000 later takeovers (more than r12's old cap of 4096).
+        do {
+            let clock = R13Clock()
+            let b = SessionBroker(passwordMode: true, log: { _ in }, now: { clock.now })
+            let idA: [UInt8] = [0xA0, 0, 0, 0, 0, 0, 0, 1]
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA0), authSession: idA, resume: nil, close: {})
+            func other(_ i: Int) -> [UInt8] { [0xB0, 0, 0, 0] + withUnsafeBytes(of: UInt32(i).bigEndian, Array.init) }
+            for i in 0..<5000 {
+                _ = b.admit(peerIP: "100.64.0.\(i % 200 + 1)", channel: .control, sessionKey: key(0xB0),
+                            authSession: other(i), resume: nil, close: {})
+                if i == 2500 { clock.advance(SessionBroker.replacedTTL / 2) }
+            }
+            b.flushClosesForTest()
+            let kept = b.replacedIDCount
+            let refusedAfterMany = b.resumeRefused(idA)
+                && b.admit(peerIP: me, channel: .control, sessionKey: key(0xA1), authSession: id(0xA1), resume: idA, close: {}) == nil
+            // Past the window from A's replacement, but not from the later half.
+            clock.advance(SessionBroker.replacedTTL / 2 + 1)
+            let aGone = !b.resumeRefused(idA)
+            let laterKept = b.resumeRefused(other(4000)) && !b.resumeRefused(other(100))
+            expect(kept == 5000 && refusedAfterMany && aGone && laterKept,
+                   "prc r13 replaced ids: an old viewer's id is still REPLACED after 5000 later takeovers (no count eviction, kept=\(kept)); ids leave only by age (\(Int(SessionBroker.replacedTTL / 3600)) h, monotonic)")
         }
     }
 
@@ -3104,6 +3313,14 @@ final class R12KernelHook: @unchecked Sendable {
 
 /// PR-C r11 self-test: holds the first `pass` after `arm` until `release`
 /// (at most 5 s); every other `pass` returns at once.
+/// r13: a monotonic clock the self-test moves by hand.
+final class R13Clock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var t: Double = 1000
+    var now: Double { lock.lock(); defer { lock.unlock() }; return t }
+    func advance(_ d: Double) { lock.lock(); t += d; lock.unlock() }
+}
+
 final class R11Hold: @unchecked Sendable {
     private let lock = NSLock()
     private var armed = false

@@ -125,8 +125,11 @@ final class SessionBroker: @unchecked Sendable {
         var close: @Sendable () -> Void
     }
 
-    /// r12: replaced session ids kept (the newest; one or two per takeover).
-    static let maxReplaced = 4096
+    /// r13 (Pepper's r12 review, item 4): how long a replaced session id
+    /// keeps getting REPLACED (monotonic clock). No count limit: an id
+    /// leaves only by age (or a restart), so no number of later logins can
+    /// push an old viewer's id out and let its auto-reconnect take over.
+    static let replacedTTL: Double = 24 * 3600
 
     let passwordMode: Bool
     /// r4 (Pepper's r3 review, item 3): picked once per start, never 0, so
@@ -150,11 +153,14 @@ final class SessionBroker: @unchecked Sendable {
     private var currentID: [UInt8]?
     /// r12: the id that takeover named (its viewer's id before), if any.
     private var currentNamed: [UInt8]?
-    /// r12: ids another login took over from since this start (newest
-    /// `maxReplaced`). A control reconnect naming one gets REPLACED, so a
-    /// replaced viewer never takes the session back. Empty after a restart.
-    private var replacedIDs: Set<[UInt8]> = []
-    private var replacedOrder: [[UInt8]] = []
+    /// r12: ids another login took over from since this start. A control
+    /// reconnect naming one gets REPLACED, so a replaced viewer never takes
+    /// the session back. Empty after a restart. r13: each is kept for
+    /// `replacedTTL` from when it was replaced, never evicted by count.
+    private var replacedAt: [[UInt8]: Double] = [:]
+    /// r13: the same ids, oldest first (the clock only moves forward).
+    private var replacedOrder: [(id: [UInt8], at: Double)] = []
+    private let now: @Sendable () -> Double
     /// r12: closes the connections a takeover voided, off the AUTH path.
     private let closeQueue = DispatchQueue(label: "JerisLink.SessionBroker.close")
     /// Connections closed by a newer AUTH.
@@ -162,10 +168,12 @@ final class SessionBroker: @unchecked Sendable {
     /// r4: reconnects refused because another viewer holds the session.
     var resumesRefused: UInt64 { lock.lock(); defer { lock.unlock() }; return resumeRefusedCount }
 
-    init(passwordMode: Bool, boot: UInt64? = nil, log: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
+    init(passwordMode: Bool, boot: UInt64? = nil, log: @escaping (String) -> Void = { print($0); fflush(stdout) },
+         now: @escaping @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }) {
         self.passwordMode = passwordMode
         self.boot = boot ?? Self.randomBoot()
         self.log = log
+        self.now = now
     }
 
     static func randomBoot() -> UInt64 {
@@ -202,14 +210,31 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        replacedIDs.contains(resume)
+        pruneReplacedLocked()
+        return replacedAt[resume] != nil
     }
 
     private func markReplacedLocked(_ id: [UInt8]?, unless resume: [UInt8]?) {
-        guard let id, id != resume, replacedIDs.insert(id).inserted else { return }
-        replacedOrder.append(id)
-        if replacedOrder.count > Self.maxReplaced { replacedIDs.remove(replacedOrder.removeFirst()) }
+        pruneReplacedLocked()
+        guard let id, id != resume, replacedAt[id] == nil else { return }
+        let t = now()
+        replacedAt[id] = t
+        replacedOrder.append((id, t))
     }
+
+    /// r13: drops ids replaced longer than `replacedTTL` ago (age only).
+    private func pruneReplacedLocked() {
+        let cutoff = now() - Self.replacedTTL
+        var drop = 0
+        while drop < replacedOrder.count, replacedOrder[drop].at <= cutoff {
+            replacedAt.removeValue(forKey: replacedOrder[drop].id)
+            drop += 1
+        }
+        if drop > 0 { replacedOrder.removeFirst(drop) }
+    }
+
+    /// r13 (self-test): how many replaced ids are kept.
+    var replacedIDCount: Int { lock.lock(); defer { lock.unlock() }; return replacedAt.count }
 
     /// r9: a clipboard, file or ping AUTH (password mode) is let in only
     /// when it names the newest control session. r12: no older one.
@@ -635,6 +660,10 @@ final class KickHandle: @unchecked Sendable {
     /// (`SessionBroker.live`). Kept on this object, which lives exactly as
     /// long as its connection, never keyed by the descriptor number.
     private var liveCheck: (@Sendable () -> Bool)?
+    /// r13: run once when the connection is kicked (the takeover's
+    /// background close), e.g. to abort a push job the session holds.
+    private var onKickActions: [@Sendable () -> Void] = []
+    private var kickActionsRan = false
 
     init(_ fd: Int32, wake: Bool = false) {
         self.fd = fd
@@ -658,6 +687,12 @@ final class KickHandle: @unchecked Sendable {
 
     func kick() {
         lock.lock()
+        let actions = kickActionsRan ? [] : onKickActions
+        kickActionsRan = true
+        onKickActions = []
+        lock.unlock()
+        for a in actions { a() }
+        lock.lock()
         defer { lock.unlock() }
         guard fd >= 0, !wasKicked else { return }
         wasKicked = true
@@ -675,6 +710,16 @@ final class KickHandle: @unchecked Sendable {
 
     func finish() {
         lock.lock(); fd = -1; lock.unlock()
+    }
+
+    /// r13: `action` runs when this connection is kicked (at once if it
+    /// already was).
+    func onKick(_ action: @escaping @Sendable () -> Void) {
+        lock.lock()
+        let already = kickActionsRan
+        if !already { onKickActions.append(action) }
+        lock.unlock()
+        if already { action() }
     }
 
     /// r12: set once the connection is in the broker.
@@ -736,8 +781,16 @@ final class SessionGatedClipboard: ClipboardBackend, @unchecked Sendable {
 
     func changeCount() -> Int { base.changeCount() }
     func readText() -> String? { base.readText() }
-    func writeText(_ text: String) -> Int? { life.whileLive { base.writeText(text) } ?? nil }
-    func writeFileURLs(_ urls: [URL]) -> Int? { life.whileLive { base.writeFileURLs(urls) } ?? nil }
+    // r13: the check runs where the write lands (inside the base's
+    // main-thread block), not before the hop.
+    func writeText(_ text: String) -> Int? { base.writeText(text, when: { !life.isRevoked }) }
+    func writeFileURLs(_ urls: [URL]) -> Int? { base.writeFileURLs(urls, when: { !life.isRevoked }) }
+    func writeText(_ text: String, when live: () -> Bool) -> Int? {
+        base.writeText(text, when: { live() && !life.isRevoked })
+    }
+    func writeFileURLs(_ urls: [URL], when live: () -> Bool) -> Int? {
+        base.writeFileURLs(urls, when: { live() && !life.isRevoked })
+    }
     func ownFileWriteChangeCount() -> Int? { base.ownFileWriteChangeCount() }
     func readFileURLs() -> [URL]? { base.readFileURLs() }
 }
