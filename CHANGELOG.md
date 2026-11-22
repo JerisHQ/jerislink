@@ -12,7 +12,7 @@ Connection password (PR-A host core, PR-B viewer, PR-C UDP + host UI):
 - With a password set, every UDP datagram (mouse, video, audio) carries an 8-byte session tag; untagged or wrong-tag packets are dropped. Video and audio go only to the IP of the logged-in control session.
 - Host app: new connection settings (連線設定) to set, change or clear the password and edit the whitelist and blacklist (`allowedIPs` / `blockedIPs`), with a yellow warning while no password is set. Also `JerisLinkHost --connection-settings`.
 - Windows viewer: password field with Show and "Remember password on this PC" (off by default; the key is sealed with DPAPI for the current user). Wrong password, lockout countdown, blocked and "host too old" show as one error line on the launch screen, no dialog.
-- Takeover (password mode): a manual Connect from a second viewer takes over the session. The old viewer's control connection gets "replaced" (or is reset if a reply to it was only partly sent), its file transfers stop and nothing late lands on the Mac. An automatic reconnect gets in only when no other control session is open.
+- Takeover (password mode): a manual Connect from a second viewer takes over the session. The old viewer's control connection gets "replaced" (or is reset if a reply to it was only partly sent) and its remaining file-transfer steps stop; a file move that already passed its check can still finish. An automatic reconnect gets in only when no other control session is open.
 - No password set (transition mode): the host still checks the whitelist and the blacklist, and 0.3.x viewers keep working when their IP passes. The viewer shows "No connection password set on this Mac". On first start, an old `listen.plist` with `clientIP` and no `allowedIPs` gets `allowedIPs = [clientIP]` and keeps `clientIP`; the old file is kept as `listen.plist.pre-0.4`. The whitelist follows `clientIP` until a whitelist is saved in the host app.
 
 Mac host:
@@ -24,13 +24,13 @@ Security fixes from the v0.3.0 review:
 - Files sent to Windows are delivered only with the Internet zone mark (Mark of the Web) in place, and the final file stays held until delivery is done.
 - File manifest size overflow fixed; Force Quit relay hardened.
 
-Microsoft Store publishing (GitHub release builds only):
+Microsoft Store publishing (GitHub `msstore-publish` workflow, started by a published GitHub release or by hand):
 
 - `msstore-publish` uploads the package file with CLI v0.4.4. Before the upload it stops if Partner Center already has a pending submission; a draft opened between that check and the upload could still be deleted by the CLI. `--noCommit` keeps the new submission as a draft for a manual Submit in Partner Center. Afterwards the Store CLI credential and token caches are removed.
 
 Packaging:
 
-- Version 0.4.0 everywhere: `VERSION`, the macOS bundle versions, and MSIX `0.4.0.0` (GitHub release builds).
+- Version 0.4.0 everywhere: `VERSION`, the macOS bundle versions, and MSIX `0.4.0.0` (GitHub `msix` workflow).
 
 ## v0.3.0
 
@@ -62,8 +62,8 @@ Windows viewer:
 
 Packaging:
 
-- MSIX sideload test packages (GitHub release builds) are signed with a fixed test certificate.
-- Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0` (GitHub release builds), and the build id `0.3.0 · <sha>`.
+- MSIX sideload test packages (GitHub `msix` workflow) are signed with a fixed test certificate when it is configured.
+- Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0` (GitHub `msix` workflow), and the build id `0.3.0 · <sha>`.
 
 ## v0.2.0
 
@@ -78,7 +78,7 @@ Streaming and input:
 
 Windows:
 
-- MSIX package for the Microsoft Store, built by the GitHub release builds (package version is `VERSION` + `.0`).
+- MSIX package for the Microsoft Store, built by the GitHub `msix` workflow on pull requests, pushes and manual runs (package version is `VERSION` + `.0`).
 - Viewer logs are written in the background with 10 MB caps. The first-frame BMP and the per-click log are written only with `JERISLINK_DEBUG=1`.
 - New v2.0 JerisLink icon on macOS and Windows.
 - Privacy policy in `PRIVACY.md`.
