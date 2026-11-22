@@ -47,6 +47,7 @@ enum AuthSelfTest {
         r11SendSliceFailClosed(expect)
         r12NonBlockingFailClosed(expect)
         r12KernelWait(expect)
+        prcR11(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -305,6 +306,302 @@ enum AuthSelfTest {
             expect(store.save(next) && store.load() == next, "keychain: a password change updates the item in place")
         }
         expect(store.delete() && store.load() == nil, "keychain: item deleted")
+    }
+
+    // MARK: PR-C r11 (Pepper's r10 review)
+
+    /// PR-C r11: revoked state on the connection's own handle (item 1), side
+    /// effects checked at the moment they run (item 2), a viewer's channels
+    /// kept across its own reconnects (item 3), and a restart retry while
+    /// the first AUTH_OK is still pending (item 4).
+    private static func prcR11(_ expect: Expect) {
+        let password = "PrcR11-\(UUID().uuidString.prefix(8))!"
+        guard let secret = ConnSecret.make(password: password, iterations: 1000) else {
+            expect(false, "prc r11: secret made")
+            return
+        }
+        let me = ListenConfig.loopbackIP
+        func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+        func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+
+        // Item 3, broker: the same viewer reconnecting again and again keeps
+        // the channels it opened before its first reconnect.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            let closed = R10Names()
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA1), authSession: id(0xA1), resume: nil,
+                             close: { closed.add("a-ctl") })
+            let fA = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0xA1),
+                             close: { closed.add("a-file") })
+            let cA = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xA1),
+                             close: { closed.add("a-clip") })
+            let tA2 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA2), authSession: id(0xA2), resume: id(0xA1),
+                              close: { closed.add("a-ctl2") })
+            let tA3 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA3), authSession: id(0xA3), resume: id(0xA2),
+                              close: { closed.add("a-ctl3") })
+            let fA3 = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0xA3),
+                              close: { closed.add("a-file3") })
+            let tA4 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA4), authSession: id(0xA4), resume: id(0xA3),
+                              close: { closed.add("a-ctl4") })
+            let admitted = [tA, fA, cA, tA2, tA3, fA3, tA4].allSatisfy { $0 != nil }
+            expect(admitted && closed.all == ["a-ctl", "a-ctl2", "a-ctl3"] && b.current.0?.sessionKey == key(0xA4)
+                       && b.channelAdmitted(id(0xA4)) && b.channelAdmitted(id(0xA3)) && !b.channelAdmitted(id(0xA1)),
+                   "prc r11 broker: the same viewer reconnecting three times keeps the file and clipboard channels it opened before the first reconnect (closed: \(closed.all)); a new channel still needs one of its two newest ids")
+            let tB = b.admit(peerIP: me, channel: .control, sessionKey: key(0xB1), authSession: id(0xB1), resume: nil,
+                             close: { closed.add("b-ctl") })
+            expect(tB != nil && Set(closed.all) == ["a-ctl", "a-ctl2", "a-ctl3", "a-ctl4", "a-file", "a-clip", "a-file3"]
+                       && b.current.0?.sessionKey == key(0xB1) && b.viewerSessionCount == 1,
+                   "prc r11 broker: a new viewer still closes every channel of the old one, whichever of its reconnects opened it; the set of viewer sessions starts over")
+            for t in [fA, cA, fA3, tA, tA2, tA3, tA4, tB] { if let t { b.end(t) } }
+        }
+
+        // Item 4, broker: after a restart the first control AUTH is in but its
+        // AUTH_OK has not gone out (nor has `abandon` run) when the viewer retries.
+        do {
+            let r = SessionBroker(passwordMode: true, log: { _ in })
+            let before = id(0x5F)   // the id the viewer had before the restart
+            let first = r.admit(peerIP: me, channel: .control, sessionKey: key(0x71), authSession: id(0x71), resume: before, close: {})
+            let pendingNotRefused = !r.resumeRefused(before)
+            let retry = r.admit(peerIP: me, channel: .control, sessionKey: key(0x72), authSession: id(0x72), resume: before, close: {})
+            let otherStale = r.resumeRefused(id(0x5D))
+            // The retry's OK fails as well; the first one's cleanup runs late.
+            if let retry { r.abandon(retry) }
+            if let first { r.abandon(first) }
+            let afterBoth = !r.resumeRefused(before)
+            let retry2 = r.admit(peerIP: me, channel: .control, sessionKey: key(0x73), authSession: id(0x73), resume: before, close: {})
+            if let retry2 { r.confirm(retry2) }
+            expect(first != nil && pendingNotRefused && retry != nil && otherStale && afterBoth && retry2 != nil
+                       && r.current.0?.sessionKey == key(0x73) && r.resumeRefused(before) && !r.resumeRefused(id(0x73)),
+                   "prc r11 broker: after a restart, a retry with the same id while the first AUTH_OK is still pending is let in (not REPLACED), and again after the retry's OK fails too; another stale id is refused; once an OK went out the old id is refused")
+            if let retry2 { r.end(retry2) }
+            // A confirmed first AUTH: its id is no longer a retry's.
+            let c = SessionBroker(passwordMode: true, log: { _ in })
+            let cFirst = c.admit(peerIP: me, channel: .control, sessionKey: key(0x81), authSession: id(0x81), resume: before, close: {})
+            if let cFirst { c.confirm(cFirst) }
+            let cRetry = c.admit(peerIP: me, channel: .control, sessionKey: key(0x82), authSession: id(0x82), resume: before, close: {})
+            expect(cFirst != nil && cRetry == nil && c.current.0?.sessionKey == key(0x81),
+                   "prc r11 broker: once the first AUTH_OK since the restart went out, the id it named gets REPLACED as before")
+            if let cFirst { c.end(cFirst) }
+        }
+
+        // Items 1 and 2, the connection's handle and its gate.
+        do {
+            let old = KickHandle(7)
+            old.finish()
+            old.revoke()   // late: the connection already finished
+            let reused = KickHandle(7)
+            expect(old.isRevoked && !reused.isRevoked && reused.whileLive({ 1 }) == 1 && old.whileLive({ 1 }) == nil,
+                   "prc r11 handle: the revoked mark lives on the connection's own handle: a late revoke after it finished does not touch a new connection on the same fd number")
+            let fake = FakeClipboard(text: nil)
+            let life = KickHandle(-1)
+            let gated = SessionGatedClipboard(fake, life: life)
+            let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), revoked = DispatchSemaphore(value: 0)
+            let order = R10Names()
+            DispatchQueue.global().async {
+                _ = life.whileLive { () -> Int? in
+                    entered.signal()
+                    _ = release.wait(timeout: .now() + 3)
+                    order.add("write")
+                    return fake.writeText("r11 in flight")
+                }
+            }
+            let inWrite = entered.wait(timeout: .now() + 3) == .success
+            DispatchQueue.global().async {
+                life.revoke()
+                order.add("revoked")
+                revoked.signal()
+            }
+            usleep(150_000)
+            let heldOff = !life.isRevoked && order.all.isEmpty
+            release.signal()
+            let revokeReturned = revoked.wait(timeout: .now() + 3) == .success
+            let lateText = gated.writeText("r11 late")
+            let lateFiles = gated.writeFileURLs([URL(fileURLWithPath: "/tmp/jl-r11-late")])
+            expect(inWrite && heldOff && revokeReturned && order.all == ["write", "revoked"] && lateText == nil && lateFiles == nil
+                       && fake.writes == ["r11 in flight"] && fake.fileURLs.isEmpty,
+                   "prc r11 gate: a pasteboard write that checked the session first lands before the takeover's revoke returns; after it no text or file write lands (\(order.all))")
+        }
+
+        /// Connects, reads the CHALLENGE and answers it for `channel`.
+        func login(_ port: UInt16, _ channel: ConnAuth.Channel, resume: [UInt8]? = nil) -> (client: MRC1Client?, result: ConnAuth.Result?) {
+            guard let c = startAuth(port, channel, resume: resume) else { return (nil, nil) }
+            guard let r = c.receive(timeout: 3), r.type == ConnAuth.MsgType.result else { return (c, nil) }
+            return (c, ConnAuth.Result.decode(r.payload))
+        }
+        /// The RESPONSE is sent; the result is left unread.
+        func startAuth(_ port: UInt16, _ channel: ConnAuth.Channel, resume: [UInt8]?) -> MRC1Client? {
+            guard let c = MRC1Client(port: port), let ch = c.receive(timeout: 2), ch.type == ConnAuth.MsgType.challenge,
+                  let challenge = ConnAuth.Challenge.decode(ch.payload),
+                  let k = ConnAuth.deriveKey(password: password, salt: challenge.salt, iterations: challenge.iterations)
+            else { return nil }
+            let cn = ConnAuth.random(ConnAuth.nonceBytes)
+            let mac = ConnAuth.macClient(key: k, hostNonce: challenge.hostNonce, clientNonce: cn, channel: channel,
+                                         hostID: challenge.hostID, resume: resume)
+            guard c.send(type: ConnAuth.MsgType.response,
+                         payload: ConnAuth.Response(clientNonce: cn, mac: mac, resume: resume).payload) else { return nil }
+            return c
+        }
+        func okID(_ r: (client: MRC1Client?, result: ConnAuth.Result?)) -> [UInt8]? {
+            if case .ok(_, let sid)? = r.result { return sid }
+            return nil
+        }
+        /// Reads what the host sends until it closes (or `seconds` pass).
+        func drain(_ c: MRC1Client?, _ seconds: Double) -> (payloads: [[UInt8]], closed: Bool) {
+            guard let c else { return ([], true) }
+            var out: [[UInt8]] = []
+            let until = Date().addingTimeInterval(seconds)
+            while Date() < until && !c.sawEOF {
+                if let m = c.receive(timeout: 0.2) { out.append(m.payload) }
+            }
+            return (out, c.sawEOF || c.hostClosed())
+        }
+        let filePing = FileProto.Message.ping(token: [1, 2, 3, 4])
+        func fileEcho(_ c: MRC1Client?) -> Bool {
+            guard let c, c.send(type: filePing.type, payload: filePing.encode() ?? []) else { return false }
+            let until = Date().addingTimeInterval(2)
+            while Date() < until {
+                guard let m = c.receive(timeout: 0.2) else { if c.sawEOF { return false }; continue }
+                if m.type == filePing.type { return true }
+            }
+            return false
+        }
+
+        // Items 1, 2 and 3 end to end.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let fake = FakeClipboard(text: nil)
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("jl-prc-r11-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                        fallback: dir.appendingPathComponent("received", isDirectory: true),
+                                        openFolder: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  allowFileSessions: true,
+                                  fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
+                                  fileSendFolder: folder,
+                                  clipboard: fake, authGate: gate, sessionBroker: broker)
+            let okHold = R11Hold(), effectHold = R11Hold()
+            s.beforeCheckedSend = { type in if type == ConnAuth.MsgType.result { okHold.pass() } }
+            s.beforeSessionEffectForTest = { kind in if kind == "clipboard" { effectHold.pass() } }
+            if (try? s.start()) != nil {
+                // Item 1: A's clipboard AUTH_OK is on its way when B takes over;
+                // the OK fails (the failure path). B's own channels then open.
+                let a = login(p, .control)
+                if let idA = okID(a) {
+                    okHold.arm()
+                    let stuck = startAuth(p, .clipboard, resume: idA)
+                    let held = okHold.waitEntered()
+                    let b = login(p, .control)
+                    let idB = okID(b)
+                    okHold.release()
+                    let stuckEnd = drain(stuck, 2)
+                    let bClip = login(p, .clipboard, resume: idB)
+                    let bPing = login(p, .ping, resume: idB)
+                    let bFile = login(p, .file, resume: idB)
+                    var fileOK = false
+                    if okID(bFile) != nil {
+                        _ = bFile.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0])
+                        fileOK = bFile.client?.receive(timeout: 2)?.type == FileProto.MsgType.helloAck
+                    }
+                    print("prc r11 item1 info: held=\(held) b_ok=\(idB != nil) stuck_closed=\(stuckEnd.closed) stuck_frames=\(stuckEnd.payloads.count) b_clip=\(String(describing: bClip.result)) b_ping=\(String(describing: bPing.result)) b_file=\(fileOK)")
+                    expect(held && idB != nil && stuckEnd.closed && stuckEnd.payloads.isEmpty && okID(bClip) != nil
+                               && Self.pong(bPing.client) && fileOK && Self.pong(b.client),
+                           "prc r11 revoked handle (e2e): a channel whose AUTH_OK was on its way when a takeover revoked it gets no OK and closes; the new viewer's clipboard, ping and file channels opened right after (descriptors reused) all get OK")
+                    bClip.client?.close(); bPing.client?.close(); bFile.client?.close(); stuck?.close()
+
+                    // Item 2: B's clipboard text is read, then C takes over before it is written.
+                    if let idB {
+                        let clip = login(p, .clipboard, resume: idB)
+                        _ = clip.client?.send(type: 0x30, payload: [])
+                        _ = clip.client?.send(type: 0x31, payload: Array("r11 before".utf8))
+                        _ = settle { fake.writes.contains("r11 before") }
+                        effectHold.arm()
+                        _ = clip.client?.send(type: 0x31, payload: Array("r11 stale".utf8))
+                        let inEffect = effectHold.waitEntered()
+                        let c = login(p, .control)
+                        let idC = okID(c)
+                        effectHold.release()
+                        let clipEnd = drain(clip.client, 3)
+                        print("prc r11 item2 info: in_effect=\(inEffect) c_ok=\(idC != nil) clip_closed=\(clipEnd.closed) writes=\(fake.writes)")
+                        expect(okID(clip) != nil && inEffect && idC != nil && clipEnd.closed && fake.writes.contains("r11 before")
+                                   && !fake.writes.contains("r11 stale") && Self.pong(c.client),
+                               "prc r11 clipboard write (e2e): a text the old viewer sent, already read when the takeover came in, is not written to the pasteboard; its channel closes")
+                        clip.client?.close()
+
+                        // Item 3: C's file channel stays open across two reconnects of C.
+                        if let idC {
+                            let file = login(p, .file, resume: idC)
+                            _ = file.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0])
+                            let ack = file.client?.receive(timeout: 2)?.type == FileProto.MsgType.helloAck
+                            let echoBefore = fileEcho(file.client)
+                            let c2 = login(p, .control, resume: idC)
+                            let idC2 = okID(c2)
+                            let c3 = login(p, .control, resume: idC2)
+                            let idC3 = okID(c3)
+                            let echoAfter = fileEcho(file.client)
+                            print("prc r11 item3 info: ack=\(ack) echo_before=\(echoBefore) c2=\(idC2 != nil) c3=\(idC3 != nil) echo_after=\(echoAfter)")
+                            expect(okID(file) != nil && ack && echoBefore && idC2 != nil && idC3 != nil && echoAfter && Self.pong(c3.client),
+                                   "prc r11 reconnects (e2e): the same viewer reconnecting twice keeps the file channel it opened before: it still answers after the second reconnect")
+                            // A new viewer still cuts it.
+                            let d = login(p, .control)
+                            let fileEnd = drain(file.client, 3)
+                            expect(okID(d) != nil && fileEnd.closed,
+                                   "prc r11 reconnects (e2e): a new viewer still closes that file channel")
+                            file.client?.close(); c2.client?.close(); c3.client?.close(); d.client?.close()
+                        } else {
+                            expect(false, "prc r11 (e2e): C login ok")
+                        }
+                        c.client?.close()
+                    } else {
+                        expect(false, "prc r11 (e2e): B login ok")
+                    }
+                    b.client?.close()
+                } else {
+                    expect(false, "prc r11 (e2e): A login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r11: listener starts")
+            }
+        }
+
+        // Item 4 end to end: a restarted host (a new server and broker); the
+        // viewer retries while the first AUTH_OK is still on its way.
+        if let p = ControlServiceSelfTest.freeLoopbackPort() {
+            let gate = AuthGate(policy: .password(whitelist: [me]),
+                                guardian: AuthGuard(whitelist: [me], blocklist: MemoryBlocklist([])),
+                                secret: secret, timeout: 2)
+            let broker = SessionBroker(passwordMode: true, log: { _ in })
+            let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
+                                  settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
+                                  clipboard: FakeClipboard(text: nil), authGate: gate, sessionBroker: broker)
+            let okHold = R11Hold()
+            s.beforeCheckedSend = { type in if type == ConnAuth.MsgType.result { okHold.pass() } }
+            if (try? s.start()) != nil {
+                let before = ConnAuth.random(8)   // the session id the viewer had before the restart
+                okHold.arm()
+                let first = startAuth(p, .control, resume: before)
+                let held = okHold.waitEntered()
+                let retry = login(p, .control, resume: before)
+                okHold.release()
+                let retryOK = okID(retry) != nil && Self.pong(retry.client)
+                let stale = login(p, .control, resume: ConnAuth.random(8))
+                print("prc r11 item4 info: held=\(held) retry=\(String(describing: retry.result)) stale=\(String(describing: stale.result))")
+                expect(held && retryOK,
+                       "prc r11 restart (e2e): the viewer's retry with the same id while the first AUTH_OK after the restart is still on its way gets in, not REPLACED")
+                expect(stale.result == .replaced && Self.pong(retry.client),
+                       "prc r11 restart (e2e): once it is in, another stale id still gets REPLACED and the session stays")
+                first?.close(); retry.client?.close(); stale.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r11 restart: listener starts")
+            }
+        }
     }
 
     // MARK: End to end on loopback
@@ -2860,4 +3157,22 @@ final class R12KernelHook: @unchecked Sendable {
 
     var sawNonBlocking: Bool { lock.lock(); defer { lock.unlock() }; return nonBlocking }
     var eagainCount: Int { lock.lock(); defer { lock.unlock() }; return eagains }
+}
+
+/// PR-C r11 self-test: holds the first `pass` after `arm` until `release`
+/// (at most 5 s); every other `pass` returns at once.
+final class R11Hold: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private let enteredSem = DispatchSemaphore(value: 0)
+    private let releaseSem = DispatchSemaphore(value: 0)
+    func arm() { lock.lock(); armed = true; lock.unlock() }
+    func pass() {
+        lock.lock(); let hold = armed; armed = false; lock.unlock()
+        guard hold else { return }
+        enteredSem.signal()
+        _ = releaseSem.wait(timeout: .now() + 5)
+    }
+    func waitEntered(_ seconds: Double = 3) -> Bool { enteredSem.wait(timeout: .now() + seconds) == .success }
+    func release() { releaseSem.signal() }
 }

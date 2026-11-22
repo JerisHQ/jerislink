@@ -124,7 +124,13 @@ final class SessionBroker: @unchecked Sendable {
         var owner: [UInt8]?
         /// r10 (blocker 2): this control AUTH was the first one since this
         /// start (the host restarted), so `abandon` puts that state back.
+        /// r11: also its retry while it was still unconfirmed.
         var firstControl = false
+        /// r11 (Pepper's r10 review, item 4): the session a control AUTH
+        /// named (its resume id), and whether its AUTH_OK went out
+        /// (`confirm`).
+        var named: [UInt8]?
+        var confirmed = false
         var close: @Sendable () -> Void
     }
 
@@ -154,6 +160,15 @@ final class SessionBroker: @unchecked Sendable {
     /// r9: a control AUTH was admitted since this start. Until then a
     /// control reconnect naming any id is let in (the host restarted).
     private var sawControl = false
+    /// r11 (Pepper's r10 review, item 3): every control session of the
+    /// viewer that holds the session now, across its own reconnects (each
+    /// one named the one before). `accepted` keeps only the newest two, for
+    /// new channels; an open clipboard, file or ping connection stays open
+    /// while its session is one of these, so a transfer that began two
+    /// reconnects ago is not cut. A new viewer starts a new set. Pruned on
+    /// every control AUTH to `accepted` plus the sessions open connections
+    /// still name.
+    private var viewerSessions: Set<[UInt8]> = []
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
@@ -202,7 +217,17 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        sawControl && !accepted.contains(resume)
+        sawControl && !accepted.contains(resume) && !restartRetryLocked(resume)
+    }
+
+    /// r11 (Pepper's r10 review, item 4): after a restart the first control
+    /// AUTH is in, but its AUTH_OK has not gone out yet (or is failing and
+    /// `abandon` has not run). The viewer, which never got that OK, retries
+    /// with the id it had before the restart: let in, as `abandon` would
+    /// have let it in a moment later, not told REPLACED. Only while that
+    /// first AUTH is still unconfirmed, and only for the id it named.
+    private func restartRetryLocked(_ resume: [UInt8]) -> Bool {
+        entries.contains { $0.channel == .control && $0.firstControl && !$0.confirmed && $0.named == resume }
     }
 
     /// r9 (Morris's simpler design): a clipboard, file or ping AUTH (password
@@ -240,6 +265,7 @@ final class SessionBroker: @unchecked Sendable {
     private func take(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
                       resume: [UInt8]?, checkIDs: Bool, close: @escaping @Sendable () -> Void) -> UInt64? {
         var kicked: [Entry] = []
+        var restartRetry = false
         // r2 (Pepper's PR-C review, item 1): the change and its listeners
         // run under `orderLock`, so two changes never reach the listeners
         // (and the session link's serial send queue) in the other order.
@@ -249,6 +275,7 @@ final class SessionBroker: @unchecked Sendable {
             let refused: Bool
             if channel == .control {
                 refused = resume.map(refusedLocked) ?? false
+                restartRetry = resume.map { sawControl && restartRetryLocked($0) } ?? false
             } else {
                 refused = resume.map { !accepted.contains($0) } ?? true
             }
@@ -264,12 +291,15 @@ final class SessionBroker: @unchecked Sendable {
         let owner: [UInt8]? = checkIDs ? (channel == .control ? authSession : resume) : nil
         var entry = Entry(token: token, peerIP: peerIP, channel: channel, sessionKey: sessionKey,
                           authSession: authSession, owner: owner, close: close)
+        entry.named = resume
         if passwordMode && channel == .control, let authSession {
             // r5: the newest session; the one before it stays valid only for
             // the same viewer's own reconnect (which named it).
             let chained = resume != nil && accepted.first == resume
-            entry.firstControl = !sawControl
+            // r11: a restart retry is still "the first since this start".
+            entry.firstControl = !sawControl || restartRetry
             accepted = chained ? [authSession, resume!] : [authSession]
+            if chained { viewerSessions.insert(authSession) } else { viewerSessions = [authSession] }
             sawControl = true
         }
         if passwordMode && channel == .control {
@@ -279,13 +309,18 @@ final class SessionBroker: @unchecked Sendable {
             // counts closes too, even from the same IP (a new viewer on the
             // same machine, or behind the same NAT). The same viewer's own
             // reconnect keeps its channels (their id is still accepted).
-            let current = accepted
+            // r11 (Pepper's r10 review, item 3): and after any number of
+            // its own reconnects (`viewerSessions`), not only the last one.
+            let current = viewerSessions
             kicked = entries.filter { e in
                 if e.channel == .control || e.peerIP != peerIP { return true }
                 guard let o = e.owner else { return false }
                 return !current.contains(o)
             }
             entries.removeAll { e in kicked.contains { $0.token == e.token } }
+            var named = Set(accepted)
+            for e in entries { if let o = e.owner { named.insert(o) } }
+            viewerSessions.formIntersection(named)
         }
         entries.append(entry)
         replacedCount &+= UInt64(kicked.count)
@@ -318,9 +353,11 @@ final class SessionBroker: @unchecked Sendable {
         if let e = entries.first(where: { $0.token == token }), let id = e.authSession {
             if e.firstControl && accepted == [id] {
                 accepted = []
+                viewerSessions = []
                 sawControl = false
             } else {
                 accepted.removeAll { $0 == id }
+                viewerSessions.remove(id)
             }
         }
         entries.removeAll { $0.token == token }
@@ -329,6 +366,16 @@ final class SessionBroker: @unchecked Sendable {
         publish(change)
         orderLock.unlock()
     }
+
+    /// r11 (item 4): the AUTH_OK of an admitted control AUTH went out. From
+    /// now on a retry naming the id it named is judged as any reconnect.
+    func confirm(_ token: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        if let i = entries.firstIndex(where: { $0.token == token }) { entries[i].confirmed = true }
+    }
+
+    /// r11: the viewer sessions open channels may stay on (self-test).
+    var viewerSessionCount: Int { lock.lock(); defer { lock.unlock() }; return viewerSessions.count }
 
     func end(_ token: UInt64) {
         orderLock.lock()
@@ -632,6 +679,16 @@ final class KickHandle: @unchecked Sendable {
     private var wasKicked = false
     private var wakeRead: Int32 = -1
     private var wakeWrite: Int32 = -1
+    /// r11 (Pepper's r10 review, item 1): this connection's session was
+    /// revoked by a takeover. Kept on this object, which lives exactly as
+    /// long as its connection, never keyed by the descriptor number: a
+    /// late `revoke` after the socket closed touches nobody else, and a
+    /// new connection that gets the same number starts unrevoked.
+    private var revokedFlag = false
+    /// r11 (item 2): held across one side effect (`whileLive`) and by
+    /// `revoke`, so a write that checked "still live" lands before the
+    /// takeover finishes, and none starts after it.
+    private let effectLock = NSLock()
 
     init(_ fd: Int32, wake: Bool = false) {
         self.fd = fd
@@ -674,6 +731,32 @@ final class KickHandle: @unchecked Sendable {
         lock.lock(); fd = -1; lock.unlock()
     }
 
+    /// r11: marks the session revoked (clipboard, file and ping channels;
+    /// the control channel still gets its REPLACED notice). Waits for a
+    /// side effect already running under `whileLive`. Never waits on the
+    /// main thread: a pasteboard write inside `whileLive` may be waiting
+    /// for it.
+    func revoke() {
+        if Thread.isMainThread {
+            lock.lock(); revokedFlag = true; lock.unlock()
+            return
+        }
+        effectLock.lock()
+        lock.lock(); revokedFlag = true; lock.unlock()
+        effectLock.unlock()
+    }
+
+    var isRevoked: Bool { lock.lock(); defer { lock.unlock() }; return revokedFlag }
+
+    /// r11 (item 2): runs `body` (a pasteboard write, an upload step) only
+    /// while the session is not revoked, and holds off `revoke` until it
+    /// is done. nil: revoked, `body` did not run.
+    func whileLive<T>(_ body: () -> T) -> T? {
+        effectLock.lock(); defer { effectLock.unlock() }
+        if isRevoked { return nil }
+        return body()
+    }
+
     /// r4: after the notice and FIN, reads and drops what the viewer still
     /// sends until it closes, for at most `noticeLinger`. Closing with input
     /// unread would send an RST, and Windows may then throw away a notice
@@ -693,4 +776,26 @@ final class KickHandle: @unchecked Sendable {
             if n <= 0 { return }
         }
     }
+}
+
+/// r11 (Pepper's r10 review, item 2): the pasteboard as one admitted
+/// clipboard connection sees it. A write runs only while that connection's
+/// session still counts (`KickHandle.whileLive`): a text the old viewer
+/// sent just before a takeover, already read, does not land after it.
+/// Reads pass through.
+final class SessionGatedClipboard: ClipboardBackend, @unchecked Sendable {
+    private let base: ClipboardBackend
+    private let life: KickHandle
+
+    init(_ base: ClipboardBackend, life: KickHandle) {
+        self.base = base
+        self.life = life
+    }
+
+    func changeCount() -> Int { base.changeCount() }
+    func readText() -> String? { base.readText() }
+    func writeText(_ text: String) -> Int? { life.whileLive { base.writeText(text) } ?? nil }
+    func writeFileURLs(_ urls: [URL]) -> Int? { life.whileLive { base.writeFileURLs(urls) } ?? nil }
+    func ownFileWriteChangeCount() -> Int? { base.ownFileWriteChangeCount() }
+    func readFileURLs() -> [URL]? { base.readFileURLs() }
 }

@@ -14,11 +14,6 @@ final class ControlServer: @unchecked Sendable {
     private var clientFDs: Set<Int32> = []
     /// Sockets set to close with RST (resetPeer); `lock`.
     private var resetFDs: Set<Int32> = []
-    /// r10 (Pepper's r9 review, blocker 1): clipboard, file and ping sockets
-    /// whose session a takeover revoked; `lock`. No frame goes out on them
-    /// any more (`sendChecked` refuses and resets), and the clipboard loop
-    /// stops at its next turn, not only when it reads the shut read side.
-    private var revokedChannelFDs: Set<Int32> = []
     private var stopping = false
     private var inputHelper: InputHelperClient?
     private let videoSettings = VideoSettingsController()
@@ -82,6 +77,11 @@ final class ControlServer: @unchecked Sendable {
     /// viewer that went away would (nothing is written). r9: kept for the
     /// "OK lost after the takeover" test. Set before start(); nil in the app.
     var failAuthOKForTest: (@Sendable (AuthOK) -> Bool)?
+    /// r11, self-test only: called with "clipboard" after a clipboard text
+    /// from the viewer was read and checked, just before it is written, so
+    /// a test can land a takeover in between. Set before start(); nil in
+    /// the app.
+    var beforeSessionEffectForTest: (@Sendable (String) -> Void)?
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
     /// viewer's window before the connection is dropped.
     static let handshakeSendSeconds: TimeInterval = 5
@@ -495,9 +495,12 @@ final class ControlServer: @unchecked Sendable {
             // and gets in once its control channel took over.
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
                                                   authSession: authChannel == .control ? authOK?.sessionID : nil,
-                                                  resume: authOK?.resume, close: { [weak self, isControl = authChannel == .control] in
+                                                  resume: authOK?.resume, close: { [isControl = authChannel == .control] in
                                                       // r10: a channel's session was revoked: no more frames out.
-                                                      if !isControl { self?.markChannelRevoked(fd) }
+                                                      // r11 (Pepper's r10 review, item 1): marked on this
+                                                      // connection's own handle, not by fd, so a late call
+                                                      // cannot touch a new connection on a reused number.
+                                                      if !isControl { kick.revoke() }
                                                       kick.kick()
                                                   }) else {
                 kick.finish()
@@ -517,7 +520,7 @@ final class ControlServer: @unchecked Sendable {
             // left half taken over, and the viewer reconnects. The viewer it
             // replaced stays replaced (Morris accepted one more reconnect and
             // a second or two without picture for the new viewer).
-            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK) {
+            if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK, life: kick) {
                 if authChannel == .control {
                     sessionBroker.abandon(token)
                     print("auth.ok_unsent peer=\(peer.ip) chan=control; session dropped, the viewer reconnects")
@@ -527,13 +530,15 @@ final class ControlServer: @unchecked Sendable {
                 kick.finish()
                 return
             }
+            // r11 (item 4): its OK went out; a retry naming its resume id
+            // is now judged as any reconnect.
+            if authChannel == .control { sessionBroker.confirm(token) }
             defer {
                 sessionBroker.end(token)
                 kick.finish()
-                lock.lock(); revokedChannelFDs.remove(fd); lock.unlock()
             }
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted,
-                          wake: kick.wakeFD)
+                          wake: kick.wakeFD, life: kick)
             if kick.kicked && authChannel == .control {
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
                 print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
@@ -557,7 +562,8 @@ final class ControlServer: @unchecked Sendable {
 
     /// The message loop of one admitted connection.
     private func serveAdmitted(_ fd: Int32, peer: ControlPeer, pending: [UInt8]?,
-                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool, wake: Int32 = -1) {
+                               authChannel: ConnAuth.Channel?, gateAdmitted: Bool, wake: Int32 = -1,
+                               life: KickHandle? = nil) {
         let authenticated = gateAdmitted
         // A connection is an input session only once it sends its first key
         // or mouse message; clipboard, PING and VIDEO_CONFIG sessions never
@@ -600,7 +606,7 @@ final class ControlServer: @unchecked Sendable {
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {
                 guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: ConnAuth.MsgType.result,
-                                  payload: ConnAuth.Result.openIPOnly.payload) == .sent else { return }
+                                  payload: ConnAuth.Result.openIPOnly.payload, life: life) == .sent else { return }
                 continue
             }
             messages += 1
@@ -633,18 +639,18 @@ final class ControlServer: @unchecked Sendable {
                     print("file.session=refused")
                     return
                 }
-                handleFileSession(fd, peerCaps: peerCaps, peerIP: peer.ip)
+                handleFileSession(fd, peerCaps: peerCaps, peerIP: peer.ip, life: life)
                 return
             case 0x30: // CLIPBOARD_HELLO: dedicate this TCP session to clipboard sync.
                 guard payload.isEmpty else { return }
                 guard sensitiveAllowed(type: type, peer: peer, authenticated: authenticated) else { return }
                 print("Clipboard session connected")
-                handleClipboardSession(fd, peerIP: peer.ip)
+                handleClipboardSession(fd, peerIP: peer.ip, life: life)
                 print("Clipboard session ended")
                 return
             case 0x01: // PING
                 if payload.count == 4 {
-                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload) == .sent else { return }
+                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload, life: life) == .sent else { return }
                 }
             case 0x40: // VIDEO_CONFIG_SET v1
                 let clientIP = settingsClientIP()
@@ -660,7 +666,7 @@ final class ControlServer: @unchecked Sendable {
                 }
                 // r10: the ACK asks again; a block that landed while the
                 // settings were applied gets no reply.
-                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload) == .sent else { return }
+                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload, life: life) == .sent else { return }
                 print("Video config ACK status=\(ack.status) codec=\(ack.codec) bitrate_mbps=\(ack.bitrateMbps) flags=0x\(String(ack.flags, radix: 16)) remote_size=\(ack.framebufferWidth)x\(ack.framebufferHeight)")
             case 0x10: // KEY
                 if payload.count == 3 {
@@ -822,7 +828,7 @@ final class ControlServer: @unchecked Sendable {
     /// an upload running removes its partial files. Runs on this client's own
     /// thread; only the final pasteboard write hops to the main thread. Logs
     /// carry no file names (D15): only open/closed and counts.
-    private func handleFileSession(_ fd: Int32, peerCaps: UInt16, peerIP: String) {
+    private func handleFileSession(_ fd: Int32, peerCaps: UInt16, peerIP: String, life: KickHandle? = nil) {
         fileSessions += 1
         let receiver = FileUploadReceiver(root: fileStagingRoot, clipboard: clipboard, sendFolder: fileSendFolder)
         let announcer: FileAnnouncer? = (peerCaps & FileProto.Caps.announce) != 0 ? FileAnnouncer() : nil
@@ -835,7 +841,7 @@ final class ControlServer: @unchecked Sendable {
         let ack = FileProto.Message.helloAck(proto: FileProto.version, caps: FileProto.Caps.host,
                                              maxChunk: FileProto.maxChunk, maxTotal: FileProto.maxTotalBytes)
         guard let ackBytes = ack.encode(),
-              sendChecked(fd, peerIP: peerIP, kind: "file", type: ack.type, payload: ackBytes) == .sent else { return }
+              sendChecked(fd, peerIP: peerIP, kind: "file", type: ack.type, payload: ackBytes, life: life) == .sent else { return }
         print("file.session=open caps=0x\(String(FileProto.Caps.host, radix: 16)) peer_caps=0x\(String(peerCaps, radix: 16))")
         // r9: every frame to the viewer asks first (the policy, then this
         // peer's block), so a block that lands mid-transfer stops a 4 MiB
@@ -845,7 +851,7 @@ final class ControlServer: @unchecked Sendable {
         // reading (sendChecked), so the wait cannot outlast the block.
         var revoked = false
         func sendGuarded(_ type: UInt8, _ payload: [UInt8]) -> Bool {
-            switch sendChecked(fd, peerIP: peerIP, kind: "file", type: type, payload: payload) {
+            switch sendChecked(fd, peerIP: peerIP, kind: "file", type: type, payload: payload, life: life) {
             case .sent: return true
             case .refused: revoked = true; return false
             case .failed: return false
@@ -882,9 +888,10 @@ final class ControlServer: @unchecked Sendable {
             push = nil
         }
         defer {
-            if revoked { reason = "policy_changed" }
-            // r10: a session the policy ended is reset, not drained.
-            if reason == "policy_changed" { resetPeer(fd) }
+            if revoked && reason != "replaced" { reason = "policy_changed" }
+            // r10: a session the policy ended is reset, not drained. r11:
+            // and one a takeover revoked.
+            if reason == "policy_changed" || reason == "replaced" { resetPeer(fd) }
             endPush()
             pushBroker.unregister(pushSession)
             receiver.abort(reason: reason)
@@ -911,6 +918,8 @@ final class ControlServer: @unchecked Sendable {
             if shouldStop { reason = "stopping"; return }
             // r5 (B3): nothing more is sent or served once the policy moved.
             if sessionRevoked("file", peerIP: peerIP) { reason = "policy_changed"; return }
+            // r11: nor once a takeover revoked this viewer's session.
+            if life?.isRevoked == true { reason = "replaced"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
             if showsNotice {
                 let seq = currentNoticeSeq()
@@ -960,6 +969,7 @@ final class ControlServer: @unchecked Sendable {
             guard length <= FileProto.maxPayload else { reason = "too_long"; return }
             guard let payload = recvExact(fd, count: length) else { return }
             if sessionRevoked("file", peerIP: peerIP) { reason = "policy_changed"; return }
+            if life?.isRevoked == true { reason = "replaced"; return }
             received += 1
             lastMessage = Date()
             pushBroker.heard(pushSession)
@@ -998,7 +1008,17 @@ final class ControlServer: @unchecked Sendable {
                 announcer?.cancel(t)
             case .offer(_, FileProto.Purpose.paste, _, _), .offer(_, FileProto.Purpose.send, _, _),
                  .entry, .data, .fileEnd, .cancel:
-                let step = receiver.handle(msg)
+                // r11 (Pepper's r10 review, item 2): the step (staging
+                // write, send-folder move, pasteboard write) runs only while
+                // this viewer's session still counts, checked under the
+                // same lock a takeover takes (`whileLive`).
+                let step: FileUploadReceiver.Step
+                if let life {
+                    guard let s = life.whileLive({ receiver.handle(msg) }) else { reason = "replaced"; return }
+                    step = s
+                } else {
+                    step = receiver.handle(msg)
+                }
                 noteUpload(&uploading, active: receiver.isActive)
                 for out in step.send {
                     guard sendMessage(out) else { reason = "send_failed"; return }
@@ -1006,7 +1026,11 @@ final class ControlServer: @unchecked Sendable {
                 if let why = step.close { reason = why; return }
             case .reveal(let transfer):
                 // F4: Finder opens the folder that send went to. No reply.
-                receiver.reveal(transfer)
+                if let life {
+                    guard life.whileLive({ receiver.reveal(transfer) }) != nil else { reason = "replaced"; return }
+                } else {
+                    receiver.reveal(transfer)
+                }
             case .offer(let transfer, _, _, _):
                 refused += 1
                 guard sendMessage(.reply(transfer: transfer, status: FileProto.Status.denied)) else {
@@ -1027,16 +1051,6 @@ final class ControlServer: @unchecked Sendable {
     /// before an inbound message is handled. One stat while listen.plist is
     /// unchanged.
     /// r8: and `admitPeerMessage` for this session's peer.
-    /// r10: see `revokedChannelFDs`.
-    private func markChannelRevoked(_ fd: Int32) {
-        lock.lock(); revokedChannelFDs.insert(fd); lock.unlock()
-    }
-
-    private func channelRevoked(_ fd: Int32) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return revokedChannelFDs.contains(fd)
-    }
-
     private func sessionRevoked(_ kind: String, peerIP: String) -> Bool {
         if let admitMessage, !admitMessage() {
             rejectedClients += 1
@@ -1051,9 +1065,12 @@ final class ControlServer: @unchecked Sendable {
         return false
     }
 
-    private func handleClipboardSession(_ fd: Int32, peerIP: String) {
+    private func handleClipboardSession(_ fd: Int32, peerIP: String, life: KickHandle? = nil) {
         // Each 100 ms poll reads only the change count, on this thread. The
         // contents are read (on the main thread) only when the count moved.
+        // r11 (Pepper's r10 review, item 2): writes go through this
+        // connection's gate, so none lands once a takeover revoked it.
+        let clipboard: ClipboardBackend = life.map { SessionGatedClipboard(self.clipboard, life: $0) as ClipboardBackend } ?? self.clipboard
         var lastChangeCount = clipboard.changeCount()
         var lastSentText = clipboard.readText()
         var lastRemoteApplied: String?
@@ -1064,7 +1081,7 @@ final class ControlServer: @unchecked Sendable {
             // r5 (B3): no clipboard read or write once the policy moved.
             if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
             // r10: a takeover revoked this viewer's session.
-            if channelRevoked(fd) { resetPeer(fd); return }
+            if life?.isRevoked == true { resetPeer(fd); return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = Darwin.poll(&pfd, 1, 100)
@@ -1083,14 +1100,22 @@ final class ControlServer: @unchecked Sendable {
                     guard length <= Self.maxClipboardBytes,
                           let payload = recvExact(fd, count: length) else { return }
                     if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
+                    if life?.isRevoked == true { resetPeer(fd); return }
 
                     if type == 0x31 {
                         guard let text = String(data: Data(payload), encoding: .utf8) else {
                             print("Clipboard rejected invalid UTF-8")
                             continue
                         }
+                        beforeSessionEffectForTest?("clipboard")
                         if clipboard.readText() != text {
                             guard let updated = clipboard.writeText(text) else {
+                                // r11: the gate refused it: a takeover came in.
+                                if life?.isRevoked == true {
+                                    print("Clipboard remote apply dropped: session replaced")
+                                    resetPeer(fd)
+                                    return
+                                }
                                 print("Clipboard remote apply failed")
                                 continue
                             }
@@ -1103,7 +1128,7 @@ final class ControlServer: @unchecked Sendable {
                         clipboardReceived += 1
                         print("Clipboard RX bytes=\(payload.count)")
                     } else if type == 0x01, payload.count == 4 {
-                        guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x02, payload: payload) == .sent else { return }
+                        guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x02, payload: payload, life: life) == .sent else { return }
                     }
                 }
             }
@@ -1137,7 +1162,7 @@ final class ControlServer: @unchecked Sendable {
             if text == lastSentText { continue }
             // r5 (B3): the policy may have moved during the 100 ms poll.
             // r10: sendChecked asks it right before the frame.
-            guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x31, payload: payload) == .sent else { return }
+            guard sendChecked(fd, peerIP: peerIP, kind: "clipboard", type: 0x31, payload: payload, life: life) == .sent else { return }
             lastSentText = text
             clipboardSent += 1
             print("Clipboard TX bytes=\(payload.count)")
@@ -1411,11 +1436,11 @@ final class ControlServer: @unchecked Sendable {
 
     /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
     /// the first frame of an admitted session: it asks too.
-    private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK) -> Bool {
+    private func sendAuthOK(_ fd: Int32, peerIP ip: String, _ ok: AuthOK, life: KickHandle? = nil) -> Bool {
         if let fail = failAuthOKForTest, fail(ok) { return false }
         guard sendChecked(fd, peerIP: ip, kind: "auth", type: ConnAuth.MsgType.result,
                           payload: ConnAuth.Result.ok(macH: ok.macH, sessionID: ok.sessionID).payload,
-                          limit: authOKSendSeconds) == .sent else {
+                          limit: authOKSendSeconds, life: life) == .sent else {
             print("auth.ok_send_failed peer=\(ip) chan=\(ok.channel.name) limit_s=\(authOKSendSeconds)")
             return false
         }
@@ -1660,12 +1685,14 @@ final class ControlServer: @unchecked Sendable {
     /// the thread past a block. A refusal resets the socket (`resetPeer`).
     /// r10: `limit` (seconds, monotonic) also bounds the wait for the
     /// window; nil keeps the checks with no time limit.
+    /// r11 (Pepper's r10 review, item 1): `life` is the connection's own
+    /// handle; its revoked mark ends with it, never with a descriptor number.
     private func sendChecked(_ fd: Int32, peerIP: String, kind: String, type: UInt8,
-                             payload: [UInt8], limit: TimeInterval? = nil) -> CheckedSend {
+                             payload: [UInt8], limit: TimeInterval? = nil, life: KickHandle? = nil) -> CheckedSend {
         beforeCheckedSend?(type)
         var refused = false
         let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP, limit: limit) {
-            if self.channelRevoked(fd) || self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
+            if life?.isRevoked == true || self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
             return refused
         }
         if refused { resetPeer(fd); return .refused }
