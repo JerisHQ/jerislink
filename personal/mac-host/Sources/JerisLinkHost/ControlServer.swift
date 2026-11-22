@@ -498,13 +498,14 @@ final class ControlServer: @unchecked Sendable {
             // and gets in once its control channel took over.
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
                                                   authSession: authChannel == .control ? authOK?.sessionID : nil,
-                                                  resume: authOK?.resume, close: { kick.kick() }) else {
+                                                  resume: authOK?.resume, auto: authOK?.auto ?? false,
+                                                  close: { kick.kick() }) else {
                 kick.finish()
                 if authChannel == .control {
                     // r4: the reconnect check again, atomically with taking
                     // the session (an AUTH may have finished since
                     // `authenticate`).
-                    refuseResume(fd, ip: peer.ip, channel: .control, resume: authOK?.resume, stage: "admit")
+                    refuseResume(fd, ip: peer.ip, channel: .control, stage: "admit")
                 } else {
                     authLog.log("auth.channel_unadmitted", peer: peer.ip,
                                 "auth.channel_unadmitted peer=\(peer.ip) chan=\(authChannel?.name ?? "open") resume=\(authOK?.resume.map(ConnAuth.hex) ?? "-") counted=0; closed, no REPLACED")
@@ -536,7 +537,16 @@ final class ControlServer: @unchecked Sendable {
                           wake: kick.wakeFD, life: kick)
             // r12: void from the takeover on, even before the broker's
             // background close reached this connection.
-            if authChannel == .control && (kick.kicked || kick.isRevoked) {
+            if authChannel == .control && (kick.kicked || kick.isRevoked) && kick.sentPartialFrame {
+                // r14 (Pepper's r13 review, item 2): a reply (PONG, ACK) was
+                // cut off part way by the takeover. REPLACED after it would
+                // be read as the rest of that frame, so the socket is reset
+                // instead, with nothing more written. The viewer's own
+                // reconnect is flagged "auto" and gets REPLACED while the
+                // new viewer is connected, so it stops all the same.
+                resetPeer(fd)
+                print("auth.replaced_notice peer=\(peer.ip) sent=0 skipped=partial_frame; connection reset")
+            } else if authChannel == .control && (kick.kicked || kick.isRevoked) {
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
                 print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
                 // r3 (Pepper's r2 review, item 1): FIN after the notice, then
@@ -1003,7 +1013,7 @@ final class ControlServer: @unchecked Sendable {
                 guard sendGuarded(type, payload) else { reason = "send_failed"; return }
             case .request(let t, let index, let offset, let length) where push != nil && t == push?.transfer:
                 guard let p = push, p.serve(index: index, offset: offset, length: length, send: sendMessage) else {
-                    reason = "send_failed"; return
+                    reason = life?.isRevoked == true ? "replaced" : "send_failed"; return
                 }
                 lastMessage = Date()
             case .reply(let t, let status) where push != nil && t == push?.transfer:
@@ -1441,16 +1451,17 @@ final class ControlServer: @unchecked Sendable {
                           failureLog: gate.failureLog)
             return nil
         }
-        // r4 (Pepper's r3 review, item 1): a reconnect from a viewer that
-        // another login replaced. The password was right (nothing counted),
-        // but the session is not taken back: it is told it was replaced, and
-        // stops, even if it never read the notice on its old connection.
-        // r9: control channel only; another channel naming a session that
-        // is not the newest is closed silently in `admit`. r12: any other
-        // control login (no id, the current id, an id from before a
-        // restart, a retry after a lost AUTH_OK) is a new takeover.
-        if channel == .control, let sessionBroker, sessionBroker.resumeRefused(response.resume) {
-            refuseResume(fd, ip: ip, channel: channel, resume: response.resume, stage: "auth")
+        // r14 (Pepper's r13 review, item 4): takeover is never automatic.
+        // A control AUTH flagged "auto" (the viewer reconnecting on its own)
+        // while another control connection is open is told REPLACED (the
+        // password was right: nothing counted) and takes nothing over; its
+        // viewer stops and says another device is connected. Only a manual
+        // connect (no flag) takes over. Checked again in `admit`, under the
+        // broker's lock. Another channel naming a session that is not the
+        // newest is closed silently in `admit` (r9).
+        let auto = channel == .control && response.resume != nil
+        if auto, let sessionBroker, sessionBroker.autoRefused(auto: true) {
+            refuseResume(fd, ip: ip, channel: channel, stage: "auth")
             return nil
         }
         let sessionID = ConnAuth.random(ConnAuth.sessionIDBytes)
@@ -1461,7 +1472,8 @@ final class ControlServer: @unchecked Sendable {
         // sends it (`sendAuthOK`) once the session broker has taken this
         // session, so a viewer never holds a session id the host does not
         // know yet (its next channel's AUTH would name it and be refused).
-        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID, resume: response.resume, macH: macH)
+        return AuthOK(channel: channel, sessionKey: sessionKey, sessionID: sessionID,
+                      resume: channel == .control ? nil : response.resume, auto: auto, macH: macH)
     }
 
     /// r5: AUTH_RESULT ok, after the broker admitted the session. r10: OK is
@@ -1479,12 +1491,13 @@ final class ControlServer: @unchecked Sendable {
     }
 
     /// r4: answers a refused reconnect (`.replaced`, the same status as the
-    /// notice) and logs it. Not a failure: no try is counted.
-    private func refuseResume(_ fd: Int32, ip: String, channel: ConnAuth.Channel, resume: [UInt8]?, stage: String) {
+    /// notice) and logs it. Not a failure: no try is counted. r14: an auto
+    /// control reconnect while another control connection is open.
+    private func refuseResume(_ fd: Int32, ip: String, channel: ConnAuth.Channel, stage: String) {
         lock.lock(); resumesRefused += 1; lock.unlock()
         let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
         authLog.log("auth.resume_refused", peer: ip,
-                    "auth.resume_refused peer=\(ip) chan=\(channel.name) stage=\(stage) resume=\(resume.map(ConnAuth.hex) ?? "-") sent=\(sent ? 1 : 0) counted=0")
+                    "auth.resume_refused peer=\(ip) chan=\(channel.name) stage=\(stage) reason=auto_while_connected sent=\(sent ? 1 : 0) counted=0")
         if sent {
             Darwin.shutdown(fd, SHUT_WR)
             KickHandle.drainAfterNotice(fd)
@@ -1496,9 +1509,12 @@ final class ControlServer: @unchecked Sendable {
     struct AuthOK {
         var channel: ConnAuth.Channel
         var sessionKey: [UInt8]
-        /// r4: the session_id sent in OK, and the one a reconnect named.
+        /// r4: the session_id sent in OK. `resume`: the control session a
+        /// clipboard, file or ping AUTH named (nil on control).
         var sessionID: [UInt8]
         var resume: [UInt8]?
+        /// r14: a control AUTH flagged "auto" (never takes over).
+        var auto: Bool = false
         /// r5: mac_h for the OK that `sendAuthOK` sends.
         var macH: [UInt8]
     }
@@ -1722,10 +1738,12 @@ final class ControlServer: @unchecked Sendable {
                              keepForNotice: Bool = false) -> CheckedSend {
         beforeCheckedSend?(type)
         var refused = false
-        let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP, limit: limit) {
+        // r14: a frame cut off part way is noted on the connection, so no
+        // REPLACED notice is written after it.
+        let ok = sendPacket(fd, type: type, payload: payload, peerIP: peerIP, limit: limit, revoked: {
             if life?.isRevoked == true || self.sessionRevoked(kind, peerIP: peerIP) { refused = true }
             return refused
-        }
+        }, partial: { life?.notePartialFrame() })
         if refused {
             // r13: a control line a takeover voided is closed after its
             // REPLACED notice instead of reset.
@@ -1814,23 +1832,30 @@ final class ControlServer: @unchecked Sendable {
     /// `revoked` (handshake frames) the wait ends after
     /// `handshakeSendSeconds`. r10: `limit` sets the wait's length, with or
     /// without `revoked`; `revoked` is still asked first on every wake.
+    /// r14: `partial` runs when it gives up after some bytes of the frame
+    /// went out, not all.
     private func sendPacket(_ fd: Int32, type: UInt8, payload: [UInt8], peerIP: String? = nil,
-                            limit: TimeInterval? = nil, revoked: (() -> Bool)? = nil) -> Bool {
+                            limit: TimeInterval? = nil, revoked: (() -> Bool)? = nil,
+                            partial: (() -> Void)? = nil) -> Bool {
         let length = UInt16(payload.count)
         let bytes: [UInt8] = [0x4d, 0x52, 0x43, 0x31, 1, type, UInt8(length >> 8), UInt8(length & 0xff)] + payload
         let now = ProcessInfo.processInfo.systemUptime
         let deadline = limit.map { now + $0 } ?? (revoked == nil ? now + Self.handshakeSendSeconds : .infinity)
         var offset = 0
+        func cut() -> Bool {
+            if offset > 0 { partial?() }
+            return false
+        }
         while offset < bytes.count {
             var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             let ready = Darwin.poll(&pfd, 1, Self.sendSliceMillis)
-            if ready < 0 && errno != EINTR { return false }
-            if let revoked, revoked() { return false }
-            if ProcessInfo.processInfo.systemUptime > deadline { return false }
+            if ready < 0 && errno != EINTR { return cut() }
+            if let revoked, revoked() { return cut() }
+            if ProcessInfo.processInfo.systemUptime > deadline { return cut() }
             lock.lock(); let shouldStop = stopping; lock.unlock()
-            if shouldStop { return false }
+            if shouldStop { return cut() }
             guard ready > 0 else { continue }
-            guard pfd.revents & Int16(POLLOUT) != 0 else { return false }
+            guard pfd.revents & Int16(POLLOUT) != 0 else { return cut() }
             let started = DispatchTime.now().uptimeNanoseconds
             let n = bytes.withUnsafeBytes { raw -> Int in
                 let p = raw.baseAddress!.advanced(by: offset), len = bytes.count - offset
@@ -1850,7 +1875,7 @@ final class ControlServer: @unchecked Sendable {
                     txLock.unlock()
                 }
             } else {
-                guard n < 0, sendErrno == EAGAIN || sendErrno == EINTR else { return false }
+                guard n < 0, sendErrno == EAGAIN || sendErrno == EINTR else { return cut() }
             }
         }
         return true

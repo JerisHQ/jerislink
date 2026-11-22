@@ -188,7 +188,16 @@ enum ConnAuth {
     /// r5 (Pepper's r4 review, item 2): the id is under mac_c
     /// (`macClient(resume:)`), so it cannot be added, stripped or changed
     /// without K: the host checks the reconnect's identity, not just its key.
+    /// r14 (Pepper's r13 review, item 4): on the control channel the 8
+    /// bytes are only a flag, "auto: do not take over" (the viewer sends the
+    /// fixed `autoMarker`, never an old session id; the host does not read
+    /// the value). Such an AUTH gets REPLACED while another control
+    /// connection is open (`SessionBroker.autoRefused`). On the other
+    /// channels they still name the newest control session (r9).
     struct Response: Equatable {
+        /// r14: what the viewer puts in the 8 bytes of an auto control AUTH.
+        static let autoMarker: [UInt8] = Array("jl-auto1".utf8)
+
         var clientNonce: [UInt8]
         var mac: [UInt8]
         var resume: [UInt8]? = nil

@@ -184,7 +184,12 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
     /// r13: a takeover voided session `id` (its connection was kicked).
     /// It gets no new job, a job waiting for it is aborted, and a job it
     /// runs is answered not_connected and abandoned, so an accept that
-    /// arrives later changes nothing.
+    /// arrives later changes nothing. r14 (Pepper's r13 review, item 3):
+    /// the running slot is freed here, at once: the next viewer's push is
+    /// not .busy while the old worker is still stuck (in a read, say). That
+    /// worker cleans up on its own (`finished` releases its job and leaves
+    /// the slot alone), and its late results are void by its epoch
+    /// (`PushSender`'s `live`).
     func abort(session id: UInt64) {
         lock.lock()
         aborted.insert(id)
@@ -192,6 +197,7 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         let waiting = pending?.session == id ? pending?.job : nil
         if waiting != nil { pending = nil }
         let run = running?.session == id ? running?.job : nil
+        if run != nil { running = nil }
         lock.unlock()
         if waiting != nil || run != nil { print("file.push_route=aborted reason=replaced") }
         waiting?.answer(.notConnected)
@@ -200,7 +206,8 @@ final class PushBroker: @unchecked Sendable {  // state behind `lock`
         run?.abandon()
     }
 
-    /// The session is done with `job` (any ending).
+    /// The session is done with `job` (any ending). r14: a job `abort`
+    /// already took out of the slot only has its descriptors released.
     func finished(_ job: PushJob) {
         lock.lock()
         if running?.job === job { running = nil }
@@ -236,8 +243,11 @@ final class PushSender {
     private var next: UInt64 = 0
     private var hasher = SHA256()
     /// r13: whether this session's epoch still counts; asked when the
-    /// viewer's REPLY would mark the push accepted.
+    /// viewer's REPLY would mark the push accepted. r14: also before a
+    /// RESULT counts and before each chunk read and sent.
     private let live: () -> Bool
+    /// r14 (self-test): runs right before each file read in `serve`.
+    var beforeReadForTest: (() -> Void)?
 
     /// Largest REQUEST served in one go; the viewer asks for 1 MiB.
     static let maxRequest: UInt32 = 4 << 20
@@ -291,6 +301,8 @@ final class PushSender {
     }
 
     func result(status: UInt8, filesOK: UInt32) {
+        // r14: a RESULT after a takeover does not count.
+        guard live() else { end("replaced", answer: .notConnected); return }
         end(status == FileProto.Status.ok ? "ok" : "failed_\(status)", files: filesOK)
     }
 
@@ -322,6 +334,8 @@ final class PushSender {
             return send(.reply(transfer: transfer, status: FileProto.Status.failed))
         }
         guard accepted, !ended else { return refuse("state") }
+        // r14: the session was taken over: nothing more is read or sent.
+        guard live() else { end("replaced", answer: .notConnected); return false }
         guard Int(i) < job.files.count else { return refuse("index") }
         let f = job.files[Int(i)]
         guard offset <= f.size else { return refuse("offset") }
@@ -336,9 +350,12 @@ final class PushSender {
         var buf = [UInt8](repeating: 0, count: Int(FileProto.maxChunk))
         while next < stop {
             let want = Int(min(UInt64(FileProto.maxChunk), stop - next))
+            beforeReadForTest?()
             let n = buf.withUnsafeMutableBytes { Darwin.pread(f.fd, $0.baseAddress!, want, off_t(next)) }
             if n < 0, errno == EINTR { continue }
             if n <= 0 { return refuse(n == 0 ? "changed" : "read") }
+            // r14: a read that ended after a takeover sends nothing.
+            guard live() else { end("replaced", answer: .notConnected); return false }
             let chunk = Array(buf[0..<n])
             hasher.update(data: chunk)
             guard send(.data(transfer: transfer, index: i, offset: next, bytes: chunk)) else { return false }

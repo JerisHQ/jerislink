@@ -1876,7 +1876,9 @@ void prcR3Tests() {
 using SessionId = std::array<uint8_t, kSessionIdBytes>;
 
 // One host-side AUTH that hands out `give`. With `live` set (another viewer
-// holds the session), a reconnect naming any other session is refused.
+// holds the session), a reconnect is refused. r14 (Pepper's r13 review,
+// item 4): as on the Mac, any control AUTH flagged "auto" (the 8 bytes after
+// mac_c) is refused while another viewer is connected, whatever it holds.
 // Returns 1 (OK sent), 2 (REPLACED sent), 0 (no proof). `named` gets what
 // the viewer appended (empty: a plain 64-byte answer).
 int hostAuthSession(SOCKET s, const Secret& sec, const SessionId& give, const SessionId* live, Bytes& named) {
@@ -1891,7 +1893,7 @@ int hostAuthSession(SOCKET s, const Secret& sec, const SessionId& give, const Se
                           p.size() == kResumeResponseBytes ? p.data() + kResponseBytes : nullptr);  // r5
     if (!want || !constantTimeEqual(want->data(), p.data() + kNonceBytes, kMacBytes)) return 0;
     named.assign(p.begin() + kResponseBytes, p.end());
-    if (live && !named.empty() && !std::equal(named.begin(), named.end(), live->begin())) {
+    if (live && !named.empty()) {
         const Bytes r{6};
         sendAllBytes(s, frame(kTypeResult, r.data(), r.size()));
         return 2;
@@ -1981,8 +1983,10 @@ void prcR4Case(Missed how, const char* label) {
         Sleep(10);
     }
     host.join();
-    const bool namedMine = againNamed.size() == kSessionIdBytes && std::equal(againNamed.begin(), againNamed.end(), mine.begin());
-    expect(again == 2 && namedMine, std::string("  ") + label + ": the reconnect named its old session (72-byte answer) and got REPLACED");
+    // r14: the control reconnect carries the "auto" flag, never its old id.
+    const bool flaggedAuto = againNamed.size() == kSessionIdBytes && std::equal(againNamed.begin(), againNamed.end(), kAutoMarker);
+    expect(again == 2 && flaggedAuto,
+           std::string("  ") + label + ": the reconnect is flagged auto (72-byte answer, no old id) and got REPLACED (no takeover)");
     expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
            std::string("  ") + label + ": viewer told once (Replaced), attempt halted");
     expect(!control.keepSession() && !control.sendKey(true, 0x0042) && l.accept(500) == INVALID_SOCKET,
@@ -2473,10 +2477,12 @@ void prcR9OkLostTest() {
            "prc r9 OK lost: the takeover's AUTH_OK never came (connection closed), the viewer is not halted and its reconnect gets in");
     dropNow = true;
     drive(2);
-    const bool carried = named3.size() == kSessionIdBytes && std::equal(named3.begin(), named3.end(), mine.begin()) &&
-                         named4.size() == kSessionIdBytes && std::equal(named4.begin(), named4.end(), mine.begin());
+    // r14: the control reconnects carry the "auto" flag (no id); with no
+    // other viewer connected the Mac lets them in.
+    const bool carried = named3.size() == kSessionIdBytes && std::equal(named3.begin(), named3.end(), kAutoMarker) &&
+                         named4.size() == kSessionIdBytes && std::equal(named4.begin(), named4.end(), kAutoMarker);
     expect(lost2 && ok2 == 1 && carried && terminals == 0 && mayConnect(),
-           "prc r9 OK lost: on its own reconnect the lost OK is retried with the id it had, and gets in");
+           "prc r9 OK lost: on its own reconnect (flagged auto) the lost OK is retried, and gets in");
     noticeNow = true;
     for (int i = 0; i < 300 && terminals == 0; ++i) {
         control.pollHostNotice();
@@ -2493,6 +2499,98 @@ void prcR9OkLostTest() {
 
 void prcR9Tests() {
     prcR9OkLostTest();
+}
+
+// PR-C r14 (Pepper's r13 review, item 4): the automatic retries of a
+// read-only view have a total budget (ReadOnlyRecovery::kAutoRetryCapMs, 2
+// min). (a) The arithmetic. (b) End to end with a short budget: the Mac
+// lets the first session in, then refuses every reconnect by closing it;
+// once the budget is spent the loop stops, the attempt halts (RetryCapped)
+// and no connection is made any more.
+void prcR14RetryCapTests() {
+    using jl::viewer::ReadOnlyRecovery;
+    {
+        ReadOnlyRecovery r;
+        const bool up = !r.retryExpired(true, 0) && !r.retryExpired(true, 500000);
+        const bool budget = !r.retryExpired(false, 1000) && !r.retryExpired(false, 1000 + 119999) &&
+                            r.retryExpired(false, 1000 + 120000) && r.retryExpired(false, 1000 + 500000);
+        // Back up: the budget starts again from the next drop.
+        const bool reset = !r.retryExpired(true, 600000) && !r.retryExpired(false, 600001) &&
+                           !r.retryExpired(false, 600001 + 119999) && r.retryExpired(false, 600001 + 120000);
+        r.retryExpired(false, 700000);
+        r.sessionBack();
+        const bool back = r.downMs(800000) == 0 && !r.retryExpired(false, 800000);
+        expect(ReadOnlyRecovery::kAutoRetryCapMs == 120000 && up && budget && reset && back,
+               "prc r14 retry cap: retries stop after 2 min down in total; the budget starts again once the session is back");
+    }
+
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    clearKnownModesForTest();
+    std::atomic<int> terms{0};
+    std::atomic<int> lastO{-1};
+    auto c = makeClient(terms, lastO, "127.0.0.1:" + std::to_string(l.port));
+    setCurrent(c);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    bool auth1 = false;
+    std::atomic<int> refusedConns{0};
+    std::atomic<bool> hostDone{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(5000);
+        if (s == INVALID_SOCKET) return;
+        auth1 = hostAuth(s, sec, Answer::Ok, kFirstAuthMs);
+        Sleep(200);
+        closesocket(s);
+        // Every reconnect is closed at once (the Mac is unreachable).
+        while (!hostDone) {
+            SOCKET r = l.accept(50);
+            if (r != INVALID_SOCKET) { ++refusedConns; closesocket(r); }
+        }
+    });
+    const double capMs = 1500;
+    ReadOnlyRecovery ro(200, capMs);
+    const auto t0 = Clock::now();
+    // The viewer loop (viewer.cpp), every 25 ms here.
+    bool stopped = false;
+    double stoppedAt = 0;
+    for (int i = 0; i < 600 && !stopped; ++i) {
+        const double nowMs = msSince(t0);
+        const auto rs = control.reconnectStats();
+        control.pollHostNotice();
+        if (ro.retryExpired(rs.live, nowMs) && mayConnect()) {
+            c->autoRetryStopped(ro.downMs(nowMs));
+            stopped = true;
+            stoppedAt = nowMs;
+        } else {
+            if (ro.wantResume(rs.pausedNow, nowMs)) control.resumeOnUserKey();
+            control.keepSession();
+        }
+        Sleep(25);
+    }
+    for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
+    const int triedBefore = refusedConns;
+    // Nothing reconnects any more, even when asked.
+    for (int i = 0; i < 40; ++i) {
+        control.keepSession();
+        control.resumeOnUserKey();
+        Sleep(25);
+    }
+    const int triedAfter = refusedConns;
+    hostDone = true;
+    host.join();
+    expect(auth1 && stopped && triedBefore > 0 && stoppedAt >= capMs && stoppedAt < capMs + 3000,
+           "prc r14 retry cap (e2e): retried while down (" + std::to_string(triedBefore) + " connections), stopped after the budget (" +
+               std::to_string(int(stoppedAt)) + " ms)");
+    expect(terms == 1 && lastO == int(Outcome::RetryCapped) && c->halted() && !mayConnect() && triedAfter == triedBefore,
+           "prc r14 retry cap (e2e): the attempt halts (RetryCapped), no connection after it");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
 }
 }  // namespace
 
@@ -2514,6 +2612,7 @@ int main() {
     prcR4ReadOnlyTests();
     prcR5Tests();
     prcR9Tests();
+    prcR14RetryCapTests();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

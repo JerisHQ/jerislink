@@ -49,6 +49,7 @@ enum AuthSelfTest {
         r12KernelWait(expect)
         prcR12(expect)
         prcR13(expect)
+        prcR14(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -334,7 +335,8 @@ enum AuthSelfTest {
         func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
         func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
 
-        // Broker: the epoch, the background close, the replaced ids.
+        // Broker: the epoch, the background close. r14: no replaced ids; an
+        // auto control reconnect is refused while a control connection is open.
         do {
             let b = SessionBroker(passwordMode: true, log: { _ in })
             let closed = R10Names()
@@ -354,29 +356,32 @@ enum AuthSelfTest {
             stuck.signal()
             b.flushClosesForTest()
             expect(tA != nil && fA != nil && tA2 != nil && liveBefore && voidAtOnce && tookMs < 500
-                       && Set(closed.all) == ["a-ctl", "a-file"] && !b.resumeRefused(id(0xA1))
+                       && Set(closed.all) == ["a-ctl", "a-file"] && b.autoRefused(auto: true) && !b.autoRefused(auto: false)
                        && !b.channelAdmitted(id(0xA1)) && b.channelAdmitted(id(0xA2)),
                    "prc r12 broker: a login (even the same viewer's) moves the epoch on: every older connection is void at once and closed in the background; a stuck close does not hold up the AUTH (took_ms=\(tookMs)); channels need the newest id")
             // Two takeovers in a row.
             let tB = b.admit(peerIP: "100.64.0.9", channel: .control, sessionKey: key(0xB1), authSession: id(0xB1), resume: nil, close: {})
             let tC = b.admit(peerIP: me, channel: .control, sessionKey: key(0xC1), authSession: id(0xC1), resume: nil, close: {})
             b.flushClosesForTest()
-            expect(tB != nil && tC != nil && b.resumeRefused(id(0xA2)) && b.resumeRefused(id(0xA1)) && b.resumeRefused(id(0xB1))
-                       && !b.resumeRefused(id(0xC1)) && tB.map(b.live) == false && tC.map(b.live) == true
-                       && b.current.0?.sessionKey == key(0xC1),
-                   "prc r12 broker: two takeovers in a row: both earlier viewers are replaced, the newest is live")
+            // r14: an auto reconnect of a replaced viewer is refused (C's
+            // control is open), nothing changes.
+            let autoB = b.admit(peerIP: "100.64.0.9", channel: .control, sessionKey: key(0xB2), authSession: id(0xB2),
+                                resume: nil, auto: true, close: {})
+            expect(tB != nil && tC != nil && autoB == nil && tB.map(b.live) == false && tC.map(b.live) == true
+                       && b.current.0?.sessionKey == key(0xC1) && b.channelAdmitted(id(0xC1)),
+                   "prc r12 broker: two takeovers in a row: both earlier viewers are void, the newest is live; r14: an auto reconnect meanwhile is refused and changes nothing")
             // C's own login again; its AUTH_OK fails; it retries with its id.
             let tC2 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xC2), authSession: id(0xC2), resume: id(0xC1), close: {})
             if let tC2 { b.abandon(tC2) }
-            let afterLost = !b.resumeRefused(id(0xC1)) && !b.channelAdmitted(id(0xC2)) && b.current.0 == nil
-            let tC3 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xC3), authSession: id(0xC3), resume: id(0xC1), close: {})
-            expect(tC2 != nil && afterLost && tC3 != nil && b.current.0?.sessionKey == key(0xC3) && b.resumeRefused(id(0xB1)),
-                   "prc r12 broker: a login whose AUTH_OK failed leaves its own viewer free to log in again (not REPLACED); the viewers it took over from stay replaced")
+            let afterLost = !b.autoRefused(auto: true) && !b.channelAdmitted(id(0xC2)) && b.current.0 == nil
+            let tC3 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xC3), authSession: id(0xC3), resume: nil, auto: true, close: {})
+            expect(tC2 != nil && afterLost && tC3 != nil && b.current.0?.sessionKey == key(0xC3) && b.autoRefused(auto: true),
+                   "prc r12 broker: a login whose AUTH_OK failed leaves no control open: its viewer's auto retry gets in (r14); then auto reconnects are refused again")
             for t in [tC3] { if let t { b.end(t) } }
             // A restart: a new broker knows no replaced id.
             let r = SessionBroker(passwordMode: true, log: { _ in })
-            expect(!r.resumeRefused(id(0xC1)) && !r.resumeRefused(id(0xB1)) && !r.channelAdmitted(id(0xC3)),
-                   "prc r12 broker: after a restart every login is new: no id is refused, no channel goes in before a control login")
+            expect(!r.autoRefused(auto: true) && !r.autoRefused(auto: false) && !r.channelAdmitted(id(0xC3)),
+                   "prc r12 broker: after a restart every login is new: nothing is refused, no channel goes in before a control login")
             // Transition mode: nothing is voided.
             let t = SessionBroker(passwordMode: false, log: { _ in })
             let x = t.begin(peerIP: me, channel: nil, sessionKey: nil, close: {})
@@ -521,13 +526,14 @@ enum AuthSelfTest {
                     let aClip = login(p, .clipboard, resume: idA)
                     let aBack = login(p, .control, resume: idA)
                     expect(aClip.result == nil && aBack.result == .replaced,
-                           "prc r12 takeover (e2e): a channel naming the old id is closed; the old viewer's control login gets REPLACED")
+                           "prc r12 takeover (e2e): a channel naming the old id is closed; the old viewer's auto reconnect gets REPLACED (r14: B is connected)")
                     // B's own login again cuts B's own file channel; nothing resumes.
                     if let idB {
                         let bFile = login(p, .file, resume: idB)
                         _ = bFile.client?.send(type: FileProto.MsgType.hello, payload: [1, 0, 0])
                         let bAck = bFile.client?.receive(timeout: 2)?.type == FileProto.MsgType.helloAck
-                        let b2 = login(p, .control, resume: idB)
+                        // r14: a manual connect (no auto flag) takes over, even its own.
+                        let b2 = login(p, .control)
                         let idB2 = okID(b2)
                         let bFileEnd = drain(bFile.client, 3)
                         let oldName = login(p, .clipboard, resume: idB)
@@ -563,10 +569,11 @@ enum AuthSelfTest {
                 let lost = login(p, .control)
                 let retry = login(p, .control)
                 let idA = okID(retry)
-                // A's own login again (naming idA), OK lost; retry with idA.
+                // A's own manual login again, OK lost; retry (r14: an auto
+                // one would be refused while A's first control is open).
                 hold.arm()
-                let lost2 = login(p, .control, resume: idA)
-                let retry2 = login(p, .control, resume: idA)
+                let lost2 = login(p, .control)
+                let retry2 = login(p, .control)
                 let idA2 = okID(retry2)
                 print("prc r12 ok lost info: lost=\(String(describing: lost.result)) retry=\(idA != nil) lost2=\(String(describing: lost2.result)) retry2=\(String(describing: retry2.result))")
                 expect(lost.result == nil && idA != nil && lost2.result == nil && idA2 != nil && Self.pong(retry2.client)
@@ -750,6 +757,77 @@ enum AuthSelfTest {
                 expect(false, "prc r13 control replies: listener starts")
             }
         }
+
+        // PR-C r14 (Pepper's r13 review, item 4): takeover is never
+        // automatic. The control trailer is only the "auto" flag.
+        if let p = Self.loopbackPort(expect, "prc r14 auto (e2e)") {
+            let s = server(p, clipboard: FakeClipboard(text: nil))
+            if (try? s.start()) != nil {
+                // No viewer connected: an auto reconnect gets in.
+                let a = login(p, .control, resume: ConnAuth.Response.autoMarker)
+                let idA = okID(a)
+                let aWorks = idA != nil && Self.pong(a.client)
+                let aClip = idA.map { okID(login(p, .clipboard, resume: $0)) != nil } ?? false
+                expect(aWorks && aClip && s.resumesRefused == 0,
+                       "prc r14 auto (e2e): with no viewer connected an auto reconnect gets in, and its channels work")
+                // Another viewer's auto reconnect while A is connected: REPLACED, no takeover.
+                let failsBefore = s.authFailures
+                let b = login(p, .control, resume: ConnAuth.Response.autoMarker)
+                let bClosed = drain(b.client, 1).closed
+                let aNotice = a.client?.receive(timeout: 0.5)
+                expect(b.result == .replaced && bClosed && aNotice == nil && Self.pong(a.client)
+                           && s.authFailures == failsBefore && s.resumesRefused == 1,
+                       "prc r14 auto (e2e): an auto reconnect while another viewer is connected gets REPLACED and is closed; no takeover, nothing counted, the connected viewer keeps working")
+                // A manual connect takes over.
+                let c = login(p, .control)
+                let cWorks = okID(c) != nil && Self.pong(c.client)
+                let aEnd = drain(a.client, 3)
+                let aReplaced = aEnd.payloads.contains { ConnAuth.Result.decode($0) == .replaced }
+                expect(cWorks && aReplaced && aEnd.closed,
+                       "prc r14 manual (e2e): a manual connect takes over; the viewer before gets REPLACED and is closed")
+                for x in [a.client, b.client, c.client] { x?.close() }
+                s.stop()
+            } else {
+                expect(false, "prc r14 auto: listener starts")
+            }
+        }
+
+        // PR-C r14 item 2: an old PONG cut off part way by a takeover. No
+        // REPLACED goes after the half frame; the old socket is reset.
+        if let p = Self.loopbackPort(expect, "prc r14 partial frame (e2e)") {
+            let s = server(p, clipboard: FakeClipboard(text: nil))
+            let stall = R14PartialStall()
+            s.sendHook = stall.send
+            if (try? s.start()) != nil {
+                let a = login(p, .control)
+                if okID(a) != nil, let ac = a.client {
+                    stall.arm()
+                    _ = ac.send(type: 0x01, payload: [1, 2, 3, 4])
+                    let stalled = stall.waitStalled()
+                    let b = login(p, .control)
+                    let idB = okID(b)
+                    stall.release()
+                    var frames: [(type: UInt8, payload: [UInt8])] = []
+                    let until = Date().addingTimeInterval(3)
+                    while Date() < until && !ac.sawEOF {
+                        if let m = ac.receive(timeout: 0.2) { frames.append(m) }
+                    }
+                    let replaced = frames.contains { $0.type == ConnAuth.MsgType.result && ConnAuth.Result.decode($0.payload) == .replaced }
+                    let closed = ac.sawEOF || ac.hostClosed()
+                    print("prc r14 partial info: stalled=\(stalled) partial_bytes=\(stall.partialBytes) frames=\(frames.map { $0.type }) closed=\(closed) reset=\(ac.sawReset) b_ok=\(idB != nil)")
+                    expect(stalled && stall.partialBytes > 0 && stall.partialBytes < 12 && idB != nil && frames.isEmpty && !replaced
+                               && closed && Self.pong(b.client),
+                           "prc r14 partial frame (e2e): a PONG stalled after a partial write, a takeover: no REPLACED is appended after the half frame, the old socket is closed (reset); the new viewer's PONG works")
+                    b.client?.close()
+                } else {
+                    expect(false, "prc r14 partial frame: A login ok")
+                }
+                a.client?.close()
+                s.stop()
+            } else {
+                expect(false, "prc r14 partial frame: listener starts")
+            }
+        }
     }
 
     // MARK: PR-C r13 (Pepper's r12 review, items 3 and 4)
@@ -807,29 +885,162 @@ enum AuthSelfTest {
             pb.unregister(sF)
         }
 
-        // Item 4: a replaced id stays refused by age, never pushed out by
-        // count: 5000 later takeovers (more than r12's old cap of 4096).
+        // Item 4 (r13 replaced-id list) is gone in r14: see prcR14.
+    }
+
+    // MARK: PR-C r14 (Pepper's r13 review)
+
+    private static func prcR14(_ expect: Expect) {
+        let me = ListenConfig.loopbackIP
+        func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+        func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+        let fm = FileManager.default
+
+        // Item 1: a clash retry ("name 2") is pending when a takeover comes
+        // in: the epoch is asked again before that rename; nothing moves.
         do {
-            let clock = R13Clock()
-            let b = SessionBroker(passwordMode: true, log: { _ in }, now: { clock.now })
-            let idA: [UInt8] = [0xA0, 0, 0, 0, 0, 0, 0, 1]
-            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0xA0), authSession: idA, resume: nil, close: {})
-            func other(_ i: Int) -> [UInt8] { [0xB0, 0, 0, 0] + withUnsafeBytes(of: UInt32(i).bigEndian, Array.init) }
+            let dir = fm.temporaryDirectory.appendingPathComponent("jl-prc-r14-\(UUID().uuidString)", isDirectory: true)
+            defer { try? fm.removeItem(at: dir) }
+            let staging = dir.appendingPathComponent("staging", isDirectory: true)
+            let dest = dir.appendingPathComponent("send", isDirectory: true)
+            try? fm.createDirectory(at: staging, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            fm.createFile(atPath: staging.appendingPathComponent("r14.bin").path, contents: Data([1]))
+            fm.createFile(atPath: dest.appendingPathComponent("r14.bin").path, contents: Data([2]))   // the clash
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x11), authSession: id(0x11), resume: nil, close: {})
+            let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x11), close: {})
+            let life = KickHandle(-1)
+            if let tF { life.bind { b.live(tF) } }
+            let fromFD = Darwin.open(staging.path, O_RDONLY | O_DIRECTORY), destFD = Darwin.open(dest.path, O_RDONLY | O_DIRECTORY)
+            defer { Darwin.close(fromFD); Darwin.close(destFD) }
+            var asks = 0
+            let r = FileSendFolder.moveAll(["r14.bin"], from: fromFD, to: destFD, live: {
+                asks += 1
+                // The first rename clashed; the takeover lands before the retry.
+                if asks == 2 {
+                    _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x12), authSession: id(0x12), resume: nil, close: {})
+                }
+                return !life.isRevoked
+            })
+            let destNames = ((try? fm.contentsOfDirectory(atPath: dest.path)) ?? []).sorted()
+            let left = (try? fm.contentsOfDirectory(atPath: staging.path)) ?? []
+            expect(tF != nil && asks == 2 && r.moved == 0 && r.renamed == 0 && r.error == ECANCELED
+                       && destNames == ["r14.bin"] && left == ["r14.bin"],
+                   "prc r14 clash retry: a takeover while a clash retry is pending renames nothing (asks=\(asks) dest=\(destNames) left=\(left))")
+            // Without a takeover the same clash still lands as "r14 2.bin".
+            let r2 = FileSendFolder.moveAll(["r14.bin"], from: fromFD, to: destFD)
+            let after = ((try? fm.contentsOfDirectory(atPath: dest.path)) ?? []).sorted()
+            expect(r2.moved == 1 && r2.renamed == 1 && after == ["r14 2.bin", "r14.bin"],
+                   "prc r14 clash retry: with no takeover the clash retry still renames (\(after))")
+        }
+
+        // Item 1: REVEAL (and the open after a send) after a takeover opens nothing.
+        do {
+            let dir = fm.temporaryDirectory.appendingPathComponent("jl-prc-r14r-\(UUID().uuidString)", isDirectory: true)
+            defer { try? fm.removeItem(at: dir) }
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let opened = R6Count()
+            let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                        fallback: dir, openFolder: { _ in opened.hit() })
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x21), authSession: id(0x21), resume: nil, close: {})
+            let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x21), close: {})
+            let life = KickHandle(-1)
+            if let tF { life.bind { b.live(tF) } }
+            let live: @Sendable () -> Bool = { !life.isRevoked }
+            folder.completed(transfer: 7, folder: dir, live: live)
+            let before = opened.value
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x22), authSession: id(0x22), resume: nil, close: {})
+            folder.completed(transfer: 8, folder: dir, live: live)
+            let done = DispatchSemaphore(value: 0)
+            let result = R14Flag()
+            folder.reveal(transfer: 7, live: live, done: { ok in result.set(ok); done.signal() })
+            let answered = done.wait(timeout: .now() + 3) == .success
+            expect(tF != nil && before == 1 && answered && result.value == false && opened.value == 1,
+                   "prc r14 reveal: after a takeover neither REVEAL nor a finished send opens Finder (opened=\(opened.value))")
+            // A live session's REVEAL still opens it.
+            let done2 = DispatchSemaphore(value: 0)
+            let result2 = R14Flag()
+            folder.reveal(transfer: 7, done: { ok in result2.set(ok); done2.signal() })
+            _ = done2.wait(timeout: .now() + 3)
+            expect(result2.value == true && opened.value == 2, "prc r14 reveal: a live REVEAL still opens the folder")
+        }
+
+        // Item 3: the old worker is stuck reading a file when a takeover
+        // comes in. The running slot is freed at once: the new viewer's
+        // push is not .busy; the old worker's late end changes nothing.
+        do {
+            let path = fm.temporaryDirectory.appendingPathComponent("jl-prc-r14p-\(UUID().uuidString).bin").path
+            defer { try? fm.removeItem(atPath: path) }
+            fm.createFile(atPath: path, contents: Data(repeating: 0x42, count: 4096))
+            let fd = Darwin.open(path, O_RDONLY)
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x31), authSession: id(0x31), resume: nil, close: {})
+            let life = KickHandle(-1)
+            let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x31),
+                             close: { life.kick() })
+            if let tF { life.bind { b.live(tF) } }
+            let pb = PushBroker()
+            let sF = pb.register(peerCaps: FileProto.Caps.pushService)
+            life.onKick { pb.abort(session: sF) }
+            let job1 = PushJob(files: [PushFile(name: Array("r14.bin".utf8), fd: fd, size: 4096, mtime: 0)])
+            let queued = pb.offer(job1) == nil
+            let taken = pb.take(session: sF, live: { !life.isRevoked })
+            let worker = R14PushWorker(PushSender(job: job1, live: { !life.isRevoked }))
+            _ = worker.sender.start()
+            worker.sender.reply(FileProto.Status.ok)
+            let hold = R11Hold()
+            worker.sender.beforeReadForTest = { hold.pass() }
+            hold.arm()
+            worker.run(pb, length: 4096)
+            let stuck = hold.waitEntered()
+            // The takeover; its background close kicks the old file session.
+            _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x32), authSession: id(0x32), resume: nil, close: {})
+            b.flushClosesForTest()
+            let oldAbandoned = job1.isAbandoned
+            // The new viewer's file session and push.
+            let sG = pb.register(peerCaps: FileProto.Caps.pushService)
+            let job2 = PushJob(files: [])
+            let offered = pb.offer(job2)
+            let taken2 = pb.take(session: sG)
+            hold.release()
+            let workerDone = worker.wait(3)
+            let stillNew = pb.runningJob === job2
+            print("prc r14 push info: queued=\(queued) taken=\(taken != nil) stuck=\(stuck) old_abandoned=\(oldAbandoned) offered=\(String(describing: offered)) done=\(workerDone) served=\(worker.served) data=\(worker.dataFrames)")
+            expect(queued && taken === job1 && stuck && oldAbandoned && offered == nil && taken2 === job2,
+                   "prc r14 push slot: a takeover while the old worker is stuck reading frees the slot at once: the new viewer's push is offered (not .busy) and taken")
+            expect(workerDone && worker.served == false && worker.dataFrames == 0 && stillNew && job2.wait(seconds: 0.1) == nil,
+                   "prc r14 push slot: the old worker, released, sends nothing and its late end leaves the new push running")
+            pb.finished(job2)
+            pb.unregister(sF); pb.unregister(sG)
+        }
+
+        // Item 4 (broker): stateless; an auto control AUTH is refused only
+        // while a control connection is open.
+        do {
+            let b = SessionBroker(passwordMode: true, log: { _ in })
+            let none = !b.autoRefused(auto: true) && !b.autoRefused(auto: false)
+            let tA = b.admit(peerIP: me, channel: .control, sessionKey: key(0x41), authSession: id(0x41), resume: nil, auto: true, close: {})
+            let autoB = b.admit(peerIP: me, channel: .control, sessionKey: key(0x42), authSession: id(0x42), resume: nil, auto: true, close: {})
+            let keptA = b.current.0?.sessionKey == key(0x41) && tA.map(b.live) == true
+            let tC = b.admit(peerIP: me, channel: .control, sessionKey: key(0x43), authSession: id(0x43), resume: nil, close: {})
+            let manualTook = b.current.0?.sessionKey == key(0x43) && tA.map(b.live) == false
+            // 5000 takeovers leave nothing behind: once nobody is connected
+            // every auto reconnect gets in again.
+            var last = tC
             for i in 0..<5000 {
-                _ = b.admit(peerIP: "100.64.0.\(i % 200 + 1)", channel: .control, sessionKey: key(0xB0),
-                            authSession: other(i), resume: nil, close: {})
-                if i == 2500 { clock.advance(SessionBroker.replacedTTL / 2) }
+                last = b.admit(peerIP: "100.64.0.\(i % 200 + 1)", channel: .control, sessionKey: key(0x44),
+                               authSession: [0x44, 0, 0, 0] + withUnsafeBytes(of: UInt32(i).bigEndian, Array.init),
+                               resume: nil, close: {})
             }
             b.flushClosesForTest()
-            let kept = b.replacedIDCount
-            let refusedAfterMany = b.resumeRefused(idA)
-                && b.admit(peerIP: me, channel: .control, sessionKey: key(0xA1), authSession: id(0xA1), resume: idA, close: {}) == nil
-            // Past the window from A's replacement, but not from the later half.
-            clock.advance(SessionBroker.replacedTTL / 2 + 1)
-            let aGone = !b.resumeRefused(idA)
-            let laterKept = b.resumeRefused(other(4000)) && !b.resumeRefused(other(100))
-            expect(kept == 5000 && refusedAfterMany && aGone && laterKept,
-                   "prc r13 replaced ids: an old viewer's id is still REPLACED after 5000 later takeovers (no count eviction, kept=\(kept)); ids leave only by age (\(Int(SessionBroker.replacedTTL / 3600)) h, monotonic)")
+            if let last { b.end(last) }
+            let freeAgain = !b.autoRefused(auto: true)
+            let tD = b.admit(peerIP: me, channel: .control, sessionKey: key(0x45), authSession: id(0x45), resume: nil, auto: true, close: {})
+            expect(none && tA != nil && autoB == nil && keptA && tC != nil && manualTook && freeAgain && tD != nil
+                       && b.current.0?.sessionKey == key(0x45),
+                   "prc r14 broker: auto with no viewer gets in; auto while one is connected is refused (no takeover); manual takes over; after 5000 takeovers and the last viewer gone, auto gets in again (nothing remembered)")
         }
     }
 
@@ -963,9 +1174,11 @@ enum AuthSelfTest {
                            "r4 resume: its clipboard reconnect is closed (r9: no REPLACED on other channels)")
                     expect(s.authFailures == failsBefore && s.resumesRefused == 1 && broker.replaced == 1 && pong(second.client),
                            "r4 resume: nothing counted, nothing kicked, the new viewer's session works")
+                    // r14: an auto reconnect is refused while any control
+                    // connection is open, the current viewer's own included.
                     let own = login(p, password: password, channel: .control, resume: newID)
-                    if case .ok? = own.result { expect(pong(own.client), "r4 resume: the current viewer's own reconnect is let in") }
-                    else { expect(false, "r4 resume: the current viewer's own reconnect is let in") }
+                    expect(own.result == .replaced && pong(second.client),
+                           "r4 resume (r14): an auto reconnect while a control connection is open is refused, whoever sends it")
                     let fresh = login(p, password: password, channel: .control)
                     if case .ok? = fresh.result { expect(pong(fresh.client), "r4 resume: a new attempt (no resume id) still takes over") }
                     else { expect(false, "r4 resume: a new attempt (no resume id) still takes over") }
@@ -996,8 +1209,9 @@ enum AuthSelfTest {
                 return false
             }
             if (try? s.start()) != nil {
-                // Item 1: A is replaced by B, then B goes offline. A missed the
-                // notice and reconnects on its own: still refused.
+                // Item 1: A is replaced by B, then B goes offline. r14: A's
+                // auto reconnect gets in now (no viewer is connected; the
+                // host remembers no replaced id).
                 let a = login(p, password: password, channel: .control)
                 let b = login(p, password: password, channel: .control)
                 if case .ok(_, let idA)? = a.result, case .ok(_, let idB)? = b.result {
@@ -1006,19 +1220,19 @@ enum AuthSelfTest {
                     expect(sessionGone(), "prc r5 replaced: the new viewer went offline (no live session)")
                     let failsBefore = s.authFailures
                     let back = login(p, password: password, channel: .control, resume: idA)
-                    expect(back.result == .replaced && back.client?.receive(timeout: 2) == nil,
-                           "prc r5 replaced: after the new viewer left, the old viewer's control reconnect still gets REPLACED")
+                    var backOK = false
+                    if case .ok? = back.result { backOK = pong(back.client) }
+                    expect(backOK, "prc r5 replaced (r14): after the new viewer left, the old viewer's auto reconnect gets in (stateless)")
                     let clip = login(p, password: password, channel: .clipboard, resume: idA)
                     let file = login(p, password: password, channel: .file, resume: idA)
                     expect(clip.result == nil && file.result == nil,
                            "prc r5 replaced: its clipboard and file reconnects are closed too (r9: without REPLACED)")
-                    expect(broker.current.0 == nil && s.authFailures == failsBefore,
-                           "prc r5 replaced: no session taken over, nothing counted")
-                    // B's own reconnect still works (it is the newest session).
+                    expect(s.authFailures == failsBefore, "prc r5 replaced: nothing counted")
+                    // r14: B's auto reconnect now meets A's open control: refused, no takeover.
                     let bBack = login(p, password: password, channel: .control, resume: idB)
-                    if case .ok? = bBack.result { expect(pong(bBack.client), "prc r5 replaced: the newest viewer's own reconnect is let in") }
-                    else { expect(false, "prc r5 replaced: the newest viewer's own reconnect is let in") }
-                    bBack.client?.close()
+                    expect(bBack.result == .replaced && pong(back.client),
+                           "prc r5 replaced (r14): an auto reconnect while another viewer is connected gets REPLACED; that viewer keeps the session")
+                    bBack.client?.close(); back.client?.close()
                     _ = sessionGone()
                     // Only a new attempt from the user (no resume id) takes over.
                     let fresh = login(p, password: password, channel: .control)
@@ -1039,7 +1253,8 @@ enum AuthSelfTest {
                     var allOK = true
                     var prev = id1
                     for round in 0..<20 {
-                        let ctl = login(p, password: password, channel: .control, resume: prev)
+                        // r14: a manual connect (the previous control may not be closed on the host yet).
+                        let ctl = login(p, password: password, channel: .control)
                         guard case .ok(_, let id)? = ctl.result else {
                             expect(false, "prc r5 order: control reconnect \(round) ok"); allOK = false; break
                         }
@@ -1060,7 +1275,7 @@ enum AuthSelfTest {
                         prev = id
                     }
                     expect(allOK, "prc r5 order: after each of 20 control reconnects, clipboard/file/ping AUTH with the new id at once get ok (r12: the id before is closed)")
-                    expect(s.resumesRefused == 1, "prc r5 order: no reconnect of the current viewer refused (only the control one above)")
+                    expect(s.resumesRefused == 1, "prc r5 order: no login refused (only the auto one above)")
                 } else {
                     expect(false, "prc r5 order: first login ok")
                 }
@@ -1080,8 +1295,8 @@ enum AuthSelfTest {
                     expect(stripped.result == .fail(triesLeft: 2), "prc r5 hmac: a stripped resume id fails")
                     expect(pong(d.client), "prc r5 hmac: the session holder is untouched")
                     let signed = login(p, password: password, channel: .control, resume: idD)
-                    if case .ok? = signed.result { expect(true, "prc r5 hmac: the signed resume id gets ok") }
-                    else { expect(false, "prc r5 hmac: the signed resume id gets ok") }
+                    expect(signed.result == .replaced && s.authFailures == failsBefore + 3,
+                           "prc r5 hmac (r14): the signed auto flag passes the proof; with d connected it is refused (REPLACED, not counted)")
                 } else {
                     expect(false, "prc r5 hmac: login ok")
                 }
@@ -1090,7 +1305,7 @@ enum AuthSelfTest {
                 expect(false, "prc r5: listener starts")
             }
         }
-        // Item 1 (broker): the replaced ids.
+        // Item 1 (broker), r14: nothing is remembered once nobody is connected.
         do {
             let b = SessionBroker(passwordMode: true, log: { _ in })
             let idA: [UInt8] = [1, 1, 1, 1, 1, 1, 1, 1], idB: [UInt8] = [2, 2, 2, 2, 2, 2, 2, 2]
@@ -1101,13 +1316,12 @@ enum AuthSelfTest {
                              resume: nil, close: {})
             if let tB { b.end(tB) }
             if let tA { b.end(tA) }
-            expect(b.current.0 == nil && b.resumeRefused(idA) && !b.resumeRefused(idB),
-                   "prc r5 broker: with nobody connected, the replaced id is refused and the newest is not")
+            expect(b.current.0 == nil && !b.autoRefused(auto: true),
+                   "prc r5 broker (r14): with nobody connected, an auto reconnect is not refused (no replaced id kept)")
             let tB2 = b.admit(peerIP: me, channel: .control, sessionKey: [UInt8](repeating: 3, count: 32), authSession: idB2,
-                              resume: idB, close: {})
-            expect(tB2 != nil && !b.resumeRefused(idB2) && !b.resumeRefused(idB) && b.resumeRefused(idA)
-                       && !b.channelAdmitted(idB) && b.channelAdmitted(idB2),
-                   "prc r5 broker: the same viewer logging in again is not refused; r12: its channels need the new id")
+                              resume: nil, auto: true, close: {})
+            expect(tB2 != nil && b.autoRefused(auto: true) && !b.channelAdmitted(idB) && b.channelAdmitted(idB2),
+                   "prc r5 broker: the auto reconnect gets in; r12: its channels need the new id")
             if let tB2 { b.end(tB2) }
         }
 
@@ -1126,7 +1340,7 @@ enum AuthSelfTest {
             let tB = b.admit(peerIP: me, channel: .control, sessionKey: key(0xB1), authSession: id(0xB1), resume: nil, close: {})
             b.flushClosesForTest()   // r12: closed in the background
             expect(tA != nil && cA != nil && tB != nil && closedA.value == 1 && closedClipA.value == 1
-                       && b.current.0?.sessionKey == key(0xB1) && b.resumeRefused(id(0xA1)) && !b.resumeRefused(id(0xB1)),
+                       && b.current.0?.sessionKey == key(0xB1) && b.autoRefused(auto: true) && !b.autoRefused(auto: false),
                    "prc r9 broker: the right password takes over at once: the old viewer is kicked and the UDP session switches")
             let unknown = b.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0xEE), close: {})
             let none = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: nil, close: {})
@@ -1141,9 +1355,9 @@ enum AuthSelfTest {
             if let tC { b.abandon(tC) }
             let fresh = SessionBroker(passwordMode: true, log: { _ in })
             let freshClip = fresh.admit(peerIP: me, channel: .clipboard, sessionKey: nil, authSession: nil, resume: id(0x77), close: {})
-            expect(tC != nil && b.current.0 == nil && !b.channelAdmitted(id(0xC1)) && !b.resumeRefused(id(0xC1))
-                       && b.resumeRefused(id(0xB1)) && b.resumeRefused(id(0xA1)) && freshClip == nil && !fresh.resumeRefused(id(0x77)),
-                   "prc r9 broker: a takeover whose AUTH_OK failed leaves nothing half taken over: no session, no channel let in on its id, the viewers it replaced stay replaced (r12: its own viewer is not)")
+            expect(tC != nil && b.current.0 == nil && !b.channelAdmitted(id(0xC1)) && !b.autoRefused(auto: true)
+                       && freshClip == nil && !fresh.autoRefused(auto: true),
+                   "prc r9 broker: a takeover whose AUTH_OK failed leaves nothing half taken over: no session, no channel let in on its id; r14: no control open, so an auto retry is not refused")
             // The same viewer's reconnect (chained) whose OK fails keeps the id it had.
             let tD = b.admit(peerIP: me, channel: .control, sessionKey: key(0xD1), authSession: id(0xD1), resume: nil, close: {})
             let tD2 = b.admit(peerIP: me, channel: .control, sessionKey: key(0xD2), authSession: id(0xD2), resume: id(0xD1), close: {})
@@ -1249,22 +1463,26 @@ enum AuthSelfTest {
                     // The new viewer (it got no id) reconnects: let in.
                     let cBack = login(p, password: password, channel: .control)
                     var cBackOK = false
-                    if case .ok(_, let idC2)? = cBack.result {
+                    var holder: MRC1Client?
+                    if case .ok? = cBack.result {
                         cBackOK = pong(cBack.client)
-                        // Its own reconnect, OK lost again, then once more with the same id.
+                        // Its own manual login again, OK lost, then once more
+                        // (r14: an auto one would meet its open control).
                         hold.arm()
-                        let lost = login(p, password: password, channel: .control, resume: idC2)
-                        let again = login(p, password: password, channel: .control, resume: idC2)
+                        let lost = login(p, password: password, channel: .control)
+                        let again = login(p, password: password, channel: .control)
                         if case .ok? = again.result, lost.result == nil { cBackOK = cBackOK && pong(again.client) } else { cBackOK = false }
-                        again.client?.close()
+                        holder = again.client
                     }
-                    expect(cBackOK, "prc r9 OK lost (e2e): the new viewer's reconnect gets in (fresh, and again with its own id after another lost OK)")
-                    cBack.client?.close()
-                    // The replaced viewers stay replaced.
+                    expect(cBackOK, "prc r9 OK lost (e2e): the new viewer's reconnect gets in (fresh, and again after another lost OK)")
+                    // r14: with a viewer connected, the replaced viewers' auto
+                    // reconnects are refused (they do not take the session back).
                     let aBack = login(p, password: password, channel: .control, resume: idA)
                     let bBack = login(p, password: password, channel: .control, resume: idB)
-                    expect(aBack.result == .replaced && bBack.result == .replaced && aBack.client?.receive(timeout: 2) == nil,
-                           "prc r9 replaced (e2e): a replaced viewer's control reconnect gets REPLACED (it does not take the session back)")
+                    expect(aBack.result == .replaced && bBack.result == .replaced && aBack.client?.receive(timeout: 2) == nil
+                               && pong(holder),
+                           "prc r9 replaced (e2e): a replaced viewer's auto control reconnect gets REPLACED while a viewer is connected (it does not take the session back)")
+                    holder?.close(); cBack.client?.close()
                 } else {
                     expect(false, "prc r9 (e2e): both logins ok")
                 }
@@ -3313,14 +3531,6 @@ final class R12KernelHook: @unchecked Sendable {
 
 /// PR-C r11 self-test: holds the first `pass` after `arm` until `release`
 /// (at most 5 s); every other `pass` returns at once.
-/// r13: a monotonic clock the self-test moves by hand.
-final class R13Clock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var t: Double = 1000
-    var now: Double { lock.lock(); defer { lock.unlock() }; return t }
-    func advance(_ d: Double) { lock.lock(); t += d; lock.unlock() }
-}
-
 final class R11Hold: @unchecked Sendable {
     private let lock = NSLock()
     private var armed = false
@@ -3335,4 +3545,73 @@ final class R11Hold: @unchecked Sendable {
     }
     func waitEntered(_ seconds: Double = 3) -> Bool { enteredSem.wait(timeout: .now() + seconds) == .success }
     func release() { releaseSem.signal() }
+}
+
+/// PR-C r14 self-test: a Bool set from another thread.
+final class R14Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: Bool?
+    func set(_ x: Bool) { lock.lock(); v = x; lock.unlock() }
+    var value: Bool? { lock.lock(); defer { lock.unlock() }; return v }
+}
+
+/// PR-C r14 self-test: runs one push REQUEST on its own thread (the old
+/// session's worker), then ends the job as the session would.
+final class R14PushWorker: @unchecked Sendable {
+    let sender: PushSender
+    private let lock = NSLock()
+    private var servedResult: Bool?
+    private var frames = 0
+    private let finished = DispatchSemaphore(value: 0)
+    init(_ sender: PushSender) { self.sender = sender }
+    func run(_ pb: PushBroker, length: UInt32) {
+        Thread.detachNewThread { [self] in
+            let ok = sender.serve(index: 0, offset: 0, length: length) { m in
+                if case .data = m { self.lock.lock(); self.frames += 1; self.lock.unlock() }
+                return true
+            }
+            lock.lock(); servedResult = ok; lock.unlock()
+            sender.close()
+            pb.finished(sender.job)
+            finished.signal()
+        }
+    }
+    func wait(_ seconds: Double) -> Bool { finished.wait(timeout: .now() + seconds) == .success }
+    var served: Bool? { lock.lock(); defer { lock.unlock() }; return servedResult }
+    var dataFrames: Int { lock.lock(); defer { lock.unlock() }; return frames }
+}
+
+/// PR-C r14 self-test (item 2): a send hook that, once armed, writes only
+/// the first 4 bytes of the next PONG and then reports EAGAIN on that
+/// socket (a viewer that stopped reading mid frame).
+final class R14PartialStall: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var stalledFD: Int32 = -1
+    private var partial = 0
+    private let stalled = DispatchSemaphore(value: 0)
+    func arm() { lock.lock(); armed = true; lock.unlock() }
+    func release() { lock.lock(); stalledFD = -1; lock.unlock() }
+    func waitStalled(_ seconds: Double = 3) -> Bool { stalled.wait(timeout: .now() + seconds) == .success }
+    var partialBytes: Int { lock.lock(); defer { lock.unlock() }; return partial }
+    func send(_ fd: Int32, _ peer: String?, _ p: UnsafeRawPointer, _ len: Int) -> Int {
+        lock.lock()
+        if armed && len >= 6 && p.load(fromByteOffset: 5, as: UInt8.self) == 0x02 {
+            armed = false
+            stalledFD = fd
+            lock.unlock()
+            let n = Darwin.send(fd, p, 4, 0)
+            lock.lock(); partial = max(n, 0); lock.unlock()
+            stalled.signal()
+            return n
+        }
+        let hold = fd == stalledFD
+        lock.unlock()
+        if hold {
+            usleep(2_000)
+            errno = EAGAIN
+            return -1
+        }
+        return Darwin.send(fd, p, len, 0)
+    }
 }

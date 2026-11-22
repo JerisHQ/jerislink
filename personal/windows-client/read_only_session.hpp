@@ -11,6 +11,10 @@
 // here. The reconnect worker renegotiates on every new control session
 // (ControlChannel::setRenegotiateOnReconnect), off the UI thread, and the
 // loop applies each answer (takeRenegotiated).
+// PR-C r14 (Pepper's r13 review, item 4): the automatic retries have a
+// total budget. Once the session has been down kAutoRetryCapMs (2 min) with
+// no round authenticating, the loop stops retrying and the attempt ends
+// (Client::autoRetryStopped): only the user connects again.
 // Plain arithmetic on a millisecond clock, so it is tested without sockets.
 #include <algorithm>
 
@@ -20,9 +24,25 @@ class ReadOnlyRecovery {
 public:
     static constexpr double kResumeFirstGapMs = 5000;
     static constexpr double kResumeMaxGapMs = 60000;
+    static constexpr double kAutoRetryCapMs = 120000;
 
-    // `resumeFirstGapMs`: tests shorten it.
-    explicit ReadOnlyRecovery(double resumeFirstGapMs = kResumeFirstGapMs) : resumeFirstGapMs_(resumeFirstGapMs) {}
+    // `resumeFirstGapMs`, `autoRetryCapMs`: tests shorten them.
+    explicit ReadOnlyRecovery(double resumeFirstGapMs = kResumeFirstGapMs, double autoRetryCapMs = kAutoRetryCapMs)
+        : resumeFirstGapMs_(resumeFirstGapMs), autoRetryCapMs_(autoRetryCapMs) {}
+
+    // r14: true once the session has been down (`connectedNow` false) for
+    // the whole budget since it was last seen up: the loop stops retrying.
+    // Stays true until the session is seen up again.
+    bool retryExpired(bool connectedNow, double nowMs) {
+        if (connectedNow) {
+            downSinceMs_ = -1;
+            return false;
+        }
+        if (downSinceMs_ < 0) downSinceMs_ = nowMs;
+        return nowMs - downSinceMs_ >= autoRetryCapMs_;
+    }
+    // How long the session has been down (0: up).
+    double downMs(double nowMs) const { return downSinceMs_ < 0 ? 0 : nowMs - downSinceMs_; }
 
     // Paused (NoChallenge retries spent): true when the loop should end the
     // pause now. The first time it sees the pause it only schedules.
@@ -42,7 +62,10 @@ public:
         return true;
     }
     // A round after a resume authenticated: the gap starts small again.
-    void sessionBack() { resumes_ = 0; }
+    void sessionBack() {
+        resumes_ = 0;
+        downSinceMs_ = -1;
+    }
     unsigned resumes() const { return resumes_; }
     double resumeGapMs() const {
         return std::min(kResumeMaxGapMs, resumeFirstGapMs_ * double(1u << std::min(resumes_, 4u)));
@@ -50,6 +73,8 @@ public:
 
 private:
     double resumeFirstGapMs_;
+    double autoRetryCapMs_;
+    double downSinceMs_ = -1;
     bool pausedSeen_ = false;
     double nextResumeMs_ = 0;
     unsigned resumes_ = 0;

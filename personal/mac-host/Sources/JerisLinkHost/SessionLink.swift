@@ -109,6 +109,12 @@ enum SessionLinkWire {
 ///   when it runs (`live`) and gives up when it moved. The old sockets are
 ///   closed in the background (`closeQueue`), so the new AUTH_OK never
 ///   waits for them.
+/// - r14 (Pepper's r13 review, item 4): takeover is never automatic. A
+///   viewer's own reconnect (control AUTH flagged "auto", see
+///   `ConnAuth.Response`) never takes over while another control
+///   connection is open (`autoRefused`); it gets REPLACED and its viewer
+///   stops. Only a manual connect (no flag) takes over. The broker keeps no
+///   list of replaced ids: it only looks at what is open now.
 /// - Transition mode: the newest open connection the whitelist admitted,
 ///   untagged (0.3 behaviour). Nothing is closed: one viewer opens several
 ///   connections (control, clipboard, file, ping).
@@ -124,12 +130,6 @@ final class SessionBroker: @unchecked Sendable {
         var epoch: UInt64
         var close: @Sendable () -> Void
     }
-
-    /// r13 (Pepper's r12 review, item 4): how long a replaced session id
-    /// keeps getting REPLACED (monotonic clock). No count limit: an id
-    /// leaves only by age (or a restart), so no number of later logins can
-    /// push an old viewer's id out and let its auto-reconnect take over.
-    static let replacedTTL: Double = 24 * 3600
 
     let passwordMode: Bool
     /// r4 (Pepper's r3 review, item 3): picked once per start, never 0, so
@@ -151,29 +151,19 @@ final class SessionBroker: @unchecked Sendable {
     /// r12: the session id of the newest control takeover, kept after its
     /// connection closes. A clipboard, file or ping AUTH must name it.
     private var currentID: [UInt8]?
-    /// r12: the id that takeover named (its viewer's id before), if any.
-    private var currentNamed: [UInt8]?
-    /// r12: ids another login took over from since this start. A control
-    /// reconnect naming one gets REPLACED, so a replaced viewer never takes
-    /// the session back. Empty after a restart. r13: each is kept for
-    /// `replacedTTL` from when it was replaced, never evicted by count.
-    private var replacedAt: [[UInt8]: Double] = [:]
-    /// r13: the same ids, oldest first (the clock only moves forward).
-    private var replacedOrder: [(id: [UInt8], at: Double)] = []
-    private let now: @Sendable () -> Double
     /// r12: closes the connections a takeover voided, off the AUTH path.
     private let closeQueue = DispatchQueue(label: "JerisLink.SessionBroker.close")
     /// Connections closed by a newer AUTH.
     var replaced: UInt64 { lock.lock(); defer { lock.unlock() }; return replacedCount }
     /// r4: reconnects refused because another viewer holds the session.
+    /// r14: an auto control reconnect while a control connection was open,
+    /// or a channel AUTH not naming the newest control session.
     var resumesRefused: UInt64 { lock.lock(); defer { lock.unlock() }; return resumeRefusedCount }
 
-    init(passwordMode: Bool, boot: UInt64? = nil, log: @escaping (String) -> Void = { print($0); fflush(stdout) },
-         now: @escaping @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+    init(passwordMode: Bool, boot: UInt64? = nil, log: @escaping (String) -> Void = { print($0); fflush(stdout) }) {
         self.passwordMode = passwordMode
         self.boot = boot ?? Self.randomBoot()
         self.log = log
-        self.now = now
     }
 
     static func randomBoot() -> UInt64 {
@@ -197,44 +187,19 @@ final class SessionBroker: @unchecked Sendable {
         lock.lock(); listeners.append(handler); lock.unlock()
     }
 
-    /// r4: a viewer reconnecting its control channel names the control
-    /// session it had (`resume`, the session_id of its last control AUTH).
-    /// r12: refused only when another login took over from that session
-    /// since this start (`replacedIDs`). Anything else (no id, the current
-    /// id, an id from before a restart, the id a viewer had before an
-    /// AUTH_OK that never reached it) is a new login and takes over.
-    func resumeRefused(_ resume: [UInt8]?) -> Bool {
-        guard passwordMode, let resume else { return false }
+    /// r14 (Pepper's r13 review, item 4; replaces the r12/r13 replaced-id
+    /// list): a control AUTH flagged "auto" (the viewer reconnecting on its
+    /// own) is refused while any control connection is open, whoever holds
+    /// it: it never takes over. A manual connect (no flag) always takes
+    /// over. Stateless: only what is open now counts, nothing is
+    /// remembered, so nothing expires.
+    func autoRefused(auto: Bool) -> Bool {
+        guard passwordMode, auto else { return false }
         lock.lock(); defer { lock.unlock() }
-        return refusedLocked(resume)
+        return controlOpenLocked()
     }
 
-    private func refusedLocked(_ resume: [UInt8]) -> Bool {
-        pruneReplacedLocked()
-        return replacedAt[resume] != nil
-    }
-
-    private func markReplacedLocked(_ id: [UInt8]?, unless resume: [UInt8]?) {
-        pruneReplacedLocked()
-        guard let id, id != resume, replacedAt[id] == nil else { return }
-        let t = now()
-        replacedAt[id] = t
-        replacedOrder.append((id, t))
-    }
-
-    /// r13: drops ids replaced longer than `replacedTTL` ago (age only).
-    private func pruneReplacedLocked() {
-        let cutoff = now() - Self.replacedTTL
-        var drop = 0
-        while drop < replacedOrder.count, replacedOrder[drop].at <= cutoff {
-            replacedAt.removeValue(forKey: replacedOrder[drop].id)
-            drop += 1
-        }
-        if drop > 0 { replacedOrder.removeFirst(drop) }
-    }
-
-    /// r13 (self-test): how many replaced ids are kept.
-    var replacedIDCount: Int { lock.lock(); defer { lock.unlock() }; return replacedAt.count }
+    private func controlOpenLocked() -> Bool { entries.contains { $0.channel == .control } }
 
     /// r9: a clipboard, file or ping AUTH (password mode) is let in only
     /// when it names the newest control session. r12: no older one.
@@ -251,18 +216,19 @@ final class SessionBroker: @unchecked Sendable {
     func begin(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?,
                close: @escaping @Sendable () -> Void) -> UInt64 {
         take(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: nil, resume: nil,
-             checkIDs: false, close: close)!
+             auto: false, checkIDs: false, close: close)!
     }
 
-    /// `begin` with the AUTH session_id and the session a reconnect names.
-    /// A password-mode control AUTH takes over here, before its AUTH_OK goes
-    /// out. nil: refused, nothing changed and nothing closed. Control:
-    /// `resumeRefused`; other channels: `channelAdmitted`; both checked
-    /// under the lock, so no AUTH can come in between.
+    /// `begin` with the AUTH session_id and, for another channel, the
+    /// control session it names. A password-mode control AUTH takes over
+    /// here, before its AUTH_OK goes out, unless it is `auto` and a control
+    /// connection is open (r14, `autoRefused`). nil: refused, nothing
+    /// changed and nothing closed. Other channels: `channelAdmitted`. Both
+    /// checked under the lock, so no AUTH can come in between.
     func admit(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
-               resume: [UInt8]?, close: @escaping @Sendable () -> Void) -> UInt64? {
+               resume: [UInt8]?, auto: Bool = false, close: @escaping @Sendable () -> Void) -> UInt64? {
         take(peerIP: peerIP, channel: channel, sessionKey: sessionKey, authSession: authSession, resume: resume,
-             checkIDs: true, close: close)
+             auto: auto, checkIDs: true, close: close)
     }
 
     /// r12: the connection is still in the epoch it was admitted in. Checked
@@ -273,7 +239,7 @@ final class SessionBroker: @unchecked Sendable {
     }
 
     private func take(peerIP: String, channel: ConnAuth.Channel?, sessionKey: [UInt8]?, authSession: [UInt8]?,
-                      resume: [UInt8]?, checkIDs: Bool, close: @escaping @Sendable () -> Void) -> UInt64? {
+                      resume: [UInt8]?, auto: Bool, checkIDs: Bool, close: @escaping @Sendable () -> Void) -> UInt64? {
         var voided: [Entry] = []
         // r2 (Pepper's PR-C review, item 1): the change and its listeners
         // run under `orderLock`, so two changes never reach the listeners
@@ -281,7 +247,7 @@ final class SessionBroker: @unchecked Sendable {
         orderLock.lock()
         lock.lock()
         if passwordMode && checkIDs {
-            let refused = channel == .control ? resume.map(refusedLocked) ?? false : resume != currentID || resume == nil
+            let refused = channel == .control ? auto && controlOpenLocked() : resume != currentID || resume == nil
             if refused {
                 resumeRefusedCount &+= 1
                 lock.unlock()
@@ -300,12 +266,7 @@ final class SessionBroker: @unchecked Sendable {
             epoch &+= 1
             entry.epoch = epoch
             if checkIDs, let authSession {
-                // The session this login took over from is replaced, unless
-                // it named it (the same viewer logging in again).
-                markReplacedLocked(currentID, unless: resume)
-                markReplacedLocked(currentNamed, unless: resume)
                 currentID = authSession
-                currentNamed = resume
             }
             voided = entries
             entries.removeAll()
@@ -337,15 +298,11 @@ final class SessionBroker: @unchecked Sendable {
 
     /// r9: the AUTH_OK of an admitted control AUTH did not go out. Its
     /// connection ends and its id stops counting: no channel comes in on it.
-    /// r12: it marked nothing of its own viewer replaced, so that viewer's
-    /// retry (naming the id it had, or none) is a new login, never REPLACED.
-    /// A viewer it took over from stays replaced.
     func abandon(_ token: UInt64) {
         orderLock.lock()
         lock.lock()
         if let e = entries.first(where: { $0.token == token }), let id = e.authSession, id == currentID {
             currentID = nil
-            currentNamed = nil
         }
         entries.removeAll { $0.token == token }
         let change = recomputeLocked()
@@ -664,6 +621,10 @@ final class KickHandle: @unchecked Sendable {
     /// background close), e.g. to abort a push job the session holds.
     private var onKickActions: [@Sendable () -> Void] = []
     private var kickActionsRan = false
+    /// r14 (Pepper's r13 review, item 2): a frame on this connection was
+    /// cut off part way (some bytes out, not all). Nothing may follow it:
+    /// the viewer would read the next bytes as the rest of that frame.
+    private var partialFrame = false
 
     init(_ fd: Int32, wake: Bool = false) {
         self.fd = fd
@@ -711,6 +672,10 @@ final class KickHandle: @unchecked Sendable {
     func finish() {
         lock.lock(); fd = -1; lock.unlock()
     }
+
+    /// r14: a frame went out only in part (see `partialFrame`).
+    func notePartialFrame() { lock.lock(); partialFrame = true; lock.unlock() }
+    var sentPartialFrame: Bool { lock.lock(); defer { lock.unlock() }; return partialFrame }
 
     /// r13: `action` runs when this connection is kicked (at once if it
     /// already was).

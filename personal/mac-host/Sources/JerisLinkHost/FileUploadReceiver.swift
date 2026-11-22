@@ -94,7 +94,8 @@ final class FileUploadReceiver {
     /// point (every send-folder rename; the pasteboard write checks its own
     /// gate inside the main-thread block). False: the session was taken
     /// over while this step ran, so nothing more lands and no RESULT goes.
-    private let live: () -> Bool
+    /// r14: @Sendable, so REVEAL can ask it on the thread that opens Finder.
+    private let live: @Sendable () -> Bool
     /// r13 (self-test): called right before a landing point ("send").
     var beforeLandForTest: ((String) -> Void)?
     private var state = State.idle
@@ -113,7 +114,7 @@ final class FileUploadReceiver {
 
     init(root: URL = FileUploadReceiver.defaultRoot, clipboard: ClipboardBackend,
          freeSpace: @escaping (URL) -> UInt64? = FileUploadReceiver.availableBytes,
-         sendFolder: FileSendFolder = .shared, live: @escaping () -> Bool = { true }) {
+         sendFolder: FileSendFolder = .shared, live: @escaping @Sendable () -> Bool = { true }) {
         self.root = root
         self.clipboard = clipboard
         self.freeSpace = freeSpace
@@ -350,7 +351,7 @@ final class FileUploadReceiver {
         guard moved == tops.count else {
             // Items already moved stay; the rest go with the staging folder.
             print("file.send_move=failed transfer=\(tr.id) moved=\(moved) of=\(tops.count) errno=\(err)")
-            if moved > 0 { sendFolder.completed(transfer: tr.id, folder: url) }
+            if moved > 0 { sendFolder.completed(transfer: tr.id, folder: url, live: live) }
             return [failMessage(tr, err == EXDEV ? "exdev" : "move")]
         }
         let ok = tr.filesOK
@@ -358,12 +359,15 @@ final class FileUploadReceiver {
         state = .idle
         completed += 1
         print("file.upload=done transfer=\(tr.id) purpose=send files=\(ok) bytes=\(tr.committed) items=\(moved) renamed=\(renamed)")
-        sendFolder.completed(transfer: tr.id, folder: url)
+        sendFolder.completed(transfer: tr.id, folder: url, live: live)
         return [.result(transfer: tr.id, status: FileProto.Status.ok, filesOK: ok)]
     }
 
-    /// REVEAL (0x5C): open the folder a send went to (no reply).
-    func reveal(_ t: UInt32) { sendFolder.reveal(transfer: t) }
+    /// REVEAL (0x5C): open the folder a send went to (no reply). r14: the
+    /// epoch is asked again right before Finder opens (`live`).
+    func reveal(_ t: UInt32, done: (@Sendable (Bool) -> Void)? = nil) {
+        sendFolder.reveal(transfer: t, live: live, done: done)
+    }
 
     /// r13: a takeover came in at a landing point: the staging goes,
     /// nothing is sent (the connection is closing).

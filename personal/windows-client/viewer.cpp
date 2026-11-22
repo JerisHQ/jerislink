@@ -6678,11 +6678,19 @@ static int appMain(int argc, char** argv) {
                             readOnlyReconnects = rs.reconnects;
                             readOnly.sessionBack();
                         }
-                        if (readOnly.wantResume(rs.pausedNow, nowMs) && control->resumeOnUserKey()) {
-                            logLine("control.read_only_resume round=" + std::to_string(readOnly.resumes()) +
-                                    " next_gap_ms=" + std::to_string(int(readOnly.resumeGapMs())));
+                        // r14 (Pepper's r13 review, item 4): the automatic
+                        // retries stop after kAutoRetryCapMs down in total;
+                        // the attempt ends and the launch screen says so.
+                        if (readOnly.retryExpired(rs.live, nowMs) && jl::auth::mayConnect()) {
+                            logLine("control.read_only_retry_stopped down_ms=" + std::to_string(int(readOnly.downMs(nowMs))));
+                            if (auto c = jl::auth::current()) c->autoRetryStopped(readOnly.downMs(nowMs));
+                        } else {
+                            if (readOnly.wantResume(rs.pausedNow, nowMs) && control->resumeOnUserKey()) {
+                                logLine("control.read_only_resume round=" + std::to_string(readOnly.resumes()) +
+                                        " next_gap_ms=" + std::to_string(int(readOnly.resumeGapMs())));
+                            }
+                            control->keepSession();
                         }
-                        control->keepSession();
                         // r5 (Pepper's r4 review, item 3): the worker
                         // renegotiated on a new control session; apply what
                         // the Mac offers now. Nothing here waits.

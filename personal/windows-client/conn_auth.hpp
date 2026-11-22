@@ -98,6 +98,13 @@ constexpr size_t kResponseBytes = kNonceBytes + kMacBytes;                      
 // answers REPLACED while another viewer holds the session, so a viewer that
 // missed the "replaced" notice still never takes the session back.
 constexpr size_t kResumeResponseBytes = kResponseBytes + kSessionIdBytes;           // 72
+// PR-C r14 (Pepper's r13 review, item 4): on the control channel those 8
+// bytes are only a flag, "auto: do not take over", never an old session id.
+// The control channel's own reconnect sends it; the Mac answers REPLACED
+// while another viewer is connected and takes nothing over. Only the first
+// AUTH of an attempt (a manual connect from the launch screen) has no flag
+// and takes over. Clipboard, file and ping still name the control session.
+constexpr uint8_t kAutoMarker[kSessionIdBytes] = {'j', 'l', '-', 'a', 'u', 't', 'o', '1'};
 
 constexpr uint8_t kTypeResponse = 0x03;
 constexpr uint8_t kTypeResult = 0x04;
@@ -614,6 +621,8 @@ enum class Outcome {
                    // (ends the attempt only before any channel authenticated; see Client::handshake)
     Retry,         // probe crossed a late challenge and cost one try; reconnect once
     Replaced,      // another viewer authenticated on the Mac and took the session (host notice after AUTH)
+                   // r14: or our own auto reconnect was refused while another device is connected
+    RetryCapped,   // r14: the session stayed down kAutoRetryCapMs; automatic retries stopped
     Network,       // connection closed / malformed: an ordinary reconnect
 };
 
@@ -633,6 +642,7 @@ inline const char* outcomeName(Outcome o) {
     case Outcome::NoChallenge: return "no_challenge";
     case Outcome::Retry: return "retry";
     case Outcome::Replaced: return "replaced";
+    case Outcome::RetryCapped: return "retry_capped";
     case Outcome::Network: return "network";
     }
     return "?";
@@ -645,6 +655,7 @@ inline bool isTerminal(Outcome o) {
     case Outcome::Fail: case Outcome::Locked: case Outcome::Blocked: case Outcome::AuthRequired:
     case Outcome::HostMismatch: case Outcome::HostTooOld: case Outcome::NeedPassword:
     case Outcome::LocalError: case Outcome::RaceUnanswered: case Outcome::NoChallenge: case Outcome::Replaced:
+    case Outcome::RetryCapped:
         return true;
     default:
         return false;
@@ -899,6 +910,20 @@ public:
         }
         halt(r);
     }
+    // r14 (Pepper's r13 review, item 4): the session stayed down for the
+    // whole automatic retry budget (ReadOnlyRecovery::kAutoRetryCapMs). The
+    // attempt ends like any answer the user must act on: nothing reconnects
+    // on its own, and the launch screen says why.
+    void autoRetryStopped(double downMs) {
+        note("auth.auto_retry_stopped down_ms=" + std::to_string(int64_t(downMs)) + " reconnect=stopped");
+        Report r;
+        r.outcome = Outcome::RetryCapped;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            last_ = r.outcome;
+        }
+        halt(r);
+    }
     // A channel of this attempt has authenticated (OK or open_ip_only).
     bool authenticatedOnce() const { std::lock_guard<std::mutex> g(m_); return authed_; }
 
@@ -998,12 +1023,14 @@ private:
         uint8_t resp[kResumeResponseBytes]{};
         if (!randomBytes(resp, kNonceBytes)) { rep.outcome = Outcome::Network; return rep; }
         // r4: only a reconnect within this attempt names the session; the
-        // first AUTH of an attempt from the launch screen never does.
+        // first AUTH of an attempt from the launch screen never does. r14:
+        // the control channel's reconnect sends the "auto" flag instead
+        // (kAutoMarker), never its old id; the others name the session.
         size_t respBytes = kResponseBytes;
         {
             std::lock_guard<std::mutex> g(m_);
             if (resumeId_) {
-                std::memcpy(resp + kResponseBytes, resumeId_->data(), kSessionIdBytes);
+                std::memcpy(resp + kResponseBytes, ch == Channel::Control ? kAutoMarker : resumeId_->data(), kSessionIdBytes);
                 respBytes = kResumeResponseBytes;
             }
         }
@@ -1019,7 +1046,8 @@ private:
         }
         std::memcpy(resp + kNonceBytes, macC->data(), kMacBytes);
         if (!sendAllBytes(s, frame(kTypeResponse, resp, respBytes))) { rep.outcome = Outcome::Network; return rep; }
-        if (respBytes == kResumeResponseBytes) note(std::string("auth.resume chan=") + channelName(ch));
+        if (respBytes == kResumeResponseBytes)
+            note(std::string(ch == Channel::Control ? "auth.auto_reconnect chan=" : "auth.resume chan=") + channelName(ch));
 
         io = rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
         if (io != Io::Ok || type != kTypeResult) { rep.outcome = Outcome::Network; return rep; }
@@ -1143,9 +1171,10 @@ private:
         case Result::Status::Blocked: rep.outcome = Outcome::Blocked; break;
         case Result::Status::AuthRequired: rep.outcome = Outcome::AuthRequired; break;
         case Result::Status::Replaced:
-            // r4: our reconnect named a session another viewer has taken
-            // since. Terminal: nothing reconnects (handshake halts).
-            note("auth.resume_refused reconnect=stopped");
+            // r14: our own reconnect (flagged "auto") while another device
+            // is connected to the Mac. Terminal: nothing reconnects
+            // (handshake halts); only a manual connect takes over.
+            note("auth.resume_refused reason=another_device reconnect=stopped");
             rep.outcome = Outcome::Replaced;
             break;
         default: rep.outcome = Outcome::Network; break;

@@ -519,24 +519,25 @@ enum UDPAuthSelfTest {
         let b = SessionBroker(passwordMode: true, log: { _ in })
         let a = "100.64.0.1", c = "100.64.0.2"
         let idA: [UInt8] = [1, 1, 1, 1, 1, 1, 1, 1], idB: [UInt8] = [2, 2, 2, 2, 2, 2, 2, 2]
-        expect(!b.resumeRefused(idA), "r4 broker: no live session, a reconnect is let in")
+        expect(!b.autoRefused(auto: true), "r4 broker: no live session, a reconnect is let in")
         let ctlA = b.admit(peerIP: a, channel: .control, sessionKey: key(30), authSession: idA, resume: nil,
                            close: { closed.add("a-ctl") })
-        expect(ctlA != nil && !b.resumeRefused(idA), "r4 broker: the live session's own reconnect is let in")
+        expect(ctlA != nil && b.autoRefused(auto: true) && !b.autoRefused(auto: false),
+               "r4 broker (r14): with a control open an auto reconnect is refused, a manual one is not")
         _ = b.admit(peerIP: c, channel: .control, sessionKey: key(31), authSession: idB, resume: nil, close: { closed.add("c-ctl") })
         b.flushClosesForTest()
         let (s1, g1) = b.current
         expect(s1?.peerIP == c && closed.all == ["a-ctl"], "r4 broker: another viewer took the session")
         // The old viewer never heard the notice and reconnects on its own.
-        expect(b.resumeRefused(idA), "r4 broker: the replaced viewer's reconnect is refused")
-        let back = b.admit(peerIP: a, channel: .control, sessionKey: key(32), authSession: [3, 3, 3, 3, 3, 3, 3, 3], resume: idA,
-                           close: { closed.add("a-ctl2") })
+        expect(b.autoRefused(auto: true), "r4 broker: the replaced viewer's auto reconnect is refused")
+        let back = b.admit(peerIP: a, channel: .control, sessionKey: key(32), authSession: [3, 3, 3, 3, 3, 3, 3, 3], resume: nil,
+                           auto: true, close: { closed.add("a-ctl2") })
         let clip = b.admit(peerIP: a, channel: .clipboard, sessionKey: nil, authSession: nil, resume: idA, close: { closed.add("a-clip") })
         b.flushClosesForTest()
         expect(back == nil && clip == nil && b.current.1 == g1 && b.current.0?.peerIP == c && closed.all == ["a-ctl"]
                && b.resumesRefused == 2 && b.replaced == 1,
                "r4 broker: refused at admit too (control and clipboard): nothing kicked, session and generation unchanged")
-        expect(!b.resumeRefused(nil), "r4 broker: a new attempt (no resume id) is not refused")
+        expect(!b.autoRefused(auto: false), "r4 broker: a manual attempt is not refused")
         if let ctlA { b.end(ctlA) }
     }
 

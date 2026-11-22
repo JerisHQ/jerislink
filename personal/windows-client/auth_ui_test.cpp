@@ -95,7 +95,8 @@ void otherTests() {
         {Outcome::LocalError, L"Nothing was sent", false},
         {Outcome::RaceUnanswered, L"now needs a connection password", false},
         {Outcome::NoChallenge, L"did not answer in time", false},
-        {Outcome::Replaced, L"took over the session", false},  // r2 item 2
+        {Outcome::Replaced, L"Another device is connected", false},  // r2 item 2; r14 item 4
+        {Outcome::RetryCapped, L"within 2 minutes", false},  // r14 item 4
     };
     for (const Case& c : cases) {
         expect(s.apply(rep(c.o), t0), std::string("shown: ") + outcomeName(c.o));
@@ -156,7 +157,7 @@ void handoffTests() {
            "handoff: fail keeps tries, saved key, probe race");
     for (Outcome o : {Outcome::Blocked, Outcome::AuthRequired, Outcome::HostMismatch, Outcome::HostTooOld,
                       Outcome::NeedPassword, Outcome::LocalError, Outcome::RaceUnanswered, Outcome::NoChallenge,
-                      Outcome::Replaced}) {
+                      Outcome::Replaced, Outcome::RetryCapped}) {
         back = decodeHandoff(encodeHandoff(rep(o), tick0), tick0);
         expect(back && back->outcome == o, std::string("handoff round trip: ") + outcomeName(o));
     }

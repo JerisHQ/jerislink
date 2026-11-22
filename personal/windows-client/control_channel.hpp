@@ -132,6 +132,7 @@ public:
         uint64_t renegotiations = 0;     // r5: background VIDEO_CONFIG exchanges that got an ACK
         uint64_t renegotiateFailures = 0;  // r5: those without one (connection closed, tried again)
         bool pausedNow = false;    // r6: paused right now
+        bool live = false;         // r14: a connection is up right now
         bool connecting = false;
         bool joined = false;       // stop() joined the worker
         double joinMs = 0.0;
@@ -275,6 +276,7 @@ public:
         ReconnectStats r = async_->stats;
         r.connecting = async_->connecting;
         r.pausedNow = async_->paused;
+        r.live = async_->s != INVALID_SOCKET;
         return r;
     }
 

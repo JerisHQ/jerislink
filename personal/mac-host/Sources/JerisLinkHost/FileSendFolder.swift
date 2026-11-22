@@ -89,16 +89,18 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     /// Moves each top-level item from `fromFD` into `destFD`, never replacing
     /// anything: "name", then "name 2", "name 3", ... Returns how many moved;
     /// stops at the first item that cannot be moved.
-    /// r13: `live` is asked right before each item's rename; false stops
-    /// (ECANCELED) with nothing more moved.
+    /// r13: `live` is asked right before each rename; false stops
+    /// (ECANCELED) with nothing more moved. r14 (Pepper's r13 review, item
+    /// 1): before every rename attempt, the "name 2", "name 3" ... retries
+    /// after a clash too, so a takeover during a clash moves nothing more.
     static func moveAll(_ names: [String], from fromFD: Int32, to destFD: Int32,
                         live: () -> Bool = { true }) -> (moved: Int, renamed: Int, error: Int32) {
         var moved = 0
         var renamed = 0
         for name in names {
-            guard live() else { return (moved, renamed, ECANCELED) }
             var n = 1
             while true {
+                guard live() else { return (moved, renamed, ECANCELED) }
                 let target = n == 1 ? name : FilePathSafety.clashName(name, attempt: n)
                 if renameatx_np(fromFD, name, destFD, target, UInt32(RENAME_EXCL)) == 0 {
                     moved += 1
@@ -114,12 +116,17 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     }
 
     /// A send finished into `folder`: remember it for REVEAL and open it.
-    func completed(transfer: UInt32, folder: URL) {
+    /// r14: Finder opens only while `live` (the session's epoch) holds.
+    func completed(transfer: UInt32, folder: URL, live: () -> Bool = { true }) {
         lock.lock()
         if byTransfer.updateValue(folder, forKey: transfer) == nil { order.append(transfer) }
         while order.count > Self.remembered { byTransfer.removeValue(forKey: order.removeFirst()) }
         last = folder
         lock.unlock()
+        guard live() else {
+            print("file.open_folder=void transfer=\(transfer) reason=replaced")
+            return
+        }
         openFolder(folder)
     }
 
@@ -127,7 +134,11 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     /// not know (the host restarted) opens the folder sends go to now, if it
     /// exists. Runs off the session thread: a stat under Downloads can wait
     /// on a privacy prompt. `done` (tests) hears whether a folder opened.
-    func reveal(transfer: UInt32, done: (@Sendable (Bool) -> Void)? = nil) {
+    /// r14 (Pepper's r13 review, item 1): `live` (the session's epoch) is
+    /// asked again on that thread, right before Finder opens: a takeover
+    /// meanwhile opens nothing.
+    func reveal(transfer: UInt32, live: @escaping @Sendable () -> Bool = { true },
+                done: (@Sendable (Bool) -> Void)? = nil) {
         lock.lock()
         let known = byTransfer[transfer]
         let recent = last
@@ -135,17 +146,21 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             // Not `done?(revealNow(...))`: optional chaining would skip the
             // reveal itself when no callback is given.
-            let opened = revealNow(transfer: transfer, known: known, recent: recent)
+            let opened = revealNow(transfer: transfer, known: known, recent: recent, live: live)
             done?(opened)
         }
     }
 
-    private func revealNow(transfer: UInt32, known: URL?, recent: URL?) -> Bool {
+    private func revealNow(transfer: UInt32, known: URL?, recent: URL?, live: () -> Bool) -> Bool {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         let candidates = [known, recent, primary, fallback].compactMap { $0 }
         guard let folder = candidates.first(where: { fm.fileExists(atPath: $0.path, isDirectory: &isDir) && isDir.boolValue }) else {
             print("file.reveal=none transfer=\(transfer)")
+            return false
+        }
+        guard live() else {
+            print("file.reveal=void transfer=\(transfer) reason=replaced")
             return false
         }
         print("file.reveal=\(known != nil ? "ok" : "unknown") transfer=\(transfer)")
