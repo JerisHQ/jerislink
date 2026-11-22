@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.0
+
+Connection password: the Mac host can require a password before a viewer connects, and video, audio and input over UDP are bound to the logged-in session.
+
+Connection password (PR-A host core, PR-B viewer, PR-C UDP + host UI):
+
+- New AUTH handshake on every TCP channel (control, clipboard, file, ping): the host sends a challenge, the viewer answers with an HMAC of a PBKDF2-SHA256 key (600000 iterations), and the host proves it knows the key too. The password itself is never sent, stored or logged.
+- The Mac keeps the derived key in the Keychain (`org.jeris.jerislink.connpw`, this device only).
+- Limits per IP: 5 wrong tries wait 5 min, 10 wait 10 min, 15 wait 15 min, 20 put the IP on the blacklist. 20 failures within 60 s host-wide make every IP wait 5 min.
+- With a password set, every UDP datagram (mouse, video, audio) carries an 8-byte session tag; untagged or wrong-tag packets are dropped. Video and audio go only to the IP of the logged-in control session.
+- Host app: new connection settings (連線設定) to set, change or clear the password and edit the whitelist and blacklist (`allowedIPs` / `blockedIPs`), with a yellow warning while no password is set. Also `JerisLinkHost --connection-settings`.
+- Windows viewer: password field with Show and "Remember password on this PC" (off by default; the key is sealed with DPAPI for the current user). Wrong password, lockout countdown, blocked and "host too old" show as one error line on the launch screen, no dialog.
+- Takeover (password mode): a manual Connect from a second viewer takes over the session. The old viewer's control connection gets "replaced" (or is reset if a reply to it was only partly sent) and its remaining file-transfer steps stop; a file move that already passed its check can still finish. An automatic reconnect gets in only when no other control session is open.
+- No password set (transition mode): the host still checks the whitelist and the blacklist, and 0.3.x viewers keep working when their IP passes. The viewer shows "No connection password set on this Mac". On first start, an old `listen.plist` with `clientIP` and no `allowedIPs` gets `allowedIPs = [clientIP]` and keeps `clientIP`; the old file is kept as `listen.plist.pre-0.4`. The whitelist follows `clientIP` until a whitelist is saved in the host app.
+
+Mac host:
+
+- The host stops capture, encoding and sending when no valid UDP packet has come from the viewer for 15 s (60 s for a session that has not sent a keep-alive yet), and resumes with a keyframe when it comes back. The control connection uses TCP keepalive to drop a dead peer in about 25 s.
+
+Security fixes from the v0.3.0 review:
+
+- Files sent to Windows are delivered only with the Internet zone mark (Mark of the Web) in place, and the final file stays held until delivery is done.
+- File manifest size overflow fixed; Force Quit relay hardened.
+
+Microsoft Store publishing (GitHub `msstore-publish` workflow, started by a published GitHub release or by hand):
+
+- `msstore-publish` uploads the package file with CLI v0.4.4. Before the upload it stops if Partner Center already has a pending submission; a draft opened between that check and the upload could still be deleted by the CLI. `--noCommit` keeps the new submission as a draft for a manual Submit in Partner Center. Afterwards the Store CLI credential and token caches are removed.
+
+Packaging:
+
+- Version 0.4.0 everywhere: `VERSION`, the macOS bundle versions, and MSIX `0.4.0.0` (GitHub `msix` workflow).
+
 ## v0.3.0
 
 Remote audio, file transfer between Windows and the Mac, keyboard layout presets, and a new viewer launch screen.
@@ -30,8 +62,8 @@ Windows viewer:
 
 Packaging:
 
-- MSIX sideload test packages are signed with a fixed test certificate.
-- Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0`, and the build id `0.3.0 · <sha>`.
+- MSIX sideload test packages (GitHub `msix` workflow) are signed with a fixed test certificate when it is configured, otherwise with a throwaway one.
+- Version 0.3.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.3.0.0` (GitHub `msix` workflow), and the build id `0.3.0 · <sha>`.
 
 ## v0.2.0
 
@@ -46,7 +78,7 @@ Streaming and input:
 
 Windows:
 
-- MSIX package for the Microsoft Store (package version is `VERSION` + `.0`).
+- MSIX package for the Microsoft Store, built by the GitHub `msix` workflow on pull requests, pushes and manual runs (package version is `VERSION` + `.0`).
 - Viewer logs are written in the background with 10 MB caps. The first-frame BMP and the per-click log are written only with `JERISLINK_DEBUG=1`.
 - New v2.0 JerisLink icon on macOS and Windows.
 - Privacy policy in `PRIVACY.md`.
