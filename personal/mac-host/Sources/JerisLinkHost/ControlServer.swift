@@ -79,7 +79,9 @@ final class ControlServer: @unchecked Sendable {
     var failAuthOKForTest: (@Sendable (AuthOK) -> Bool)?
     /// r11, self-test only: called with "clipboard" after a clipboard text
     /// from the viewer was read and checked, just before it is written, so
-    /// a test can land a takeover in between. Set before start(); nil in
+    /// a test can land a takeover in between. r12: and with "file" inside
+    /// an upload step that already passed its check, so a test can hold an
+    /// old file step while a new viewer logs in. Set before start(); nil in
     /// the app.
     var beforeSessionEffectForTest: (@Sendable (String) -> Void)?
     /// r10: how long a handshake frame (CHALLENGE, RESULT) may wait for the
@@ -486,23 +488,17 @@ final class ControlServer: @unchecked Sendable {
             // control channel then tells the viewer it was replaced, so it stops
             // reconnecting instead of taking the session back.
             let kick = KickHandle(fd, wake: authChannel == .control)
-            // r9 (Morris's simpler design, replacing the r6-r8 reservation
-            // and wait): a password-mode control AUTH takes over here, before
-            // its OK goes out (old viewer kicked, UDP session switched). A
-            // clipboard, file or ping AUTH goes in only on a session that took
-            // over (`channelAdmitted`); otherwise it is closed at once: no
+            // r12 (Morris's decision after Pepper's r11 review): a
+            // password-mode control AUTH takes over here, before its OK goes
+            // out: the session epoch moves on, so every older connection is
+            // void at once, and the broker closes them in the background. A
+            // clipboard, file or ping AUTH goes in only on the newest control
+            // session (`channelAdmitted`); otherwise it is closed at once: no
             // REPLACED, no OK, none of its messages read. Its viewer retries,
             // and gets in once its control channel took over.
             guard let token = sessionBroker.admit(peerIP: peer.ip, channel: authChannel, sessionKey: udpSessionKey,
                                                   authSession: authChannel == .control ? authOK?.sessionID : nil,
-                                                  resume: authOK?.resume, close: { [isControl = authChannel == .control] in
-                                                      // r10: a channel's session was revoked: no more frames out.
-                                                      // r11 (Pepper's r10 review, item 1): marked on this
-                                                      // connection's own handle, not by fd, so a late call
-                                                      // cannot touch a new connection on a reused number.
-                                                      if !isControl { kick.revoke() }
-                                                      kick.kick()
-                                                  }) else {
+                                                  resume: authOK?.resume, close: { kick.kick() }) else {
                 kick.finish()
                 if authChannel == .control {
                     // r4: the reconnect check again, atomically with taking
@@ -515,11 +511,13 @@ final class ControlServer: @unchecked Sendable {
                 }
                 return
             }
+            // r12: every side effect of this connection checks its epoch
+            // (`KickHandle.isRevoked`, `whileLive`).
+            kick.bind { sessionBroker.live(token) }
             // OK once the connection is in the broker. r9: a control OK that
             // did not go out drops its session id (`abandon`): nothing is
-            // left half taken over, and the viewer reconnects. The viewer it
-            // replaced stays replaced (Morris accepted one more reconnect and
-            // a second or two without picture for the new viewer).
+            // left half taken over. r12: the viewer logs in again (it keeps
+            // the password) as a new login, never told REPLACED.
             if let authOK, !sendAuthOK(fd, peerIP: peer.ip, authOK, life: kick) {
                 if authChannel == .control {
                     sessionBroker.abandon(token)
@@ -530,16 +528,15 @@ final class ControlServer: @unchecked Sendable {
                 kick.finish()
                 return
             }
-            // r11 (item 4): its OK went out; a retry naming its resume id
-            // is now judged as any reconnect.
-            if authChannel == .control { sessionBroker.confirm(token) }
             defer {
                 sessionBroker.end(token)
                 kick.finish()
             }
             serveAdmitted(fd, peer: peer, pending: pending, authChannel: authChannel, gateAdmitted: gateAdmitted,
                           wake: kick.wakeFD, life: kick)
-            if kick.kicked && authChannel == .control {
+            // r12: void from the takeover on, even before the broker's
+            // background close reached this connection.
+            if authChannel == .control && (kick.kicked || kick.isRevoked) {
                 let sent = sendPacket(fd, type: ConnAuth.MsgType.result, payload: ConnAuth.Result.replaced.payload)
                 print("auth.replaced_notice peer=\(peer.ip) sent=\(sent ? 1 : 0)")
                 // r3 (Pepper's r2 review, item 1): FIN after the notice, then
@@ -574,6 +571,10 @@ final class ControlServer: @unchecked Sendable {
         // END is sent only for a started session. The relay listener has no
         // lifecycle and forwards as before.
         let sessionID = Self.sessionIDs.next()
+        // r12: the control channel's own replies are covered by the check
+        // per message below; once void it gets the REPLACED notice, so its
+        // socket is not reset under it. Ping replies are checked as they go.
+        let replyLife = authChannel == .control ? nil : life
         var sessionStarted = false
         defer { if sessionStarted { endInputSession(sessionID) } }
         var firstHeader: [UInt8]? = pending
@@ -590,6 +591,9 @@ final class ControlServer: @unchecked Sendable {
             let type = header[5]
             let length = Int(UInt16(header[6]) << 8 | UInt16(header[7]))
             guard length <= Self.maxClipboardBytes, let payload = recvExact(fd, count: length, wake: wake) else { return }
+            // r12: a newer login took over: nothing this connection read is
+            // acted on.
+            if life?.isRevoked == true { return }
             if let admitMessage, !admitMessage() {
                 rejectedClients += 1
                 print("Control reject peer=\(peer.ip) reason=policy_changed type=0x\(String(type, radix: 16)) on \(bindIP):\(port); open connection closed")
@@ -606,7 +610,7 @@ final class ControlServer: @unchecked Sendable {
             // has no password yet. Not counted, so FILE_HELLO can follow.
             if type == ConnAuth.MsgType.response, let authGate, !authGate.requiresPassword {
                 guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: ConnAuth.MsgType.result,
-                                  payload: ConnAuth.Result.openIPOnly.payload, life: life) == .sent else { return }
+                                  payload: ConnAuth.Result.openIPOnly.payload, life: replyLife) == .sent else { return }
                 continue
             }
             messages += 1
@@ -650,7 +654,7 @@ final class ControlServer: @unchecked Sendable {
                 return
             case 0x01: // PING
                 if payload.count == 4 {
-                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload, life: life) == .sent else { return }
+                    guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x02, payload: payload, life: replyLife) == .sent else { return }
                 }
             case 0x40: // VIDEO_CONFIG_SET v1
                 let clientIP = settingsClientIP()
@@ -666,7 +670,7 @@ final class ControlServer: @unchecked Sendable {
                 }
                 // r10: the ACK asks again; a block that landed while the
                 // settings were applied gets no reply.
-                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload, life: life) == .sent else { return }
+                guard sendChecked(fd, peerIP: peer.ip, kind: "control", type: 0x41, payload: ack.payload, life: replyLife) == .sent else { return }
                 print("Video config ACK status=\(ack.status) codec=\(ack.codec) bitrate_mbps=\(ack.bitrateMbps) flags=0x\(String(ack.flags, radix: 16)) remote_size=\(ack.framebufferWidth)x\(ack.framebufferHeight)")
             case 0x10: // KEY
                 if payload.count == 3 {
@@ -890,7 +894,9 @@ final class ControlServer: @unchecked Sendable {
         defer {
             if revoked && reason != "replaced" { reason = "policy_changed" }
             // r10: a session the policy ended is reset, not drained. r11:
-            // and one a takeover revoked.
+            // and one a takeover voided. r12: `receiver.abort` below drops
+            // the transfer in flight (staging files removed, nothing lands);
+            // it does not resume, and the viewer marks it failed.
             if reason == "policy_changed" || reason == "replaced" { resetPeer(fd) }
             endPush()
             pushBroker.unregister(pushSession)
@@ -918,7 +924,7 @@ final class ControlServer: @unchecked Sendable {
             if shouldStop { reason = "stopping"; return }
             // r5 (B3): nothing more is sent or served once the policy moved.
             if sessionRevoked("file", peerIP: peerIP) { reason = "policy_changed"; return }
-            // r11: nor once a takeover revoked this viewer's session.
+            // r11: nor once a takeover voided this connection (r12: epoch).
             if life?.isRevoked == true { reason = "replaced"; return }
             if Date().timeIntervalSince(lastMessage) > FileProto.idleTimeoutSeconds { reason = "idle"; return }
             if showsNotice {
@@ -1010,11 +1016,14 @@ final class ControlServer: @unchecked Sendable {
                  .entry, .data, .fileEnd, .cancel:
                 // r11 (Pepper's r10 review, item 2): the step (staging
                 // write, send-folder move, pasteboard write) runs only while
-                // this viewer's session still counts, checked under the
-                // same lock a takeover takes (`whileLive`).
+                // this connection's epoch still counts (r12: `whileLive`
+                // checks it as the step starts; a takeover never waits).
                 let step: FileUploadReceiver.Step
                 if let life {
-                    guard let s = life.whileLive({ receiver.handle(msg) }) else { reason = "replaced"; return }
+                    guard let s = life.whileLive({ () -> FileUploadReceiver.Step in
+                        beforeSessionEffectForTest?("file")
+                        return receiver.handle(msg)
+                    }) else { reason = "replaced"; return }
                     step = s
                 } else {
                     step = receiver.handle(msg)
@@ -1069,7 +1078,7 @@ final class ControlServer: @unchecked Sendable {
         // Each 100 ms poll reads only the change count, on this thread. The
         // contents are read (on the main thread) only when the count moved.
         // r11 (Pepper's r10 review, item 2): writes go through this
-        // connection's gate, so none lands once a takeover revoked it.
+        // connection's gate, so none lands once a takeover voided it.
         let clipboard: ClipboardBackend = life.map { SessionGatedClipboard(self.clipboard, life: $0) as ClipboardBackend } ?? self.clipboard
         var lastChangeCount = clipboard.changeCount()
         var lastSentText = clipboard.readText()
@@ -1080,7 +1089,7 @@ final class ControlServer: @unchecked Sendable {
             if shouldStop { return }
             // r5 (B3): no clipboard read or write once the policy moved.
             if sessionRevoked("clipboard", peerIP: peerIP) { resetPeer(fd); return }
-            // r10: a takeover revoked this viewer's session.
+            // r10: a takeover voided this connection (r12: epoch).
             if life?.isRevoked == true { resetPeer(fd); return }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -1414,11 +1423,13 @@ final class ControlServer: @unchecked Sendable {
             return nil
         }
         // r4 (Pepper's r3 review, item 1): a reconnect from a viewer that
-        // another viewer replaced. The password was right (nothing counted),
+        // another login replaced. The password was right (nothing counted),
         // but the session is not taken back: it is told it was replaced, and
         // stops, even if it never read the notice on its old connection.
         // r9: control channel only; another channel naming a session that
-        // never took over or was replaced is closed silently in `admit`.
+        // is not the newest is closed silently in `admit`. r12: any other
+        // control login (no id, the current id, an id from before a
+        // restart, a retry after a lost AUTH_OK) is a new takeover.
         if channel == .control, let sessionBroker, sessionBroker.resumeRefused(response.resume) {
             refuseResume(fd, ip: ip, channel: channel, resume: response.resume, stage: "auth")
             return nil
@@ -1686,7 +1697,7 @@ final class ControlServer: @unchecked Sendable {
     /// r10: `limit` (seconds, monotonic) also bounds the wait for the
     /// window; nil keeps the checks with no time limit.
     /// r11 (Pepper's r10 review, item 1): `life` is the connection's own
-    /// handle; its revoked mark ends with it, never with a descriptor number.
+    /// handle, never a descriptor number. r12: it reads the broker epoch.
     private func sendChecked(_ fd: Int32, peerIP: String, kind: String, type: UInt8,
                              payload: [UInt8], limit: TimeInterval? = nil, life: KickHandle? = nil) -> CheckedSend {
         beforeCheckedSend?(type)

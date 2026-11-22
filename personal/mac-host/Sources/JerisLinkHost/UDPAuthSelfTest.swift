@@ -165,22 +165,26 @@ enum UDPAuthSelfTest {
         let closed = Closed()
         let b = SessionBroker(passwordMode: true, log: { _ in })
         let a = "100.64.0.1", c = "100.64.0.2"
-        let clip = b.begin(peerIP: a, channel: .clipboard, sessionKey: nil, close: { closed.add("a-clip") })
+        let lone = b.begin(peerIP: a, channel: .clipboard, sessionKey: nil, close: { closed.add("lone-clip") })
         expect(b.current.0 == nil, "broker: a clipboard login alone is no UDP session")
         let ctlA = b.begin(peerIP: a, channel: .control, sessionKey: key(5), close: { closed.add("a-ctl") })
+        let clip = b.begin(peerIP: a, channel: .clipboard, sessionKey: nil, close: { closed.add("a-clip") })
+        b.flushClosesForTest()
         let (s1, g1) = b.current
-        expect(s1?.peerIP == a && s1?.sessionKey == key(5) && closed.all.isEmpty,
-               "broker: control AUTH is the session; same viewer's clipboard stays")
+        expect(s1?.peerIP == a && s1?.sessionKey == key(5) && closed.all == ["lone-clip"] && b.live(clip) && !b.live(lone),
+               "broker: control AUTH is the session (r12: older connections void); the clipboard after it stays")
         _ = b.begin(peerIP: a, channel: .control, sessionKey: key(6), close: { closed.add("a-ctl2") })
+        b.flushClosesForTest()
         let (s2, g2) = b.current
-        expect(s2?.sessionKey == key(6) && g2 != g1 && closed.all == ["a-ctl"] && b.replaced == 1,
-               "broker: a new AUTH from the same viewer replaces the old key and closes the old control")
+        expect(s2?.sessionKey == key(6) && g2 != g1 && Set(closed.all) == ["lone-clip", "a-ctl", "a-clip"] && b.replaced == 3,
+               "broker: a new AUTH from the same viewer replaces the old key; r12: it closes every older connection (\(closed.all))")
         b.end(ctlA)
         expect(b.current.1 == g2, "broker: ending the replaced connection changes nothing")
         let ctlC = b.begin(peerIP: c, channel: .control, sessionKey: key(7), close: { closed.add("c-ctl") })
-        expect(b.current.0?.peerIP == c && Set(closed.all) == ["a-ctl", "a-clip", "a-ctl2"],
+        b.flushClosesForTest()
+        expect(b.current.0?.peerIP == c && Set(closed.all) == ["lone-clip", "a-ctl", "a-clip", "a-ctl2"],
                "broker: another viewer's AUTH takes over and closes every connection of the old one")
-        b.end(clip)
+        b.end(clip); b.end(lone)
         b.end(ctlC)
         expect(b.current.0 == nil && b.activePeerIP == nil, "broker: the session ends with its control connection")
 
@@ -520,6 +524,7 @@ enum UDPAuthSelfTest {
                            close: { closed.add("a-ctl") })
         expect(ctlA != nil && !b.resumeRefused(idA), "r4 broker: the live session's own reconnect is let in")
         _ = b.admit(peerIP: c, channel: .control, sessionKey: key(31), authSession: idB, resume: nil, close: { closed.add("c-ctl") })
+        b.flushClosesForTest()
         let (s1, g1) = b.current
         expect(s1?.peerIP == c && closed.all == ["a-ctl"], "r4 broker: another viewer took the session")
         // The old viewer never heard the notice and reconnects on its own.
@@ -527,6 +532,7 @@ enum UDPAuthSelfTest {
         let back = b.admit(peerIP: a, channel: .control, sessionKey: key(32), authSession: [3, 3, 3, 3, 3, 3, 3, 3], resume: idA,
                            close: { closed.add("a-ctl2") })
         let clip = b.admit(peerIP: a, channel: .clipboard, sessionKey: nil, authSession: nil, resume: idA, close: { closed.add("a-clip") })
+        b.flushClosesForTest()
         expect(back == nil && clip == nil && b.current.1 == g1 && b.current.0?.peerIP == c && closed.all == ["a-ctl"]
                && b.resumesRefused == 2 && b.replaced == 1,
                "r4 broker: refused at admit too (control and clipboard): nothing kicked, session and generation unchanged")
