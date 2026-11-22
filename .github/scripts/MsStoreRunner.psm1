@@ -8,7 +8,16 @@
 #   There is no --inputFile option; -i/--inputDirectory is unused for MSIX files.
 # - `msstore reconfigure` stores the client secret as a Windows generic credential
 #   "MicrosoftStoreCli:user=<clientId>" (persist LocalMachine), and settings.json
-#   plus the MSAL token cache under %LOCALAPPDATA%\Microsoft\MSStore.CLI.
+#   plus the interactive MSAL token cache under %LOCALAPPDATA%\Microsoft\MSStore.CLI.
+# - Every Partner Center call signs in with the client secret through
+#   MSStore.API (SubmissionClient.CreateAppAsync), which keeps its own MSAL token
+#   cache in %LOCALAPPDATA%\Microsoft\MSStore.API\Cache (msstore_msal_cache.txt).
+#   Clear-MsStoreCliState removes that folder too.
+# - `msstore publish` for an app that already has a published submission
+#   DELETES the app's pending submission before it creates a new draft
+#   (IStorePackagedAPIExtensions.PublishAsync); with no published submission it
+#   reuses the pending one. Assert-NoPendingSubmission runs `msstore apps get`
+#   first and stops if any pending submission exists, so nothing is deleted.
 # - `msstore reconfigure --reset` always asks a y/n question and throws
 #   "Failed to read input in non-interactive mode" on a runner, so it cannot be
 #   used in CI. Clear-MsStoreCliState removes the same things directly.
@@ -18,6 +27,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:CredentialPrefix = 'MicrosoftStoreCli:'
 $script:StateDir = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.CLI'
+$script:ApiStateDir = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API'
 
 if (-not ('JerisLink.WinCred' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -102,18 +112,22 @@ function Get-MsStoreCliCredentialTargets {
   [JerisLink.WinCred]::List("$($script:CredentialPrefix)*") | ForEach-Object { $_.Key }
 }
 
-# Removes every MSStore CLI credential and the CLI's settings/token cache folder,
-# then checks both are gone. Throws if anything is left. Prints no secret values
+# Removes every MSStore CLI credential, the CLI's settings/token cache folder and
+# the MSStore.API token cache folder, then checks all of them are gone. Throws if anything is left. Prints no secret values
 # (target names hold the client id, which GitHub masks as a secret in logs).
 function Clear-MsStoreCliState {
   $creds = @([JerisLink.WinCred]::List("$($script:CredentialPrefix)*"))
   foreach ($c in $creds) { [JerisLink.WinCred]::Delete($c.Key, $c.Value) }
-  if (Test-Path -LiteralPath $script:StateDir) { Remove-Item -LiteralPath $script:StateDir -Recurse -Force }
+  foreach ($d in $script:StateDir, $script:ApiStateDir) {
+    if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+  }
 
   $left = @(Get-MsStoreCliCredentialTargets)
   if ($left.Count -ne 0) { throw "$($left.Count) MSStore CLI credential(s) still in Credential Manager" }
-  if (Test-Path -LiteralPath $script:StateDir) { throw "$($script:StateDir) still exists" }
-  Write-Host "MSStore CLI state cleared: removed $($creds.Count) credential(s); $($script:StateDir) is gone"
+  foreach ($d in $script:StateDir, $script:ApiStateDir) {
+    if (Test-Path -LiteralPath $d) { throw "$d still exists" }
+  }
+  Write-Host "MSStore CLI state cleared: removed $($creds.Count) credential(s); $($script:StateDir) and $($script:ApiStateDir) are gone"
 }
 
 # Writes a throwaway CLI configuration (dummy ids, dummy secret) exactly where and
@@ -131,6 +145,9 @@ function Set-MsStoreCliDummyState {
   [JerisLink.WinCred]::WriteGeneric("$($script:CredentialPrefix)user=$clientId", $clientId, 'dummy-not-a-secret')
   New-Item -ItemType Directory -Force -Path (Join-Path $script:StateDir 'Cache') | Out-Null
   Set-Content -LiteralPath (Join-Path $script:StateDir 'Cache\msstore_msal_cache.txt') -Value 'dummy'
+  # Stand-in for the token cache MSStore.API writes after a real sign-in.
+  New-Item -ItemType Directory -Force -Path (Join-Path $script:ApiStateDir 'Cache') | Out-Null
+  Set-Content -LiteralPath (Join-Path $script:ApiStateDir 'Cache\msstore_msal_cache.txt') -Value 'dummy'
   $clientId
 }
 
@@ -174,4 +191,39 @@ function Get-StorePackage {
   $upload.FullName
 }
 
-Export-ModuleMember -Function Get-StorePackage, Clear-MsStoreCliState, Set-MsStoreCliDummyState, Get-MsStoreCliCredentialTargets
+# Checks the JSON that `msstore apps get <productId>` prints (DevCenterApplication)
+# and throws if the app has a pending submission, or if the JSON is not that app.
+function Test-NoPendingSubmission {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
+  $start = $AppJson.IndexOf('{')
+  if ($start -lt 0) { throw "msstore apps get printed no application JSON; not publishing" }
+  try { $app = $AppJson.Substring($start) | ConvertFrom-Json -ErrorAction Stop }
+  catch { throw "msstore apps get printed JSON that does not parse; not publishing" }
+  $idProp = $app.PSObject.Properties['Id']
+  if (-not $idProp -or $idProp.Value -ne $ProductId) { throw "msstore apps get returned a different or empty application id; not publishing" }
+  $pendingProp = $app.PSObject.Properties['PendingApplicationSubmission']
+  if (-not $pendingProp) { throw "msstore apps get output has no PendingApplicationSubmission field; cannot tell whether a draft exists; not publishing" }
+  $pending = $pendingProp.Value
+  if ($null -ne $pending) {
+    $pid_ = $pending.PSObject.Properties['Id']
+    $pendingId = if ($pid_) { $pid_.Value } else { '(no id)' }
+    throw ("Partner Center already has a pending submission $pendingId for $ProductId. " +
+      "msstore publish would delete it (or reuse it) before uploading, so this run stops and touches nothing. " +
+      "Open Partner Center, decide what to do with that draft (submit or delete it), then re-run this workflow.")
+  }
+  Write-Host "No pending submission for $ProductId; safe to create a new draft."
+}
+
+# Asks Partner Center (msstore apps get) whether the app has a pending submission
+# and throws unless the CLI succeeded and reported none. Fails closed.
+function Assert-NoPendingSubmission {
+  param([Parameter(Mandatory)][string]$ProductId)
+  $ErrorActionPreference = 'Continue'
+  $out = (& msstore apps get $ProductId | Out-String)
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  if ($code -ne 0) { throw "msstore apps get failed (exit $code); cannot check for a pending submission; not publishing" }
+  Test-NoPendingSubmission -AppJson $out -ProductId $ProductId
+}
+
+Export-ModuleMember -Function Get-StorePackage, Clear-MsStoreCliState, Set-MsStoreCliDummyState, Get-MsStoreCliCredentialTargets, Test-NoPendingSubmission, Assert-NoPendingSubmission

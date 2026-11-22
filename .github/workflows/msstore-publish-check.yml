@@ -5,13 +5,17 @@ name: msstore-publish-check
 # of the newest successful `msix` push run on main (or the given run), and with
 # the same pinned Store CLI:
 # - runs the exact `msstore publish` command line of msstore-publish.yml against
-#   that .msixupload, with a dummy CLI configuration and every HTTP request sent
-#   to a dead local proxy. Passing means the CLI accepted the arguments, read the
-#   stored credential and picked its MSIX publisher for the file; it then fails
-#   on its first token request at the dead proxy, as it must.
+#   that .msixupload, with a dummy CLI configuration and HTTP(S)_PROXY pointed at
+#   a dead loopback port. Passing means the CLI accepted the arguments, read the
+#   stored credential and picked its MSIX publisher for the file, then its token
+#   request failed at the loopback proxy.
+# - checks the pending-submission guard: Test-NoPendingSubmission against sample
+#   `msstore apps get` JSON (with and without a pending draft), and
+#   Assert-NoPendingSubmission against the dead proxy, which must fail closed.
 # - checks that the v0.3.0 command line and `msstore reconfigure --reset` still
 #   fail the way they did (so the fix is for the real cause).
-# - runs Clear-MsStoreCliState and checks the dummy credential and files are gone.
+# - runs Clear-MsStoreCliState and checks the dummy credential, the CLI folder and
+#   the MSStore.API token cache folder (seeded with a stand-in cache) are gone.
 
 on:
   pull_request:
@@ -64,6 +68,8 @@ jobs:
           if (-not $wf.Contains($cmd)) { throw "msstore-publish.yml does not run: $cmd" }
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
           if ($code -match "--inputFile|reconfigure --reset") { throw "msstore-publish.yml still runs --inputFile or reconfigure --reset" }
+          $guard = $wf.IndexOf('Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID')
+          if ($guard -lt 0 -or $guard -gt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-NoPendingSubmission before msstore publish" }
           Write-Host "CLI $ver; publish command: $cmd"
           "cli_version=$ver" >> $env:GITHUB_OUTPUT
 
@@ -137,8 +143,9 @@ jobs:
           if ($r.Out -match 'could not find credentials') { throw "CLI did not find the stored credential" }
           # PublishCommand.Handler finds the publisher first and returns early with the
           # message above if there is none; only then does CreatePackagedAsync fetch a
-          # token. Failing there, on the dead proxy, proves every earlier step passed
-          # and that nothing left the runner.
+          # token. Failing there shows every earlier step passed, and that this token
+          # request went to the loopback proxy and failed there. It says nothing about
+          # other traffic.
           if ($r.Out -notmatch 'PublishCommand\.Handler' -or $r.Out -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "CLI did not reach the token request inside publish" }
           if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "CLI did not fail on the dead proxy" }
           if ($r.Code -eq 0) { throw "publish succeeded with a dummy configuration; the dry run is not isolated" }
@@ -156,6 +163,24 @@ jobs:
           if ($r.Code -eq 0) { throw "reconfigure --reset exited 0" }
           if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "expected reconfigure --reset to leave the credential in place" }
 
+          # 4. Pending-submission guard, parsing: sample `msstore apps get` output.
+          $app = '{"Id":"' + $env:STORE_PRODUCT_ID + '","PrimaryName":"JerisLink","LastPublishedApplicationSubmission":{"Id":"1152921505000000001","ResourceLocation":"x"},"PendingApplicationSubmission":'
+          function Expect-Stop([string]$json, [string]$pattern, [string]$what) {
+            try { Test-NoPendingSubmission -AppJson $json -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP: $what" }
+            catch { if ("$_" -like 'GUARD-DID-NOT-STOP*' -or "$_" -notmatch $pattern) { throw "guard, $what : $_" }; Write-Host "guard stopped ($what): $_" }
+          }
+          Expect-Stop ($app + '{"Id":"1152921505000000002","ResourceLocation":"y"}}') 'already has a pending submission 1152921505000000002' 'pending draft present'
+          Expect-Stop ("Retrieving Application`n" + $app + '{"Id":"1152921505000000002"}}') 'already has a pending submission' 'pending draft after status text'
+          Expect-Stop '{"Id":"9NOTTHISAPP0","PendingApplicationSubmission":null}' 'different or empty application id' 'wrong app'
+          Expect-Stop ('{"Id":"' + $env:STORE_PRODUCT_ID + '"}') 'no PendingApplicationSubmission field' 'field missing'
+          Expect-Stop 'Error while retrieving Application.' 'no application JSON' 'no JSON'
+          Test-NoPendingSubmission -AppJson ($app + 'null}') -ProductId $env:STORE_PRODUCT_ID
+
+          # 5. Pending-submission guard, live CLI: `msstore apps get` cannot reach
+          #    Partner Center here, so the guard must stop the run, not let it through.
+          try { Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP" }
+          catch { if ("$_" -notmatch 'msstore apps get failed \(exit -?[1-9]') { throw "guard on CLI failure: $_" }; Write-Host "guard stopped (CLI failed): $_" }
+
           # Every assertion above passed. Steps 2 and 3 are expected CLI failures and
           # leave $LASTEXITCODE at 1; the pwsh step wrapper ends with
           # `exit $LASTEXITCODE`, which would fail this step after a passing check.
@@ -167,6 +192,11 @@ jobs:
         timeout-minutes: 2
         run: |
           Import-Module ./.github/scripts/MsStoreRunner.psm1
+          $apiCache = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API\Cache\msstore_msal_cache.txt'
+          if (-not (Test-Path -LiteralPath $apiCache)) { throw "the seeded MSStore.API token cache is missing before cleanup" }
+          Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') -Recurse -File | ForEach-Object { Write-Host "before cleanup: $($_.FullName) ($($_.Length) bytes)" }
           Clear-MsStoreCliState
+          if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API')) { throw "MSStore.API still exists after cleanup" }
+          Write-Host "after cleanup: $(Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') does not exist"
           # Second run on a clean runner must also pass.
           Clear-MsStoreCliState

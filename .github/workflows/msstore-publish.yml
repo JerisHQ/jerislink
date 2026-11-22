@@ -19,6 +19,10 @@ name: msstore-publish
 # - Runs in the `store` environment, so its secrets are only released after the
 #   environment's reviewers approve. The environment's deployment policy must
 #   allow the tag ref (refs/tags/v*) for the release trigger to get past it.
+# - Before uploading, the job asks Partner Center whether the app already has a
+#   pending submission and stops if it does. `msstore publish` would otherwise
+#   delete that draft (when a published submission exists) to make room for the
+#   new one. There is no override: resolve the draft in Partner Center and re-run.
 # - `msstore publish --noCommit` keeps the submission in draft state: nothing
 #   goes to certification or the Store until someone presses "Submit" in
 #   Partner Center by hand.
@@ -143,6 +147,13 @@ jobs:
           }
           msstore reconfigure --tenantId $env:PC_TENANT_ID --sellerId $env:PC_SELLER_ID --clientId $env:PC_CLIENT_ID --clientSecret $env:PC_CLIENT_SECRET
           if ($LASTEXITCODE -ne 0) { throw "msstore reconfigure failed ($LASTEXITCODE)" }
+
+      - name: Stop if Partner Center already has a pending submission
+        run: |
+          # msstore publish deletes an existing pending submission before it creates
+          # a new draft (see .github/scripts/MsStoreRunner.psm1). Never let it.
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID
 
       - name: Upload to Partner Center as a draft submission (no commit, no Store release)
         env:
