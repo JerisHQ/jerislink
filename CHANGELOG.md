@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.0
+
+Connection password: the Mac host can require a password before a viewer connects, and video, audio and input over UDP are bound to the logged-in session.
+
+Connection password (PR-A host core, PR-B viewer, PR-C UDP + host UI):
+
+- New AUTH handshake on every TCP channel (control, clipboard, file, ping): the host sends a challenge, the viewer answers with an HMAC of a PBKDF2-SHA256 key (600000 iterations), and the host proves it knows the key too. The password itself is never sent, stored or logged.
+- The Mac keeps the derived key in the Keychain (`org.jeris.jerislink.connpw`, this device only).
+- Limits per IP: 5 wrong tries wait 5 min, 10 wait 10 min, 15 wait 15 min, 20 put the IP on the blacklist. 20 failures within 60 s host-wide make every IP wait 5 min.
+- With a password set, every UDP datagram (mouse, video, audio) carries an 8-byte session tag; untagged or wrong-tag packets are dropped. Video and audio go only to the IP of the logged-in control session.
+- Host app: new connection settings (連線設定) to set, change or clear the password and edit the whitelist and blacklist (`allowedIPs` / `blockedIPs`, replacing `clientIP`), with a yellow warning while no password is set. Also `JerisLinkHost --connection-settings`.
+- Windows viewer: password field with Show and "Remember password on this PC" (off by default; the key is sealed with DPAPI for the current user). Wrong password, lockout countdown, blocked and "host too old" show as one error line on the launch screen, no dialog.
+- Takeover: a manual Connect from a second viewer takes over the session; the old viewer gets "replaced", its file transfers stop and nothing late lands on the Mac. Automatic reconnects never take over.
+- Transition: with no password set, the host checks the whitelist only and 0.3.x viewers keep working; the viewer shows "No connection password set on this Mac". The first start migrates `listen.plist` and keeps the old file as `listen.plist.pre-0.4`.
+
+Mac host:
+
+- The host stops capture, encoding and sending when the viewer goes away (15 s without keep-alives, 60 s fallback), and resumes with a keyframe when it comes back. The control connection uses TCP keepalive to drop a dead peer in about 25 s.
+
+Security fixes from the v0.3.0 review:
+
+- Files sent to Windows are delivered only with the Internet zone mark (Mark of the Web) in place, and the final file stays held until delivery is done.
+- File manifest size overflow fixed; Force Quit relay hardened.
+
+Microsoft Store publishing:
+
+- `msstore-publish` now uploads the package file with CLI v0.4.4 (`msstore publish <package> --appId ... --noCommit`), stops if Partner Center already has a pending submission, and really removes the Store CLI credential and token caches afterwards. The submission still waits for a manual Submit in Partner Center.
+
+Packaging:
+
+- Version 0.4.0 everywhere: `VERSION`, the macOS bundle versions, MSIX `0.4.0.0`.
+
 ## v0.3.0
 
 Remote audio, file transfer between Windows and the Mac, keyboard layout presets, and a new viewer launch screen.
