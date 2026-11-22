@@ -456,6 +456,8 @@ enum AuthSelfTest {
             let fake = FakeClipboard(text: nil)
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("jl-prc-r12-\(UUID().uuidString)", isDirectory: true)
             defer { try? FileManager.default.removeItem(at: dir) }
+            // The send folder is made with a plain mkdir: its parent must exist.
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                         fallback: dir.appendingPathComponent("received", isDirectory: true),
                                         openFolder: { _ in })
