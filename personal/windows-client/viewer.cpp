@@ -5363,10 +5363,18 @@ static constexpr UINT_PTR kLaunchAuthTimer = 0x4A41;
 // Before a session: AUTH on the ping channel, then one PING (design §7). The
 // Client stays current for the session, so every channel reuses K without
 // running PBKDF2 again. A typed password is wiped once K is derived.
-static jl::auth::Report authPreflight(const Options& o, std::wstring password, bool remember) {
+// r15 (Pepper's r14 review, item 1): `intent` says who asked for this
+// attempt. Both callers are the user's own Connect (the launch screen's
+// button, or the user starting the viewer with an address; a relaunch always
+// goes back to the launch screen). That allows one control AUTH without the
+// "auto" flag; every control AUTH after it, the startup retries below and
+// the background reconnects included, carries the flag and never takes over.
+static jl::auth::Report authPreflight(const Options& o, std::wstring password, bool remember,
+                                      jl::auth::LoginIntent intent) {
     jl::auth::Client::Options co;
     co.password = std::move(password);
     co.remember = remember;
+    co.intent = intent;
     // What this host answered before (password or not) carries over to
     // this attempt: a host known to want a password is not probed again.
     co.hostKey = o.sourceIp + ":" + std::to_string(o.controlPort);
@@ -5690,7 +5698,7 @@ static void launchConnect(HWND dlg, const std::string& noPasswordFor = {}) {
     logLine(std::string("launch.auth_check password=") + (password.empty() ? "empty" : "typed") +
             " remember=" + (remember ? "on" : "off"));
     std::thread([dlg, opts = request.options, password = std::move(password), remember]() mutable {
-        const auto rep = authPreflight(opts, std::move(password), remember);
+        const auto rep = authPreflight(opts, std::move(password), remember, jl::auth::LoginIntent::UserConnect);
         jl::auth::wipe(password);
         PostMessageW(dlg, WM_MR_AUTH_PREFLIGHT, static_cast<WPARAM>(rep.outcome), 0);
     }).detach();
@@ -6017,7 +6025,7 @@ static int appMain(int argc, char** argv) {
             if (gLaunchPreflightDone) break;
             // Address from the command line: no password typed, so only a
             // remembered one can answer a Mac that wants it.
-            const auto rep = authPreflight(request.options, std::wstring(), false);
+            const auto rep = authPreflight(request.options, std::wstring(), false, jl::auth::LoginIntent::UserConnect);
             if (!jl::auth::isTerminal(rep.outcome)) break;
             launch.note.clear();
             launch.authAnswer = rep;

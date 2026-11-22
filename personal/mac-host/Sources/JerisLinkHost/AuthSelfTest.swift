@@ -50,6 +50,7 @@ enum AuthSelfTest {
         prcR12(expect)
         prcR13(expect)
         prcR14(expect)
+        prcR15(expect)
         return failures == 0 ? 0 : 1
     }
 
@@ -466,7 +467,7 @@ enum AuthSelfTest {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                         fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                        openFolder: { _ in })
+                                        onMain: FileSendFolder.inline, openFolder: { _ in })
             let s = server(p, clipboard: fake, root: dir, folder: folder)
             let fileHold = R11Hold(), clipHold = R11Hold()
             s.beforeSessionEffectForTest = { kind in
@@ -645,7 +646,7 @@ enum AuthSelfTest {
             defer { try? FileManager.default.removeItem(at: dir) }
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                         fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                        openFolder: { _ in })
+                                        onMain: FileSendFolder.inline, openFolder: { _ in })
             let s = server(p, clipboard: fake, root: dir, folder: folder)
             let hold = R11Hold()
             s.beforeSessionEffectForTest = { kind in if kind == "land:send" { hold.pass() } }
@@ -888,6 +889,57 @@ enum AuthSelfTest {
         // Item 4 (r13 replaced-id list) is gone in r14: see prcR14.
     }
 
+    // MARK: PR-C r15 (Pepper's r14 review)
+
+    /// Item 2: the open is queued for the main actor, a takeover comes in,
+    /// then the main actor runs the work: Finder does not open, for the open
+    /// after a send and for REVEAL. A live session's queued open still runs.
+    private static func prcR15(_ expect: Expect) {
+        let me = ListenConfig.loopbackIP
+        func id(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 8) }
+        func key(_ v: UInt8) -> [UInt8] { [UInt8](repeating: v, count: 32) }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("jl-prc-r15-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: dir) }
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let opened = R6Count()
+        let main = R15MainQueue()
+        let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
+                                    fallback: dir, onMain: { main.add($0) }, openFolder: { _ in opened.hit() })
+        let b = SessionBroker(passwordMode: true, log: { _ in })
+        _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x31), authSession: id(0x31), resume: nil, close: {})
+        let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x31), close: {})
+        let life = KickHandle(-1)
+        if let tF { life.bind { b.live(tF) } }
+        let live: @Sendable () -> Bool = { !life.isRevoked }
+
+        // Both opens are queued while the session is live.
+        folder.completed(transfer: 7, folder: dir, live: live)
+        let result = R14Flag()
+        let answered = DispatchSemaphore(value: 0)
+        folder.reveal(transfer: 7, live: live, done: { ok in result.set(ok); answered.signal() })
+        let queued = main.waitCount(2)
+        let liveWhenQueued = live()
+        // The takeover, then the main actor runs what was queued.
+        _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x32), authSession: id(0x32), resume: nil, close: {})
+        main.runAll()
+        let got = answered.wait(timeout: .now() + 3) == .success
+        expect(tF != nil && queued && liveWhenQueued && got && result.value == false && opened.value == 0,
+               "prc r15 main hop: queued, takeover, then the main actor runs: Finder does not open (opened=\(opened.value) queued=\(queued))")
+
+        // A live session's queued opens still open Finder.
+        let result2 = R14Flag()
+        let answered2 = DispatchSemaphore(value: 0)
+        folder.completed(transfer: 8, folder: dir)
+        folder.reveal(transfer: 8, done: { ok in result2.set(ok); answered2.signal() })
+        let queued2 = main.waitCount(2)
+        let before = opened.value
+        main.runAll()
+        _ = answered2.wait(timeout: .now() + 3)
+        expect(queued2 && before == 0 && result2.value == true && opened.value == 2,
+               "prc r15 main hop: a live session's queued open and REVEAL still open the folder (opened=\(opened.value))")
+    }
+
     // MARK: PR-C r14 (Pepper's r13 review)
 
     private static func prcR14(_ expect: Expect) {
@@ -942,7 +994,7 @@ enum AuthSelfTest {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
             let opened = R6Count()
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
-                                        fallback: dir, openFolder: { _ in opened.hit() })
+                                        fallback: dir, onMain: FileSendFolder.inline, openFolder: { _ in opened.hit() })
             let b = SessionBroker(passwordMode: true, log: { _ in })
             _ = b.admit(peerIP: me, channel: .control, sessionKey: key(0x21), authSession: id(0x21), resume: nil, close: {})
             let tF = b.admit(peerIP: me, channel: .file, sessionKey: nil, authSession: nil, resume: id(0x21), close: {})
@@ -1504,7 +1556,7 @@ enum AuthSelfTest {
             defer { try? FileManager.default.removeItem(at: r10Dir) }
             let r10Folder = FileSendFolder(primary: r10Dir.appendingPathComponent("send", isDirectory: true),
                                            fallback: r10Dir.appendingPathComponent("received", isDirectory: true),
-                                           openFolder: { _ in })
+                                           onMain: FileSendFolder.inline, openFolder: { _ in })
             let s = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
                                   settingsClientIP: { me }, acceptProxy: false, inputHelper: nil,
                                   allowFileSessions: true,
@@ -2462,7 +2514,7 @@ enum AuthSelfTest {
         let board = FakeClipboard(text: "mac-before")
         let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                     fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                    openFolder: { _ in })
+                                    onMain: FileSendFolder.inline, openFolder: { _ in })
         let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
                                    settingsClientIP: { me }, acceptProxy: false, allowFileSessions: true,
                                    fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
@@ -2915,7 +2967,7 @@ enum AuthSelfTest {
         let board = FakeClipboard(text: "mac-before")
         let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                     fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                    openFolder: { _ in })
+                                    onMain: FileSendFolder.inline, openFolder: { _ in })
         // The direct listener's wiring in ControlService.startServers, with
         // PROXY on so one loopback socket can stand for each viewer.
         let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
@@ -3003,7 +3055,7 @@ enum AuthSelfTest {
             let board = FakeClipboard(text: "before")
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                         fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                        openFolder: { _ in })
+                                        onMain: FileSendFolder.inline, openFolder: { _ in })
             let server = ControlServer(bindIP: me, allowedClientIP: nil, port: port, inject: false,
                                        settingsClientIP: { vy }, acceptProxy: true, allowFileSessions: true,
                                        fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
@@ -3112,7 +3164,7 @@ extension AuthSelfTest {
             let board = FakeClipboard(text: "before")
             let folder = FileSendFolder(primary: dir.appendingPathComponent("send", isDirectory: true),
                                         fallback: dir.appendingPathComponent("received", isDirectory: true),
-                                        openFolder: { _ in })
+                                        onMain: FileSendFolder.inline, openFolder: { _ in })
             server = ControlServer(bindIP: me, allowedClientIP: nil, port: p, inject: false,
                                    settingsClientIP: { settingsIP }, acceptProxy: true, allowFileSessions: true,
                                    fileStagingRoot: dir.appendingPathComponent("staging", isDirectory: true),
@@ -3545,6 +3597,28 @@ final class R11Hold: @unchecked Sendable {
     }
     func waitEntered(_ seconds: Double = 3) -> Bool { enteredSem.wait(timeout: .now() + seconds) == .success }
     func release() { releaseSem.signal() }
+}
+
+/// PR-C r15 self-test: stands in for the main actor. Holds the work
+/// `FileSendFolder` queues until the test runs it.
+final class R15MainQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var work: [@Sendable () -> Void] = []
+    func add(_ w: @escaping @Sendable () -> Void) { lock.lock(); work.append(w); lock.unlock() }
+    /// Waits (up to 3 s) until `n` pieces of work are queued.
+    func waitCount(_ n: Int) -> Bool {
+        let end = Date().addingTimeInterval(3)
+        while Date() < end {
+            lock.lock(); let c = work.count; lock.unlock()
+            if c >= n { return c == n }
+            usleep(2_000)
+        }
+        return false
+    }
+    func runAll() {
+        lock.lock(); let w = work; work = []; lock.unlock()
+        w.forEach { $0() }
+    }
 }
 
 /// PR-C r14 self-test: a Bool set from another thread.

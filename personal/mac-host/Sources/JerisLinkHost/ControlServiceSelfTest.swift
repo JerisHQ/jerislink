@@ -953,7 +953,7 @@ enum ControlServiceSelfTest {
         let opened = OpenedFolders()
         let folder = FileSendFolder(primary: base.appendingPathComponent("Downloads/JerisLink", isDirectory: true),
                                     fallback: base.appendingPathComponent("JerisLink Received", isDirectory: true),
-                                    openFolder: { opened.add($0) })
+                                    onMain: FileSendFolder.inline, openFolder: { opened.add($0) })
         let staging = base.appendingPathComponent("staging", isDirectory: true)
         let board = FakeClipboard(text: "before-send")
         let cache = InputSourceCache(backend: FakeInputSource(id: "com.apple.keylayout.US"),

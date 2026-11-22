@@ -105,6 +105,14 @@ constexpr size_t kResumeResponseBytes = kResponseBytes + kSessionIdBytes;       
 // AUTH of an attempt (a manual connect from the launch screen) has no flag
 // and takes over. Clipboard, file and ping still name the control session.
 constexpr uint8_t kAutoMarker[kSessionIdBytes] = {'j', 'l', '-', 'a', 'u', 't', 'o', '1'};
+// PR-C r15 (Pepper's r14 review, item 1): why a Client exists. A Client made
+// for a user's Connect (launch screen, or the user starting the viewer with
+// an address) may send exactly one control AUTH without the flag: the first
+// one it actually sends. Every control AUTH after it carries kAutoMarker,
+// even when no AUTH_OK ever came back (lost OK), so no retry can take the
+// session over from a viewer that connected in the meantime. A Client made
+// for anything else (Auto, the default) never sends an unflagged one.
+enum class LoginIntent { Auto, UserConnect };
 
 constexpr uint8_t kTypeResponse = 0x03;
 constexpr uint8_t kTypeResult = 0x04;
@@ -812,12 +820,14 @@ public:
         std::wstring storeDir;     // empty: HostKeyStore::defaultDir()
         std::string hostKey;       // "ip:port" of the host; empty: mode not kept across Clients
         LogFn log;
+        // r15: set by the Connect entry point only (see LoginIntent).
+        LoginIntent intent = LoginIntent::Auto;
     };
 
     explicit Client(Options o)
         : password_(std::move(o.password)), remember_(o.remember),
           store_(o.storeDir.empty() ? HostKeyStore::defaultDir() : o.storeDir), log_(std::move(o.log)),
-          hostKey_(std::move(o.hostKey)) {
+          hostKey_(std::move(o.hostKey)), manualLeft_(o.intent == LoginIntent::UserConnect) {
         wipe(o.password);
         mode_ = knownMode(hostKey_);
     }
@@ -1022,15 +1032,24 @@ private:
 
         uint8_t resp[kResumeResponseBytes]{};
         if (!randomBytes(resp, kNonceBytes)) { rep.outcome = Outcome::Network; return rep; }
-        // r4: only a reconnect within this attempt names the session; the
-        // first AUTH of an attempt from the launch screen never does. r14:
-        // the control channel's reconnect sends the "auto" flag instead
-        // (kAutoMarker), never its old id; the others name the session.
+        // r4: clipboard, file and ping name the control session once there
+        // is one. r14/r15: the control channel never names an old id; it
+        // sends the "auto" flag (kAutoMarker) on every AUTH except the one
+        // manual AUTH a user's Connect allows (manualLeft_), spent here as
+        // soon as it is sent, whatever the answer (a lost AUTH_OK too).
         size_t respBytes = kResponseBytes;
+        bool manual = false;
         {
             std::lock_guard<std::mutex> g(m_);
-            if (resumeId_) {
-                std::memcpy(resp + kResponseBytes, ch == Channel::Control ? kAutoMarker : resumeId_->data(), kSessionIdBytes);
+            if (ch == Channel::Control) {
+                manual = manualLeft_;
+                manualLeft_ = false;
+                if (!manual) {
+                    std::memcpy(resp + kResponseBytes, kAutoMarker, kSessionIdBytes);
+                    respBytes = kResumeResponseBytes;
+                }
+            } else if (resumeId_) {
+                std::memcpy(resp + kResponseBytes, resumeId_->data(), kSessionIdBytes);
                 respBytes = kResumeResponseBytes;
             }
         }
@@ -1046,8 +1065,10 @@ private:
         }
         std::memcpy(resp + kNonceBytes, macC->data(), kMacBytes);
         if (!sendAllBytes(s, frame(kTypeResponse, resp, respBytes))) { rep.outcome = Outcome::Network; return rep; }
-        if (respBytes == kResumeResponseBytes)
-            note(std::string(ch == Channel::Control ? "auth.auto_reconnect chan=" : "auth.resume chan=") + channelName(ch));
+        if (ch == Channel::Control)
+            note(std::string("auth.control_login intent=") + (manual ? "manual" : "auto"));
+        else if (respBytes == kResumeResponseBytes)
+            note(std::string("auth.resume chan=") + channelName(ch));
 
         io = rd.next(Clock::now() + std::chrono::milliseconds(kResultTimeoutMs), type, payload);
         if (io != Io::Ok || type != kTypeResult) { rep.outcome = Outcome::Network; return rep; }
@@ -1325,6 +1346,9 @@ private:
     Report terminal_;
     Outcome last_ = Outcome::Network;
     std::string hostKey_;
+    // r15: the one unflagged control AUTH of a user's Connect is still
+    // unsent (under m_).
+    bool manualLeft_ = false;
 };
 
 // MARK: Process-wide hook for the channels

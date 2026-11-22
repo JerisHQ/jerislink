@@ -158,9 +158,12 @@ struct UiClock {
 };
 
 std::shared_ptr<Client> makeClient(std::atomic<int>& terminals, std::atomic<int>& lastOutcome,
-                                   const std::string& hostKey = "") {
+                                   const std::string& hostKey = "",
+                                   LoginIntent intent = LoginIntent::UserConnect) {
     Client::Options o;
     o.hostKey = hostKey;
+    // r15: as the viewer's Connect does; its first control AUTH is manual.
+    o.intent = intent;
     o.password = kPw;
     o.remember = false;
     o.storeDir = L"";
@@ -2473,8 +2476,13 @@ void prcR9OkLostTest() {
         for (int i = 0; i < 300 && control.reconnectStats().connecting; ++i) Sleep(10);
     };
     drive(1);
-    expect(lost1 && named1.empty() && ok1 == 1 && named2.empty() && terminals == 0 && mayConnect(),
-           "prc r9 OK lost: the takeover's AUTH_OK never came (connection closed), the viewer is not halted and its reconnect gets in");
+    // r15 (Pepper's r14 review, item 1): the user's Connect sent the one
+    // manual AUTH (named1 empty); its AUTH_OK was lost, so the retry is the
+    // viewer's own and carries the "auto" flag. No other viewer is connected
+    // here, so the Mac lets it in.
+    const bool retryAuto = named2.size() == kSessionIdBytes && std::equal(named2.begin(), named2.end(), kAutoMarker);
+    expect(lost1 && named1.empty() && ok1 == 1 && retryAuto && terminals == 0 && mayConnect(),
+           "prc r9 OK lost: the takeover's AUTH_OK never came (connection closed), the viewer is not halted and its reconnect (flagged auto) gets in");
     dropNow = true;
     drive(2);
     // r14: the control reconnects carry the "auto" flag (no id); with no
@@ -2499,6 +2507,100 @@ void prcR9OkLostTest() {
 
 void prcR9Tests() {
     prcR9OkLostTest();
+}
+
+// PR-C r15 (Pepper's r14 review, item 1): a user's Connect allows exactly
+// one control AUTH without the "auto" flag. Its AUTH_OK is lost (the Mac
+// took over, the OK never arrived); meanwhile another viewer connects. The
+// viewer's retry carries the flag, so the Mac answers REPLACED and the
+// other viewer keeps the session: the attempt halts (Replaced) and nothing
+// reconnects. A Client not made for a user's Connect (LoginIntent::Auto)
+// never sends an unflagged control AUTH at all.
+void prcR15LostOkTest() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    {
+        Listener l;
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+
+        const SessionId other{9, 9, 9, 9, 9, 9, 9, 9};
+        bool lost = false;
+        std::atomic<int> retry{-1};
+        Bytes named1, named2;
+        std::atomic<bool> hostDone{false};
+        std::thread host([&] {
+            SOCKET s1 = l.accept(5000);
+            if (s1 != INVALID_SOCKET) {
+                lost = hostAuthOkLost(s1, sec, named1);
+                // Another viewer connects now and holds the session (other).
+                SOCKET s2 = l.accept(8000);
+                if (s2 != INVALID_SOCKET) {
+                    retry = hostAuthSession(s2, sec, other, &other, named2);
+                    Sleep(200);
+                    closesocket(s2);
+                }
+            }
+            hostDone = true;
+        });
+        for (int i = 0; i < 1000 && !hostDone && terminals == 0; ++i) {
+            control.pollHostNotice();
+            control.keepSession();
+            Sleep(10);
+        }
+        for (int i = 0; i < 300 && terminals == 0; ++i) {
+            control.pollHostNotice();
+            control.keepSession();
+            Sleep(10);
+        }
+        host.join();
+        const bool flagged = named2.size() == kSessionIdBytes && std::equal(named2.begin(), named2.end(), kAutoMarker);
+        expect(lost && named1.empty() && flagged && retry == 2,
+               "prc r15 lost OK: the Connect's one manual AUTH lost its OK; the retry after another viewer connected is flagged auto and gets REPLACED (no takeover)");
+        expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect() && !control.keepSession() &&
+                   l.accept(500) == INVALID_SOCKET,
+               "prc r15 lost OK: the attempt halts (Replaced) and nothing reconnects on its own");
+        control.stop();
+        setCurrent(nullptr);
+    }
+    {
+        Listener l;
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome, "", LoginIntent::Auto);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        const SessionId mine{1, 2, 3, 4, 5, 6, 7, 8};
+        std::atomic<int> got{-1};
+        Bytes named;
+        std::thread host([&] {
+            SOCKET s = l.accept(5000);
+            if (s != INVALID_SOCKET) {
+                got = hostAuthSession(s, sec, mine, nullptr, named);
+                Sleep(200);
+                closesocket(s);
+            }
+        });
+        for (int i = 0; i < 500 && got < 0; ++i) {
+            control.keepSession();
+            Sleep(10);
+        }
+        host.join();
+        const bool flagged = named.size() == kSessionIdBytes && std::equal(named.begin(), named.end(), kAutoMarker);
+        expect(got == 1 && flagged,
+               "prc r15 intent: a Client not made for a user's Connect sends its first control AUTH flagged auto");
+        control.stop();
+        setCurrent(nullptr);
+    }
 }
 
 // PR-C r14 (Pepper's r13 review, item 4): the automatic retries of a
@@ -2613,6 +2715,7 @@ int main() {
     prcR5Tests();
     prcR9Tests();
     prcR14RetryCapTests();
+    prcR15LostOkTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

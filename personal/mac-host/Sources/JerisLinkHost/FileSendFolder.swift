@@ -31,6 +31,7 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     private let gate: FileOpenGate
     private let fallbackOpener: FileOpenGate.Opener
     private let openFolder: @Sendable (URL) -> Void
+    private let onMain: Hop
     private let lock = NSLock()
     private var byTransfer: [UInt32: URL] = [:]
     private var order: [UInt32] = []
@@ -57,18 +58,35 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
         return (fd, fd >= 0 ? 0 : errno)
     }
 
+    /// Runs a piece of work on the main actor, later.
+    typealias Hop = @Sendable (@escaping @Sendable () -> Void) -> Void
+
+    /// r15 (Pepper's r14 review, item 2): the hop onto the main actor is
+    /// the only place that waits, so the epoch is asked inside it, right
+    /// before `openFolder`. A takeover between queueing and the main actor
+    /// running the work opens nothing.
+    static let mainHop: Hop = { work in
+        Task { @MainActor in work() }
+    }
+
+    /// Tests: runs the work at once, on the caller's thread.
+    static let inline: Hop = { work in work() }
+
+    /// Runs inside `mainHop`, so already on the main actor.
     static let finderOpen: @Sendable (URL) -> Void = { url in
-        Task { @MainActor in _ = NSWorkspace.shared.open(url) }
+        MainActor.assumeIsolated { _ = NSWorkspace.shared.open(url) }
     }
 
     init(primary: URL = FileSendFolder.defaultPrimary, fallback: URL = FileSendFolder.defaultFallback,
          primaryOpener: @escaping FileOpenGate.Opener = FileSendFolder.folderOpener,
          fallbackOpener: @escaping FileOpenGate.Opener = FileSendFolder.folderOpener,
+         onMain: @escaping Hop = FileSendFolder.mainHop,
          openFolder: @escaping @Sendable (URL) -> Void = FileSendFolder.finderOpen) {
         self.primary = primary
         self.fallback = fallback
         self.gate = FileOpenGate(opener: primaryOpener)
         self.fallbackOpener = fallbackOpener
+        self.onMain = onMain
         self.openFolder = openFolder
     }
 
@@ -117,17 +135,21 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
 
     /// A send finished into `folder`: remember it for REVEAL and open it.
     /// r14: Finder opens only while `live` (the session's epoch) holds.
-    func completed(transfer: UInt32, folder: URL, live: () -> Bool = { true }) {
+    /// r15: asked on the main actor, right before Finder opens.
+    func completed(transfer: UInt32, folder: URL, live: @escaping @Sendable () -> Bool = { true }) {
         lock.lock()
         if byTransfer.updateValue(folder, forKey: transfer) == nil { order.append(transfer) }
         while order.count > Self.remembered { byTransfer.removeValue(forKey: order.removeFirst()) }
         last = folder
         lock.unlock()
-        guard live() else {
-            print("file.open_folder=void transfer=\(transfer) reason=replaced")
-            return
+        let openFolder = self.openFolder
+        onMain {
+            guard live() else {
+                print("file.open_folder=void transfer=\(transfer) reason=replaced")
+                return
+            }
+            openFolder(folder)
         }
-        openFolder(folder)
     }
 
     /// REVEAL: opens the folder `transfer` went to. An id this process does
@@ -136,7 +158,8 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
     /// on a privacy prompt. `done` (tests) hears whether a folder opened.
     /// r14 (Pepper's r13 review, item 1): `live` (the session's epoch) is
     /// asked again on that thread, right before Finder opens: a takeover
-    /// meanwhile opens nothing.
+    /// meanwhile opens nothing. r15: and again on the main actor, inside
+    /// the work that opens Finder; `done` is answered from there.
     func reveal(transfer: UInt32, live: @escaping @Sendable () -> Bool = { true },
                 done: (@Sendable (Bool) -> Void)? = nil) {
         lock.lock()
@@ -144,27 +167,36 @@ final class FileSendFolder: @unchecked Sendable {  // mutable state behind `lock
         let recent = last
         lock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            // Not `done?(revealNow(...))`: optional chaining would skip the
-            // reveal itself when no callback is given.
-            let opened = revealNow(transfer: transfer, known: known, recent: recent, live: live)
-            done?(opened)
+            revealNow(transfer: transfer, known: known, recent: recent, live: live, done: done)
         }
     }
 
-    private func revealNow(transfer: UInt32, known: URL?, recent: URL?, live: () -> Bool) -> Bool {
+    private func revealNow(transfer: UInt32, known: URL?, recent: URL?, live: @escaping @Sendable () -> Bool,
+                           done: (@Sendable (Bool) -> Void)?) {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         let candidates = [known, recent, primary, fallback].compactMap { $0 }
         guard let folder = candidates.first(where: { fm.fileExists(atPath: $0.path, isDirectory: &isDir) && isDir.boolValue }) else {
             print("file.reveal=none transfer=\(transfer)")
-            return false
+            done?(false)
+            return
         }
         guard live() else {
             print("file.reveal=void transfer=\(transfer) reason=replaced")
-            return false
+            done?(false)
+            return
         }
-        print("file.reveal=\(known != nil ? "ok" : "unknown") transfer=\(transfer)")
-        openFolder(folder)
-        return true
+        let openFolder = self.openFolder
+        let how = known != nil ? "ok" : "unknown"
+        onMain {
+            guard live() else {
+                print("file.reveal=void transfer=\(transfer) reason=replaced stage=main")
+                done?(false)
+                return
+            }
+            print("file.reveal=\(how) transfer=\(transfer)")
+            openFolder(folder)
+            done?(true)
+        }
     }
 }
