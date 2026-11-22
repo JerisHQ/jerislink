@@ -19,11 +19,19 @@ name: msstore-publish
 # - Runs in the `store` environment, so its secrets are only released after the
 #   environment's reviewers approve. The environment's deployment policy must
 #   allow the tag ref (refs/tags/v*) for the release trigger to get past it.
+# - Before uploading, the job asks Partner Center whether the app already has a
+#   pending submission and stops if it does. `msstore publish` would otherwise
+#   delete that draft (when a published submission exists) to make room for the
+#   new one. There is no override: resolve the draft in Partner Center and re-run.
 # - `msstore publish --noCommit` keeps the submission in draft state: nothing
 #   goes to certification or the Store until someone presses "Submit" in
 #   Partner Center by hand.
 # - Secrets reach msstore only through step env vars in the sign-in step; they
 #   are never echoed, written to disk by this workflow, or put in the repo.
+# - The Store CLI version is pinned (STORE_CLI_VERSION). The publish command
+#   line and the credential cleanup are written for that version; see
+#   .github/scripts/MsStoreRunner.psm1. msstore-publish-check.yml runs the same
+#   steps without secrets on every change to these files.
 
 on:
   release:
@@ -47,6 +55,7 @@ env:
   STORE_PRODUCT_ID: 9NM3VWQ9MD7N
   EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
   EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
+  STORE_CLI_VERSION: v0.4.4
 
 jobs:
   publish-draft:
@@ -61,6 +70,11 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
       - name: Find the msix run for this commit and check the commit is in main
         id: src
         env:
@@ -111,29 +125,15 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ steps.src.outputs.version }}
         run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'store'
-          $upload = @(Get-ChildItem $dir -Filter *.msixupload)
-          if ($upload.Count -ne 1) { throw "expected exactly one .msixupload, found $($upload.Count)" }
-          $work = Join-Path $env:RUNNER_TEMP 'inspect'
-          New-Item -ItemType Directory $work | Out-Null
-          Copy-Item $upload[0].FullName (Join-Path $work 'upload.zip')
-          Expand-Archive (Join-Path $work 'upload.zip') (Join-Path $work 'upload')
-          $msix = @(Get-ChildItem (Join-Path $work 'upload') -Filter *.msix)
-          if ($msix.Count -ne 1) { throw "expected one .msix inside the .msixupload" }
-          Copy-Item $msix[0].FullName (Join-Path $work 'pkg.zip')
-          Expand-Archive (Join-Path $work 'pkg.zip') (Join-Path $work 'pkg')
-          [xml]$m = Get-Content (Join-Path $work 'pkg\AppxManifest.xml')
-          $id = $m.Package.Identity
-          Write-Host "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version)"
-          if ($id.Name -ne $env:EXPECTED_IDENTITY_NAME) { throw "unexpected Identity Name" }
-          if ($id.Publisher -ne $env:EXPECTED_PUBLISHER) { throw "unexpected Identity Publisher" }
-          if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw "Store versions must end in .0" }
-          if ($env:EXPECTED_VERSION -and $id.Version -ne $env:EXPECTED_VERSION) { throw "package version $($id.Version) does not match the release ($env:EXPECTED_VERSION)" }
-          (Get-FileHash $upload[0].FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $upload[0].Name | Write-Host
-          "file=$($upload[0].FullName)" >> $env:GITHUB_OUTPUT
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          $file = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
+          "file=$file" >> $env:GITHUB_OUTPUT
 
       - name: Set up Microsoft Store Developer CLI
         uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+        with:
+          version: ${{ env.STORE_CLI_VERSION }}
 
       - name: Sign in to Partner Center (Entra app client credentials)
         env:
@@ -148,11 +148,21 @@ jobs:
           msstore reconfigure --tenantId $env:PC_TENANT_ID --sellerId $env:PC_SELLER_ID --clientId $env:PC_CLIENT_ID --clientSecret $env:PC_CLIENT_SECRET
           if ($LASTEXITCODE -ne 0) { throw "msstore reconfigure failed ($LASTEXITCODE)" }
 
+      - name: Stop if Partner Center already has a pending submission
+        run: |
+          # msstore publish deletes an existing pending submission before it creates
+          # a new draft (see .github/scripts/MsStoreRunner.psm1). Never let it.
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID
+
       - name: Upload to Partner Center as a draft submission (no commit, no Store release)
         env:
           PKG_FILE: ${{ steps.pkg.outputs.file }}
         run: |
-          msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit
+          # The .msixupload file itself is the pathOrUrl argument; the CLI has no
+          # --inputFile option (see .github/scripts/MsStoreRunner.psm1).
+          if (-not (Test-Path -LiteralPath $env:PKG_FILE -PathType Leaf)) { throw "package file missing: $env:PKG_FILE" }
+          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit
           if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
           Write-Host "Draft submission updated. Review and press Submit in Partner Center to send it to certification."
 
@@ -160,4 +170,8 @@ jobs:
         if: always()
         timeout-minutes: 2
         run: |
-          if (Get-Command msstore -ErrorAction SilentlyContinue) { msstore reconfigure --reset; exit 0 }
+          # Not `msstore reconfigure --reset`: it asks y/n and crashes without a
+          # console. This removes the same credential and files, then checks they
+          # are gone and fails the step if not.
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Clear-MsStoreCliState

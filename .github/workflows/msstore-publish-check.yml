@@ -1,0 +1,202 @@
+name: msstore-publish-check
+
+# Dry run of msstore-publish.yml without Partner Center: no `store` environment,
+# no secrets, no network to Microsoft. It takes the jerislink-msix-store artifact
+# of the newest successful `msix` push run on main (or the given run), and with
+# the same pinned Store CLI:
+# - runs the exact `msstore publish` command line of msstore-publish.yml against
+#   that .msixupload, with a dummy CLI configuration and HTTP(S)_PROXY pointed at
+#   a dead loopback port. Passing means the CLI accepted the arguments, read the
+#   stored credential and picked its MSIX publisher for the file, then its token
+#   request failed at the loopback proxy.
+# - checks the pending-submission guard: Test-NoPendingSubmission against sample
+#   `msstore apps get` JSON (with and without a pending draft), and
+#   Assert-NoPendingSubmission against the dead proxy, which must fail closed.
+# - checks that the v0.3.0 command line and `msstore reconfigure --reset` still
+#   fail the way they did (so the fix is for the real cause).
+# - runs Clear-MsStoreCliState and checks the dummy credential, the CLI folder and
+#   the MSStore.API token cache folder (seeded with a stand-in cache) are gone.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/msstore-publish.yml
+      - .github/workflows/msstore-publish-check.yml
+      - .github/scripts/MsStoreRunner.psm1
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/msstore-publish.yml
+      - .github/workflows/msstore-publish-check.yml
+      - .github/scripts/MsStoreRunner.psm1
+  workflow_dispatch:
+    inputs:
+      msix_run_id:
+        description: 'Run id of a successful "msix" push run (default: newest on main)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  STORE_PRODUCT_ID: 9NM3VWQ9MD7N
+  EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
+  EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
+
+jobs:
+  dry-run:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Read the pinned CLI version and publish command from msstore-publish.yml
+        id: cfg
+        run: |
+          $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
+          if ($wf -notmatch '(?m)^\s+STORE_CLI_VERSION:\s*(v\d+\.\d+\.\d+)\s*$') { throw "STORE_CLI_VERSION not pinned in msstore-publish.yml" }
+          $ver = $Matches[1]
+          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit'
+          if (-not $wf.Contains($cmd)) { throw "msstore-publish.yml does not run: $cmd" }
+          $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
+          if ($code -match "--inputFile|reconfigure --reset") { throw "msstore-publish.yml still runs --inputFile or reconfigure --reset" }
+          $guard = $wf.IndexOf('Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID')
+          if ($guard -lt 0 -or $guard -gt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-NoPendingSubmission before msstore publish" }
+          Write-Host "CLI $ver; publish command: $cmd"
+          "cli_version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Find the msix run
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.msix_run_id }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          if ($env:RUN_ID) {
+            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
+            $run = gh api "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+            if ($run.name -ne 'msix' -or $run.event -ne 'push' -or $run.conclusion -ne 'success') { throw "not a successful msix push run" }
+          } else {
+            $run = @((gh api "repos/$repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1" | ConvertFrom-Json).workflow_runs)[0]
+            if (-not $run) { throw "no successful msix push run on main" }
+          }
+          $sha = $run.head_sha
+          $v = gh api "repos/$repo/contents/VERSION?ref=$sha" --jq .content
+          $version = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v -join '')).Split("`n")[0].Trim()) + '.0'
+          Write-Host "msix run $($run.id): event=$($run.event) ref=$($run.head_branch) sha=$sha -> expected package version $version"
+          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Download the Store package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jerislink-msix-store
+          run-id: ${{ steps.src.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/store
+
+      - name: Check the package identity and version
+        id: pkg
+        env:
+          EXPECTED_VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'store') | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          $file = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
+          Write-Host "PKG_FILE=$file"
+          "file=$file" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Microsoft Store Developer CLI
+        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+        with:
+          version: ${{ steps.cfg.outputs.cli_version }}
+
+      - name: Dry run of the publish command (dummy config, dead proxy)
+        timeout-minutes: 8
+        env:
+          PKG_FILE: ${{ steps.pkg.outputs.file }}
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: ''
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Set-MsStoreCliDummyState -DevCenterServiceUrl 'https://127.0.0.1:9/' | Out-Null
+          if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "dummy credential was not written" }
+
+          function Invoke-Cli([scriptblock]$b) { $ErrorActionPreference = "Continue"; $out = (& $b 2>&1 | Out-String); [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out } }
+
+          # 1. The fixed command, exactly as msstore-publish.yml runs it.
+          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
+          Write-Host "--- fixed command, exit $($r.Code) ---`n$($r.Out)"
+          if ($r.Out -match 'Unrecognized command or argument') { throw "CLI rejected the arguments" }
+          if ($r.Out -match 'could not find a project publisher') { throw "CLI found no publisher for the package file" }
+          if ($r.Out -match 'could not find credentials') { throw "CLI did not find the stored credential" }
+          # PublishCommand.Handler finds the publisher first and returns early with the
+          # message above if there is none; only then does CreatePackagedAsync fetch a
+          # token. Failing there shows every earlier step passed, and that this token
+          # request went to the loopback proxy and failed there. It says nothing about
+          # other traffic.
+          if ($r.Out -notmatch 'PublishCommand\.Handler' -or $r.Out -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "CLI did not reach the token request inside publish" }
+          if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "CLI did not fail on the dead proxy" }
+          if ($r.Code -eq 0) { throw "publish succeeded with a dummy configuration; the dry run is not isolated" }
+
+          # 2. The v0.3.0 command line still fails the same way (run 44259595238).
+          $r = Invoke-Cli { msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
+          Write-Host "--- v0.3.0 command, exit $($r.Code) ---`n$($r.Out)"
+          if ($r.Out -notmatch "Unrecognized command or argument '--inputFile'") { throw "v0.3.0 command did not fail on --inputFile" }
+          if ($r.Code -eq 0) { throw "v0.3.0 command exited 0" }
+
+          # 3. `reconfigure --reset` still cannot run here, and leaves the credential behind.
+          $r = Invoke-Cli { msstore reconfigure --reset }
+          Write-Host "--- reconfigure --reset, exit $($r.Code) ---`n$($r.Out)"
+          if ($r.Out -notmatch 'non-interactive mode') { throw "reconfigure --reset no longer fails in CI; recheck the cleanup" }
+          if ($r.Code -eq 0) { throw "reconfigure --reset exited 0" }
+          if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "expected reconfigure --reset to leave the credential in place" }
+
+          # 4. Pending-submission guard, parsing: sample `msstore apps get` output.
+          $app = '{"Id":"' + $env:STORE_PRODUCT_ID + '","PrimaryName":"JerisLink","LastPublishedApplicationSubmission":{"Id":"1152921505000000001","ResourceLocation":"x"},"PendingApplicationSubmission":'
+          function Expect-Stop([string]$json, [string]$pattern, [string]$what) {
+            try { Test-NoPendingSubmission -AppJson $json -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP: $what" }
+            catch { if ("$_" -like 'GUARD-DID-NOT-STOP*' -or "$_" -notmatch $pattern) { throw "guard, $what : $_" }; Write-Host "guard stopped ($what): $_" }
+          }
+          Expect-Stop ($app + '{"Id":"1152921505000000002","ResourceLocation":"y"}}') 'already has a pending submission 1152921505000000002' 'pending draft present'
+          Expect-Stop ("Retrieving Application`n" + $app + '{"Id":"1152921505000000002"}}') 'already has a pending submission' 'pending draft after status text'
+          Expect-Stop '{"Id":"9NOTTHISAPP0","PendingApplicationSubmission":null}' 'different or empty application id' 'wrong app'
+          Expect-Stop ('{"Id":"' + $env:STORE_PRODUCT_ID + '"}') 'no PendingApplicationSubmission field' 'field missing'
+          Expect-Stop 'Error while retrieving Application.' 'no application JSON' 'no JSON'
+          Test-NoPendingSubmission -AppJson ($app + 'null}') -ProductId $env:STORE_PRODUCT_ID
+
+          # 5. Pending-submission guard, live CLI: `msstore apps get` cannot reach
+          #    Partner Center here, so the guard must stop the run, not let it through.
+          try { Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP" }
+          catch { if ("$_" -notmatch 'msstore apps get failed \(exit -?[1-9]') { throw "guard on CLI failure: $_" }; Write-Host "guard stopped (CLI failed): $_" }
+
+          # Every assertion above passed. Steps 2 and 3 are expected CLI failures and
+          # leave $LASTEXITCODE at 1; the pwsh step wrapper ends with
+          # `exit $LASTEXITCODE`, which would fail this step after a passing check.
+          Write-Host "dry run: all assertions passed"
+          exit 0
+
+      - name: Forget the credentials (the cleanup msstore-publish.yml runs)
+        if: always()
+        timeout-minutes: 2
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          $apiCache = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API\Cache\msstore_msal_cache.txt'
+          if (-not (Test-Path -LiteralPath $apiCache)) { throw "the seeded MSStore.API token cache is missing before cleanup" }
+          Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') -Recurse -File | ForEach-Object { Write-Host "before cleanup: $($_.FullName) ($($_.Length) bytes)" }
+          Clear-MsStoreCliState
+          if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API')) { throw "MSStore.API still exists after cleanup" }
+          Write-Host "after cleanup: $(Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') does not exist"
+          # Second run on a clean runner must also pass.
+          Clear-MsStoreCliState
