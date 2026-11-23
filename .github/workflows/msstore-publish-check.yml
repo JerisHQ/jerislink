@@ -2,29 +2,23 @@ name: msstore-publish-check
 
 # Dry run of msstore-publish.yml without Partner Center: no `store` environment,
 # no secrets, no network to Microsoft. It takes the jerislink-msix-store artifact
-# of the newest successful `msix` push run on main (or the given run), and with
-# the same pinned Store CLI:
-# - runs the exact `msstore publish` command line of msstore-publish.yml against
-#   that .msixupload, with a dummy CLI configuration and HTTP(S)_PROXY pointed at
-#   a dead loopback port. Passing means the CLI accepted the arguments, read the
-#   stored credential and picked its MSIX publisher for the file, then its token
-#   request failed at the loopback proxy.
-# - checks the order of the publish job in msstore-publish.yml: pending guard,
-#   `msstore publish --noCommit` (draft), Assert-DraftReadyToCommit, then
-#   Invoke-SubmissionCommit, then Assert-SubmissionHasPackage on the same
-#   submission id; and that the package is printed from an `inspect` job outside
-#   the `store` environment, so the approver sees it before approving `publish`.
-# - runs `msstore submission publish` (the commit) against the dead proxy, so a
-#   CLI that no longer accepts it fails here, not after approval.
-# - checks the pending-submission guard: Test-NoPendingSubmission against sample
-#   `msstore apps get` JSON (with and without a pending draft), and
-#   Assert-NoPendingSubmission against the dead proxy, which must fail closed.
-# - checks that the v0.3.0 command line and `msstore reconfigure --reset` still
-#   fail the way they did (so the fix is for the real cause).
-# - runs Clear-MsStoreCliState and checks the dummy credential, the CLI folder and
-#   the MSStore.API token cache folder (seeded with a stand-in cache) are gone.
-# The `pester` job runs .github/scripts/tests (draft check before commit,
-# submission read-back, run submission id).
+# of the newest successful `msix` push run on main (or the given run) and:
+# - checks the publish job in msstore-publish.yml: no Store CLI; sign-in, then
+#   Publish-StoreSubmission, then the read-back (Assert-SubmissionHasPackage) on
+#   the submission id the publish step returned; default API and sign-in hosts;
+#   and that the package is printed from an `inspect` job outside the `store`
+#   environment (and without secrets), so the approver sees it before approving.
+# - runs that flow with the real package over real HTTP against a stand-in for
+#   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1):
+#   the calls and their order, every call after create on the created id, the
+#   uploaded zip (only the package, same SHA-256), no DELETE, the read-back, a
+#   pending submission stopping the run before create, and no token, secret or
+#   SAS URL in the output.
+# - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
+# The stand-in only models what the module relies on; the real service's JSON
+# shapes, status changes and upload are not verified here.
+# The `pester` job runs .github/scripts/tests (the same flow with a mocked HTTP
+# layer, the draft check, the read-back, masking, pricing and delete-by-id).
 
 on:
   pull_request:
@@ -58,8 +52,7 @@ env:
 
 jobs:
   pester:
-    # Unit tests for the draft check, the commit guard and the submission
-    # read-back, with a mocked CLI: .github/scripts/tests.
+    # Unit tests: .github/scripts/tests.
     runs-on: windows-latest
     timeout-minutes: 10
     defaults:
@@ -99,43 +92,35 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github
 
-      - name: Read the pinned CLI version and publish command from msstore-publish.yml
-        id: cfg
+      - name: Check the publish job in msstore-publish.yml
         run: |
           $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
-          if ($wf -notmatch '(?m)^\s+STORE_CLI_VERSION:\s*(v\d+\.\d+\.\d+)\s*$') { throw "STORE_CLI_VERSION not pinned in msstore-publish.yml" }
-          $ver = $Matches[1]
-          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit --uploadTimeout 600'
-          if (-not $wf.Contains($cmd)) { throw "msstore-publish.yml does not run: $cmd" }
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
-          if ($code -match "--inputFile|reconfigure --reset") { throw "msstore-publish.yml still runs --inputFile or reconfigure --reset" }
-          $guard = $wf.IndexOf('Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID')
-          if ($guard -lt 0 -or $guard -gt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-NoPendingSubmission before msstore publish" }
-          # The package goes into a draft (--noCommit), the draft is checked, and
-          # only then committed through the API; the read-back checks the same id.
-          if (([regex]::Matches($code, 'msstore publish \$env:')).Count -ne 1) { throw "msstore-publish.yml must run msstore publish exactly once" }
+          if ($code -match '(?m)^\s*msstore\s|microsoft-store-apppublisher|STORE_CLI_VERSION') { throw "msstore-publish.yml still uses the Store CLI" }
+          if ($code -match '-ApiBase|-AuthorityHost') { throw "msstore-publish.yml must use the default Store API and sign-in hosts" }
+          $connect = 'Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET'
           $steps = @(
-            'Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID',
-            $cmd,
-            'Assert-DraftReadyToCommit -ProductId $env:STORE_PRODUCT_ID -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION',
-            'Invoke-SubmissionCommit -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID',
+            $connect,
+            'Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION',
+            $connect,
             'Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION'
           )
           $at = -1
           foreach ($st in $steps) {
-            $i = $code.IndexOf($st)
-            if ($i -lt 0) { throw "msstore-publish.yml does not run: $st" }
-            if ($i -le $at) { throw "msstore-publish.yml runs out of order: $st" }
+            $i = $code.IndexOf($st, $at + 1)
+            if ($i -lt 0) { throw "msstore-publish.yml does not run (in this order): $st" }
             $at = $i
           }
-          if ($code -notmatch 'SUBMISSION_ID: \$\{\{ steps\.draft\.outputs\.submission_id \}\}') { throw "commit/read-back do not use the submission id of the checked draft" }
+          if (([regex]::Matches($code, 'Publish-StoreSubmission ')).Count -ne 1) { throw "msstore-publish.yml must run Publish-StoreSubmission exactly once" }
+          if ($code -notmatch 'SUBMISSION_ID: \$\{\{ steps\.submit\.outputs\.submission_id \}\}') { throw "the read-back does not use the submission id the publish step returned" }
+          if ($code -notmatch 'PKG_NAME: \$\{\{ needs\.inspect\.outputs\.file_name \}\}') { throw "the publish step does not check the file name inspect showed" }
           # The approver must see the package before approving: the job that
-          # prints it must not be in the store environment.
-          if ($wf -notmatch '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*?Package to publish after approval') { throw "inspect job does not print the package before approval" }
-          if ($wf -match '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*?^\s+environment:') { throw "inspect job must not use an environment" }
+          # prints it must not be in the store environment or see its secrets.
+          $inspect = [regex]::Match($wf, '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*').Value
+          if ($inspect -notmatch 'Package to publish after approval') { throw "inspect job does not print the package before approval" }
+          if ($inspect -match '(?m)^\s+environment:' -or $inspect -match 'secrets\.') { throw "inspect job must not use an environment or secrets" }
           if ($wf -notmatch '(?ms)^  publish:\s*\n(?:(?!^  \S).)*?^\s+needs: inspect\s*$(?:(?!^  \S).)*?^\s+environment: store\s*$') { throw "publish job must need inspect and run in the store environment" }
-          Write-Host "CLI $ver; publish command: $cmd"
-          "cli_version=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "msstore-publish.yml: publish job order and package gate OK"
 
       - name: Find the msix run
         id: src
@@ -180,104 +165,83 @@ jobs:
           if ($p.FileName -ne (Split-Path -Leaf $p.Path) -or $p.Sha256 -notmatch '^[0-9a-f]{64}$') { throw "Get-StorePackage returned unexpected FileName/Sha256" }
           Write-Host "PKG_FILE=$($p.Path) Version=$($p.Version) SHA256=$($p.Sha256)"
           "file=$($p.Path)" >> $env:GITHUB_OUTPUT
+          "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
+          "sha256=$($p.Sha256)" >> $env:GITHUB_OUTPUT
 
-      - name: Set up Microsoft Store Developer CLI
-        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
-        with:
-          version: ${{ steps.cfg.outputs.cli_version }}
-
-      - name: Dry run of the publish command (dummy config, dead proxy)
+      - name: Dry run of the publish flow against a local stand-in for the Store API
         timeout-minutes: 8
         env:
           PKG_FILE: ${{ steps.pkg.outputs.file }}
-          HTTP_PROXY: http://127.0.0.1:9
-          HTTPS_PROXY: http://127.0.0.1:9
-          ALL_PROXY: http://127.0.0.1:9
-          NO_PROXY: ''
+          PKG_NAME: ${{ steps.pkg.outputs.file_name }}
+          PKG_SHA256: ${{ steps.pkg.outputs.sha256 }}
+          EXPECTED_VERSION: ${{ steps.src.outputs.version }}
         run: |
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          Set-MsStoreCliDummyState -DevCenterServiceUrl 'https://127.0.0.1:9/' | Out-Null
-          if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "dummy credential was not written" }
-
-          function Invoke-Cli([scriptblock]$b) { $ErrorActionPreference = "Continue"; $out = (& $b 2>&1 | Out-String); [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out } }
-
-          # 1. The draft upload command, exactly as msstore-publish.yml runs it.
-          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit --uploadTimeout 600 }
-          Write-Host "--- fixed command, exit $($r.Code) ---`n$($r.Out)"
-          if ($r.Out -match 'Unrecognized command or argument') { throw "CLI rejected the arguments" }
-          if ($r.Out -match 'could not find a project publisher') { throw "CLI found no publisher for the package file" }
-          if ($r.Out -match 'could not find credentials') { throw "CLI did not find the stored credential" }
-          # PublishCommand.Handler finds the publisher first and returns early with the
-          # message above if there is none; only then does CreatePackagedAsync fetch a
-          # token. Failing there shows every earlier step passed, and that this token
-          # request went to the loopback proxy and failed there. It says nothing about
-          # other traffic.
-          if ($r.Out -notmatch 'PublishCommand\.Handler' -or $r.Out -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "CLI did not reach the token request inside publish" }
-          if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "CLI did not fail on the dead proxy" }
-          if ($r.Code -eq 0) { throw "publish succeeded with a dummy configuration; the dry run is not isolated" }
-
-          # 1b. The commit command Invoke-SubmissionCommit runs: the CLI must accept
-          #     it and fail only on the token request at the dead proxy. Unlike
-          #     `msstore publish`, its handler catches the exception and prints
-          #     only "Error!"; the exception goes to the logger, which shows
-          #     nothing below Critical unless --verbose is given (run 45137066741).
-          $r = Invoke-Cli { msstore submission publish $env:STORE_PRODUCT_ID --verbose }
-          Write-Host "--- submission publish, exit $($r.Code) ---`n$($r.Out)"
-          if ($r.Out -match 'Unrecognized command or argument|Required argument missing') { throw "CLI rejected submission publish" }
-          # The logger writes through Spectre.Console, which wraps long lines at the
-          # console width, so match with all whitespace removed.
-          $flat = $r.Out -replace '\s', ''
-          if ($flat -notmatch 'Errorwhilepublishingsubmission' -or $flat -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "submission publish did not reach the token request" }
-          if ($flat -notmatch 'Couldnotretrieveaccesstoken' -or $flat -notmatch '127\.0\.0\.1:9') { throw "submission publish did not fail on the dead proxy" }
-          if ($r.Code -eq 0) { throw "submission publish succeeded with a dummy configuration; the dry run is not isolated" }
-
-          # 2. The v0.3.0 command line still fails the same way (run 44259595238).
-          $r = Invoke-Cli { msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
-          Write-Host "--- v0.3.0 command, exit $($r.Code) ---`n$($r.Out)"
-          if ($r.Out -notmatch "Unrecognized command or argument '--inputFile'") { throw "v0.3.0 command did not fail on --inputFile" }
-          if ($r.Code -eq 0) { throw "v0.3.0 command exited 0" }
-
-          # 3. `reconfigure --reset` still cannot run here, and leaves the credential behind.
-          $r = Invoke-Cli { msstore reconfigure --reset }
-          Write-Host "--- reconfigure --reset, exit $($r.Code) ---`n$($r.Out)"
-          if ($r.Out -notmatch 'non-interactive mode') { throw "reconfigure --reset no longer fails in CI; recheck the cleanup" }
-          if ($r.Code -eq 0) { throw "reconfigure --reset exited 0" }
-          if (@(Get-MsStoreCliCredentialTargets).Count -ne 1) { throw "expected reconfigure --reset to leave the credential in place" }
-
-          # 4. Pending-submission guard, parsing: sample `msstore apps get` output.
-          $app = '{"Id":"' + $env:STORE_PRODUCT_ID + '","PrimaryName":"JerisLink","LastPublishedApplicationSubmission":{"Id":"1152921505000000001","ResourceLocation":"x"},"PendingApplicationSubmission":'
-          function Expect-Stop([string]$json, [string]$pattern, [string]$what) {
-            try { Test-NoPendingSubmission -AppJson $json -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP: $what" }
-            catch { if ("$_" -like 'GUARD-DID-NOT-STOP*' -or "$_" -notmatch $pattern) { throw "guard, $what : $_" }; Write-Host "guard stopped ($what): $_" }
+          Import-Module ./.github/scripts/tests/FakeStoreApi.psm1
+          $secret = 'dry-run-secret-' + [guid]::NewGuid().ToString('N')
+          # Runs a command, shows what it printed, returns value, text and error.
+          function Invoke-Shown([scriptblock]$b) {
+            $printed = [Collections.Generic.List[string]]::new(); $value = @(); $err = ''
+            try {
+              $value = @(& $b 6>&1 | ForEach-Object {
+                if ($_ -is [Management.Automation.InformationRecord]) { $printed.Add([string]$_.MessageData); Write-Host "  | $($_.MessageData)" } else { $_ } })
+            } catch { $err = "$_"; Write-Host "  ! $err" }
+            [pscustomobject]@{ Value = $value; Text = (($printed -join "`n") + "`n" + $err); Err = $err }
           }
-          Expect-Stop ($app + '{"Id":"1152921505000000002","ResourceLocation":"y"}}') 'already has a pending submission 1152921505000000002' 'pending draft present'
-          Expect-Stop ("Retrieving Application`n" + $app + '{"Id":"1152921505000000002"}}') 'already has a pending submission' 'pending draft after status text'
-          Expect-Stop '{"Id":"9NOTTHISAPP0","PendingApplicationSubmission":null}' 'different or empty application id' 'wrong app'
-          Expect-Stop ('{"Id":"' + $env:STORE_PRODUCT_ID + '"}') 'no PendingApplicationSubmission field' 'field missing'
-          Expect-Stop 'Error while retrieving Application.' 'no application JSON' 'no JSON'
-          Test-NoPendingSubmission -AppJson ($app + 'null}') -ProductId $env:STORE_PRODUCT_ID
+          function Assert-NoLeak([string]$text, $store) {
+            foreach ($bad in @($secret, $store.Token, 'FAKE+SAS', 'FAKE%2BSAS', 'SIGNATURE-0123456789', '/blob/')) {
+              if ($text.Contains($bad)) { throw "output contains a secret, token or SAS URL part" }
+            }
+          }
+          $app = $env:STORE_PRODUCT_ID
+          $base = "/v1.0/my/applications/$app"
 
-          # 5. Pending-submission guard, live CLI: `msstore apps get` cannot reach
-          #    Partner Center here, so the guard must stop the run, not let it through.
-          try { Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID; throw "GUARD-DID-NOT-STOP" }
-          catch { if ("$_" -notmatch 'msstore apps get failed \(exit -?[1-9]') { throw "guard on CLI failure: $_" }; Write-Host "guard stopped (CLI failed): $_" }
+          # 1. The whole flow with the real package, over HTTP.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url }
+            if ($r.Err) { throw "sign-in to the stand-in failed" }
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            if ($r.Err) { throw "publish flow failed against the stand-in" }
+            Assert-NoLeak $r.Text $s
+            $id = $s.NewId
+            if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
+            $want = @("POST /tenant-dry-run/oauth2/v2.0/token", "GET $base", "POST $base/submissions", "GET $base", "GET $base/submissions/$id",
+                      "PUT $base/submissions/$id", "PUT /blob/upload.zip", "GET $base/submissions/$id", "POST $base/submissions/$id/commit")
+            $got = @($s.Log)
+            Write-Host "calls:`n  $($got -join "`n  ")"
+            if (($got -join "`n") -cne ($want -join "`n")) { throw "the calls differ from the expected flow" }
+            if ($s.BlobHeaders['x-ms-blob-type'] -cne 'BlockBlob' -or $s.BlobHeaders['Content-Type'] -cne 'application/zip') { throw "upload headers are wrong" }
+            $z = @(Get-FakeUploadedZip $s)
+            if ($z.Count -ne 1 -or $z[0].Name -cne $env:PKG_NAME) { throw "the uploaded zip must hold only $env:PKG_NAME at its root" }
+            $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$z[0].Bytes)).ToLower()
+            if ($sha -ne $env:PKG_SHA256) { throw "the uploaded package differs from the checked one" }
+            Write-Host "uploaded zip: $($z[0].Name) SHA256=$sha (same as the checked package)"
+            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 0 -IntervalSeconds 0 }
+            if ($r.Err) { throw "read-back failed against the stand-in" }
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
 
-          # Every assertion above passed. Steps 2 and 3 are expected CLI failures and
-          # leave $LASTEXITCODE at 1; the pwsh step wrapper ends with
-          # `exit $LASTEXITCODE`, which would fail this step after a passing check.
+          # 2. A pending submission the run did not create: stop before create, delete nothing.
+          $s = New-FakeStore -AppId $app -PendingId '1152921505000000007'
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url } | Out-Null
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            if ($r.Err -notmatch "already has a pending submission 1152921505000000007" -or $r.Err -notmatch "DELETE $([regex]::Escape($base))/submissions/1152921505000000007 ") { throw "pending submission did not stop the run with delete-by-id guidance" }
+            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base") { throw "calls after the pending check: $(@($s.Log) -join ', ')" }
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+
+          # 3. Dead port: sign-in and the pending check fail closed, masked.
+          $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost 'http://127.0.0.1:9' }
+          if ($r.Err -notmatch '^could not get a Partner Center access token: ' -or $r.Text.Contains($secret)) { throw "sign-in on a dead port did not fail closed and masked" }
+          $s = New-FakeStore -AppId $app
+          $url = Start-FakeStoreServer -Store $s
+          try { Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase 'http://127.0.0.1:9' } | Out-Null }
+          finally { Stop-FakeStoreServer -Store $s }
+          $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+          if ($r.Err -notmatch "Store API GET /v1\.0/my/applications/$app failed: .*cannot check for a pending submission; not publishing") { throw "pending check on a dead port did not fail closed" }
+          Assert-NoLeak $r.Text $s
           Write-Host "dry run: all assertions passed"
-          exit 0
-
-      - name: Forget the credentials (the cleanup msstore-publish.yml runs)
-        if: always()
-        timeout-minutes: 2
-        run: |
-          Import-Module ./.github/scripts/MsStoreRunner.psm1
-          $apiCache = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API\Cache\msstore_msal_cache.txt'
-          if (-not (Test-Path -LiteralPath $apiCache)) { throw "the seeded MSStore.API token cache is missing before cleanup" }
-          Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') -Recurse -File | ForEach-Object { Write-Host "before cleanup: $($_.FullName) ($($_.Length) bytes)" }
-          Clear-MsStoreCliState
-          if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API')) { throw "MSStore.API still exists after cleanup" }
-          Write-Host "after cleanup: $(Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API') does not exist"
-          # Second run on a clean runner must also pass.
-          Clear-MsStoreCliState
