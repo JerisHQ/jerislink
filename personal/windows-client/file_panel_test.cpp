@@ -75,9 +75,9 @@ void cards() {
     expect(st[0].muted, "card 2: not set up is grey");
     st = sendToRows(SendToSetup::StoreMenu);
     expectEq(st[0].text,
-             "Right-click files \xE2\x80\xBA Send to JerisLink, or drag them onto this window. "
-             "They go to Downloads/JerisLink on the Mac.",
-             "card 2: Store build has its own Explorer command");
+             "If you see Send to JerisLink in the right-click menu, choose it; otherwise drag "
+             "files onto this window. They go to Downloads/JerisLink on the Mac.",
+             "card 2: Store build: menu if Explorer shows it, else drag");
     expect(!st[0].muted && st.size() == 1, "card 2: Store menu line is not grey");
     st = sendToRows(SendToSetup::StoreMenu, true);
     expect(st.size() == 2 && !st[1].muted, "card 2: Store menu build shows the Mac line");

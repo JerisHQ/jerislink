@@ -91,8 +91,8 @@ inline std::vector<CardRow> sendToRows(SendToSetup setup, bool macPush = false) 
         break;
     case SendToSetup::StoreMenu:
         rows.push_back({pcToMac(),
-                        "Right-click files \xE2\x80\xBA Send to JerisLink, or drag them onto this window. "
-                        "They go to Downloads/JerisLink on the Mac.",
+                        "If you see Send to JerisLink in the right-click menu, choose it; otherwise drag "
+                        "files onto this window. They go to Downloads/JerisLink on the Mac.",
                         false});
         break;
     case SendToSetup::StorePackage:
