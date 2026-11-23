@@ -217,11 +217,18 @@ jobs:
           if ($r.Code -eq 0) { throw "publish succeeded with a dummy configuration; the dry run is not isolated" }
 
           # 1b. The commit command Invoke-SubmissionCommit runs: the CLI must accept
-          #     it and fail only on the token request at the dead proxy.
-          $r = Invoke-Cli { msstore submission publish $env:STORE_PRODUCT_ID }
+          #     it and fail only on the token request at the dead proxy. Unlike
+          #     `msstore publish`, its handler catches the exception and prints
+          #     only "Error!"; the exception goes to the logger, which shows
+          #     nothing below Critical unless --verbose is given (run 45137066741).
+          $r = Invoke-Cli { msstore submission publish $env:STORE_PRODUCT_ID --verbose }
           Write-Host "--- submission publish, exit $($r.Code) ---`n$($r.Out)"
           if ($r.Out -match 'Unrecognized command or argument|Required argument missing') { throw "CLI rejected submission publish" }
-          if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "submission publish did not fail on the dead proxy" }
+          # The logger writes through Spectre.Console, which wraps long lines at the
+          # console width, so match with all whitespace removed.
+          $flat = $r.Out -replace '\s', ''
+          if ($flat -notmatch 'Errorwhilepublishingsubmission' -or $flat -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "submission publish did not reach the token request" }
+          if ($flat -notmatch 'Couldnotretrieveaccesstoken' -or $flat -notmatch '127\.0\.0\.1:9') { throw "submission publish did not fail on the dead proxy" }
           if ($r.Code -eq 0) { throw "submission publish succeeded with a dummy configuration; the dry run is not isolated" }
 
           # 2. The v0.3.0 command line still fails the same way (run 44259595238).
