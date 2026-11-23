@@ -6,11 +6,11 @@ The Microsoft Store (MSIX) viewer gets "Send to JerisLink" in the Explorer right
 
 Windows viewer, Microsoft Store (MSIX) build:
 
-- Right-click files or folders in Explorer and pick "Send to JerisLink" (Windows 11: in the first menu, no Show more options). They go to `Downloads/JerisLink` on the Mac, the same as dragging them onto the viewer. Tested on Windows 11. Windows 10 1809 or later meets Microsoft's manifest requirements, but the menu has not been verified on Windows 10; where the entry does not appear, drag files onto the viewer instead.
+- Right-click files or folders in Explorer and pick "Send to JerisLink" (Windows 11: in the first menu, no Show more options). They go to `~/Downloads/JerisLink` on the Mac by default, the same as dragging them onto the viewer; when access to Downloads is refused, the Mac uses `~/JerisLink Received` instead. Tested on Windows 11. The package needs Windows 10 1809 or later, but the menu has not been tested on Windows 10 yet. If the viewer is installed but the right-click entry does not appear, drag files onto the viewer instead.
 - The command is an `IExplorerCommand` shell extension (`JerisLinkSendTo.dll`, served by the package's COM surrogate). It only starts `Jerislink.exe --send-to <paths>` and returns, so Explorer never waits on a transfer; the viewer sends through its existing named pipe and dialogs.
 - A selection too long for one command line shows the "too many items" dialog. The entry is hidden for a selection that is not all on disk, and an item without a file system path makes the run refuse the whole request.
-- With both the installer and the Store version open, each one's entry sends to its own viewer. The installer's Send to > JerisLink entry is unchanged.
-- The Files panel hint for the Store build points at the right-click command (on Windows older than 10 1809: drag files instead).
+- Each menu entry hands off only to its own build: the Store entry to the Store viewer, the installer's Send to > JerisLink entry (unchanged) to the installer viewer. That viewer must already be connected to the Mac; otherwise it says JerisLink is not connected and nothing is sent.
+- The Files panel hint for the Store build points at the right-click command.
 
 CI (GitHub `msix` and `windows` workflows):
 
