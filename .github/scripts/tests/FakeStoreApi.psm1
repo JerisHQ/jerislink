@@ -78,11 +78,11 @@ function ConvertTo-FakeNode([string]$Json) {
 # LoseResponse ('Create' or 'Commit'): that request gets no answer, either
 # After the service carried it out or Before; LoseAsStatus 0 means no
 # response at all (the mocked Invoke-StoreHttp throws), another value is the
-# status sent instead (e.g. 504). LoseWhen Delayed (Commit only): the commit
-# is still being processed; the next CommitDelayReads GETs of that submission
-# still show PendingCommit, the one after shows CommitStarted, later ones
-# CommitStatus. FailAfterLoss: every API call after a lost answer or a
-# refused create (CreateErrorStatus) gets 503.
+# status sent instead (e.g. 504), with LoseBody as its body. LoseWhen Delayed
+# (Commit only): the commit is still being processed; the next
+# CommitDelayReads GETs of that submission still show PendingCommit, the one
+# after shows CommitStarted, later ones CommitStatus. FailAfterLoss: every API
+# call after a lost answer or a refused create (CreateErrorStatus) gets 503.
 # Redirect ('Token', 'Api' or 'Upload'): those requests get a 302 to
 # /redirected/<kind> on the same host.
 # HangOn: a request that never gets an answer, so the caller waits until its
@@ -117,6 +117,7 @@ function New-FakeStore {
     [ValidateSet('', 'Create', 'Commit')][string]$LoseResponse = '',
     [ValidateSet('After', 'Before', 'Delayed')][string]$LoseWhen = 'After',
     [int]$LoseAsStatus = 0,
+    [string]$LoseBody = 'lost',
     [int]$CommitDelayReads = 1,
     [switch]$FailAfterLoss,
     [ValidateSet('', 'Token', 'Api', 'Upload')][string]$Redirect = '',
@@ -134,7 +135,7 @@ function New-FakeStore {
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
     CreateErrorStatus = $CreateErrorStatus; CreateErrorBody = $CreateErrorBody; CreateQuery = $null
     KeepOldPackage = [bool]$KeepOldPackage; CommitStatus = $CommitStatus; BaseUrl = $BaseUrl; Served = $false
-    DriftOnPut = $DriftOnPut; LoseResponse = $LoseResponse; LoseWhen = $LoseWhen; LoseAsStatus = $LoseAsStatus
+    DriftOnPut = $DriftOnPut; LoseResponse = $LoseResponse; LoseWhen = $LoseWhen; LoseAsStatus = $LoseAsStatus; LoseBody = $LoseBody
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
     CommitDelayReads = $CommitDelayReads; HeldCommit = ''; FinalStatus = ''
     HangOn = $HangOn; CallSeconds = $CallSeconds; UploadSeconds = $UploadSeconds; CommitTried = $false
@@ -229,8 +230,8 @@ function Invoke-FakeStoreRequest {
   }
   if ($lose) {
     $Store.Lost = $true
-    if ($Store.LoseWhen -eq 'Before') { return New-FakeResponse $Store.LoseAsStatus 'lost' }
-    if ($Store.LoseWhen -eq 'Delayed' -and $lose -eq 'Commit') { $Store.HeldCommit = $path; return New-FakeResponse $Store.LoseAsStatus 'lost' }
+    if ($Store.LoseWhen -eq 'Before') { return New-FakeResponse $Store.LoseAsStatus $Store.LoseBody }
+    if ($Store.LoseWhen -eq 'Delayed' -and $lose -eq 'Commit') { $Store.HeldCommit = $path; return New-FakeResponse $Store.LoseAsStatus $Store.LoseBody }
   }
   # A held (delayed) commit: GETs of that submission see PendingCommit until
   # CommitDelayReads have passed, then the commit is processed and the next
@@ -244,7 +245,7 @@ function Invoke-FakeStoreRequest {
     }
   } elseif ($Method -eq 'GET' -and $Store.FinalStatus -and $Store.Sub) { $Store.Sub.status = $Store.FinalStatus; $Store.FinalStatus = '' }
   $r = Invoke-FakeApiRoute -Store $Store -Method $Method -Path $path -Text $text -App $app
-  if ($lose) { return New-FakeResponse $Store.LoseAsStatus 'lost' }
+  if ($lose) { return New-FakeResponse $Store.LoseAsStatus $Store.LoseBody }
   $r
 }
 

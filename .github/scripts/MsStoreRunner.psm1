@@ -149,10 +149,26 @@ function New-StoreError([string]$Message, [switch]$OutcomeUnknown, [switch]$NotS
   $e
 }
 
+# Fixed text printed instead of the diagnostics of a failed call when they
+# cannot be formatted (Get-StoreErrorText, Get-StoreFailureText). Formatting
+# never decides how an error is classified: Invoke-StoreApi decides
+# OutcomeUnknown before it formats anything, and neither function throws
+# (Pepper, PR #74 r2).
+$script:NoDiagnostic = 'diagnostics not shown (they could not be formatted)'
+
 # Text for a failed call that got no HTTP response: a New-StoreError message,
 # or else only the exception type names (and HttpRequestError/SocketErrorCode
 # enum names) of the chain. Exception messages can hold the URL; never printed.
+# Never throws: if formatting fails, the text is "no HTTP response;" and the
+# fixed $script:NoDiagnostic text.
 function Get-StoreFailureText($ErrorRecord) {
+  try {
+    $t = Format-StoreFailureText $ErrorRecord
+    if ($t -is [string] -and $t) { return $t }
+  } catch { }
+  "no HTTP response; $script:NoDiagnostic"
+}
+function Format-StoreFailureText($ErrorRecord) {
   $ex = $ErrorRecord.Exception
   if ($ex.Data.Contains('StoreText')) { return [string]$ex.Data['StoreText'] }
   $names = [System.Collections.Generic.List[string]]::new()
@@ -273,8 +289,11 @@ foreach ($n in @(
     'videoFileName', 'videoFileId', 'trailerAssets', 'imageList')) { $script:StoreTargetNames[$n] = $n }
 
 # The target of a Store API error as this module spells it: a listed field
-# name, or a path of up to 8 of them joined by "." with an optional [index]
-# (applicationPackages[0].fileName). Anything else is "[unlisted target]".
+# name, or a path of up to 8 of them joined by "." with an optional [index] of
+# 1 to 4 ASCII digits (applicationPackages[0].fileName). Anything else is
+# "[unlisted target]". [0-9], not \d: \d also matches the digits of other
+# scripts (Arabic-Indic, fullwidth, ...), which [int] cannot convert (Pepper,
+# PR #74 r2).
 function Get-ListedTarget([AllowNull()][AllowEmptyString()][string]$Target) {
   $no = '[unlisted target]'
   if (-not $Target -or $Target.Length -gt 300) { return $no }
@@ -282,7 +301,7 @@ function Get-ListedTarget([AllowNull()][AllowEmptyString()][string]$Target) {
   if ($segments.Count -gt 8) { return $no }
   $out = [System.Collections.Generic.List[string]]::new()
   foreach ($seg in $segments) {
-    $m = [regex]::Match($seg, '^([A-Za-z]{1,64})(?:\[(\d{1,4})\])?\z')
+    $m = [regex]::Match($seg, '^([A-Za-z]{1,64})(?:\[([0-9]{1,4})\])?\z')
     $name = ''
     if (-not $m.Success -or -not $script:StoreTargetNames.TryGetValue($m.Groups[1].Value, [ref]$name)) { return $no }
     $out.Add($(if ($m.Groups[2].Success) { "$name[$([int]$m.Groups[2].Value)]" } else { $name }))
@@ -327,8 +346,17 @@ $script:StoreUnknownHint = 'no description of this error is known here (the API'
 # upload). With Detail (Store API calls only), also the API's target through
 # Get-ListedTarget (read from the top level of the JSON body or from its error
 # object) and a hint from the tables above. No message text from the body is
-# ever printed.
+# ever printed. Never throws: if formatting fails, the line is the status and
+# the fixed $script:NoDiagnostic text.
 function Get-StoreErrorText {
+  param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body, [switch]$Detail)
+  try {
+    $t = Format-StoreErrorText -StatusCode $StatusCode -Body $Body -Detail:$Detail
+    if ($t -is [string] -and $t) { return $t }
+  } catch { }
+  "HTTP $StatusCode; $script:NoDiagnostic"
+}
+function Format-StoreErrorText {
   param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body, [switch]$Detail)
   $codes = [System.Collections.Generic.List[string]]::new()
   $target = $null
@@ -379,10 +407,11 @@ function Get-JsonField($Object, [string]$Name) {
 # pattern; anything else (a newline, a workflow command, a URL) becomes
 # [invalid]. Empty stays empty. A value that passes still goes through
 # Protect-WorkflowCommand (no pattern here lets ":" or "#" through; that is a
-# second line of defence).
+# second line of defence). Digits are [0-9] only: \d would also pass the
+# digits of other scripts.
 $script:SafeWord = '^[A-Za-z]{1,40}\z'
-$script:SafeId = '^\d{1,20}\z'
-$script:SafeVersion = '^\d{1,5}(\.\d{1,5}){0,3}\z'
+$script:SafeId = '^[0-9]{1,20}\z'
+$script:SafeVersion = '^[0-9]{1,5}(\.[0-9]{1,5}){0,3}\z'
 $script:SafePriceId = '^[A-Za-z][A-Za-z0-9]{0,39}\z'
 $script:SafeFileName = '^[A-Za-z0-9_][A-Za-z0-9_.()+ -]{0,199}\z'
 function Get-SafeValue([AllowNull()][AllowEmptyString()][string]$Value, [string]$Pattern) {
@@ -437,7 +466,9 @@ function Connect-StoreApi {
 # listed target and a hint: Get-StoreErrorText -Detail). OutcomeUnknown is
 # set when no answer came back (except a
 # refusal before sending) or the status is 408 or 5xx: the service may have
-# carried the request out.
+# carried the request out. That is decided before any diagnostic text is
+# formatted, and a failure while reading the NotSent mark counts as sent, so
+# an unconfirmed outcome stays unconfirmed whatever the text turns out to be.
 function Invoke-StoreApi {
   param(
     [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PUT', 'DELETE')][string]$Method,
@@ -451,11 +482,15 @@ function Invoke-StoreApi {
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
   try { $a.TimeoutSec = Get-CallTimeout $TimeoutSec; $r = Invoke-StoreHttp @a }
   catch {
-    $notSent = $_.Exception.Data.Contains('StoreNotSent') -and $_.Exception.Data['StoreNotSent']
-    throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $_)" -OutcomeUnknown:(-not $notSent))
+    $notSent = $false
+    $failure = $_
+    try { $notSent = [bool]($failure.Exception.Data.Contains('StoreNotSent') -and $failure.Exception.Data['StoreNotSent']) } catch { }
+    $unknown = -not $notSent
+    throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $failure)" -OutcomeUnknown:$unknown)
   }
   if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) {
-    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body -Detail)" -OutcomeUnknown:($r.StatusCode -eq 408 -or $r.StatusCode -ge 500))
+    $unknown = $r.StatusCode -eq 408 -or $r.StatusCode -ge 500
+    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body -Detail)" -OutcomeUnknown:$unknown)
   }
   [string]$r.Body
 }

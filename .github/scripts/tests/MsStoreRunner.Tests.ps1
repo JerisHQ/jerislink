@@ -22,6 +22,16 @@ BeforeAll {
   $script:Leak = 'FAKE\+SAS|FAKE%2BSAS|SIGNATURE-0123456789|jlfakeupload|/blob/|dummy-client-secret|fake-access-token'
   # Lines that must never be printed from API strings (workflow commands, line breaks).
   $script:Injected = '::error::|::warning::|::set-output|::add-mask|pwned'
+  # Digits of other scripts (Arabic-Indic, Extended Arabic-Indic, Devanagari,
+  # fullwidth): .NET \d matches them and [int] cannot convert them. None may
+  # be printed.
+  $script:OtherDigits = '[\u0660-\u0669\u06F0-\u06F9\u0966-\u096F\uFF10-\uFF19]'
+  # A Store API error body (code ServiceError) with this target, at the top
+  # level or (Nested) in an error object.
+  function script:New-TargetBody($Target, [switch]$Nested) {
+    $e = @{ code = 'ServiceError'; target = $Target; message = 'Internal error.' }
+    if ($Nested) { @{ error = $e } | ConvertTo-Json -Compress } else { $e | ConvertTo-Json -Compress }
+  }
 
   # Runs a command, returns its pipeline output, everything it printed
   # (Write-Host) and the error text it threw ('' if none).
@@ -982,6 +992,178 @@ Describe 'No answer to create or commit (fake Store)' {
   }
 }
 
+# PR #74 r2: an error target whose index is in the digits of another script
+# (applicationPackages[\u0661]) made Get-ListedTarget throw ([int] cannot convert
+# it) while the error text was formatted, before the error was built. A 5xx,
+# whose result is unconfirmed, then became an ordinary error: a commit went
+# down the "not accepted" path (delete advice, no read-back by id), a create
+# down the "refused" path. Now the index is ASCII digits only, the formatters
+# never throw (fixed text instead), and Invoke-StoreApi decides OutcomeUnknown
+# before it formats anything.
+Describe 'Diagnostics that cannot be formatted never change how an error is classified (PR #74 r2)' {
+  BeforeAll {
+    $script:UnlistedServiceError = 'target: \[unlisted target\]; hint: the service reported an internal error'
+    $script:NoDiag = 'diagnostics not shown \(they could not be formatted\)'
+    # Fails the way [int] fails on such digits.
+    $script:CastFailure = { throw 'Cannot convert value "x" to type "System.Int32". Error: "The input string was not in a correct format."' }
+  }
+
+  It 'Get-ListedTarget prints [unlisted target] for an index in <Case>, and so does Get-StoreErrorText for a 503' -ForEach @(
+    @{ Case = 'an Arabic-Indic digit'; Target = "applicationPackages[$([char]0x0661)]" }
+    @{ Case = 'three Arabic-Indic digits'; Target = "applicationPackages[$([char]0x0660)$([char]0x0661)$([char]0x0662)].fileName" }
+    @{ Case = 'fullwidth digits'; Target = "applicationPackages[$([char]0xFF11)$([char]0xFF12)]" }
+    @{ Case = 'an ASCII digit and a Devanagari digit'; Target = "applicationPackages[1$([char]0x0967)].version" }
+    @{ Case = 'an Extended Arabic-Indic digit, deeper in the path'; Target = "listings.baseListing.images[$([char]0x06F1)].imageType" }
+  ) {
+    Get-ListedTarget $Target | Should -BeExactly '[unlisted target]'
+    foreach ($nested in $false, $true) {
+      Get-StoreErrorText -StatusCode 503 -Body (New-TargetBody $Target -Nested:$nested) -Detail |
+        Should -BeExactly 'HTTP 503 (ServiceError); target: [unlisted target]; hint: the service reported an internal error'
+    }
+  }
+  It 'Get-StoreErrorText prints the status and a fixed text when <Fails> throws' -ForEach @(
+    @{ Fails = 'Get-ListedTarget' }, @{ Fails = 'Protect-WorkflowCommand' }
+  ) {
+    Mock -ModuleName MsStoreRunner -CommandName $Fails -MockWith $CastFailure
+    Get-StoreErrorText -StatusCode 503 -Body (New-TargetBody 'applicationPackages[0]') -Detail |
+      Should -BeExactly 'HTTP 503; diagnostics not shown (they could not be formatted)'
+  }
+  It 'Get-StoreFailureText prints a fixed text for a failure it cannot format' {
+    InModuleScope MsStoreRunner { Get-StoreFailureText ([pscustomobject]@{ NotAnErrorRecord = 1 }) } |
+      Should -BeExactly 'no HTTP response; diagnostics not shown (they could not be formatted)'
+  }
+  It 'Invoke-StoreApi: HTTP <Status> with an Arabic-Indic index in the error target stays <Want>' -ForEach @(
+    @{ Status = 408; Want = 'unconfirmed' }, @{ Status = 500; Want = 'unconfirmed' }, @{ Status = 502; Want = 'unconfirmed' }
+    @{ Status = 503; Want = 'unconfirmed' }, @{ Status = 504; Want = 'unconfirmed' }
+    @{ Status = 400; Want = 'refused' }, @{ Status = 409; Want = 'refused' }
+  ) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus $Status -LoseBody (New-TargetBody "applicationPackages[$([char]0x0661)]"); Use-FakeStore $s
+    $e = InModuleScope MsStoreRunner -Parameters @{ P = "applications/$App/submissions/$NewId/commit" } { param($P) try { Invoke-StoreApi -Method POST -Path $P; $null } catch { $_ } }
+    $e | Should -Not -BeNullOrEmpty
+    InModuleScope MsStoreRunner -Parameters @{ E = $e } { param($E) Test-StoreOutcomeUnknown $E } | Should -Be ($Want -eq 'unconfirmed')
+    "$e" | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: HTTP $Status (ServiceError); target: [unlisted target]; hint: the service reported an internal error") + '\z')
+  }
+  It 'Invoke-StoreApi: <Case> stays unconfirmed when <Fails> throws' -ForEach @(
+    @{ Case = 'HTTP 503'; Lost = 503; Fails = 'Format-StoreErrorText'; Text = 'HTTP 503' }
+    @{ Case = 'HTTP 503'; Lost = 503; Fails = 'Get-ListedTarget'; Text = 'HTTP 503' }
+    @{ Case = 'no response'; Lost = 0; Fails = 'Format-StoreFailureText'; Text = 'no HTTP response' }
+  ) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus $Lost -LoseBody (New-TargetBody 'applicationPackages[0]'); Use-FakeStore $s
+    Mock -ModuleName MsStoreRunner -CommandName $Fails -MockWith $CastFailure
+    $e = InModuleScope MsStoreRunner -Parameters @{ P = "applications/$App/submissions/$NewId/commit" } { param($P) try { Invoke-StoreApi -Method POST -Path $P; $null } catch { $_ } }
+    InModuleScope MsStoreRunner -Parameters @{ E = $e } { param($E) Test-StoreOutcomeUnknown $E } | Should -BeTrue
+    "$e" | Should -BeExactly "Store API POST $Base/submissions/$NewId/commit failed: $Text; diagnostics not shown (they could not be formatted)"
+  }
+  It 'Invoke-StoreApi: a refusal before sending stays not sent when its text cannot be formatted' {
+    $s = New-FakeStore; Use-FakeStore $s
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw (& (Get-Module MsStoreRunner) { New-StoreError 'refused: nothing was sent' -NotSent }) }
+    Mock -ModuleName MsStoreRunner Format-StoreFailureText $CastFailure
+    $e = InModuleScope MsStoreRunner -Parameters @{ P = "applications/$App/submissions/$NewId/commit" } { param($P) try { Invoke-StoreApi -Method POST -Path $P; $null } catch { $_ } }
+    InModuleScope MsStoreRunner -Parameters @{ E = $e } { param($E) Test-StoreOutcomeUnknown $E } | Should -BeFalse
+    "$e" | Should -BeExactly "Store API POST $Base/submissions/$NewId/commit failed: no HTTP response; diagnostics not shown (they could not be formatted)"
+  }
+  It 'a submission id or version in other digits is [invalid], and no request is sent for such an id' {
+    $id = -join ('1152921505000000004'.ToCharArray() | ForEach-Object { [char](0x0660 + [int]"$_") })
+    $ver = -join ('0.4.1.0'.ToCharArray() | ForEach-Object { if ($_ -eq '.') { '.' } else { [char](0xFF10 + [int]"$_") } })
+    $json = @{ Id = $id; Status = 'Certification'; ApplicationPackages = @(@{ FileName = $File; FileStatus = 'Uploaded'; Version = $ver }) } | ConvertTo-Json -Depth 5 -Compress
+    $c = Test-SubmissionHasPackage -SubmissionJson $json -ExpectedVersion '0.4.1.0'
+    $c.Result | Should -Be 'Fail'
+    $c.Id | Should -BeExactly '[invalid]'
+    $c.Packages[0].Version | Should -BeExactly '[invalid]'
+    ($c | ConvertTo-Json -Depth 5) | Should -Not -Match $OtherDigits
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Invoke-SubmissionCommit -ProductId $App -SubmissionId $id }
+    $r.Err | Should -BeExactly "submission id '[invalid]' is not a number"
+    @($s.Calls).Count | Should -Be 0
+  }
+
+  Context 'publish (fake Store)' {
+    BeforeEach { $script:Pkg = New-TestPackage }
+    AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+    It 'create gets HTTP <Lost> (<When> it was carried out), error target <Case>: result unconfirmed, reads the app back, no delete advice' -ForEach @(
+      @{ Case = 'with an Arabic-Indic index'; Lost = 503; When = 'After'; Target = "applicationPackages[$([char]0x0661)]"; Nested = $false }
+      @{ Case = 'with a fullwidth index, in an error object'; Lost = 500; When = 'Before'; Target = "applicationPackages[$([char]0xFF11)$([char]0xFF12)]"; Nested = $true }
+      @{ Case = 'with a Devanagari digit in the index'; Lost = 502; When = 'After'; Target = "applicationPackages[1$([char]0x0967)].version"; Nested = $false }
+      @{ Case = 'with an Extended Arabic-Indic index deeper in the path'; Lost = 504; When = 'Before'; Target = "listings.baseListing.images[$([char]0x06F1)].imageType"; Nested = $false }
+      @{ Case = 'with an unclosed index'; Lost = 503; When = 'Before'; Target = 'applicationPackages[0'; Nested = $false }
+      @{ Case = 'with an empty index, in an error object'; Lost = 500; When = 'After'; Target = 'applicationPackages[]'; Nested = $true }
+      @{ Case = 'that is a number'; Lost = 503; When = 'After'; Target = 42; Nested = $false }
+    ) {
+      $s = New-FakeStore -LoseResponse Create -LoseWhen $When -LoseAsStatus $Lost -LoseBody (New-TargetBody $Target -Nested:$Nested); Use-FakeStore $s
+      $r = Invoke-Publish $Pkg
+      $r.Err | Should -Match ("^Store API POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: HTTP $Lost \(ServiceError\); $UnlistedServiceError\. " +
+        'Result unconfirmed: the create request got no answer')
+      if ($When -eq 'After') {
+        $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
+        $r.Err | Should -Not -Match $RetryAdvice
+      } else {
+        $r.Err | Should -Match 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up'
+      }
+      $r.All | Should -Not -Match "$DeleteAdvice|No submission was created|Cannot convert|$OtherDigits"
+      @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    }
+    It 'commit gets HTTP <Lost>, error target <Case>, commit carried out: reads it back by id, sees it committed, goes on' -ForEach @(
+      @{ Case = 'with an Arabic-Indic index'; Lost = 503; Target = "applicationPackages[$([char]0x0661)]"; Nested = $false }
+      @{ Case = 'with an Extended Arabic-Indic index, in an error object'; Lost = 504; Target = "applicationPackages[$([char]0x06F1)].fileName"; Nested = $true }
+      @{ Case = 'that is a number'; Lost = 500; Target = 42; Nested = $false }
+    ) {
+      $s = New-FakeStore -LoseResponse Commit -LoseWhen After -LoseAsStatus $Lost -LoseBody (New-TargetBody $Target -Nested:$Nested); Use-FakeStore $s
+      $r = Invoke-Publish $Pkg
+      $r.Err | Should -BeNullOrEmpty
+      $r.Value | Should -Be @($NewId)
+      $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
+      $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|Cannot convert|$OtherDigits"
+      @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+    }
+    It 'commit gets HTTP <Lost>, error target <Case>, commit not carried out: unconfirmed after 3 read-backs by id, no delete or retry advice' -ForEach @(
+      @{ Case = 'with a fullwidth index'; Lost = 500; Target = "applicationPackages[$([char]0xFF11)$([char]0xFF12)]"; Nested = $false }
+      @{ Case = 'with a Devanagari digit in the index'; Lost = 502; Target = "applicationPackages[1$([char]0x0967)].version"; Nested = $false }
+      @{ Case = 'with three Arabic-Indic digits, in an error object'; Lost = 503; Target = "applicationPackages[$([char]0x0660)$([char]0x0661)$([char]0x0662)]"; Nested = $true }
+      @{ Case = 'with an unclosed index'; Lost = 504; Target = 'applicationPackages[0'; Nested = $false }
+      @{ Case = 'that is an object'; Lost = 503; Target = @{ name = 'pricing' }; Nested = $false }
+    ) {
+      $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus $Lost -LoseBody (New-TargetBody $Target -Nested:$Nested); Use-FakeStore $s
+      $r = Invoke-Publish $Pkg
+      $r.Out | Should -Match ("::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer " +
+        "\(Store API POST $([regex]::Escape($Base))/submissions/$NewId/commit failed: HTTP $Lost \(ServiceError\); $UnlistedServiceError\)")
+      $r.Err | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer, so it may or may not have been committed\. Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\."
+      $r.Err | Should -Match "A person needs to check GET /v1\.0/my/applications/$App/submissions/$NewId later"
+      $r.Err | Should -Not -Match $RetryAdvice
+      $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|Cannot convert|$OtherDigits"
+      @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+      @($s.Log) | Should -Not -Match '^DELETE '
+    }
+    It '<Step> gets HTTP 503 (<When> it was carried out) and <Fails> throws while its error is formatted: result unconfirmed, read back, no delete advice' -ForEach @(
+      @{ Step = 'Create'; When = 'After'; Fails = 'Get-ListedTarget' }, @{ Step = 'Create'; When = 'After'; Fails = 'Format-StoreErrorText' }
+      @{ Step = 'Commit'; When = 'Before'; Fails = 'Get-ListedTarget' }, @{ Step = 'Commit'; When = 'Before'; Fails = 'Format-StoreErrorText' }
+    ) {
+      $s = New-FakeStore -LoseResponse $Step -LoseWhen $When -LoseAsStatus 503 -LoseBody (New-TargetBody 'applicationPackages[0]'); Use-FakeStore $s
+      Mock -ModuleName MsStoreRunner -CommandName $Fails -MockWith $CastFailure
+      $r = Invoke-Publish $Pkg
+      if ($Step -eq 'Create') {
+        $r.Err | Should -Match ("^Store API POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: HTTP 503; $NoDiag\. " +
+          "Result unconfirmed: the create request got no answer.* a pending submission $NewId exists, origin unconfirmed")
+        @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+      } else {
+        $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $([regex]::Escape($Base))/submissions/$NewId/commit failed: HTTP 503; $NoDiag\)"
+        $r.Err | Should -Match 'Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\.'
+        @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+      }
+      $r.Err | Should -Not -Match $RetryAdvice
+      $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|No submission was created|Cannot convert"
+    }
+    It 'a create response whose id is in other digits: that id is not used, and the run says how to look the draft up' {
+      $s = New-FakeStore; Use-FakeStore $s
+      $s.NewId = -join ('1152921505000000099'.ToCharArray() | ForEach-Object { [char](0x0660 + [int]"$_") })
+      $r = Invoke-Publish $Pkg
+      $r.Err | Should -Match "the create response has no submission id\. A draft may have been created; look it up with GET /v1\.0/my/applications/$App \(pendingApplicationSubmission\.id\)"
+      $r.All | Should -Not -Match "$DeleteAdvice|$OtherDigits"
+      @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions")
+    }
+  }
+}
+
 # Item r5: the publish step has one timeout, and nothing prints once the runner
 # kills it. A fake clock stands in for time: the mocked Invoke-StoreHttp moves
 # it on by what each call takes (or its timeout), Start-Sleep moves it on too.
@@ -1436,6 +1618,32 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r.Err | Should -Match "Read back by id $($reads.Count) time\(s\), 1 s apart \(stopped: the read-back time budget of 4 s is used up\); last: read-back $($reads.Count) of 10 failed \(Store API GET .* failed: no response \("
     $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
     $r.All | Should -Not -Match "$DeleteAdvice|$Leak|$([regex]::Escape($Url))"
+  }
+  # PR #74 r2 over HTTP: a 5xx whose error target has an index in other digits
+  # (sent as JSON \u escapes, so the test does not depend on the charset).
+  It 'commit that gets HTTP 503 with an Arabic-Indic index in the error target: result unconfirmed, read back by id, no delete advice' -ForEach @(
+    @{ Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Before'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceError","target":"applicationPackages[\u0661]","message":"x"}' } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Publish $Pkg
+    $r.Out | Should -Match ("::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $([regex]::Escape($Base))/submissions/$NewId/commit " +
+      'failed: HTTP 503 \(ServiceError\); target: \[unlisted target\]; hint: the service reported an internal error\)')
+    $r.Err | Should -Match 'Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\.'
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|Cannot convert|$OtherDigits|$Leak|$([regex]::Escape($Url))"
+    @($Srv.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+  }
+  It 'create that gets HTTP 502 with a fullwidth index in the error target: result unconfirmed, reads the app back, no delete advice' -ForEach @(
+    @{ Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 502; LoseBody = '{"error":{"code":"ServiceError","target":"applicationPackages[\uFF11\uFF12]","message":"x"}}' } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 502 (ServiceError); target: [unlisted target]; " +
+      'hint: the service reported an internal error. Result unconfirmed: the create request got no answer'))
+    $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match "$DeleteAdvice|No submission was created|Cannot convert|$OtherDigits|$Leak|$([regex]::Escape($Url))"
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "POST $Base/submissions", "GET $Base")
   }
   It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
     $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }
