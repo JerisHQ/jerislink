@@ -26,25 +26,35 @@ name: msstore-publish
 #   policy must allow the tag ref (refs/tags/v*) for the release trigger to get
 #   past it. It re-downloads the same artifact and stops unless the file and its
 #   SHA-256 match what `inspect` showed.
-# - Approving means shipping: `msstore publish` (no --noCommit) commits the
-#   submission through the API. Nobody presses Submit in Partner Center, and
-#   nobody edits the submission this workflow created in the Partner Center UI:
-#   Microsoft only takes in the uploaded package on the API commit, and a
-#   submission changed in the UI can no longer be committed through the API.
-#   (Up to v0.4.1 this workflow used --noCommit; the UI Submit then shipped the
-#   0.3.0.0 package cloned from the live submission, not the uploaded one.)
-# - Whether a certified submission goes live by itself is the submission's
-#   Publish setting in Partner Center (targetPublishMode, cloned from the last
-#   submission). The read-back step prints it and warns if it is not Manual.
-#
-# - Before uploading, the job asks Partner Center whether the app already has a
-#   pending submission and stops if it does. `msstore publish` would otherwise
+# - Approving means shipping. Everything after approval goes through the Store
+#   submission API (msstore), in this order:
+#   1. stop if the app already has a pending submission (Assert-NoPendingSubmission);
+#   2. `msstore publish --noCommit` creates the draft and uploads the package;
+#   3. Assert-DraftReadyToCommit reads that draft back (its id is the one this
+#      run created) and stops without committing unless only the new package
+#      would remain. CLI v0.4.4 marks only the first old package with the same
+#      extension for deletion, so an old package with another extension would
+#      otherwise stay in the committed submission;
+#   4. Invoke-SubmissionCommit commits that same draft (`msstore submission
+#      publish`) after checking it is still the pending submission;
+#   5. Assert-SubmissionHasPackage reads that same submission id back until it
+#      reaches a committed status (Published included) with exactly one
+#      Uploaded package, the release's version, and no other Uploaded package.
+#   A submission this workflow creates is changed, committed or deleted only
+#   through the API, never in the Partner Center UI: Microsoft only takes in
+#   the uploaded package on an API commit, and a submission changed in the UI
+#   can no longer be committed through the API. (Up to v0.4.1 the draft was left
+#   uncommitted and submitted from the UI, which shipped the 0.3.0.0 package
+#   cloned from the live submission.) The only Partner Center action is Publish,
+#   after certification has passed.
+# - Whether a certified submission goes live by itself is its targetPublishMode
+#   (cloned from the last submission). The read-back step prints it and warns
+#   if it is not Manual.
+# - No override for an existing pending submission: `msstore publish` would
 #   delete that draft (when a published submission exists) to make room for the
-#   new one. There is no override: resolve the draft in Partner Center and re-run.
-# - After publish, the job reads the submission back and fails unless it holds
-#   exactly one Uploaded package, with the release's version, and no other
-#   Uploaded package (see Assert-SubmissionHasPackage). It never prints the raw
-#   submission JSON: that holds a SAS upload URL.
+#   new one. If it is in certification, let it finish; if it is an uncommitted
+#   draft, delete it through the API (`msstore submission delete`), then re-run.
+# - No step prints the raw submission JSON: it holds a SAS upload URL.
 # - Secrets reach msstore only through step env vars in the sign-in step; they
 #   are never echoed, written to disk by this workflow, or put in the repo.
 # - The Store CLI version is pinned (STORE_CLI_VERSION). The publish command
@@ -165,7 +175,7 @@ jobs:
             "- Version=``$($p.Version)``"
             "- SHA-256: ``$($p.Sha256)``"
             ''
-            'Approving the `publish` job uploads this package and commits the Store submission (certification, then the Store). Do not press Submit or edit the submission in Partner Center.'
+            'Approving the `publish` job uploads this package and commits the Store submission (certification, then the Store). The submission is changed and committed only through the API: do not press Submit or edit it in Partner Center. The only Partner Center action is Publish, after certification.'
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
           "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
           "version=$($p.Version)" >> $env:GITHUB_OUTPUT
@@ -236,24 +246,45 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID
 
-      - name: Upload and commit the Store submission (the store approval was the human gate)
+      - name: Upload the package into a new draft (not committed yet)
         env:
           PKG_FILE: ${{ steps.pkg.outputs.file }}
         run: |
           # The .msixupload file itself is the pathOrUrl argument; the CLI has no
-          # --inputFile option (see .github/scripts/MsStoreRunner.psm1). No
-          # --noCommit: the CLI commits the submission and polls the commit, and
-          # exits non-zero on CommitFailed. --uploadTimeout is in seconds.
+          # --inputFile option (see .github/scripts/MsStoreRunner.psm1).
+          # --noCommit here only splits create and commit: the next step checks
+          # the draft and the one after commits it through the API.
+          # --uploadTimeout is in seconds.
           if (-not (Test-Path -LiteralPath $env:PKG_FILE -PathType Leaf)) { throw "package file missing: $env:PKG_FILE" }
-          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600
+          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit --uploadTimeout 600
           if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
-          Write-Host "Submission committed through the API. Do not press Submit or edit it in Partner Center."
+
+      - name: Check the draft before commit (only the new package may remain)
+        id: draft
+        env:
+          PKG_NAME: ${{ needs.inspect.outputs.file_name }}
+        run: |
+          # CLI v0.4.4 marks only the first old package with the same extension
+          # for deletion; stop here, uncommitted, if anything else would remain.
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          $id = Assert-DraftReadyToCommit -ProductId $env:STORE_PRODUCT_ID -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION
+          if ($id -notmatch '^\d+$') { throw "draft submission id is not a number" }
+          "submission_id=$id" >> $env:GITHUB_OUTPUT
+
+      - name: Commit the checked draft through the API (the store approval was the human gate)
+        env:
+          SUBMISSION_ID: ${{ steps.draft.outputs.submission_id }}
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Invoke-SubmissionCommit -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID
 
       - name: Read the submission back and fail unless it holds the new package
         timeout-minutes: 35
+        env:
+          SUBMISSION_ID: ${{ steps.draft.outputs.submission_id }}
         run: |
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60
+          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60
 
       - name: Forget the Partner Center credentials on the runner
         if: always()

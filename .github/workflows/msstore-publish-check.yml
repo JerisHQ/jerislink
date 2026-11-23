@@ -9,10 +9,13 @@ name: msstore-publish-check
 #   a dead loopback port. Passing means the CLI accepted the arguments, read the
 #   stored credential and picked its MSIX publisher for the file, then its token
 #   request failed at the loopback proxy.
-# - checks that msstore-publish.yml commits (no --noCommit), reads the
-#   submission back with Assert-SubmissionHasPackage after publish, and prints
-#   the package from an `inspect` job outside the `store` environment, so the
-#   approver sees it before approving `publish`.
+# - checks the order of the publish job in msstore-publish.yml: pending guard,
+#   `msstore publish --noCommit` (draft), Assert-DraftReadyToCommit, then
+#   Invoke-SubmissionCommit, then Assert-SubmissionHasPackage on the same
+#   submission id; and that the package is printed from an `inspect` job outside
+#   the `store` environment, so the approver sees it before approving `publish`.
+# - runs `msstore submission publish` (the commit) against the dead proxy, so a
+#   CLI that no longer accepts it fails here, not after approval.
 # - checks the pending-submission guard: Test-NoPendingSubmission against sample
 #   `msstore apps get` JSON (with and without a pending draft), and
 #   Assert-NoPendingSubmission against the dead proxy, which must fail closed.
@@ -20,7 +23,8 @@ name: msstore-publish-check
 #   fail the way they did (so the fix is for the real cause).
 # - runs Clear-MsStoreCliState and checks the dummy credential, the CLI folder and
 #   the MSStore.API token cache folder (seeded with a stand-in cache) are gone.
-# The `pester` job runs .github/scripts/tests (submission read-back parsing).
+# The `pester` job runs .github/scripts/tests (draft check before commit,
+# submission read-back, run submission id).
 
 on:
   pull_request:
@@ -54,8 +58,8 @@ env:
 
 jobs:
   pester:
-    # Unit tests for the submission read-back (Test-SubmissionHasPackage and
-    # Assert-SubmissionHasPackage with a mocked CLI): .github/scripts/tests.
+    # Unit tests for the draft check, the commit guard and the submission
+    # read-back, with a mocked CLI: .github/scripts/tests.
     runs-on: windows-latest
     timeout-minutes: 10
     defaults:
@@ -101,17 +105,30 @@ jobs:
           $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
           if ($wf -notmatch '(?m)^\s+STORE_CLI_VERSION:\s*(v\d+\.\d+\.\d+)\s*$') { throw "STORE_CLI_VERSION not pinned in msstore-publish.yml" }
           $ver = $Matches[1]
-          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600'
+          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit --uploadTimeout 600'
           if (-not $wf.Contains($cmd)) { throw "msstore-publish.yml does not run: $cmd" }
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
           if ($code -match "--inputFile|reconfigure --reset") { throw "msstore-publish.yml still runs --inputFile or reconfigure --reset" }
           $guard = $wf.IndexOf('Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID')
           if ($guard -lt 0 -or $guard -gt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-NoPendingSubmission before msstore publish" }
-          # The submission must be committed by the API: --noCommit left every
-          # release up to v0.4.1 as an uncommitted draft.
-          if ($code -match "--noCommit|(?<![\w-])-nc(?![\w-])") { throw "msstore-publish.yml still runs msstore publish with --noCommit" }
-          $readBack = $wf.IndexOf('Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -ExpectedVersion $env:EXPECTED_VERSION')
-          if ($readBack -lt 0 -or $readBack -lt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-SubmissionHasPackage after msstore publish" }
+          # The package goes into a draft (--noCommit), the draft is checked, and
+          # only then committed through the API; the read-back checks the same id.
+          if (([regex]::Matches($code, 'msstore publish \$env:')).Count -ne 1) { throw "msstore-publish.yml must run msstore publish exactly once" }
+          $steps = @(
+            'Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID',
+            $cmd,
+            'Assert-DraftReadyToCommit -ProductId $env:STORE_PRODUCT_ID -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION',
+            'Invoke-SubmissionCommit -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID',
+            'Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION'
+          )
+          $at = -1
+          foreach ($st in $steps) {
+            $i = $code.IndexOf($st)
+            if ($i -lt 0) { throw "msstore-publish.yml does not run: $st" }
+            if ($i -le $at) { throw "msstore-publish.yml runs out of order: $st" }
+            $at = $i
+          }
+          if ($code -notmatch 'SUBMISSION_ID: \$\{\{ steps\.draft\.outputs\.submission_id \}\}') { throw "commit/read-back do not use the submission id of the checked draft" }
           # The approver must see the package before approving: the job that
           # prints it must not be in the store environment.
           if ($wf -notmatch '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*?Package to publish after approval') { throw "inspect job does not print the package before approval" }
@@ -184,8 +201,8 @@ jobs:
 
           function Invoke-Cli([scriptblock]$b) { $ErrorActionPreference = "Continue"; $out = (& $b 2>&1 | Out-String); [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out } }
 
-          # 1. The fixed command, exactly as msstore-publish.yml runs it.
-          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600 }
+          # 1. The draft upload command, exactly as msstore-publish.yml runs it.
+          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit --uploadTimeout 600 }
           Write-Host "--- fixed command, exit $($r.Code) ---`n$($r.Out)"
           if ($r.Out -match 'Unrecognized command or argument') { throw "CLI rejected the arguments" }
           if ($r.Out -match 'could not find a project publisher') { throw "CLI found no publisher for the package file" }
@@ -198,6 +215,14 @@ jobs:
           if ($r.Out -notmatch 'PublishCommand\.Handler' -or $r.Out -notmatch 'StoreAPIFactory\.<CreatePackagedAsync>') { throw "CLI did not reach the token request inside publish" }
           if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "CLI did not fail on the dead proxy" }
           if ($r.Code -eq 0) { throw "publish succeeded with a dummy configuration; the dry run is not isolated" }
+
+          # 1b. The commit command Invoke-SubmissionCommit runs: the CLI must accept
+          #     it and fail only on the token request at the dead proxy.
+          $r = Invoke-Cli { msstore submission publish $env:STORE_PRODUCT_ID }
+          Write-Host "--- submission publish, exit $($r.Code) ---`n$($r.Out)"
+          if ($r.Out -match 'Unrecognized command or argument|Required argument missing') { throw "CLI rejected submission publish" }
+          if ($r.Out -notmatch 'Could not retrieve access token' -or $r.Out -notmatch '127\.0\.0\.1:9') { throw "submission publish did not fail on the dead proxy" }
+          if ($r.Code -eq 0) { throw "submission publish succeeded with a dummy configuration; the dry run is not isolated" }
 
           # 2. The v0.3.0 command line still fails the same way (run 44259595238).
           $r = Invoke-Cli { msstore publish (Split-Path $env:PKG_FILE) --inputFile $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
