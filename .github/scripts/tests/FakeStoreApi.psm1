@@ -93,6 +93,12 @@ function ConvertTo-FakeNode([string]$Json) {
 # the upload take, for the mocked Invoke-StoreHttp and its fake clock (the
 # HTTP server ignores them). Calls: what the mocked Invoke-StoreHttp was asked
 # to send, with its timeout.
+# DripOn ('AppRead': every GET of the app; 'AppReadAfterCreate': every GET of
+# the app once a create request came in) with DripSeconds: Start-FakeStoreServer
+# waits DripHeadSeconds, sends the headers and the first byte of that answer,
+# then a space every 250 ms for DripSeconds, then the rest of the body (a
+# server that answers but drips its body). The mocked Invoke-StoreHttp ignores
+# it.
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -124,6 +130,9 @@ function New-FakeStore {
     [ValidateSet('', 'Commit', 'ReadBack')][string]$HangOn = '',
     [ValidateRange(0, 100000)][int]$CallSeconds = 0,
     [ValidateRange(0, 100000)][int]$UploadSeconds = 0,
+    [ValidateSet('', 'AppRead', 'AppReadAfterCreate')][string]$DripOn = '',
+    [ValidateRange(0, 600)][int]$DripSeconds = 0,
+    [ValidateRange(0, 600)][int]$DripHeadSeconds = 0,
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
   $f = ConvertTo-FakeNode $script:FieldsTemplate
@@ -139,6 +148,7 @@ function New-FakeStore {
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
     CommitDelayReads = $CommitDelayReads; HeldCommit = ''; FinalStatus = ''
     HangOn = $HangOn; CallSeconds = $CallSeconds; UploadSeconds = $UploadSeconds; CommitTried = $false
+    DripOn = $DripOn; DripSeconds = $DripSeconds; DripHeadSeconds = $DripHeadSeconds; Dripped = ''
     Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Fields = $f.ToJsonString()
@@ -155,7 +165,7 @@ function Get-FakeSasUrl($Store) {
 
 function New-FakeResponse([int]$StatusCode, $Object, [string]$Location = '') {
   $body = if ($null -eq $Object) { '' } elseif ($Object -is [string]) { $Object } else { $Object | ConvertTo-Json -Depth 20 -Compress }
-  [pscustomobject]@{ StatusCode = $StatusCode; Body = $body; Location = $Location }
+  [pscustomobject]@{ StatusCode = $StatusCode; Body = $body; Location = $Location; DripSeconds = 0 }
 }
 
 # The submission as JSON text: the stored fields plus id, status,
@@ -246,6 +256,8 @@ function Invoke-FakeStoreRequest {
   } elseif ($Method -eq 'GET' -and $Store.FinalStatus -and $Store.Sub) { $Store.Sub.status = $Store.FinalStatus; $Store.FinalStatus = '' }
   $r = Invoke-FakeApiRoute -Store $Store -Method $Method -Path $path -Text $text -App $app
   if ($lose) { return New-FakeResponse $Store.LoseAsStatus $Store.LoseBody }
+  if ($Store.DripOn -and $Method -eq 'GET' -and $path -match "^/v1\.0/my/applications/$app$" -and
+    ($Store.DripOn -eq 'AppRead' -or $null -ne $Store.CreateQuery)) { $r.DripSeconds = $Store.DripSeconds }
   $r
 }
 
@@ -352,7 +364,26 @@ function Start-FakeStoreServer {
         $ctx.Response.StatusCode = if ($r.StatusCode -eq 0) { 504 } else { $r.StatusCode }
         if ($r.Location) { $ctx.Response.RedirectLocation = $r.Location }
         $bytes = [Text.Encoding]::UTF8.GetBytes([string]$r.Body)
-        if ($bytes.Length) { $ctx.Response.ContentType = 'application/json'; $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length) }
+        if ($r.DripSeconds -gt 0 -and $bytes.Length -gt 1) {
+          # The headers and the first byte after DripHeadSeconds, then a space
+          # every 250 ms (JSON allows them), then the rest. Stops when the
+          # client hangs up or the server is stopped.
+          $ctx.Response.ContentType = 'application/json'; $ctx.Response.SendChunked = $true
+          $o = $ctx.Response.OutputStream
+          $sp = [byte[]]@(32)
+          try {
+            if ($Store.DripHeadSeconds -gt 0) { Start-Sleep -Seconds $Store.DripHeadSeconds }
+            $until = [DateTime]::UtcNow.AddSeconds($r.DripSeconds)
+            $o.Write($bytes, 0, 1); $o.Flush()
+            while ([DateTime]::UtcNow -lt $until -and $l.IsListening) { Start-Sleep -Milliseconds 250; $o.Write($sp, 0, 1); $o.Flush() }
+            $o.Write($bytes, 1, $bytes.Length - 1)
+            $Store.Dripped = 'whole body sent'
+          } catch {
+            $Store.Dripped = 'client hung up'
+            $hold = $true; try { $ctx.Response.Abort() } catch { }
+          }
+        }
+        elseif ($bytes.Length) { $ctx.Response.ContentType = 'application/json'; $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length) }
       } catch {
         [void]$Store.Log.Add("SERVER ERROR $_")
         $ctx.Response.StatusCode = 500

@@ -44,8 +44,9 @@
 # Get-SafeValue also go through Protect-WorkflowCommand, so neither "::" nor
 # "##[" workflow command syntax reaches the log. All HTTP goes through
 # Invoke-StoreHttp (the Pester tests mock it): https to the Store hosts only,
-# no redirects, no verbose or debug output. The token lives only in this
-# PowerShell session; nothing is written to disk.
+# no redirects, no verbose or debug output, and one time limit for the whole
+# call (headers and body). The token lives only in this PowerShell session;
+# nothing is written to disk.
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
@@ -195,10 +196,18 @@ function Test-StoreOutcomeUnknown($ErrorRecord) {
 # an HTTP error status (a redirect too) is returned, not thrown; a network
 # failure throws. Refuses, before sending, a Uri that Test-StoreUri does not
 # allow for Kind. No redirects: a redirect could take the token, the secret or
-# the package elsewhere. No progress, verbose or debug output: PowerShell 7.6
-# writes the URL, the headers and the body of a web request (the client
-# secret, the bearer token, the SAS signature) to the debug stream
-# (PowerShell/PowerShell#27695), so both are switched off for the call.
+# the package elsewhere.
+# TimeoutSec is the time limit for the whole call: connecting, sending, the
+# answer's headers and its body. Invoke-WebRequest -TimeoutSec is not that:
+# since PowerShell 7.4 it bounds only the wait for the headers, so a server
+# that answers in time and then drips its body held a call far past it
+# (Pepper, PR #74 r3). So the call goes through HttpClient: one stopwatch for
+# the whole call, every wait bounded by what is left of the limit
+# (Wait-StoreHttpTask), and when the limit is reached the call is cancelled,
+# its connection closed, and the fixed "no response (time limit ...)" error
+# thrown (OutcomeUnknown). HttpClient writes nothing to PowerShell's streams
+# (Invoke-WebRequest in PowerShell 7.6 writes the URL, the headers and the
+# body of a request to the debug stream, PowerShell/PowerShell#27695).
 function Invoke-StoreHttp {
   param(
     [Parameter(Mandatory)][string]$Method,
@@ -213,22 +222,51 @@ function Invoke-StoreHttp {
   if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
     throw (New-StoreError "refused: $Kind requests go only to $($script:UriRule[$Kind]); nothing was sent" -NotSent)
   }
-  $a = @{ Method = $Method; Uri = $Uri; Headers = $Headers; SkipHttpErrorCheck = $true; TimeoutSec = $TimeoutSec; MaximumRedirection = 0 }
-  if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body }
-  if ($ContentType) { $a.ContentType = $ContentType }
-  if ($InFile) { $a.InFile = $InFile }
-  $ProgressPreference = 'SilentlyContinue'
-  # A redirect comes back as the 3xx response plus a non-terminating "maximum
-  # redirection count exceeded" error; the caller reports the 3xx status.
-  # Network failures are terminating errors and still throw.
-  $webErr = $null
-  $r = Invoke-WebRequest @a -Verbose:$false -Debug:$false -ErrorAction SilentlyContinue -ErrorVariable webErr
-  if ($null -eq $r) {
-    if ($webErr) { throw $webErr[0] }
-    throw (New-StoreError "no response (no result)" -OutcomeUnknown)
+  $clock = [System.Diagnostics.Stopwatch]::StartNew()
+  $handler = [System.Net.Http.SocketsHttpHandler]::new()
+  $handler.AllowAutoRedirect = $false
+  $handler.UseCookies = $false
+  $client = [System.Net.Http.HttpClient]::new($handler, $true)
+  # The limit is enforced below; HttpClient's own 100 s default must not cut
+  # a long upload short.
+  $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+  $cts = [System.Threading.CancellationTokenSource]::new()
+  $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method), $Uri)
+  $file = $null; $resp = $null
+  try {
+    # Invoke-WebRequest sent a User-Agent; HttpClient sends none by default.
+    [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'JerisLink-msstore-publish/1.0')
+    foreach ($k in $Headers.Keys) {
+      if (-not $req.Headers.TryAddWithoutValidation([string]$k, [string]$Headers[$k])) { throw (New-StoreError "refused: request header $k cannot be set; nothing was sent" -NotSent) }
+    }
+    if ($InFile) { $file = [System.IO.File]::OpenRead($InFile); $req.Content = [System.Net.Http.StreamContent]::new($file) }
+    elseif ($PSBoundParameters.ContainsKey('Body')) { $req.Content = [System.Net.Http.ByteArrayContent]::new([System.Text.UTF8Encoding]::new($false).GetBytes($Body)) }
+    if ($req.Content -and $ContentType) { $req.Content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType) }
+    $resp = Wait-StoreHttpTask ($client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)) $clock $TimeoutSec $cts
+    $text = Wait-StoreHttpTask ($resp.Content.ReadAsStringAsync($cts.Token)) $clock $TimeoutSec $cts
+    [pscustomobject]@{ StatusCode = [int]$resp.StatusCode; Body = [string]$text }
+  } finally {
+    if ($resp) { $resp.Dispose() }
+    $req.Dispose(); $client.Dispose(); $cts.Dispose()
+    if ($file) { $file.Dispose() }
   }
-  $text = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
-  [pscustomobject]@{ StatusCode = [int]$r.StatusCode; Body = $text }
+}
+
+# Waits for one step of an Invoke-StoreHttp call (Task), at most until TimeoutSec
+# have passed on Clock since the call started. Then it cancels the call (Cts)
+# and throws the fixed "no response (time limit ...)" error, OutcomeUnknown:
+# the service may have received the request. Returns the step's result, or
+# throws the exception the step failed with.
+function Wait-StoreHttpTask($Task, [System.Diagnostics.Stopwatch]$Clock, [int]$TimeoutSec, [System.Threading.CancellationTokenSource]$Cts) {
+  $left = [Math]::Max(0, [Math]::Ceiling($TimeoutSec * 1000 - $Clock.Elapsed.TotalMilliseconds))
+  $done = $false
+  try { $done = $Task.Wait([int]$left) } catch { $done = $Task.IsCompleted }
+  if (-not $done -or $Task.IsCanceled) {
+    $Cts.Cancel()
+    throw (New-StoreError "no response (time limit of $TimeoutSec s for the whole request reached)" -OutcomeUnknown)
+  }
+  if ($Task.IsFaulted) { throw $Task.Exception.InnerException }
+  $Task.Result
 }
 
 # The current UTC time (the tests replace it with a fake clock).
@@ -569,20 +607,25 @@ function Assert-NoPendingSubmission {
 # POST /applications/{productId}/submissions?isMinimalResponse=true (the query
 # the msstore CLI and StoreBroker send). Returns the new submission's id, the
 # only field read from the create response. When the service answered with an
-# error, nothing was created and nothing is deleted; one read-only GET of the
-# app then reports whether a submission is pending (Get-RefusedCreateReadBack).
-# When no answer came back (or HTTP 408/5xx), the result is unconfirmed:
-# Resolve-UnconfirmedCreate reads the app back and reports what it shows.
+# error, nothing was created and nothing is deleted. That error is printed
+# first ("create refused: ..."), so it is in the log whatever happens next;
+# then one read-only GET of the app, within ReadBackTimeoutSec for the whole
+# call, reports whether a submission is pending (Get-RefusedCreateReadBack),
+# and the error is thrown with that report. When no answer came back (or HTTP
+# 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the app
+# back and reports what it shows.
 function New-StoreSubmission {
-  param([Parameter(Mandatory)][string]$ProductId)
+  param([Parameter(Mandatory)][string]$ProductId, [ValidateRange(1, 600)][int]$ReadBackTimeoutSec = 30)
   Assert-ProductId $ProductId
   try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions?isMinimalResponse=true" }
   catch {
     if (Test-StoreOutcomeUnknown $_) { throw (Resolve-UnconfirmedCreate -ProductId $ProductId -Failure "$_") }
-    $failure = "$_"
-    throw ("$failure. No submission was created and none was deleted. HTTP 409 means the app's current state does not " +
-      "allow a new submission, for example because another submission is pending; see the pending-submission check above. " +
-      (Get-RefusedCreateReadBack $ProductId))
+    $refused = "$_. No submission was created and none was deleted."
+    Write-Host "create refused: $refused"
+    $readBack = 'Read-back of the app after the refused create: not done.'
+    try { $readBack = Get-RefusedCreateReadBack $ProductId $ReadBackTimeoutSec } catch { }
+    throw ("$refused HTTP 409 means the app's current state does not allow a new submission, for example because " +
+      "another submission is pending; see the pending-submission check above. $readBack")
   }
   $id = ''
   try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
@@ -595,12 +638,13 @@ function New-StoreSubmission {
 }
 
 # The service answered the create with an error, so nothing was created. For
-# the log only: one read-only GET of the app (waiting at most TimeoutSec, and
-# no longer than the call deadline) and a sentence saying whether a submission
-# is pending, by id only. Changes and deletes nothing and gives no delete
-# advice: the pending check before create found none, so a pending submission
-# now did not come from this run.
-function Get-RefusedCreateReadBack([string]$ProductId, [int]$TimeoutSec = 30) {
+# the log only: one read-only GET of the app (at most TimeoutSec for the whole
+# call, headers and body, and no longer than the call deadline) and a
+# sentence saying whether a submission is pending, by id only. A failure or a
+# timeout of the GET is reported in that sentence, never thrown. Changes and
+# deletes nothing and gives no delete advice: the pending check before create
+# found none, so a pending submission now did not come from this run.
+function Get-RefusedCreateReadBack([string]$ProductId, [int]$TimeoutSec) {
   $h = 'Read-back of the app after the refused create (one GET; nothing changed or deleted):'
   try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId -TimeoutSec $TimeoutSec) -ProductId $ProductId }
   catch { return "$h failed ($_)." }

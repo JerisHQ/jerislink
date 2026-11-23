@@ -50,8 +50,8 @@ BeforeAll {
   # is logged in $Store.Calls with its timeout (and printed as "[http] ..."
   # when $global:FakeTrace is set). A call that takes longer than its timeout
   # (CallSeconds, UploadSeconds; a hung one, status -1, never ends) throws what
-  # HttpClient throws on its timeout; with $global:FakeClock set, the call moves
-  # that clock on by the time it took.
+  # the real Invoke-StoreHttp throws when its time limit is reached; with
+  # $global:FakeClock set, the call moves that clock on by the time it took.
   function script:Use-FakeStore([hashtable]$Store) {
     $global:FakeStore = $Store
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
@@ -68,9 +68,7 @@ BeforeAll {
       $took = if ($r.StatusCode -eq -1) { [int]::MaxValue } elseif ($Kind -eq 'Upload') { $global:FakeStore.UploadSeconds } else { $global:FakeStore.CallSeconds }
       if ($took -gt $wait) {
         if ($null -ne $global:FakeClock) { $global:FakeClock = $global:FakeClock.AddSeconds($wait) }
-        throw [System.Threading.Tasks.TaskCanceledException]::new(
-          "The request was canceled due to the configured HttpClient.Timeout of $wait seconds elapsing ($Uri).",
-          [System.TimeoutException]::new('The operation was canceled.'))
+        throw (& (Get-Module MsStoreRunner) { param($s) New-StoreError "no response (time limit of $s s for the whole request reached)" -OutcomeUnknown } $wait)
       }
       if ($null -ne $global:FakeClock) { $global:FakeClock = $global:FakeClock.AddSeconds($took) }
       if ($r.StatusCode -eq 0) {
@@ -760,6 +758,7 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted. "))
     $r.Err | Should -Match 'Read-back of the app after the refused create \(one GET; nothing changed or deleted\): no pendingApplicationSubmission\.$'
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape("create refused: Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted.") + '$')
     $r.Err | Should -Not -Match $DeleteAdvice
     $r.All | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
     $s.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
@@ -782,8 +781,49 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match 'failed: HTTP 400 \(InvalidParameterValue\); target: \[unlisted target\]; hint: a parameter in the request body is invalid\. No submission was created'
     $r.Err | Should -Match "Read-back of the app after the refused create \(one GET; nothing changed or deleted\): failed \(Store API GET $([regex]::Escape($Base)) failed: HTTP 503 \(ServiceUnavailable\); hint: the service reported that it is unavailable\)\.$"
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape('create refused: Store API POST ' + $Base + '/submissions?isMinimalResponse=true failed: HTTP 400 (InvalidParameterValue); target: [unlisted target]; hint: a parameter in the request body is invalid. No submission was created and none was deleted.') + '$')
     $r.Err | Should -Not -Match $DeleteAdvice
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+
+  It 'create refused and the read-back reaches its time limit: the create error is printed before it, the read-back says so, no advice' {
+    $s = New-FakeStore -CreateErrorStatus 400 -CallSeconds 40; Use-FakeStore $s
+    $s.CreateErrorBody = New-PlantedErrorBody $s.Token
+    $r = Invoke-Publish $Pkg
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted."
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape("create refused: $refused") + '$')
+    $r.Err | Should -Match ('^' + [regex]::Escape("$refused ") + '.*' + [regex]::Escape(
+        "Read-back of the app after the refused create (one GET; nothing changed or deleted): failed (Store API GET $Base failed: no response (time limit of 30 s for the whole request reached)).") + '$')
+    $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($s.Token))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
+    @($s.Calls)[-1] | Should -BeExactly "GET $Base timeout=30"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+
+  It 'create refused: the create error is printed before the read-back starts' {
+    $s = New-FakeStore -CreateErrorStatus 400; Use-FakeStore $s
+    $s.CreateErrorBody = New-PlantedErrorBody $s.Token
+    Mock -ModuleName MsStoreRunner Get-RefusedCreateReadBack { Write-Host 'fake read-back started'; 'Fake read-back sentence.' }
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App }
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted."
+    $lines = @($r.Out -split "`n")
+    $lines.IndexOf("create refused: $refused") | Should -BeGreaterOrEqual 0
+    $lines.IndexOf("create refused: $refused") | Should -BeLessThan $lines.IndexOf('fake read-back started')
+    $r.Err | Should -BeLike "$refused * Fake read-back sentence."
+    Should -Invoke -ModuleName MsStoreRunner Get-RefusedCreateReadBack -Times 1 -Exactly -ParameterFilter { $ProductId -ceq $App -and $TimeoutSec -eq 30 }
+  }
+
+  It 'create refused and the read-back step itself throws: the create error is still printed and thrown unchanged, the throw is not shown' {
+    $s = New-FakeStore -CreateErrorStatus 400; Use-FakeStore $s
+    $s.CreateErrorBody = New-PlantedErrorBody $s.Token
+    Mock -ModuleName MsStoreRunner Get-RefusedCreateReadBack { throw 'fake read-back step broke' }
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App -ReadBackTimeoutSec 7 }
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted."
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape("create refused: $refused") + '$')
+    $r.Err | Should -BeExactly ("$refused HTTP 409 means the app's current state does not allow a new submission, for example because " +
+      "another submission is pending; see the pending-submission check above. Read-back of the app after the refused create: not done.")
+    $r.All | Should -Not -Match "broke|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($s.Token))|$PlantedWords"
+    Should -Invoke -ModuleName MsStoreRunner Get-RefusedCreateReadBack -Times 1 -Exactly -ParameterFilter { $TimeoutSec -eq 7 }
+    @($s.Log) | Should -Be @("POST $Base/submissions")
   }
 
   It 'treats a missing pendingApplicationSubmission field as nothing pending' {
@@ -1203,7 +1243,7 @@ Describe 'Time budget: the commit hand-off prints before the step can time out (
       "printed below, the result is unconfirmed: check GET $EB/submissions/$NewId by hand \(CommitStarted or a later status means it was committed\)")
     $post = Get-LineIndex $lines "^\[http\] POST $EB/submissions/$NewId/commit timeout=60$"
     $warn = Get-LineIndex $lines ("^::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer " +
-      "\(Store API POST $EB/submissions/$NewId/commit failed: no response \(TaskCanceledException <- TimeoutException\)\)\. Reading it back by id " +
+      "\(Store API POST $EB/submissions/$NewId/commit failed: no response \(time limit of 60 s for the whole request reached\)\)\. Reading it back by id " +
       "for up to 300 s\. If this step ends before a result is printed below, check GET $EB/submissions/$NewId by hand")
     $read = Get-LineIndex $lines "^\[http\] GET $EB/submissions/$NewId timeout=30$"
     $pre | Should -BeGreaterOrEqual 0
@@ -1227,7 +1267,7 @@ Describe 'Time budget: the commit hand-off prints before the step can time out (
     ($global:FakeClock - $T0).TotalSeconds | Should -Be $Secs
     $r.Out | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $EB/submissions/$NewId/commit failed: HTTP 504; hint: a gateway in front of the service timed out\)\. Reading it back by id for up to $B s"
     $r.Err | Should -Match ("Read back by id $Reads time\(s\), 30 s apart \(stopped: the read-back time budget of $B s is used up\); last: read-back $Reads of 10 " +
-      "failed \(Store API GET $EB/submissions/$NewId failed: no response \(TaskCanceledException <- TimeoutException\)\)")
+      "failed \(Store API GET $EB/submissions/$NewId failed: no response \(time limit of $T s for the whole request reached\)\)")
     $r.Err | Should -Match "A person needs to check GET $EB/submissions/$NewId later"
     $r.All | Should -Not -Match $DeleteAdvice
     $r.All | Should -Not -Match $RetryAdvice
@@ -1259,7 +1299,7 @@ Describe 'Time budget: the commit hand-off prints before the step can time out (
     $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $T0.AddSeconds(860) }
     @($s.Calls) | Should -Contain 'PUT (upload) timeout=500' -Because '860 s minus the 360 s kept for the commit and its read-backs'
     ($global:FakeClock - $T0).TotalSeconds | Should -Be 500
-    $r.Err | Should -Match "package upload failed: no response \(TaskCanceledException <- TimeoutException\)\. Not committed: draft $NewId stays uncommitted"
+    $r.Err | Should -Match "package upload failed: no response \(time limit of 500 s for the whole request reached\)\. Not committed: draft $NewId stays uncommitted"
     $r.Err | Should -Match $DeleteAdvice
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
   }
@@ -1644,6 +1684,84 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r.Err | Should -Not -Match $RetryAdvice
     $r.All | Should -Not -Match "$DeleteAdvice|No submission was created|Cannot convert|$OtherDigits|$Leak|$([regex]::Escape($Url))"
     @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+  # PR #74 r3 (Pepper): Invoke-WebRequest -TimeoutSec bounds only the wait for
+  # the headers (PowerShell 7.4+); a server that answers in time and then
+  # drips its body held a GET with a 2 s limit for about 4.85 s. The limit now
+  # covers the whole call.
+  It 'total time limit: a GET whose answer drips its body for 15 s gives up at its 2 s limit' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15 } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 2 }
+    $sw.Stop()
+    Write-Host "    GET with a 2 s limit and a 15 s body returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
+    $r.Err | Should -BeExactly 'no response (time limit of 2 s for the whole request reached)'
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 5
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base")
+  }
+  It 'total time limit: one limit for headers and body together (headers after 3 s, then a 15 s body, 4 s limit: gives up at 4 s, not 3 + 4)' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15; DripHeadSeconds = 3 } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 4 }
+    $sw.Stop()
+    Write-Host "    GET with a 4 s limit, headers after 3 s and a 15 s body returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
+    $r.Err | Should -BeExactly 'no response (time limit of 4 s for the whole request reached)'
+    $sw.Elapsed.TotalSeconds | Should -BeGreaterThan 3.5
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 6
+  }
+  It 'total time limit: a GET whose body drips for 1 s, inside its 8 s limit, returns the whole body' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 1 } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 8
+    $r.StatusCode | Should -Be 200
+    ($r.Body | ConvertFrom-Json).id | Should -BeExactly $App
+    $Srv.Dripped | Should -BeExactly 'whole body sent'
+  }
+  It 'total time limit: create refused with HTTP 400, then the app read-back drips its body: the create error prints first, the read-back gives up at its limit, no advice, nothing secret' -ForEach @(
+    @{ Opt = @{ CreateErrorStatus = 400; DripOn = 'AppReadAfterCreate'; DripSeconds = 15 } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $Srv.CreateErrorBody = New-PlantedErrorBody $Srv.Token
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App -ReadBackTimeoutSec 2 }
+    $sw.Stop()
+    Write-Host "    refused create with a dripping read-back (2 s limit, 15 s body) returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted."
+    @($r.Out -split "`n")[0] | Should -BeExactly "create refused: $refused"
+    $r.Err | Should -Match ('^' + [regex]::Escape("$refused ") + '.*' + [regex]::Escape(
+        "Read-back of the app after the refused create (one GET; nothing changed or deleted): failed (Store API GET $Base failed: no response (time limit of 2 s for the whole request reached)).") + '$')
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 6
+    $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "POST $Base/submissions", "GET $Base")
+  }
+  # A failed step must throw the exception it failed with (not the
+  # AggregateException around it), so the printed type chain stays as before.
+  It 'a network failure (nothing listens on the port) throws the HttpRequestException itself; the text is the type chain only' {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
+    $caught = $null
+    try { $null = Invoke-StoreHttp -Method GET -Uri "http://127.0.0.1:$port$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 20 } catch { $caught = $_ }
+    $caught | Should -Not -BeNullOrEmpty
+    $caught.Exception.GetType().FullName | Should -BeExactly 'System.Net.Http.HttpRequestException'
+    $text = & (Get-Module MsStoreRunner) { param($e) Get-StoreFailureText $e } $caught
+    Write-Host "    nothing listening: $text"
+    $text | Should -Match '^no response \(HttpRequestException( [A-Za-z]+)? <- SocketException [A-Za-z]+\)$'
+    @($Srv.Log).Count | Should -Be 1
+  }
+  # Azure Blob Put Blob needs Content-Length (no chunked upload); the bearer
+  # token never goes to the blob host.
+  It 'the package upload carries Content-Length (not chunked), the block-blob headers, a User-Agent and no Authorization header' {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r.Err | Should -BeNullOrEmpty
+    $Srv.Blob.Length | Should -BeGreaterThan 0
+    $Srv.BlobHeaders['Content-Length'] | Should -BeExactly ([string]$Srv.Blob.Length)
+    $Srv.BlobHeaders['Transfer-Encoding'] | Should -BeNullOrEmpty
+    $Srv.BlobHeaders['Expect'] | Should -BeNullOrEmpty
+    $Srv.BlobHeaders['Authorization'] | Should -BeNullOrEmpty
+    $Srv.BlobHeaders['x-ms-blob-type'] | Should -BeExactly 'BlockBlob'
+    $Srv.BlobHeaders['Content-Type'] | Should -BeExactly 'application/zip'
+    $Srv.BlobHeaders['User-Agent'] | Should -BeExactly 'JerisLink-msstore-publish/1.0'
+    @(Get-FakeUploadedZip $Srv)[0].Name | Should -BeExactly $File
   }
   It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
     $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }
