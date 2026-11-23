@@ -42,10 +42,10 @@ Notes
     install, so it asks for the Mac host address on first start.
   - The package adds a Windows Firewall rule for inbound UDP 38402 (video).
   - The normal installer version can stay installed side by side.
-  - "Send to JerisLink" in the Explorer right-click menu is not in this
-    package (or the Store version); it is in the normal installer version
-    only. To send files, drop them on the viewer or its Files panel, or copy
-    and paste them.
+  - Right-click files or folders in Explorer and pick "Send to JerisLink"
+    to send them to Downloads/JerisLink on the Mac (Windows 10 version 1903
+    or later). If the normal installer version is installed too, its
+    Send to > JerisLink entry still works as before.
 
 Remove
   Get-AppxPackage jerisHQ.JerisLink | Remove-AppxPackage

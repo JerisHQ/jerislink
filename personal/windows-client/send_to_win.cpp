@@ -262,11 +262,11 @@ Reply sendItems(const std::wstring& name, const std::vector<std::wstring>& items
     return reply;
 }
 
-int runSendTo(const std::vector<std::wstring>& items) {
-    Reply r = checkItems(items);
+int runSendTo(const Args& args) {
+    Reply r = checkArgs(args);
     if (r == Reply::Started) {
         const std::wstring name = currentPipeName();
-        r = name.empty() ? Reply::Failed : sendItems(name, items);
+        r = name.empty() ? Reply::Failed : sendItems(name, args.items);
     }
     wchar_t quiet[8] = {};
     const bool silent = GetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", quiet, 8) == 1 && quiet[0] == L'1';

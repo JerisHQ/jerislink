@@ -10,7 +10,10 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
-  IgnorableNamespaces="uap rescap desktop2">
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  IgnorableNamespaces="uap rescap desktop2 desktop4 desktop5 com">
 
   <Identity
     Name="jerisHQ.JerisLink"
@@ -42,6 +45,32 @@
         Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
       </uap:VisualElements>
+      <Extensions>
+        <!--
+          Explorer right-click "Send to JerisLink" for files (*) and folders
+          (Directory). Windows 11 shows it in the first-level menu, Windows 10
+          1903+ in the classic menu; older Windows ignores these entries.
+          The Clsid is the IExplorerCommand in JerisLinkSendTo.dll
+          (send_to_shell.cpp, kClsid); it starts Jerislink.exe --send-to.
+        -->
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb Id="SendToJerisLink" Clsid="8C96D31C-0D45-435B-B555-9465096C2E8A" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="SendToJerisLink" Clsid="8C96D31C-0D45-435B-B555-9465096C2E8A" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="JerisLink Send to">
+              <com:Class Id="8C96D31C-0D45-435B-B555-9465096C2E8A" Path="JerisLinkSendTo.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
     </Application>
   </Applications>
 

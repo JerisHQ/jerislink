@@ -1,10 +1,12 @@
 // Windows test for the F5a Send to pipe (send_to_win.cpp): real named pipe,
 // real client. Round trip of paths (non-ASCII, folders), replies passed
 // through, first-instance ownership, this-user-only DACL, corrupt and idle
-// clients, no listener, and the quiet "--send-to" exit code.
+// clients, no listener, the quiet "--send-to" exit code, and the Store
+// Explorer command's command line through the real CommandLineToArgvW.
 #include "send_to_win.hpp"
 
 #include <aclapi.h>
+#include <shellapi.h>
 #include <sddl.h>
 
 #include <atomic>
@@ -180,10 +182,39 @@ void slowViewer() {
 
 void quietExit() {
     SetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", L"1");
-    expect(runSendTo({L"C:\\Windows\\win.ini"}) == exitCode(Reply::NotConnected),
+    expect(runSendTo(parseArgs({L"x.exe", kFlag, L"C:\\Windows\\win.ini"})) == exitCode(Reply::NotConnected),
            "--send-to with no viewer: exit 21, no dialog");
-    expect(runSendTo({}) == exitCode(Reply::NothingSelected), "--send-to with nothing: exit 27");
+    expect(runSendTo(parseArgs({L"x.exe", kFlag})) == exitCode(Reply::NothingSelected), "--send-to with nothing: exit 27");
+    expect(runSendTo(parseArgs({L"x.exe", kTooManyFlag})) == exitCode(Reply::TooMany),
+           "--send-to-too-many: exit 28 without opening the pipe");
     SetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", nullptr);
+}
+
+// The Store build's Explorer command builds its command line with
+// commandLine(); the real CommandLineToArgvW must give every path back
+// exactly (spaces, drive roots ending in a backslash, UNC, non-ASCII).
+void commandLineRoundTrip() {
+    const std::wstring exe = L"C:\\Program Files\\WindowsApps\\jerisHQ.JerisLink_0.3.1.0_x64__1cbzj2979sfxw\\Jerislink.exe";
+    const std::vector<std::wstring> items = {L"C:\\Users\\me\\a b.txt", L"D:\\", L"\\\\nas\\share\\dir\\",
+                                             L"C:\\\x4E2D\x6587\\\x5831\x544A.pdf", L"C:\\x\\\\\\y", L"C:\\ends with space \\"};
+    const std::wstring line = commandLine(exe, items);
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(line.c_str(), &argc);
+    std::vector<std::wstring> got;
+    for (int i = 0; argv && i < argc; ++i) got.emplace_back(argv[i]);
+    if (argv) LocalFree(argv);
+    const Args a = parseArgs(got);
+    expect(got.size() == items.size() + 2 && got[0] == exe, "cmdline: exe path with spaces comes back as argv[0]");
+    expect(a.sendTo && !a.tooMany && a.items == items, "cmdline: every path round trips through CommandLineToArgvW");
+
+    const std::vector<std::wstring> many(800, L"C:\\Users\\someone\\Documents\\a fairly long folder name\\file.bin");
+    const std::wstring tooLong = commandLine(exe, many);
+    argv = CommandLineToArgvW(tooLong.c_str(), &argc);
+    got.clear();
+    for (int i = 0; argv && i < argc; ++i) got.emplace_back(argv[i]);
+    if (argv) LocalFree(argv);
+    expect(tooLong.size() <= kMaxCommandLineChars && parseArgs(got).tooMany,
+           "cmdline: a selection over the CreateProcess limit becomes --send-to-too-many");
 }
 
 }  // namespace
@@ -194,6 +225,7 @@ int main() {
     roundTrip();
     slowViewer();
     quietExit();
+    commandLineRoundTrip();
     std::printf("send to pipe: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

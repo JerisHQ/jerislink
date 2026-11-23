@@ -36,20 +36,25 @@ jobs:
           python msix/gen-assets.py check
       - name: Configure (static CRT for the Store build)
         run: cmake -S . -B build-msix -A x64 -DJERISLINK_STATIC_CRT=ON
-      - name: Build viewer (Release x64)
-        run: cmake --build build-msix --config Release --target Jerislink
-      - name: Check the exe does not need the VC++ runtime DLLs
+      - name: Build viewer and Explorer command DLL (Release x64)
+        run: cmake --build build-msix --config Release --target Jerislink JerisLinkSendTo
+      - name: Check the exe and DLL do not need the VC++ runtime DLLs
         run: |
           $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
             -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
-          $deps = & $dumpbin /nologo /dependents build-msix\Release\Jerislink.exe
-          $deps | Write-Host
-          if ($deps -match '(?i)(vcruntime|msvcp)\d+\.dll|api-ms-win-crt-') { throw 'Jerislink.exe still links the dynamic CRT' }
+          foreach ($bin in 'Jerislink.exe', 'JerisLinkSendTo.dll') {
+            $deps = & $dumpbin /nologo /dependents "build-msix\Release\$bin"
+            $deps | Write-Host
+            if ($deps -match '(?i)(vcruntime|msvcp)\d+\.dll|api-ms-win-crt-') { throw "$bin still links the dynamic CRT" }
+          }
+          $exports = & $dumpbin /nologo /exports build-msix\Release\JerisLinkSendTo.dll
+          $exports | Write-Host
+          foreach ($e in 'DllGetClassObject', 'DllCanUnloadNow') { if (-not ($exports -match "\b$e\b")) { throw "JerisLinkSendTo.dll does not export $e" } }
       - name: Package MSIX + sideload test package
         env:
           MSIX_SIDELOAD_TEST_PFX: ${{ secrets.MSIX_SIDELOAD_TEST_PFX }}
           MSIX_SIDELOAD_TEST_PFX_PASSWORD: ${{ secrets.MSIX_SIDELOAD_TEST_PFX_PASSWORD }}
-        run: ./msix/build-msix.ps1 -ExePath build-msix\Release\Jerislink.exe -OutDir "$env:RUNNER_TEMP\msix" -SideloadTest
+        run: ./msix/build-msix.ps1 -ExePath build-msix\Release\Jerislink.exe -SendToDllPath build-msix\Release\JerisLinkSendTo.dll -OutDir "$env:RUNNER_TEMP\msix" -SideloadTest
       - name: Check the packed icons are the checked v2.0 assets
         run: |
           $work = Join-Path $env:RUNNER_TEMP 'msix-inspect'
@@ -65,6 +70,19 @@ jobs:
           $ve = $m.Package.Applications.Application.VisualElements
           if ($ve.BackgroundColor -ne 'transparent') { throw "BackgroundColor is $($ve.BackgroundColor)" }
           Write-Host "OK: $($got.Count) packed icons match msix/Assets (v2.0), resources.pri present"
+          # Explorer "Send to JerisLink": the DLL is packed next to the exe and the
+          # context menu verbs (files and folders) point at the surrogate class it serves.
+          if ((Get-FileHash "$work\JerisLinkSendTo.dll").Hash -ne (Get-FileHash build-msix\Release\JerisLinkSendTo.dll).Hash) { throw 'packed JerisLinkSendTo.dll differs from the build' }
+          $ns = New-Object Xml.XmlNamespaceManager $m.NameTable
+          $ns.AddNamespace('d5', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/5')
+          $ns.AddNamespace('com', 'http://schemas.microsoft.com/appx/manifest/com/windows10')
+          $verbs = $m.SelectNodes('//d5:ItemType/d5:Verb', $ns)
+          $types = @($m.SelectNodes('//d5:ItemType', $ns) | ForEach-Object Type) -join ','
+          $class = $m.SelectSingleNode('//com:SurrogateServer/com:Class', $ns)
+          if ($types -ne '*,Directory') { throw "context menu item types are '$types'" }
+          if (-not $class -or $class.Path -ne 'JerisLinkSendTo.dll') { throw 'no surrogate class for JerisLinkSendTo.dll' }
+          foreach ($v in $verbs) { if ($v.Clsid -ne $class.Id) { throw "verb $($v.Id) Clsid $($v.Clsid) is not the surrogate class $($class.Id)" } }
+          Write-Host "OK: Send to JerisLink verbs for $types -> $($class.Id) in $($class.Path)"
       - name: Install and remove the sideload test package
         run: |
           $side = Join-Path $env:RUNNER_TEMP 'msix\sideload'
@@ -79,6 +97,9 @@ jobs:
           $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Group -like '*jerisHQ.JerisLink*' -or $_.DisplayName -like '*JerisLink*' }
           $rules | Format-Table DisplayName, Direction, Action, Enabled, Profile -AutoSize | Out-String | Write-Host
           $rules | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue | Format-Table Protocol, LocalPort -AutoSize | Out-String | Write-Host
+          # The installed package serves the Explorer command out of process
+          # (dllhost.exe, packaged COM surrogate), as Explorer will use it.
+          ./msix/check-sendto-command.ps1 -InstallLocation $installed.InstallLocation
           Remove-AppxPackage -Package $installed.PackageFullName
       - name: Windows App Certification Kit (best effort)
         id: wack

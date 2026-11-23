@@ -3,7 +3,10 @@
 // F5a: Explorer > right-click > Send to > JerisLink.
 //
 // The installer puts a JerisLink shortcut in the user's SendTo folder that
-// runs "Jerislink.exe --send-to <paths...>". That short-lived process never
+// runs "Jerislink.exe --send-to <paths...>". The Microsoft Store (MSIX) build
+// has no SendTo shortcut: its Explorer menu command (send_to_shell.cpp, in
+// JerisLinkSendTo.dll) starts the same "--send-to" run instead, built with
+// commandLine() below. That short-lived process never
 // opens a viewer window: it hands the paths over a local named pipe to the
 // running viewer of the same user and logon session, which sends them to the
 // Mac exactly like a drop (purpose=send, ~/Downloads/JerisLink), and prints a
@@ -24,6 +27,9 @@
 namespace jl::sendto {
 
 inline constexpr wchar_t kFlag[] = L"--send-to";
+// The Explorer menu command's selection did not fit on one command line: the
+// run only shows the "too many" dialog.
+inline constexpr wchar_t kTooManyFlag[] = L"--send-to-too-many";
 
 // Limits. Explorer passes Send to items on the command line (about 32k
 // characters), so real requests are far smaller; the pipe enforces these
@@ -31,23 +37,68 @@ inline constexpr wchar_t kFlag[] = L"--send-to";
 inline constexpr size_t kMaxItems = 1000;                    // design D7
 inline constexpr size_t kMaxPathChars = 32767;               // longest Win32 path
 inline constexpr size_t kMaxRequestBytes = 4u * 1024 * 1024;  // whole request
+inline constexpr size_t kMaxCommandLineChars = 32766;         // CreateProcessW, without the NUL
 
 // ---- command line ----
 
 struct Args {
-    bool sendTo = false;              // argv[1] is --send-to
+    bool sendTo = false;              // argv[1] is --send-to or --send-to-too-many
+    bool tooMany = false;             // argv[1] is --send-to-too-many
     std::vector<std::wstring> items;  // what followed it, unchecked
 };
 
 // argv as CommandLineToArgvW returns it (argv[0] is the exe).
 inline Args parseArgs(const std::vector<std::wstring>& argv) {
     Args a;
-    if (argv.size() < 2 || argv[1] != kFlag) return a;
+    if (argv.size() < 2) return a;
+    if (argv[1] == kTooManyFlag) {
+        a.sendTo = a.tooMany = true;
+        return a;
+    }
+    if (argv[1] != kFlag) return a;
     a.sendTo = true;
     for (size_t i = 2; i < argv.size(); ++i) {
         if (!argv[i].empty()) a.items.push_back(argv[i]);
     }
     return a;
+}
+
+// One argument quoted so CommandLineToArgvW gives it back unchanged:
+// backslashes are literal except before a quote, so a run of them before a
+// quote (or before the closing quote, as in "C:\") is doubled.
+inline std::wstring quoteArg(const std::wstring& s) {
+    std::wstring out = L"\"";
+    size_t slashes = 0;
+    for (wchar_t c : s) {
+        if (c == L'\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == L'"') {
+            out.append(slashes * 2 + 1, L'\\');
+        } else {
+            out.append(slashes, L'\\');
+        }
+        slashes = 0;
+        out.push_back(c);
+    }
+    out.append(slashes * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+// The command line the Store build's Explorer command starts:
+// "<exe>" --send-to "<item>"... When it would not fit in CreateProcessW's
+// limit, "<exe>" --send-to-too-many instead, so the user still gets the
+// "too many" dialog rather than a silently cut list.
+inline std::wstring commandLine(const std::wstring& exe, const std::vector<std::wstring>& items) {
+    std::wstring line = quoteArg(exe) + L" " + kFlag;
+    for (const auto& p : items) {
+        line += L" ";
+        line += quoteArg(p);
+        if (line.size() > kMaxCommandLineChars) return quoteArg(exe) + L" " + kTooManyFlag;
+    }
+    return line;
 }
 
 // A full local or UNC path: "C:\..." or "\\server\share\...". Explorer only
@@ -146,6 +197,9 @@ inline Reply checkItems(const std::vector<std::wstring>& items) {
     }
     return Reply::Started;
 }
+
+// The same for a whole "--send-to" / "--send-to-too-many" run.
+inline Reply checkArgs(const Args& a) { return a.tooMany ? Reply::TooMany : checkItems(a.items); }
 
 // ---- pipe bytes ----
 //

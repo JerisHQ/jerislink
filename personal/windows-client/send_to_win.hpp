@@ -60,9 +60,9 @@ private:
 // NotTrusted when the listener is not this user's process in this session.
 Reply sendItems(const std::wstring& name, const std::vector<std::wstring>& items, DWORD timeoutMs = 10000);
 
-// The whole "--send-to" run: checks the items, sends them, shows a dialog
-// when nothing was sent (not with JERISLINK_SENDTO_QUIET=1) and returns the
-// process exit code (exitCode()).
-int runSendTo(const std::vector<std::wstring>& items);
+// The whole "--send-to" run (parseArgs() result): checks the items, sends
+// them, shows a dialog when nothing was sent (not with
+// JERISLINK_SENDTO_QUIET=1) and returns the process exit code (exitCode()).
+int runSendTo(const Args& args);
 
 }  // namespace jl::sendto

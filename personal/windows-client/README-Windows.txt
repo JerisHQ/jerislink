@@ -98,9 +98,12 @@ pick Send to > JerisLink (Windows 11: Show more options first). They go to
 Downloads/JerisLink on the Mac, the same as dragging them onto the viewer.
 At most 1,000 items at a time. Uninstalling JerisLink removes the entry.
 
-Not connected: a dialog says so and nothing is sent. The Microsoft Store
-version and the bare Jerislink.exe have no Send to entry yet: drag files onto
-the viewer instead.
+Not connected: a dialog says so and nothing is sent.
+
+The Microsoft Store version has its own command instead: right-click files or
+folders and pick Send to JerisLink (Windows 11: in the first menu; Windows 10
+version 1903 or later: in the menu directly). Older Windows 10 and the bare
+Jerislink.exe have no Send to entry: drag files onto the viewer instead.
 
 Logs
 ----

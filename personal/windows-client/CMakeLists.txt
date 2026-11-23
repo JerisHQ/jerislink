@@ -81,6 +81,13 @@ if(MSVC)
     target_link_options(JerislinkSetup PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_BINARY_DIR}/setup.manifest")
 endif()
 
+# Microsoft Store (MSIX) build only: Explorer's "Send to JerisLink" command
+# (IExplorerCommand), loaded by the package's COM surrogate. See send_to_shell.cpp
+# and msix/AppxManifest.xml.in. The installer build uses a SendTo shortcut instead.
+add_library(JerisLinkSendTo SHARED send_to_shell.cpp send_to_shell.def)
+target_compile_definitions(JerisLinkSendTo PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerisLinkSendTo PRIVATE ole32 shell32 shlwapi user32 uuid)
+
 option(JERISLINK_BUILD_DIAGNOSTICS "Build decoder/control diagnostic probes" OFF)
 if(JERISLINK_BUILD_DIAGNOSTICS)
     add_executable(JerislinkDecodeProbe decoder_probe.cpp)
@@ -155,7 +162,14 @@ add_executable(JerislinkSendToTest send_to_test.cpp)
 # Windows test for the F5a Send to named pipe: real server and client (send_to_win.cpp).
 add_executable(JerislinkSendToPipeTest send_to_pipe_test.cpp send_to_win.cpp)
 target_compile_definitions(JerislinkSendToPipeTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(JerislinkSendToPipeTest PRIVATE advapi32 user32)
+target_link_libraries(JerislinkSendToPipeTest PRIVATE advapi32 user32 shell32)
+
+# Windows test for the Store build's Explorer command (JerisLinkSendTo.dll): COM
+# factory, title, icon, state, and Invoke starting Jerislink.exe --send-to.
+add_executable(JerislinkSendToShellTest send_to_shell_test.cpp)
+target_compile_definitions(JerislinkSendToShellTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(JerislinkSendToShellTest PRIVATE ole32 shell32 user32 uuid)
+add_dependencies(JerislinkSendToShellTest JerisLinkSendTo)
 
 # Console test for the connection password: shared vectors, DPAPI copy and the
 # AUTH exchange against a loopback fake host (conn_auth.hpp).
