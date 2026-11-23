@@ -1,0 +1,13 @@
+{
+  "Id": "1152921505000000004",
+  "ApplicationCategory": "Productivity",
+  "Visibility": "Public",
+  "TargetPublishMode": "Immediate",
+  "TargetPublishDate": null,
+  "Status": "PreProcessing",
+  "StatusDetails": { "Errors": [], "Warnings": [], "CertificationReports": [] },
+  "FileUploadUrl": "https://productingestionbin1.blob.core.windows.net/ingestion/00000000-0000-0000-0000-000000000000?sv=2019-07-07&sr=b&sig=FIXTURE-NOT-A-REAL-SIGNATURE&se=2026-11-24T00%3A00%3A00Z&sp=rwl",
+  "ApplicationPackages": [ { "FileName": "Jerislink-0.4.1.0-x64.msix", "FileStatus": "Uploaded", "Id": "2000000000000000002", "Version": "0.4.1.0", "Architecture": "X64", "Languages": ["en-us"], "Capabilities": ["runFullTrust"], "MinimumDirectXVersion": "None", "MinimumSystemRam": "None" } ],
+  "PackageDeliveryOptions": { "PackageRollout": { "IsPackageRollout": false, "PackageRolloutPercentage": 0.0, "PackageRolloutStatus": "PackageRolloutNotStarted", "FallbackSubmissionId": "0" }, "IsMandatoryUpdate": false, "MandatoryUpdateEffectiveDate": "1601-01-01T00:00:00.0000000Z" },
+  "FriendlyName": "Submission 5"
+}

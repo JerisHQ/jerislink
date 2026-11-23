@@ -1,7 +1,8 @@
 name: msstore-publish
 
 # Uploads the .msixupload that the `msix` workflow built for a released commit
-# to Partner Center as a DRAFT submission for Store product 9NM3VWQ9MD7N.
+# to Partner Center for Store product 9NM3VWQ9MD7N and COMMITS the submission:
+# once committed, it goes to certification and then to the Store.
 #
 # Triggers
 # - release `released`: a GitHub release is published as a full release (or a
@@ -10,28 +11,94 @@ name: msstore-publish
 #   that draft by hand is the release decision, and that is what starts this.
 # - workflow_dispatch (fallback): give the run id of a successful `msix` run.
 #
-# Package selection: the job never builds. It finds the successful `msix` push
-# run for exactly the released commit and downloads its jerislink-msix-store
+# Package selection: the jobs never build. They find the successful `msix` push
+# run for exactly the released commit and download its jerislink-msix-store
 # artifact (the bytes CI already checked, WACK-tested and sideload-installed).
 # No matching run means the job fails; it never falls back to another commit.
 # The commit must also be in main's history.
 #
-# - Runs in the `store` environment, so its secrets are only released after the
-#   environment's reviewers approve. The environment's deployment policy must
-#   allow the tag ref (refs/tags/v*) for the release trigger to get past it.
-# - Before uploading, the job asks Partner Center whether the app already has a
-#   pending submission and stops if it does. `msstore publish` would otherwise
-#   delete that draft (when a published submission exists) to make room for the
-#   new one. There is no override: resolve the draft in Partner Center and re-run.
-# - `msstore publish --noCommit` keeps the submission in draft state: nothing
-#   goes to certification or the Store until someone presses "Submit" in
-#   Partner Center by hand.
-# - Secrets reach msstore only through step env vars in the sign-in step; they
-#   are never echoed, written to disk by this workflow, or put in the repo.
-# - The Store CLI version is pinned (STORE_CLI_VERSION). The publish command
-#   line and the credential cleanup are written for that version; see
-#   .github/scripts/MsStoreRunner.psm1. msstore-publish-check.yml runs the same
-#   steps without secrets on every change to these files.
+# Human gate: the `store` environment approval, and nothing after it.
+# - The `inspect` job runs without the environment, before anyone approves. Its
+#   log and the run summary show the package file name, Version= and SHA-256.
+#   Check those before approving the `publish` job.
+# - `publish` runs in the `store` environment, so its secrets are only released
+#   after the environment's reviewers approve. The environment's deployment
+#   policy must allow the tag ref (refs/tags/v*) for the release trigger to get
+#   past it. It re-downloads the same artifact and stops unless the file and its
+#   SHA-256 match what `inspect` showed.
+# - Approving means shipping. Everything after approval goes straight to the
+#   Store submission API (no Store CLI), and every call after create names the
+#   submission id the create response returned (MsStoreRunner.psm1,
+#   Publish-StoreSubmission):
+#   1. GET the app: stop if any submission is pending. This run never deletes
+#      a submission it did not create;
+#   2. POST a new submission; its id comes from that response. If the service
+#      refuses (HTTP 409, e.g. a submission appeared after step 1), stop. If
+#      the POST gets no answer, the result is unconfirmed: read the app back
+#      and stop, reporting only what it shows. Without an id from a create
+#      response a pending submission there is of unconfirmed origin (someone
+#      may have created it after step 1), so no delete advice is given;
+#   3. GET the app again: its pending submission must be that id;
+#   4. GET the submission, check its price can be sent back unchanged, PUT it
+#      with every old package PendingDelete and the new .msixupload
+#      PendingUpload (minimumDirectXVersion and minimumSystemRam None), then
+#      PUT the zipped package to its SAS upload URL;
+#   5. GET it again and stop, uncommitted, unless every field other than
+#      applicationPackages (pricing, listings, visibility, publish mode and
+#      date, device families, ...) reads back as in step 4's GET
+#      (Compare-SubmissionFields) and only the new package would remain
+#      (Test-DraftReadyToCommit);
+#   6. print the submission id and how to check it by hand, then POST
+#      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
+#      gets no answer, print at once that the result is unconfirmed, with that
+#      id, then read that id back up to 10 times, 30 s apart, each GET waiting
+#      up to 30 s, all within 300 s (the commit API is asynchronous):
+#      CommitStarted or a committed status means carry on; any other status
+#      stops; still PendingCommit or no read-back means the result stays
+#      unconfirmed, so stop with no delete or retry advice and ask a person
+#      to check that id;
+#   7. the next step reads that id back until it reaches a committed status
+#      (Published included) with exactly one Uploaded package, the release's
+#      version, and no other Uploaded package.
+#   Any stop in steps 3-5 leaves this run's draft uncommitted, and the error
+#   gives the exact DELETE for that id (Remove-StoreDraftSubmission).
+#   Time budget: when a step times out the runner is killed and nothing more
+#   is printed. The submit step therefore gives Publish-StoreSubmission a
+#   deadline 2 min before its timeout. The last 6 min before that deadline are
+#   kept for step 6 (60 s for the commit, 300 s for its read-backs): every
+#   call in steps 1-5 (the upload too) waits at most until that time starts,
+#   and once it has started the commit is not sent (stop uncommitted, with the
+#   DELETE for that id). The id and how to check it by hand are printed before
+#   the commit is sent and again as soon as it gets no answer, so they are in
+#   the log even if the step is killed. Every step of the publish job has a
+#   timeout, and they add up to the job's, so the job timeout cannot cut the
+#   submit step short.
+#   A submission this workflow creates is changed, committed or deleted only
+#   through the API, never in the Partner Center UI: Microsoft only takes in
+#   the uploaded package on an API commit, and a submission changed in the UI
+#   can no longer be committed through the API. (Up to v0.4.1 the draft was left
+#   uncommitted and submitted from the UI, which shipped the 0.3.0.0 package
+#   cloned from the live submission.) The only Partner Center action is Publish,
+#   after certification has passed.
+# - Whether a certified submission goes live by itself is its targetPublishMode
+#   (cloned from the last submission). The read-back step prints it and warns
+#   if it is not Manual.
+# - The Store CLI is not used: `msstore publish` deletes an existing pending
+#   draft, `msstore submission publish|delete` act on whatever is pending, and
+#   it logs the SAS upload URL (see MsStoreRunner.psm1).
+# - No step prints a token, the client secret, the SAS upload URL or raw
+#   submission JSON (it holds that URL). API and upload errors are fixed text:
+#   the HTTP status and allowlisted error codes, never the response body.
+#   Status strings and file names from the API are checked against a pattern
+#   before they are printed.
+# - Web calls go only over https to login.microsoftonline.com,
+#   manage.devcenter.microsoft.com and <account>.blob.core.windows.net, follow
+#   no redirects, and run with verbose and debug output off (PowerShell 7.6
+#   writes request URLs, headers and bodies to the debug stream).
+# - Secrets reach the API only through step env vars of the two steps that
+#   sign in; the token stays in that step's PowerShell session. Nothing is
+#   written to disk or put in the repo. msstore-publish-check.yml runs the same
+#   flow against a local stand-in for the API on every change to these files.
 
 on:
   release:
@@ -55,20 +122,26 @@ env:
   STORE_PRODUCT_ID: 9NM3VWQ9MD7N
   EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
   EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
-  STORE_CLI_VERSION: v0.4.4
 
 jobs:
-  publish-draft:
+  # No environment: runs before the approval, so the approver can see exactly
+  # which package the publish job would upload.
+  inspect:
     if: >-
       (github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
         && !github.event.release.draft && !github.event.release.prerelease)
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
-    environment: store
-    timeout-minutes: 30
+    timeout-minutes: 15
     defaults:
       run:
         shell: pwsh
+    outputs:
+      run_id: ${{ steps.src.outputs.run_id }}
+      sha: ${{ steps.src.outputs.sha }}
+      file_name: ${{ steps.pkg.outputs.file_name }}
+      version: ${{ steps.pkg.outputs.version }}
+      sha256: ${{ steps.pkg.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,54 +197,100 @@ jobs:
         id: pkg
         env:
           EXPECTED_VERSION: ${{ steps.src.outputs.version }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          $file = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+          $p = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
             -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
-          "file=$file" >> $env:GITHUB_OUTPUT
+          Write-Host "Package to publish after approval: $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+          @(
+            '### Store package waiting for approval'
+            ''
+            "- Tag: ``$(if ($env:TAG) { $env:TAG } else { '(workflow_dispatch)' })``"
+            "- msix run: ${{ steps.src.outputs.run_id }} (commit ``${{ steps.src.outputs.sha }}``)"
+            "- File: ``$($p.FileName)``"
+            "- Version=``$($p.Version)``"
+            "- SHA-256: ``$($p.Sha256)``"
+            ''
+            'Approving the `publish` job uploads this package and commits the Store submission (certification, then the Store). The submission is changed and committed only through the API: do not press Submit or edit it in Partner Center. The only Partner Center action is Publish, after certification.'
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+          "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
+          "version=$($p.Version)" >> $env:GITHUB_OUTPUT
+          "sha256=$($p.Sha256)" >> $env:GITHUB_OUTPUT
 
-      - name: Set up Microsoft Store Developer CLI
-        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+  publish:
+    needs: inspect
+    runs-on: windows-latest
+    environment: store
+    # The step timeouts add up to this (checked by msstore-publish-check.yml):
+    # checkout 5 + download 10 + package check 5 + create, upload and commit 20
+    # + read-back 35 min.
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      EXPECTED_VERSION: ${{ needs.inspect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
         with:
-          version: ${{ env.STORE_CLI_VERSION }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
 
-      - name: Sign in to Partner Center (Entra app client credentials)
+      - name: Download the Store package artifact
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: jerislink-msix-store
+          run-id: ${{ needs.inspect.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/store
+
+      - name: Check it is the package the approver saw
+        id: pkg
+        timeout-minutes: 5
         env:
+          EXPECTED_FILE: ${{ needs.inspect.outputs.file_name }}
+          EXPECTED_SHA256: ${{ needs.inspect.outputs.sha256 }}
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          if (-not $env:EXPECTED_VERSION -or -not $env:EXPECTED_FILE -or -not $env:EXPECTED_SHA256) { throw "inspect job outputs are missing" }
+          $p = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
+          if ($p.FileName -cne $env:EXPECTED_FILE) { throw "package file $($p.FileName) is not the one shown before approval ($env:EXPECTED_FILE)" }
+          if ($p.Sha256 -ne $env:EXPECTED_SHA256) { throw "package SHA-256 differs from the one shown before approval" }
+          Write-Host "Publishing $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+          "file=$($p.Path)" >> $env:GITHUB_OUTPUT
+
+      - name: Create the submission, upload, check and commit it (Store API, by submission id; the store approval was the human gate)
+        id: submit
+        timeout-minutes: 20
+        env:
+          PKG_FILE: ${{ steps.pkg.outputs.file }}
+          PKG_NAME: ${{ needs.inspect.outputs.file_name }}
           PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
-          PC_SELLER_ID: ${{ secrets.PARTNER_CENTER_SELLER_ID }}
           PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
           PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
         run: |
-          foreach ($n in 'PC_TENANT_ID','PC_SELLER_ID','PC_CLIENT_ID','PC_CLIENT_SECRET') {
-            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($n))) { throw "$n is empty (store environment secret missing?)" }
-          }
-          msstore reconfigure --tenantId $env:PC_TENANT_ID --sellerId $env:PC_SELLER_ID --clientId $env:PC_CLIENT_ID --clientSecret $env:PC_CLIENT_SECRET
-          if ($LASTEXITCODE -ne 0) { throw "msstore reconfigure failed ($LASTEXITCODE)" }
-
-      - name: Stop if Partner Center already has a pending submission
-        run: |
-          # msstore publish deletes an existing pending submission before it creates
-          # a new draft (see .github/scripts/MsStoreRunner.psm1). Never let it.
+          # No call waits past this deadline, 2 min before timeout-minutes (20)
+          # above, so the result and the id are printed before the runner is
+          # killed (checked by msstore-publish-check.yml).
+          $deadline = [DateTime]::UtcNow.AddMinutes(18)
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID
+          Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+          $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
+          if ($id -notmatch '^\d+$') { throw "submission id is not a number" }
+          "submission_id=$id" >> $env:GITHUB_OUTPUT
 
-      - name: Upload to Partner Center as a draft submission (no commit, no Store release)
+      - name: Read the submission back by its id and fail unless it holds the new package
+        timeout-minutes: 35
         env:
-          PKG_FILE: ${{ steps.pkg.outputs.file }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+          PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
+          PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
+          PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
         run: |
-          # The .msixupload file itself is the pathOrUrl argument; the CLI has no
-          # --inputFile option (see .github/scripts/MsStoreRunner.psm1).
-          if (-not (Test-Path -LiteralPath $env:PKG_FILE -PathType Leaf)) { throw "package file missing: $env:PKG_FILE" }
-          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit
-          if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
-          Write-Host "Draft submission updated. Review and press Submit in Partner Center to send it to certification."
-
-      - name: Forget the Partner Center credentials on the runner
-        if: always()
-        timeout-minutes: 2
-        run: |
-          # Not `msstore reconfigure --reset`: it asks y/n and crashes without a
-          # console. This removes the same credential and files, then checks they
-          # are gone and fails the step if not.
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          Clear-MsStoreCliState
+          Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60

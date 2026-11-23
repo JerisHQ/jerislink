@@ -1,158 +1,64 @@
-# Helpers for msstore-publish.yml and msstore-publish-check.yml (Windows runners, pwsh).
+# Helpers for msstore-publish.yml and msstore-publish-check.yml (pwsh 7).
 #
-# Written against Microsoft Store Developer CLI v0.4.4, the version both workflows
-# pin. What the CLI does there (MSStore.CLI source at tag v0.4.4):
-# - `msstore publish <pathOrUrl>`: the MSIX publisher takes pathOrUrl as the
-#   package file itself and accepts it only if its extension is exactly (ordinal,
-#   case-sensitive) .msix, .msixbundle or .msixupload. A folder is not a package.
-#   There is no --inputFile option; -i/--inputDirectory is unused for MSIX files.
-# - `msstore reconfigure` stores the client secret as a Windows generic credential
-#   "MicrosoftStoreCli:user=<clientId>" (persist LocalMachine), and settings.json
-#   plus the interactive MSAL token cache under %LOCALAPPDATA%\Microsoft\MSStore.CLI.
-# - Every Partner Center call signs in with the client secret through
-#   MSStore.API (SubmissionClient.CreateAppAsync), which keeps its own MSAL token
-#   cache in %LOCALAPPDATA%\Microsoft\MSStore.API\Cache (msstore_msal_cache.txt).
-#   Clear-MsStoreCliState removes that folder too.
-# - `msstore publish` for an app that already has a published submission
-#   DELETES the app's pending submission before it creates a new draft
-#   (IStorePackagedAPIExtensions.PublishAsync); with no published submission it
-#   reuses the pending one. Assert-NoPendingSubmission runs `msstore apps get`
-#   first and stops if any pending submission exists, so nothing is deleted.
-# - `msstore reconfigure --reset` always asks a y/n question and throws
-#   "Failed to read input in non-interactive mode" on a runner, so it cannot be
-#   used in CI. Clear-MsStoreCliState removes the same things directly.
+# Talks to the Microsoft Store submission API directly
+# (https://manage.devcenter.microsoft.com/v1.0/my, Entra client credentials,
+# scope https://manage.devcenter.microsoft.com/.default: the same calls the
+# Microsoft Store Developer CLI makes). Every call after create names this run's
+# submission id. Why not the CLI (MSStore.CLI source at tag v0.4.4):
+# - `msstore publish` DELETES the app's pending submission before it creates a
+#   new one when a published submission exists
+#   (IStorePackagedAPIExtensions.cs#L389-L410), and only logs the id it created.
+# - `msstore submission publish|get|delete <productId>` act on whatever
+#   submission is pending at that moment (or the last published one), not on a
+#   given submission id (PublishCommand.cs#L43-L77).
+# - with logging on, it logs the package upload SAS URL at Information level
+#   (IStorePackagedAPIExtensions.cs#L521-L522).
+#
+# Flow (Publish-StoreSubmission), each step on this run's submission id:
+#   GET app: stop if a submission is pending (never delete one this run did not
+#   create) -> POST create, id taken from the response -> GET app: the pending
+#   submission must be that id -> GET submission -> price check -> PUT with every
+#   old package PendingDelete and the new file PendingUpload -> PUT the zip to
+#   the SAS upload URL -> GET submission: every field except the packages is
+#   unchanged (Compare-SubmissionFields) and Test-DraftReadyToCommit passes ->
+#   POST .../submissions/{id}/commit. Assert-SubmissionHasPackage then reads
+#   that id back until it is committed with the new package. When create or
+#   commit gets no answer, the run reads the app or the submission back and
+#   reports what it shows (Resolve-UnconfirmedCreate/-Commit); while the result
+#   is unconfirmed it gives no delete or retry advice.
+# Time budget: the publish step has one timeout, and nothing prints once the
+# runner kills it. Publish-StoreSubmission works to a deadline set before that
+# timeout: the commit and its read-backs keep their own time at the end, every
+# call before the commit is cut short so it cannot eat that time, and the
+# submission id and how to check it by hand are printed before the commit
+# request is sent and again as soon as it gets no answer.
+#
+# Nothing here prints the token, the client secret, a SAS URL or a raw
+# submission JSON (it holds fileUploadUrl). HTTP errors are reported as fixed
+# text: the status code, a plain error code, or the exception type names
+# (Get-StoreErrorText, Get-StoreFailureText); strings from the API are printed
+# only when they match a plain pattern (Get-SafeValue). All HTTP goes through
+# Invoke-StoreHttp (the Pester tests mock it): https to the Store hosts only,
+# no redirects, no verbose or debug output. The token lives only in this
+# PowerShell session; nothing is written to disk.
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
-$script:CredentialPrefix = 'MicrosoftStoreCli:'
-$script:StateDir = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.CLI'
-$script:ApiStateDir = Join-Path $env:LOCALAPPDATA 'Microsoft\MSStore.API'
-
-if (-not ('JerisLink.WinCred' -as [type])) {
-  Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-namespace JerisLink {
-  public static class WinCred {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct CREDENTIAL {
-      public int Flags;
-      public int Type;
-      public string TargetName;
-      public string Comment;
-      public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-      public int CredentialBlobSize;
-      public IntPtr CredentialBlob;
-      public int Persist;
-      public int AttributeCount;
-      public IntPtr Attributes;
-      public string TargetAlias;
-      public string UserName;
-    }
-
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern bool CredEnumerateW(string filter, int flags, out int count, out IntPtr credentials);
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern bool CredDeleteW(string target, int type, int flags);
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern bool CredWriteW(ref CREDENTIAL credential, int flags);
-    [DllImport("advapi32.dll")]
-    static extern void CredFree(IntPtr buffer);
-
-    const int ERROR_NOT_FOUND = 1168;
-
-    // Target name and type of every credential matching filter (e.g. "Prefix:*").
-    public static List<KeyValuePair<string, int>> List(string filter) {
-      var result = new List<KeyValuePair<string, int>>();
-      int count; IntPtr list;
-      if (!CredEnumerateW(filter, 0, out count, out list)) {
-        int err = Marshal.GetLastWin32Error();
-        if (err == ERROR_NOT_FOUND) return result;
-        throw new Win32Exception(err);
-      }
-      try {
-        for (int i = 0; i < count; i++) {
-          IntPtr p = Marshal.ReadIntPtr(list, i * IntPtr.Size);
-          var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
-          result.Add(new KeyValuePair<string, int>(c.TargetName, c.Type));
-        }
-      } finally { CredFree(list); }
-      return result;
-    }
-
-    public static void Delete(string target, int type) {
-      if (!CredDeleteW(target, type, 0)) {
-        int err = Marshal.GetLastWin32Error();
-        if (err != ERROR_NOT_FOUND) throw new Win32Exception(err);
-      }
-    }
-
-    // Generic credential, persist LocalMachine: the same shape the CLI writes.
-    public static void WriteGeneric(string target, string userName, string secret) {
-      byte[] blob = Encoding.Unicode.GetBytes(secret);
-      IntPtr p = Marshal.AllocHGlobal(blob.Length);
-      try {
-        Marshal.Copy(blob, 0, p, blob.Length);
-        var c = new CREDENTIAL { Type = 1, TargetName = target, UserName = userName,
-                                 CredentialBlobSize = blob.Length, CredentialBlob = p, Persist = 2 };
-        if (!CredWriteW(ref c, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
-      } finally { Marshal.FreeHGlobal(p); }
-    }
-  }
-}
-'@
-}
-
-function Get-MsStoreCliCredentialTargets {
-  [JerisLink.WinCred]::List("$($script:CredentialPrefix)*") | ForEach-Object { $_.Key }
-}
-
-# Removes every MSStore CLI credential, the CLI's settings/token cache folder and
-# the MSStore.API token cache folder, then checks all of them are gone. Throws if anything is left. Prints no secret values
-# (target names hold the client id, which GitHub masks as a secret in logs).
-function Clear-MsStoreCliState {
-  $creds = @([JerisLink.WinCred]::List("$($script:CredentialPrefix)*"))
-  foreach ($c in $creds) { [JerisLink.WinCred]::Delete($c.Key, $c.Value) }
-  foreach ($d in $script:StateDir, $script:ApiStateDir) {
-    if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }
-  }
-
-  $left = @(Get-MsStoreCliCredentialTargets)
-  if ($left.Count -ne 0) { throw "$($left.Count) MSStore CLI credential(s) still in Credential Manager" }
-  foreach ($d in $script:StateDir, $script:ApiStateDir) {
-    if (Test-Path -LiteralPath $d) { throw "$d still exists" }
-  }
-  Write-Host "MSStore CLI state cleared: removed $($creds.Count) credential(s); $($script:StateDir) and $($script:ApiStateDir) are gone"
-}
-
-# Writes a throwaway CLI configuration (dummy ids, dummy secret) exactly where and
-# how `msstore reconfigure` stores a real one. Test use only (msstore-publish-check).
-function Set-MsStoreCliDummyState {
-  param([Parameter(Mandatory)][string]$DevCenterServiceUrl)
-  $clientId = [guid]::NewGuid().ToString()
-  New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null
-  [ordered]@{
-    SellerId            = 1
-    TenantId            = '00000000-0000-0000-0000-000000000000'
-    ClientId            = $clientId
-    DevCenterServiceUrl = $DevCenterServiceUrl
-  } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:StateDir 'settings.json') -Encoding utf8NoBOM
-  [JerisLink.WinCred]::WriteGeneric("$($script:CredentialPrefix)user=$clientId", $clientId, 'dummy-not-a-secret')
-  New-Item -ItemType Directory -Force -Path (Join-Path $script:StateDir 'Cache') | Out-Null
-  Set-Content -LiteralPath (Join-Path $script:StateDir 'Cache\msstore_msal_cache.txt') -Value 'dummy'
-  # Stand-in for the token cache MSStore.API writes after a real sign-in.
-  New-Item -ItemType Directory -Force -Path (Join-Path $script:ApiStateDir 'Cache') | Out-Null
-  Set-Content -LiteralPath (Join-Path $script:ApiStateDir 'Cache\msstore_msal_cache.txt') -Value 'dummy'
-  $clientId
-}
+$script:DefaultApiBase = 'https://manage.devcenter.microsoft.com'
+$script:DefaultAuthorityHost = 'https://login.microsoftonline.com'
+$script:ApiScope = 'https://manage.devcenter.microsoft.com/.default'
+$script:ApiBase = $script:DefaultApiBase
+# UTC time no call may wait past (Get-CallTimeout); $null: no limit. Set and
+# cleared by Publish-StoreSubmission and Resolve-UnconfirmedCommit.
+$script:CallDeadline = $null
+$script:Token = ''
+# Set only by Connect-StoreApi -LoopbackTestServer (msstore-publish-check.yml
+# and the HTTP tests): then a stand-in on 127.0.0.1/localhost is also allowed.
+$script:LoopbackTestServer = $false
 
 # Finds the one Store package in $Dir and checks its identity and version.
-# Returns the full path of the .msixupload, which is what `msstore publish` takes.
+# Returns Path (the full path of the .msixupload that is uploaded), FileName, Version (the manifest Identity Version) and Sha256.
 function Get-StorePackage {
   param(
     [Parameter(Mandatory)][string]$Dir,
@@ -163,7 +69,7 @@ function Get-StorePackage {
   $all = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Name -like '*.msixupload' })
   if ($all.Count -ne 1) { throw "expected exactly one .msixupload in $Dir, found $($all.Count)" }
   $upload = $all[0]
-  # The CLI compares the extension ordinally; a .MSIXUPLOAD would be rejected there.
+  # Only the exact lower-case extension is accepted, as the Store CLI did.
   if ($upload.Extension -cne '.msixupload') { throw "extension '$($upload.Extension)' is not exactly .msixupload" }
   if ($upload.Length -le 0) { throw "$($upload.Name) is empty" }
 
@@ -180,6 +86,7 @@ function Get-StorePackage {
     [xml]$m = Get-Content (Join-Path $work 'pkg\AppxManifest.xml')
     $id = $m.Package.Identity
     Write-Host "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version)"
+    $version = [string]$id.Version
     if ($id.Name -ne $ExpectedName) { throw "unexpected Identity Name" }
     if ($id.Publisher -ne $ExpectedPublisher) { throw "unexpected Identity Publisher" }
     if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw "Store versions must end in .0" }
@@ -187,43 +94,858 @@ function Get-StorePackage {
   } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }
-  Write-Host ((Get-FileHash -LiteralPath $upload.FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $upload.Name)
-  $upload.FullName
+  $sha = (Get-FileHash -LiteralPath $upload.FullName -Algorithm SHA256).Hash.ToLower()
+  Write-Host "$sha  $($upload.Name)"
+  [pscustomobject]@{ Path = $upload.FullName; FileName = $upload.Name; Version = $version; Sha256 = $sha }
 }
 
-# Checks the JSON that `msstore apps get <productId>` prints (DevCenterApplication)
-# and throws if the app has a pending submission, or if the JSON is not that app.
+# Masks what must never reach a log: URLs (a SAS upload URL carries a write
+# signature), any sig= value, bearer tokens and the current access token.
+function Protect-StoreText {
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+  if (-not $Text) { return '' }
+  $t = $Text -replace 'https?:(?:\\?/){2}[^\s"''<>]+', '[url]'
+  $t = $t -replace '(?i)(\bsig=)[^&\s"''<>]+', '$1[redacted]'
+  $t = $t -replace '(?i)(\bbearer\s+)[A-Za-z0-9\-._~+/]+=*', '$1[redacted]'
+  if ($script:Token) { $t = $t.Replace($script:Token, '[token]') }
+  $t
+}
+
+# Where requests may go. In production: https on the default port to the
+# sign-in host (Token), the Store API host (Api) or a blob storage account
+# (Upload, the SAS URL the API hands out). With Connect-StoreApi
+# -LoopbackTestServer, also http(s) to a loopback address (127.0.0.1,
+# localhost, ::1) and nothing else. Pure apart from reading that switch.
+function Test-StoreUri {
+  param([AllowEmptyString()][string]$Uri, [Parameter(Mandatory)][ValidateSet('Token', 'Api', 'Upload')][string]$Kind)
+  $u = $null
+  if (-not [uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$u)) { return $false }
+  if ($u.UserInfo) { return $false }
+  if ($script:LoopbackTestServer -and $u.Scheme -in 'http', 'https' -and $u.IsLoopback) { return $true }
+  if ($u.Scheme -cne 'https' -or -not $u.IsDefaultPort) { return $false }
+  $h = $u.Host.ToLowerInvariant()
+  switch ($Kind) {
+    'Token' { return $h -ceq 'login.microsoftonline.com' }
+    'Api' { return $h -ceq 'manage.devcenter.microsoft.com' }
+    'Upload' { return $h -cmatch '^[a-z0-9-]{1,63}\.blob\.core\.windows\.net\z' }
+  }
+}
+
+$script:UriRule = @{ Token = 'https://login.microsoftonline.com'; Api = 'https://manage.devcenter.microsoft.com'; Upload = 'https://<account>.blob.core.windows.net' }
+
+# An exception whose message is fixed text that is safe to print. OutcomeUnknown:
+# the request may have reached the service and no answer says what it did.
+# NotSent: refused before anything was sent.
+function New-StoreError([string]$Message, [switch]$OutcomeUnknown, [switch]$NotSent) {
+  $e = [System.InvalidOperationException]::new($Message)
+  $e.Data['StoreText'] = $Message
+  $e.Data['StoreOutcomeUnknown'] = [bool]$OutcomeUnknown
+  $e.Data['StoreNotSent'] = [bool]$NotSent
+  $e
+}
+
+# Text for a failed call that got no HTTP response: a New-StoreError message,
+# or else only the exception type names (and HttpRequestError/SocketErrorCode
+# enum names) of the chain. Exception messages can hold the URL; never printed.
+function Get-StoreFailureText($ErrorRecord) {
+  $ex = $ErrorRecord.Exception
+  if ($ex.Data.Contains('StoreText')) { return [string]$ex.Data['StoreText'] }
+  $names = [System.Collections.Generic.List[string]]::new()
+  while ($ex -and $names.Count -lt 6) {
+    $n = $ex.GetType().Name
+    foreach ($p in 'HttpRequestError', 'SocketErrorCode') {
+      $v = $ex.PSObject.Properties[$p]
+      if ($v -and "$($v.Value)" -cmatch '^[A-Za-z]{1,40}\z') { $n += " $($v.Value)" }
+    }
+    $names.Add($n)
+    $ex = $ex.InnerException
+  }
+  "no response ($($names -join ' <- '))"
+}
+
+# True when the request may have been carried out although no answer says so:
+# no response at all (except a refusal before sending), HTTP 408 or 5xx.
+function Test-StoreOutcomeUnknown($ErrorRecord) {
+  $d = $ErrorRecord.Exception.Data
+  [bool]($d.Contains('StoreOutcomeUnknown') -and $d['StoreOutcomeUnknown'])
+}
+
+# The one place that touches the network. Returns StatusCode and Body (text);
+# an HTTP error status (a redirect too) is returned, not thrown; a network
+# failure throws. Refuses, before sending, a Uri that Test-StoreUri does not
+# allow for Kind. No redirects: a redirect could take the token, the secret or
+# the package elsewhere. No progress, verbose or debug output: PowerShell 7.6
+# writes the URL, the headers and the body of a web request (the client
+# secret, the bearer token, the SAS signature) to the debug stream
+# (PowerShell/PowerShell#27695), so both are switched off for the call.
+function Invoke-StoreHttp {
+  param(
+    [Parameter(Mandatory)][string]$Method,
+    [Parameter(Mandatory)][string]$Uri,
+    [Parameter(Mandatory)][ValidateSet('Token', 'Api', 'Upload')][string]$Kind,
+    [hashtable]$Headers = @{},
+    [string]$Body,
+    [string]$ContentType,
+    [string]$InFile,
+    [ValidateRange(1, 3600)][int]$TimeoutSec = 600
+  )
+  if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
+    throw (New-StoreError "refused: $Kind requests go only to $($script:UriRule[$Kind]); nothing was sent" -NotSent)
+  }
+  $a = @{ Method = $Method; Uri = $Uri; Headers = $Headers; SkipHttpErrorCheck = $true; TimeoutSec = $TimeoutSec; MaximumRedirection = 0 }
+  if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body }
+  if ($ContentType) { $a.ContentType = $ContentType }
+  if ($InFile) { $a.InFile = $InFile }
+  $ProgressPreference = 'SilentlyContinue'
+  # A redirect comes back as the 3xx response plus a non-terminating "maximum
+  # redirection count exceeded" error; the caller reports the 3xx status.
+  # Network failures are terminating errors and still throw.
+  $webErr = $null
+  $r = Invoke-WebRequest @a -Verbose:$false -Debug:$false -ErrorAction SilentlyContinue -ErrorVariable webErr
+  if ($null -eq $r) {
+    if ($webErr) { throw $webErr[0] }
+    throw (New-StoreError "no response (no result)" -OutcomeUnknown)
+  }
+  $text = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
+  [pscustomobject]@{ StatusCode = [int]$r.StatusCode; Body = $text }
+}
+
+# The current UTC time (the tests replace it with a fake clock).
+function Get-StoreUtcNow { [datetime]::UtcNow }
+
+# Seconds a call may wait for its answer: Requested, cut to what is left before
+# $script:CallDeadline. Throws (NotSent: nothing goes out) when less than one
+# second is left.
+function Get-CallTimeout([int]$Requested) {
+  if ($null -eq $script:CallDeadline) { return $Requested }
+  $left = [int][Math]::Floor(($script:CallDeadline - (Get-StoreUtcNow)).TotalSeconds)
+  if ($left -lt 1) { throw (New-StoreError "not sent: no time left in this step's time budget" -NotSent) }
+  [Math]::Min($Requested, $left)
+}
+
+# Fixed diagnostics for an HTTP error response: the status code and, when the
+# body has them, error codes that are plain identifiers (the Store API's code,
+# the token endpoint's error and AADSTS numbers, blob storage's <Code>). No
+# message text, URL or other part of the body is printed.
+function Get-StoreErrorText {
+  param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body)
+  $codes = [System.Collections.Generic.List[string]]::new()
+  if ($Body) {
+    $j = $null
+    try { $j = $Body | ConvertFrom-Json -ErrorAction Stop } catch { }
+    if ($j -is [System.Management.Automation.PSCustomObject]) {
+      foreach ($n in 'code', 'error') {
+        $p = $j.PSObject.Properties[$n]
+        if (-not $p -or $null -eq $p.Value) { continue }
+        if ($p.Value -is [string]) { $codes.Add($p.Value) }
+        elseif ($p.Value -is [System.Management.Automation.PSCustomObject] -and $p.Value.PSObject.Properties['code']) { $codes.Add([string]$p.Value.code) }
+      }
+      $ec = $j.PSObject.Properties['error_codes']
+      if ($ec -and $null -ne $ec.Value) { foreach ($c in @($ec.Value)) { if ("$c" -cmatch '^\d{1,9}\z') { $codes.Add("AADSTS$c") } } }
+    } else {
+      $m = [regex]::Match($Body, '<Code>([^<]{1,64})</Code>')
+      if ($m.Success) { $codes.Add($m.Groups[1].Value) }
+    }
+  }
+  $safe = @($codes | Where-Object { $_ -cmatch '^[A-Za-z][A-Za-z0-9_.]{0,63}\z' } | Select-Object -Unique | Select-Object -First 3)
+  if ($safe.Count) { "HTTP $StatusCode ($($safe -join ', '))" } else { "HTTP $StatusCode" }
+}
+
+function Get-JsonField($Object, [string]$Name) {
+  if ($null -eq $Object -or $Object -is [string]) { return '' }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { [string]$p.Value } else { '' }
+}
+
+# Strings from the API are printed (and compared) only when they match a plain
+# pattern; anything else (a newline, a workflow command, a URL) becomes
+# [invalid]. Empty stays empty.
+$script:SafeWord = '^[A-Za-z]{1,40}\z'
+$script:SafeId = '^\d{1,20}\z'
+$script:SafeVersion = '^\d{1,5}(\.\d{1,5}){0,3}\z'
+$script:SafePriceId = '^[A-Za-z][A-Za-z0-9]{0,39}\z'
+$script:SafeFileName = '^[A-Za-z0-9_][A-Za-z0-9_.()+ -]{0,199}\z'
+function Get-SafeValue([AllowNull()][AllowEmptyString()][string]$Value, [string]$Pattern) {
+  if (-not $Value) { return '' }
+  if ($Value -cmatch $Pattern) { $Value } else { '[invalid]' }
+}
+
+# Gets an access token for the Store submission API with the Entra app's client
+# credentials (what the CLI's MSAL AcquireTokenForClient does) and keeps it in
+# this session only. Never prints the token or the secret. AuthorityHost,
+# ApiBase and LoopbackTestServer exist for msstore-publish-check.yml and the
+# HTTP tests (a stand-in on 127.0.0.1); msstore-publish.yml never passes them.
+# Without LoopbackTestServer only the default hosts over https are accepted,
+# and a wrong host fails before the client secret is sent anywhere.
+function Connect-StoreApi {
+  [CmdletBinding()]
+  param(
+    [AllowEmptyString()][string]$TenantId,
+    [AllowEmptyString()][string]$ClientId,
+    [AllowEmptyString()][string]$ClientSecret,
+    [string]$AuthorityHost = $script:DefaultAuthorityHost,
+    [string]$ApiBase = $script:DefaultApiBase,
+    [switch]$LoopbackTestServer
+  )
+  $script:Token = ''
+  $script:LoopbackTestServer = [bool]$LoopbackTestServer
+  if (-not $TenantId -or -not $ClientId -or -not $ClientSecret) { throw "tenant id, client id or client secret is empty (store environment secret missing?)" }
+  if ($TenantId -notmatch '^[0-9A-Za-z.-]+\z') { throw "tenant id has unexpected characters" }
+  $tokenUri = "$($AuthorityHost.TrimEnd('/'))/$TenantId/oauth2/v2.0/token"
+  $base = $ApiBase.TrimEnd('/')
+  if (-not (Test-StoreUri -Uri $tokenUri -Kind Token) -or -not (Test-StoreUri -Uri "$base/v1.0/my/" -Kind Api)) {
+    throw "refused: sign-in goes only to $($script:UriRule.Token) and API calls only to $($script:UriRule.Api) (a loopback stand-in only with -LoopbackTestServer); the client secret was not sent"
+  }
+  $body = 'grant_type=client_credentials&client_id=' + [uri]::EscapeDataString($ClientId) +
+          '&client_secret=' + [uri]::EscapeDataString($ClientSecret) + '&scope=' + [uri]::EscapeDataString($script:ApiScope)
+  try {
+    $r = Invoke-StoreHttp -Method POST -Uri $tokenUri -Kind Token -Body $body -ContentType 'application/x-www-form-urlencoded'
+  } catch { throw "could not get a Partner Center access token: $(Get-StoreFailureText $_)" }
+  finally { $body = $null }
+  if ($r.StatusCode -ne 200) { throw "could not get a Partner Center access token: $(Get-StoreErrorText $r.StatusCode $r.Body)" }
+  $tok = ''
+  try { $tok = Get-JsonField ($r.Body | ConvertFrom-Json -ErrorAction Stop) 'access_token' } catch { }
+  if (-not $tok) { throw "the token response has no access_token" }
+  $script:Token = $tok
+  $script:ApiBase = $base
+  Write-Host "signed in to the Store submission API (token kept in memory, not printed)"
+}
+
+# One Store submission API call. Path is relative to /v1.0/my/. Returns the
+# response body; throws a New-StoreError with fixed text on a network error or
+# a non-2xx status. OutcomeUnknown is set when no answer came back (except a
+# refusal before sending) or the status is 408 or 5xx: the service may have
+# carried the request out.
+function Invoke-StoreApi {
+  param(
+    [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PUT', 'DELETE')][string]$Method,
+    [Parameter(Mandatory)][string]$Path,
+    [string]$Body,
+    [ValidateRange(1, 3600)][int]$TimeoutSec = 600
+  )
+  if (-not $script:Token) { throw "not signed in to the Store submission API (Connect-StoreApi)" }
+  $what = "$Method /v1.0/my/$Path"
+  $a = @{ Method = $Method; Uri = "$script:ApiBase/v1.0/my/$Path"; Kind = 'Api'; Headers = @{ Authorization = "Bearer $script:Token" } }
+  if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
+  try { $a.TimeoutSec = Get-CallTimeout $TimeoutSec; $r = Invoke-StoreHttp @a }
+  catch {
+    $notSent = $_.Exception.Data.Contains('StoreNotSent') -and $_.Exception.Data['StoreNotSent']
+    throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $_)" -OutcomeUnknown:(-not $notSent))
+  }
+  if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) {
+    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body)" -OutcomeUnknown:($r.StatusCode -eq 408 -or $r.StatusCode -ge 500))
+  }
+  [string]$r.Body
+}
+
+function Assert-ProductId([string]$ProductId) {
+  if ($ProductId -cnotmatch '^[0-9A-Za-z]{1,20}\z') { throw "product id is not a Store product id" }
+}
+function Assert-SubmissionId([string]$SubmissionId) {
+  if ($SubmissionId -cnotmatch $script:SafeId) { throw "submission id '$(Get-SafeValue $SubmissionId $script:SafeId)' is not a number" }
+}
+
+# Submissions this workflow creates are changed, committed and deleted only
+# through the API. A draft committed from the Partner Center UI ships the
+# packages cloned from the live submission, not the uploaded one.
+$script:ApiOnlyNote = 'Submissions this workflow creates are changed, committed or deleted only through the Store submission API, never in the Partner Center UI; the only Partner Center action is Publish after certification has passed.'
+
+# How to delete exactly one submission, by id.
+function Get-DeleteByIdText([string]$ProductId, [string]$SubmissionId) {
+  "Delete exactly this submission through the API: DELETE /v1.0/my/applications/$ProductId/submissions/$SubmissionId " +
+  "(Remove-StoreDraftSubmission -ProductId $ProductId -SubmissionId $SubmissionId in .github/scripts/MsStoreRunner.psm1 " +
+  "does this, and only while it is still an uncommitted PendingCommit draft). Then re-run this workflow."
+}
+
+# Parses GET /applications/{productId}: returns the pending submission id, or
+# '' when none is pending. The docs do not say whether "none" is a missing
+# field or null, so both count as none; the create call (HTTP 409 while a
+# submission is pending) and the post-create pending check back this up.
+# A pending submission without a numeric id is '(no usable id)'.
+# Throws on JSON that does not parse or is another app.
+function Read-AppPendingSubmissionId {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
+  try { $app = $AppJson | ConvertFrom-Json -ErrorAction Stop } catch { throw "GET application returned JSON that does not parse" }
+  if ($null -eq $app -or (Get-JsonField $app 'id') -cne $ProductId) { throw "GET application returned a different or empty application id" }
+  $p = $app.PSObject.Properties['pendingApplicationSubmission']
+  if (-not $p -or $null -eq $p.Value) { return '' }
+  $id = Get-JsonField $p.Value 'id'
+  if ($id -cnotmatch $script:SafeId) { return '(no usable id)' }
+  $id
+}
+
+# Throws if the app (GET /applications/{productId} JSON) has a pending
+# submission. Pure. Deletes nothing.
 function Test-NoPendingSubmission {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
-  $start = $AppJson.IndexOf('{')
-  if ($start -lt 0) { throw "msstore apps get printed no application JSON; not publishing" }
-  try { $app = $AppJson.Substring($start) | ConvertFrom-Json -ErrorAction Stop }
-  catch { throw "msstore apps get printed JSON that does not parse; not publishing" }
-  $idProp = $app.PSObject.Properties['Id']
-  if (-not $idProp -or $idProp.Value -ne $ProductId) { throw "msstore apps get returned a different or empty application id; not publishing" }
-  $pendingProp = $app.PSObject.Properties['PendingApplicationSubmission']
-  if (-not $pendingProp) { throw "msstore apps get output has no PendingApplicationSubmission field; cannot tell whether a draft exists; not publishing" }
-  $pending = $pendingProp.Value
-  if ($null -ne $pending) {
-    $pid_ = $pending.PSObject.Properties['Id']
-    $pendingId = if ($pid_) { $pid_.Value } else { '(no id)' }
-    throw ("Partner Center already has a pending submission $pendingId for $ProductId. " +
-      "msstore publish would delete it (or reuse it) before uploading, so this run stops and touches nothing. " +
-      "Open Partner Center, decide what to do with that draft (submit or delete it), then re-run this workflow.")
+  $pendingId = Read-AppPendingSubmissionId -AppJson $AppJson -ProductId $ProductId
+  if ($pendingId -ceq '(no usable id)') {
+    throw ("Partner Center already has a pending submission (no usable id) for $ProductId. This run did not create it, " +
+      "so it stops and touches nothing. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote")
   }
-  Write-Host "No pending submission for $ProductId; safe to create a new draft."
+  if ($pendingId) {
+    throw ("Partner Center already has a pending submission $pendingId for $ProductId. This run did not create it, " +
+      "so it stops and touches nothing (it never deletes a submission it did not create). $script:ApiOnlyNote " +
+      "If it is in certification, let certification finish. If it is an uncommitted draft: " + (Get-DeleteByIdText $ProductId $pendingId))
+  }
+  Write-Host "No pending submission for $ProductId; safe to create a new one."
 }
 
-# Asks Partner Center (msstore apps get) whether the app has a pending submission
-# and throws unless the CLI succeeded and reported none. Fails closed.
+function Get-StoreApp([string]$ProductId) {
+  Assert-ProductId $ProductId
+  Invoke-StoreApi -Method GET -Path "applications/$ProductId"
+}
+
+function Get-StoreSubmissionJson([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec = 600) {
+  Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
+  Invoke-StoreApi -Method GET -Path "applications/$ProductId/submissions/$SubmissionId" -TimeoutSec $TimeoutSec
+}
+
+# Asks Partner Center whether the app has a pending submission; throws unless
+# the call succeeded and reported none. Fails closed.
 function Assert-NoPendingSubmission {
   param([Parameter(Mandatory)][string]$ProductId)
-  $ErrorActionPreference = 'Continue'
-  $out = (& msstore apps get $ProductId | Out-String)
-  $code = $LASTEXITCODE
-  $ErrorActionPreference = 'Stop'
-  if ($code -ne 0) { throw "msstore apps get failed (exit $code); cannot check for a pending submission; not publishing" }
-  Test-NoPendingSubmission -AppJson $out -ProductId $ProductId
+  try { $json = Get-StoreApp $ProductId } catch { throw "$_; cannot check for a pending submission; not publishing" }
+  Test-NoPendingSubmission -AppJson $json -ProductId $ProductId
 }
 
-Export-ModuleMember -Function Get-StorePackage, Clear-MsStoreCliState, Set-MsStoreCliDummyState, Get-MsStoreCliCredentialTargets, Test-NoPendingSubmission, Assert-NoPendingSubmission
+# POST /applications/{productId}/submissions. Returns the new submission's id,
+# taken from the create response. When the service answered with an error,
+# nothing was created and nothing is deleted. When no answer came back (or
+# HTTP 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the
+# app back and reports what it shows.
+function New-StoreSubmission {
+  param([Parameter(Mandatory)][string]$ProductId)
+  Assert-ProductId $ProductId
+  try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions" }
+  catch {
+    if (Test-StoreOutcomeUnknown $_) { throw (Resolve-UnconfirmedCreate -ProductId $ProductId -Failure "$_") }
+    throw ("$_. No submission was created and none was deleted. HTTP 409 means the app's current state does not " +
+      "allow a new submission, for example because another submission is pending; see the pending-submission check above.")
+  }
+  $id = ''
+  try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
+  $json = $null
+  if ($id -cnotmatch $script:SafeId) {
+    throw "the create response has no submission id. A draft may have been created; look it up with GET /v1.0/my/applications/$ProductId (pendingApplicationSubmission.id). $script:ApiOnlyNote"
+  }
+  Write-Host "created submission id=$id (from the create response)"
+  $id
+}
+
+# The create request got no answer. This run has no submission id of its own
+# (that comes only from a create response), so a pending submission on the
+# read-back cannot be tied to this run: someone else (a person in the Partner
+# Center UI, another tool) may have created it after Assert-NoPendingSubmission
+# while this run's POST failed or never landed. Reports only what the
+# read-back shows. Returns the error text to throw; deletes nothing and gives
+# no delete advice.
+function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
+  $head = "$Failure. Result unconfirmed: the create request got no answer, so a submission may or may not have been created. Read-back of the app:"
+  try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId) -ProductId $ProductId }
+  catch {
+    return ("$head failed too ($_). The result stays unknown: do not delete anything. Once the API answers, read " +
+      "GET /v1.0/my/applications/${ProductId}: no pendingApplicationSubmission means none is pending (re-run this workflow); " +
+      "a pending submission there is of unconfirmed origin, since this run never got a submission id to compare. $script:ApiOnlyNote")
+  }
+  if (-not $pending) {
+    return ("$head no pending submission, so none had been created when the app was read back, and there is nothing to clean up. " +
+      "Re-run this workflow; its pending-submission check stops before creating anything if a submission appears in the meantime.")
+  }
+  if ($pending -ceq '(no usable id)') {
+    return "$head it shows a pending submission without a usable id, origin unconfirmed. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote"
+  }
+  ("$head a pending submission $pending exists, origin unconfirmed. This run never got a submission id from a create " +
+    "response, so it cannot tell whether $pending is its own draft or one someone else created after the pending-submission " +
+    "check (for example in the Partner Center UI). This run changes and deletes nothing. Find out who created submission " +
+    "$pending (GET /v1.0/my/applications/$ProductId/submissions/$pending shows its status and packages) before anything is " +
+    "done with it. $script:ApiOnlyNote")
+}
+
+# The service rejects or mishandles some pricing on PUT; the CLI refuses the
+# same cases before its PUT (PriceIds.IsRoundTrippable): no pricing, an empty
+# priceId (a PUT with it makes the product free) or 'Base'. Pure.
+function Test-SubmissionPricing {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
+  try { $s = $SubmissionJson | ConvertFrom-Json -ErrorAction Stop } catch { return [pscustomobject]@{ Result = 'Fail'; Reason = 'submission JSON does not parse' } }
+  $p = if ($null -ne $s) { $s.PSObject.Properties['pricing'] } else { $null }
+  if (-not $p -or $null -eq $p.Value) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'submission has no pricing; a PUT without it could change the price' } }
+  $price = Get-JsonField $p.Value 'priceId'
+  if (-not $price) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is empty; a PUT with it would make the product free' } }
+  if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = "pricing.priceId is 'Base', which the service rejects on PUT" } }
+  [pscustomobject]@{ Result = 'Pass'; Reason = "pricing.priceId=$(Get-SafeValue $price $script:SafePriceId) is kept as is" }
+}
+
+# Returns the submission JSON for the PUT: every existing package is marked
+# PendingDelete (one still PendingUpload is dropped), and FileName is added as
+# the only PendingUpload package. Everything else is passed through unchanged
+# (System.Text.Json nodes, no re-typing of dates or numbers). Pure.
+# The update docs require fileName, fileStatus, minimumDirectXVersion and
+# minimumSystemRam on every package object. The last two only apply to
+# Windows 8.x/Phone 8.x packages; for an MSIX the value "must be present ...
+# but the value you specify is ignored", so the new entry sends "None" (the
+# docs' sample and the API's "no minimum").
+function Set-SubmissionPackage {
+  param([Parameter(Mandatory)][string]$SubmissionJson, [Parameter(Mandatory)][string]$FileName)
+  $o = [System.Text.Json.Nodes.JsonNodeOptions]::new()
+  $o.PropertyNameCaseInsensitive = $true
+  $n = [System.Text.Json.Nodes.JsonNode]::Parse($SubmissionJson, $o)
+  if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { throw "submission JSON is not an object" }
+  $pk = $n['applicationPackages']
+  if ($null -eq $pk) { $pk = [System.Text.Json.Nodes.JsonArray]::new(); $n['applicationPackages'] = $pk }
+  if ($pk -isnot [System.Text.Json.Nodes.JsonArray]) { throw "applicationPackages is not a list" }
+  for ($i = $pk.Count - 1; $i -ge 0; $i--) {
+    $st = if ($null -ne $pk[$i]) { [string]$pk[$i]['fileStatus'] } else { '' }
+    if ($st -ceq 'PendingUpload') { $pk.RemoveAt($i) }
+    elseif ($st -cne 'PendingDelete') { $pk[$i]['fileStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PendingDelete') }
+  }
+  $new = [System.Text.Json.Nodes.JsonObject]::new()
+  $new['fileName'] = [System.Text.Json.Nodes.JsonValue]::Create($FileName)
+  $new['fileStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PendingUpload')
+  $new['minimumDirectXVersion'] = [System.Text.Json.Nodes.JsonValue]::Create('None')
+  $new['minimumSystemRam'] = [System.Text.Json.Nodes.JsonValue]::Create('None')
+  $pk.Add($new)
+  $n.ToJsonString()
+}
+
+# Top-level submission fields left out of the before/after comparison:
+# Partner Center owns them (id, status, statusDetails, fileUploadUrl) or this
+# run changes them on purpose (applicationPackages). Every other field, known
+# or not (pricing, listings, visibility, targetPublishMode, targetPublishDate,
+# allowTargetFutureDeviceFamilies, ...), must come back from the PUT unchanged.
+$script:UncomparedFields = @('id', 'status', 'statusDetails', 'fileUploadUrl', 'applicationPackages')
+
+function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json) {
+  $o = [System.Text.Json.Nodes.JsonNodeOptions]::new()
+  $o.PropertyNameCaseInsensitive = $true
+  $n = $null
+  try { $n = [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o) } catch { }
+  if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { throw "submission JSON is not an object" }
+  foreach ($f in $script:UncomparedFields) { [void]$n.Remove($f) }
+  , $n
+}
+
+# The compared fields of a submission as JSON (no fileUploadUrl, so no SAS
+# URL is kept). Pure.
+function Get-SubmissionComparedFields {
+  param([Parameter(Mandatory)][string]$SubmissionJson)
+  (ConvertTo-SubmissionNode $SubmissionJson).ToJsonString()
+}
+
+# Compares the fields kept by Get-SubmissionComparedFields with a submission
+# read later. Returns Compared (how many fields) and Changed: the names of
+# fields that differ, were dropped or were added (names that are not plain
+# identifiers are shown as [unexpected field name]). Pure.
+function Compare-SubmissionFields {
+  param([Parameter(Mandatory)][string]$ExpectedJson, [Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
+  $want = ConvertTo-SubmissionNode $ExpectedJson
+  $got = ConvertTo-SubmissionNode $SubmissionJson
+  $names = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($kv in $want) {
+    if (-not $got.ContainsKey($kv.Key) -or -not [System.Text.Json.Nodes.JsonNode]::DeepEquals($kv.Value, $got[$kv.Key])) { [void]$names.Add($kv.Key) }
+  }
+  foreach ($kv in $got) { if (-not $want.ContainsKey($kv.Key)) { [void]$names.Add($kv.Key) } }
+  [pscustomobject]@{
+    Compared = $want.Count
+    Changed = @($names | ForEach-Object { if ($_ -cmatch '^[A-Za-z][A-Za-z0-9]{0,63}\z') { $_ } else { '[unexpected field name]' } } | Select-Object -Unique)
+  }
+}
+
+# fileUploadUrl from submission JSON. Never print the result.
+function Get-SubmissionUploadUrl([string]$SubmissionJson) {
+  $u = ''
+  try { $u = Get-JsonField ($SubmissionJson | ConvertFrom-Json -ErrorAction Stop) 'fileUploadUrl' } catch { }
+  if (-not $u) { throw "the submission has no fileUploadUrl" }
+  $u
+}
+
+# Zips the package (at the zip root, as the CLI does) and PUTs the zip to the
+# submission's SAS upload URL as a block blob. Refuses an upload URL that is
+# not https to a blob storage account (Test-StoreUri Upload) before zipping.
+# Prints one fixed line on success; on failure throws fixed text only.
+function Send-StorePackage {
+  param([Parameter(Mandatory)][string]$UploadUrl, [Parameter(Mandatory)][string]$PackagePath)
+  if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw "package file missing" }
+  if (-not (Test-StoreUri -Uri $UploadUrl -Kind Upload)) { throw "package upload refused: the upload URL is not $($script:UriRule.Upload); nothing was sent" }
+  $name = Split-Path -Leaf $PackagePath
+  $work = Join-Path ([IO.Path]::GetTempPath()) ("store-upload-" + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory $work | Out-Null
+  try {
+    $zip = Join-Path $work 'Upload.zip'
+    $z = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try { [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $PackagePath, $name) | Out-Null } finally { $z.Dispose() }
+    $len = (Get-Item -LiteralPath $zip).Length
+    # The CLI escapes '+' in the SAS URL the same way before uploading.
+    try {
+      $wait = Get-CallTimeout 600
+      $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip -TimeoutSec $wait
+    } catch { throw "package upload failed: $(Get-StoreFailureText $_)" }
+    if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)" }
+    Write-Host "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)"
+  } finally {
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+# POST /applications/{productId}/submissions/{submissionId}/commit: commits
+# exactly this submission, whatever else the app has.
+function Invoke-SubmissionCommit {
+  param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId, [ValidateRange(1, 600)][int]$TimeoutSec = 600)
+  Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
+  $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions/$SubmissionId/commit" -TimeoutSec $TimeoutSec
+  $st = ''
+  try { $st = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'status' } catch { }
+  Write-Host "submission $SubmissionId commit requested through the API: status=$(Get-SafeValue $st $script:SafeWord)"
+}
+
+# The commit request got no answer. The commit API is asynchronous
+# (https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission),
+# so a PendingCommit read-back does not show the commit did not happen: the
+# request may still be on its way or being processed. First prints (an
+# annotation) that the result is unconfirmed, with the id and how to check it
+# by hand, so that text is in the log even if the step is killed during the
+# read-backs. Then reads this submission back by id up to Attempts times,
+# IntervalSeconds apart, each GET waiting at most TimeoutSeconds, all of them
+# within BudgetSeconds and before DeadlineUtc:
+# - CommitStarted or a committed status: committed; warns and returns (the
+#   caller goes on to the read-back step).
+# - any other status (e.g. CommitFailed): throws; no delete or retry advice.
+# - PendingCommit, a failed read-back or another submission on every attempt,
+#   or the budget used up: throws "result unconfirmed" and asks a person to
+#   check that id later; no delete or retry advice.
+function Resolve-UnconfirmedCommit {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [Parameter(Mandatory)][string]$Failure,
+    [ValidateRange(1, 100)][int]$Attempts = 10,
+    [ValidateRange(0, 600)][int]$IntervalSeconds = 30,
+    [ValidateRange(1, 600)][int]$TimeoutSeconds = 30,
+    [ValidateRange(1, 3600)][int]$BudgetSeconds = 300,
+    [datetime]$DeadlineUtc = [datetime]::MaxValue
+  )
+  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId got no answer, so it may or may not have been committed."
+  $get = "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
+  Write-Host ("::warning title=Store commit::Result unconfirmed: the commit request for submission $SubmissionId got no answer " +
+    "($Failure). Reading it back by id for up to $BudgetSeconds s. If this step ends before a result is printed below, check " +
+    "$get by hand: CommitStarted or a later status means it was committed. Do not delete, edit, commit or re-submit it, " +
+    "and do not re-run this workflow for it.")
+  $end = (Get-StoreUtcNow).AddSeconds($BudgetSeconds)
+  $why = "the read-back time budget of $BudgetSeconds s is used up"
+  if ($DeadlineUtc -ne [datetime]::MaxValue) { $DeadlineUtc = $DeadlineUtc.ToUniversalTime() }
+  if ($DeadlineUtc -lt $end) { $end = $DeadlineUtc; $why = "the step's deadline $($DeadlineUtc.ToString('u')) is near" }
+  $saved = $script:CallDeadline
+  $script:CallDeadline = $end
+  $last = ''; $done = 0; $stopped = ''
+  try {
+    for ($i = 1; $i -le $Attempts; $i++) {
+      if ($i -gt 1) {
+        # The next read-back needs the interval plus at least one second.
+        if ((Get-StoreUtcNow).AddSeconds($IntervalSeconds + 1) -ge $end) { $stopped = " (stopped: $why)"; break }
+        Write-Host "commit of submission $SubmissionId not confirmed yet ($last); reading it back again in $IntervalSeconds s"
+        Start-Sleep -Seconds $IntervalSeconds
+      }
+      $done = $i
+      $sub = $null; $readErr = ''
+      try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSeconds) } catch { $readErr = "$_" }
+      if ($readErr) { $last = "read-back $i of ${Attempts} failed ($readErr)"; continue }
+      if (-not $sub -or $sub.Id -cne $SubmissionId) { $last = "read-back $i of ${Attempts} did not return that submission"; continue }
+      if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
+        Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but read-back " +
+          "$i by id shows status $($sub.Status): it was committed. The next step checks its package.")
+        return
+      }
+      if ($sub.Status -ceq 'PendingCommit') { $last = "read-back $i of ${Attempts} shows status PendingCommit"; continue }
+      throw "$head Read-back $i by id: status is '$($sub.Status)'. Nothing is deleted or retried; check it with $get. $script:ApiOnlyNote"
+    }
+  } finally { $script:CallDeadline = $saved }
+  throw ("$head Read back by id $done time(s), $IntervalSeconds s apart$stopped; last: $last. The commit API is asynchronous, " +
+    "so PendingCommit does not show the commit failed: it may still be processing. The result stays unconfirmed: do not " +
+    "delete, edit, commit or re-submit this submission, and do not re-run this workflow for it. A person needs to check " +
+    "$get later: CommitStarted or a later status means it was committed. $script:ApiOnlyNote")
+}
+
+# Deletes one submission by id, only while it is an uncommitted draft
+# (PendingCommit). For recovery by hand; the publish workflow never deletes.
+function Remove-StoreDraftSubmission {
+  param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
+  $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId)
+  if (-not $sub -or $sub.Id -cne $SubmissionId) { throw "GET submission $SubmissionId did not return that submission; not deleting" }
+  if ($sub.Status -cne 'PendingCommit') { throw "submission $SubmissionId is '$($sub.Status)', not an uncommitted PendingCommit draft; not deleting" }
+  Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" | Out-Null
+  Write-Host "deleted draft submission $SubmissionId"
+}
+# Parses submission JSON into safe fields only: Id, Status, TargetPublishMode,
+# and FileName, Version, FileStatus per package, each passed through
+# Get-SafeValue (a value that is not a plain id, word, version or file name is
+# [invalid]). FileUploadUrl (a SAS URL with write access) is never copied.
+# Returns $null when there is no JSON object.
+function Read-SubmissionSafe {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
+  $start = $SubmissionJson.IndexOf('{')
+  if ($start -lt 0) { return $null }
+  try { $raw = $SubmissionJson.Substring($start) | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+  $pkgs = @()
+  $pkgProp = $raw.PSObject.Properties['ApplicationPackages']
+  if ($pkgProp -and $null -ne $pkgProp.Value) {
+    $pkgs = @(foreach ($p in @($pkgProp.Value)) {
+      [pscustomobject]@{ FileName = Get-SafeValue (Get-JsonField $p 'FileName') $script:SafeFileName
+                         Version = Get-SafeValue (Get-JsonField $p 'Version') $script:SafeVersion
+                         FileStatus = Get-SafeValue (Get-JsonField $p 'FileStatus') $script:SafeWord }
+    })
+  }
+  [pscustomobject]@{ Id = Get-SafeValue (Get-JsonField $raw 'Id') $script:SafeId; Status = Get-SafeValue (Get-JsonField $raw 'Status') $script:SafeWord
+                     TargetPublishMode = Get-SafeValue (Get-JsonField $raw 'TargetPublishMode') $script:SafeWord; Packages = $pkgs }
+}
+
+function New-CheckResult($Sub, [string]$Result, [string]$Reason) {
+  [pscustomobject]@{ Result = $Result; Reason = $Reason
+                     Id = $(if ($Sub) { $Sub.Id } else { '' }); Status = $(if ($Sub) { $Sub.Status } else { '' })
+                     TargetPublishMode = $(if ($Sub) { $Sub.TargetPublishMode } else { '' })
+                     Packages = $(if ($Sub) { @($Sub.Packages) } else { @() }) }
+}
+
+# Before commit: checks the draft this run created, read back by its id after
+# the package update and upload. Pure. Set-SubmissionPackage marks every old
+# package PendingDelete; this checks Partner Center kept it that way, so no old
+# package (another extension, a second package) stays in the submission on commit.
+# Pass only when: the id is SubmissionId, the status is PendingCommit (an
+# uncommitted draft), and every package except PendingDelete ones is exactly
+# one entry: ExpectedFileName, PendingUpload or Uploaded, and its Version (if
+# Partner Center filled it in) is ExpectedVersion. Fail otherwise.
+function Test-DraftReadyToCommit {
+  param(
+    [Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [Parameter(Mandatory)][string]$ExpectedFileName,
+    [Parameter(Mandatory)][string]$ExpectedVersion
+  )
+  $sub = Read-SubmissionSafe -SubmissionJson $SubmissionJson
+  if (-not $sub) { return New-CheckResult $null 'Fail' 'the submission GET returned no submission JSON that parses' }
+  if ($sub.Id -cne $SubmissionId) { return New-CheckResult $sub 'Fail' "the submission GET returned submission '$($sub.Id)', not draft $SubmissionId that this run created" }
+  if ($sub.Status -cne 'PendingCommit') { return New-CheckResult $sub 'Fail' "draft status is '$($sub.Status)', not PendingCommit" }
+  $remain = @($sub.Packages | Where-Object { $_.FileStatus -cne 'PendingDelete' })
+  $list = ($remain | ForEach-Object { "$($_.FileName) version=$($_.Version) fileStatus=$($_.FileStatus)" }) -join '; '
+  if ($remain.Count -ne 1) { return New-CheckResult $sub 'Fail' "$($remain.Count) package(s) would remain after commit ($list); expected only $ExpectedFileName" }
+  $p = $remain[0]
+  if ($p.FileName -cne $ExpectedFileName) { return New-CheckResult $sub 'Fail' "the package that would remain after commit is $list, not $ExpectedFileName" }
+  if ($p.FileStatus -cnotin @('PendingUpload', 'Uploaded')) { return New-CheckResult $sub 'Fail' "new package fileStatus is '$($p.FileStatus)'" }
+  if ($p.Version -and $p.Version -ne $ExpectedVersion) { return New-CheckResult $sub 'Fail' "new package version is $($p.Version), not $ExpectedVersion" }
+  New-CheckResult $sub 'Pass' "only $ExpectedFileName would remain after commit"
+}
+
+# Statuses of a submission that has been committed and is on its way (Microsoft
+# app submission resource). CommitStarted is still in progress (Pending); every
+# *Failed status fails; None, Canceled, PendingCommit, an empty or unknown
+# status is not a committed submission and fails.
+$script:CommittedStatuses = @('PreProcessing', 'Certification', 'Release', 'PendingPublication', 'Publishing', 'Published')
+
+# After commit: checks the submission this run created, read back by its id. Pure. Returns Result ('Pass', 'Pending' or
+# 'Fail'), Reason and the safe fields of Read-SubmissionSafe.
+# - Fail: no JSON, another submission id than ExpectedSubmissionId, a status that
+#   is not committed (see CommittedStatuses), no packages, an Uploaded package
+#   with another version, more than one Uploaded package with the expected
+#   version, or none with it.
+# - Pending: CommitStarted, an Uploaded package whose version is not filled in
+#   yet, or a package still PendingUpload.
+# - Pass: a committed status, and exactly one Uploaded package, with the
+#   expected version, and no other Uploaded package. Published counts.
+function Test-SubmissionHasPackage {
+  param(
+    [Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [string]$ExpectedSubmissionId = ''
+  )
+  $sub = Read-SubmissionSafe -SubmissionJson $SubmissionJson
+  if (-not $sub) { return New-CheckResult $null 'Fail' 'the submission GET returned no submission JSON that parses' }
+  if (-not $sub.Id) { return New-CheckResult $sub 'Fail' 'submission JSON has no Id' }
+  if ($ExpectedSubmissionId -and $sub.Id -cne $ExpectedSubmissionId) {
+    return New-CheckResult $sub 'Fail' "the submission GET returned submission $($sub.Id), not submission $ExpectedSubmissionId that this run created"
+  }
+  if ($sub.Status -like '*Failed') { return New-CheckResult $sub 'Fail' "submission status is $($sub.Status)" }
+  $committing = $sub.Status -ceq 'CommitStarted'
+  if (-not $committing -and $sub.Status -cnotin $script:CommittedStatuses) {
+    return New-CheckResult $sub 'Fail' "submission status is '$($sub.Status)', not a committed status"
+  }
+  $pkgs = @($sub.Packages)
+  if ($pkgs.Count -eq 0) { return New-CheckResult $sub 'Fail' 'submission has no application packages' }
+
+  $uploaded = @($pkgs | Where-Object { $_.FileStatus -eq 'Uploaded' })
+  $match    = @($uploaded | Where-Object { $_.Version -eq $ExpectedVersion })
+  $unset    = @($uploaded | Where-Object { -not $_.Version })
+  $other    = @($uploaded | Where-Object { $_.Version -and $_.Version -ne $ExpectedVersion })
+  $pendUp   = @($pkgs | Where-Object { $_.FileStatus -eq 'PendingUpload' })
+
+  if ($other.Count -gt 0) {
+    $v = ($other | ForEach-Object { $_.Version }) -join ', '
+    return New-CheckResult $sub 'Fail' "submission still has Uploaded package(s) with version $v; expected only $ExpectedVersion"
+  }
+  if ($match.Count -gt 1) { return New-CheckResult $sub 'Fail' "submission has $($match.Count) Uploaded packages with version $ExpectedVersion; expected exactly one" }
+  if ($committing) { return New-CheckResult $sub 'Pending' 'commit still processing (CommitStarted)' }
+  if ($unset.Count -gt 0) { return New-CheckResult $sub 'Pending' 'package version not filled in yet' }
+  if ($pendUp.Count -gt 0) { return New-CheckResult $sub 'Pending' 'package still PendingUpload' }
+  if ($match.Count -eq 1) { return New-CheckResult $sub 'Pass' "submission holds exactly one Uploaded package, version $ExpectedVersion" }
+  New-CheckResult $sub 'Fail' "submission has no Uploaded package with version $ExpectedVersion"
+}
+
+# Prints only the safe fields of a check result.
+function Write-SubmissionSummary {
+  param([Parameter(Mandatory)]$Check)
+  Write-Host "submission id=$($Check.Id) status=$($Check.Status) targetPublishMode=$($Check.TargetPublishMode)"
+  foreach ($p in $Check.Packages) { Write-Host "  package fileName=$($p.FileName) version=$($p.Version) fileStatus=$($p.FileStatus)" }
+}
+
+# The publish job's API flow, every step after create on the id the create
+# response returned (see the header). Returns that submission id once the
+# commit was accepted (or, when the commit got no answer, once a read-back by
+# id shows it committed within CommitReadBackAttempts read-backs,
+# CommitReadBackIntervalSeconds apart). Before the commit, any failure leaves this run's
+# draft uncommitted and says how to delete exactly that draft.
+# Time budget: DeadlineUtc is the last moment a call may still wait for an
+# answer; msstore-publish.yml sets it some minutes before the step's timeout so
+# the error text still prints. The last CommitTimeoutSeconds +
+# CommitReadBackBudgetSeconds before it are kept for the commit and its
+# read-backs: every call before the commit waits at most until then (an upload
+# or a GET that would run into it is cut short and stops the run uncommitted),
+# and the commit is not sent when that point has passed. Each read-back GET
+# waits at most CommitReadBackTimeoutSeconds.
+function Publish-StoreSubmission {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$PackagePath,
+    [Parameter(Mandatory)][string]$ExpectedFileName,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [ValidateRange(1, 100)][int]$CommitReadBackAttempts = 10,
+    [ValidateRange(0, 600)][int]$CommitReadBackIntervalSeconds = 30,
+    [ValidateRange(1, 600)][int]$CommitTimeoutSeconds = 60,
+    [ValidateRange(1, 600)][int]$CommitReadBackTimeoutSeconds = 30,
+    [ValidateRange(1, 3600)][int]$CommitReadBackBudgetSeconds = 300,
+    [datetime]$DeadlineUtc = (Get-StoreUtcNow).AddMinutes(18)
+  )
+  Assert-ProductId $ProductId
+  if ((Split-Path -Leaf $PackagePath) -cne $ExpectedFileName) { throw "package file is not $ExpectedFileName" }
+  if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw "package file missing" }
+  $DeadlineUtc = $DeadlineUtc.ToUniversalTime()
+  $reserve = $CommitTimeoutSeconds + $CommitReadBackBudgetSeconds
+  $commitBy = $DeadlineUtc.AddSeconds(-$reserve)
+  if ($commitBy -le (Get-StoreUtcNow).AddSeconds(60)) {
+    throw ("not publishing: the deadline $($DeadlineUtc.ToString('u')) leaves less than 60 s for the work before the commit " +
+      "($reserve s are kept for the commit and its read-backs); nothing was sent")
+  }
+  # try/finally clears the call deadline however this ends (body kept at its
+  # old indent to keep the diff small).
+  try {
+  $script:CallDeadline = $commitBy
+
+  Assert-NoPendingSubmission -ProductId $ProductId
+  $id = New-StoreSubmission -ProductId $ProductId
+  try {
+    $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId) -ProductId $ProductId
+    if ($pending -cne $id) { throw "after create, the app's pending submission is '$pending', not $id" }
+
+    $sub = Get-StoreSubmissionJson $ProductId $id
+    $safe = Read-SubmissionSafe -SubmissionJson $sub
+    if (-not $safe -or $safe.Id -cne $id) { throw "GET submission $id returned another submission" }
+    $price = Test-SubmissionPricing -SubmissionJson $sub
+    if ($price.Result -ne 'Pass') { throw "price check failed: $($price.Reason)" }
+    Write-Host "price check: $($price.Reason)"
+    # Every field but the packages, as this run read it before its PUT.
+    $kept = Get-SubmissionComparedFields -SubmissionJson $sub
+
+    $put = Set-SubmissionPackage -SubmissionJson $sub -FileName $ExpectedFileName
+    $sub = $null
+    $updated = Invoke-StoreApi -Method PUT -Path "applications/$ProductId/submissions/$id" -Body $put
+    $put = $null
+    $safe = Read-SubmissionSafe -SubmissionJson $updated
+    if (-not $safe -or $safe.Id -cne $id) { throw "PUT submission $id returned another submission" }
+    $url = Get-SubmissionUploadUrl $updated
+    $updated = $null
+    Write-Host "submission $id updated: old packages PendingDelete, $ExpectedFileName PendingUpload"
+    Send-StorePackage -UploadUrl $url -PackagePath $PackagePath
+    $url = $null
+
+    $now = Get-StoreSubmissionJson $ProductId $id
+    $check = Test-DraftReadyToCommit -SubmissionJson $now -SubmissionId $id `
+      -ExpectedFileName $ExpectedFileName -ExpectedVersion $ExpectedVersion
+    Write-SubmissionSummary -Check $check
+    if ($check.Result -ne 'Pass') { throw "draft check failed: $($check.Reason)" }
+    $diff = Compare-SubmissionFields -ExpectedJson $kept -SubmissionJson $now
+    $now = $null
+    if ($diff.Changed.Count -gt 0) {
+      throw ("submission fields changed after this run's update: $($diff.Changed -join ', '). Only applicationPackages " +
+        "may change; every other field (pricing, listings, visibility, publish mode and date, device families, ...) " +
+        "must read back as it was before the update")
+    }
+    Write-Host "fields unchanged: $($diff.Compared) submission fields other than applicationPackages read back as before the update"
+    Write-Host "draft verified: $($check.Reason)"
+    if ((Get-StoreUtcNow) -ge $commitBy) {
+      throw ("no time left for the commit: it and its read-backs need the last $reserve s before the deadline " +
+        "$($DeadlineUtc.ToString('u')), and that time has started")
+    }
+  } catch {
+    throw "$_. Not committed: draft $id stays uncommitted. $script:ApiOnlyNote $(Get-DeleteByIdText $ProductId $id)"
+  }
+  $script:CallDeadline = $commitBy.AddSeconds($CommitTimeoutSeconds)
+  Write-Host ("committing submission $id (waiting up to $CommitTimeoutSeconds s for the answer). If this step ends before a " +
+    "commit result is printed below, the result is unconfirmed: check GET /v1.0/my/applications/$ProductId/submissions/$id " +
+    "by hand (CommitStarted or a later status means it was committed); do not delete or re-submit it.")
+  try { Invoke-SubmissionCommit -ProductId $ProductId -SubmissionId $id -TimeoutSec $CommitTimeoutSeconds }
+  catch {
+    if (Test-StoreOutcomeUnknown $_) {
+      Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" `
+        -Attempts $CommitReadBackAttempts -IntervalSeconds $CommitReadBackIntervalSeconds `
+        -TimeoutSeconds $CommitReadBackTimeoutSeconds -BudgetSeconds $CommitReadBackBudgetSeconds -DeadlineUtc $DeadlineUtc
+    }
+    else {
+      throw ("$_. Commit of submission $id was not accepted. Read it back with GET /v1.0/my/applications/$ProductId/submissions/$id; " +
+        "if it is still PendingCommit: $(Get-DeleteByIdText $ProductId $id)")
+    }
+  }
+  $id
+  } finally { $script:CallDeadline = $null }
+}
+
+# Runs after the commit: reads submission SubmissionId back by its id and
+# checks it with Test-SubmissionHasPackage. Checks again every IntervalSeconds
+# while Pending (a failed GET counts as Pending); throws "not verified" after
+# TimeoutMinutes. Prints only safe fields. targetPublishMode other than Manual
+# is a warning only: the commit has already happened, so failing the job here
+# would stop nothing.
+function Assert-SubmissionHasPackage {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [int]$TimeoutMinutes = 30,
+    [int]$IntervalSeconds = 60
+  )
+  Assert-SubmissionId $SubmissionId
+  Write-Host "checking submission id=$SubmissionId (created and committed by this run)"
+  $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+  $warned = $false
+  while ($true) {
+    try {
+      $json = Get-StoreSubmissionJson $ProductId $SubmissionId
+      $check = Test-SubmissionHasPackage -SubmissionJson $json -ExpectedVersion $ExpectedVersion -ExpectedSubmissionId $SubmissionId
+    } catch {
+      $check = [pscustomobject]@{ Result = 'Pending'; Reason = "$_"; Id = $SubmissionId; Status = ''; TargetPublishMode = ''; Packages = @() }
+    }
+    $json = $null
+    Write-SubmissionSummary -Check $check
+    if ($check.TargetPublishMode -and $check.TargetPublishMode -ne 'Manual' -and -not $warned) {
+      Write-Host ("::warning title=Store publish mode::targetPublishMode is '$($check.TargetPublishMode)', not Manual: " +
+        "this submission goes live by itself once it passes certification. Publish mode is part of the submission and is " +
+        "set through the submission API before commit, not in the Partner Center UI.")
+      $warned = $true
+    }
+    if ($check.Result -eq 'Pass') { Write-Host "verified submission ${SubmissionId}: $($check.Reason)"; return }
+    if ($check.Result -eq 'Fail') { throw "submission check failed: $($check.Reason)" }
+    if ((Get-Date).AddSeconds($IntervalSeconds) -gt $deadline) {
+      throw "submission not verified after $TimeoutMinutes min: $($check.Reason)"
+    }
+    Write-Host "pending: $($check.Reason); checking again in $IntervalSeconds s"
+    Start-Sleep -Seconds $IntervalSeconds
+  }
+}
+
+Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage
