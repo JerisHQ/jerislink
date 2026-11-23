@@ -859,11 +859,13 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     (Invoke-Publish $Pkg).Value | Should -Be @($NewId)
   }
 
-  It 'stops before any change when the create response has no id' {
+  It 'stops before any change when the create response has no id: created, id unknown, the app read back once' {
     $s = New-FakeStore -CreateWithoutId; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'the create response has no submission id'
-    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions")
+    $r.Err | Should -Match '^the create response \(HTTP 2xx\) has no usable submission id\. Created, id unknown: '
+    $r.Err | Should -Match "Read-back of the app \(one GET\): pending submission $NewId\. Reported by id only: not updated, not committed, not deleted\."
+    $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
 
   It 'stops uncommitted when the app shows another pending submission after create' {
@@ -970,11 +972,15 @@ Describe 'No answer to create or commit (fake Store)' {
     $s.Sub | Should -BeNullOrEmpty
     $s.PendingId | Should -Be $other
   }
-  It 'create not carried out, no answer: reads the app back and says none had been created' {
+  # Pepper, PR #74 r5: the Store may show a new submission only after a
+  # while, so a read-back without one is not taken as "none was created", and
+  # the run gives no re-run advice.
+  It 'create not carried out, no answer: the read-back shows none yet, which is not taken as none created; no re-run or delete advice' {
     $s = New-FakeStore -LoseResponse Create -LoseWhen Before; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: .* no pending submission, so none had been created when the app was read back, and there is nothing to clean up'
-    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Match ('Result unconfirmed: .* no pending submission yet\. That does not show none was created: the Store may take a while to show a new submission\. ' +
+      "This run changes and deletes nothing\. A person needs to read GET /v1\.0/my/applications/$App later; a pending submission there is of unconfirmed origin")
+    $r.Err | Should -Not -Match "$DeleteAdvice|$RetryAdvice|none had been created|nothing to clean up"
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     $s.Sub | Should -BeNullOrEmpty
   }
@@ -983,7 +989,7 @@ Describe 'No answer to create or commit (fake Store)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\); hint: the service reported that it is unavailable\)\. The result stays unknown: do not delete anything\.'
     $r.Err | Should -Match 'a pending submission there is of unconfirmed origin'
-    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match "$DeleteAdvice|$RetryAdvice"
     $r.Err | Should -Not -Match "most likely|this run's (uncommitted )?draft"
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
@@ -1096,27 +1102,18 @@ Describe 'An answer whose body is lost is classified by its status (PR #74 r4, f
     $s.Sub | Should -BeNullOrEmpty
   }
   # Carried out: the read-back finds a pending submission of unconfirmed
-  # origin, no advice. Not carried out: the read-back confirms none was
-  # created, and that answer (as before) says the workflow can be re-run.
-  It 'create answered HTTP <Status> (<When> it was carried out), body lost: result unconfirmed by its status, the app read back, no delete advice' -ForEach @(
+  # origin, no advice. Not carried out: the read-back shows none yet, which
+  # (PR #74 r6) is not taken as none created: no re-run or delete advice.
+  It 'create answered HTTP <Status> (<When> it was carried out), body lost: result unconfirmed by its status, the app read back, no re-run or delete advice' -ForEach @(
     @{ Status = 503; When = 'After'; Shows = "a pending submission 1152921505000000099 exists, origin unconfirmed" }
-    @{ Status = 500; When = 'Before'; Shows = 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up' }
-    @{ Status = 408; When = 'Before'; Shows = 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up' }
+    @{ Status = 500; When = 'Before'; Shows = 'no pending submission yet. That does not show none was created' }
+    @{ Status = 408; When = 'Before'; Shows = 'no pending submission yet. That does not show none was created' }
   ) {
     $s = New-FakeStore -LoseResponse Create -LoseWhen $When -LoseAsStatus $Status -LoseBody '{"code":"ServiceError"}' -DripOn Create -DripSeconds 30; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP ${Status}; hint: $(Get-StatusHint $Status); $($LostLimit -f 600). Result unconfirmed: the create request got no answer"))
     $r.Err | Should -Match ([regex]::Escape($Shows))
-    $r.All | Should -Not -Match "create refused|No submission was created|$DeleteAdvice|$Leak"
-    if ($When -eq 'After') { $r.All | Should -Not -Match $RetryAdvice }
-    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
-  }
-  It 'create answered HTTP 201, body lost: the new id is unknown, so the result is unconfirmed and the app is read back' {
-    $s = New-FakeStore -DripOn Create -DripSeconds 30; Use-FakeStore $s
-    $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $($LostLimit -f 600). Result unconfirmed: the create request got no answer"))
-    $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
-    $r.All | Should -Not -Match "create refused|has no submission id|$DeleteAdvice|$RetryAdvice|$Leak"
+    $r.All | Should -Not -Match "create refused|No submission was created|none had been created|nothing to clean up|$DeleteAdvice|$RetryAdvice|$Leak"
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
   It 'commit answered HTTP <Status> (carried out), body lost: unconfirmed by its status, read back by id, committed, goes on' -ForEach @(
@@ -1129,7 +1126,8 @@ Describe 'An answer whose body is lost is classified by its status (PR #74 r4, f
     $r.Value | Should -Be @($NewId)
     $why = if ($Status -eq 200) { 'HTTP 200' } else { "HTTP ${Status}; hint: $(Get-StatusHint $Status)" }
     $r.Out | Should -Match ([regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: $why; $($LostLimit -f 60)"))
-    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
+    $got = if ($Status -eq 200) { "was accepted (HTTP 200) but its answer's body was not read;" } else { 'got no answer, but' }
+    $r.Out | Should -Match ([regex]::Escape("::warning title=Store commit::The commit request for submission $NewId $got read-back 1 by id shows status Certification: it was committed"))
     $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|$Leak"
     @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
   }
@@ -1141,6 +1139,19 @@ Describe 'An answer whose body is lost is classified by its status (PR #74 r4, f
     $r.Err | Should -Match "Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\."
     $r.Err | Should -Not -Match $RetryAdvice
     $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|$Leak"
+    @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+  }
+  # PR #74 r6: an HTTP 2xx to the commit means it was accepted; the text says
+  # so instead of "got no answer". The commit API is asynchronous, so a
+  # submission still PendingCommit on every read-back stays unconfirmed.
+  It 'commit answered HTTP 200 (accepted), body lost, still PendingCommit on 3 read-backs: unconfirmed, says accepted, no retry or delete advice' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Delayed -LoseAsStatus 200 -LoseBody '{"status":"CommitStarted"}' -CommitDelayReads 5 -DripOn Commit -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $fail = "Store API POST $Base/submissions/$NewId/commit failed: HTTP 200; $($LostLimit -f 60)"
+    $r.Out | Should -Match ([regex]::Escape("::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId was accepted (HTTP 200) but its answer's body was not read ($fail). Reading it back by id"))
+    $r.Err | Should -Match ('^' + [regex]::Escape("$fail. Result unconfirmed: the commit request for submission $NewId was accepted (HTTP 200) but its answer's body was not read, so whether the commit has started is not confirmed. Read back by id 3 time(s), 0 s apart; last: read-back 3 of 3 shows status PendingCommit."))
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|got no answer|$Leak"
     @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
   }
   It 'commit answered HTTP 409, body lost: refused by its status (not accepted), not read back as unconfirmed' {
@@ -1172,6 +1183,195 @@ Describe 'An answer whose body is lost is classified by its status (PR #74 r4, f
     $r.Err | Should -Match ('^' + [regex]::Escape("package upload failed: HTTP 403; $($LostLimit -f 600). Not committed: draft $NewId stays uncommitted"))
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
     $r.All | Should -Not -Match $Leak
+  }
+}
+
+# Pepper, PR #74 r5: a create answered HTTP 201 whose body was cut off went
+# down the "no answer" path, and a read-back without a pending submission was
+# reported as "none had been created" with advice to re-run. An HTTP 2xx means
+# the Store created a submission; only its id is unknown. Now that is
+# "created, id unknown": a warning first, then one read-back of the app; a
+# pending submission is reported by id only; the run stops with no update,
+# upload, commit or delete, and no re-run or delete advice, whatever the
+# read-back shows (the Store may show a new submission only after a while).
+Describe 'A create answered HTTP 2xx without a usable id: created, id unknown (PR #74 r6, fake Store)' {
+  BeforeAll {
+    $script:LostLimit = 'body not received (time limit of {0} s for the whole request reached)'
+    $script:LostBroken = 'body not received (the connection broke or the body could not be read)'
+    $script:ApiOnly = & (Get-Module MsStoreRunner) { $script:ApiOnlyNote }
+    $script:NotCreated = 'Result unconfirmed|create refused|No submission was created|none had been created|nothing to clean up|origin unconfirmed|has no submission id'
+    $script:Look = "A person needs to check the app's pending submission in Partner Center (look only, change nothing there) or with GET $Base (pendingApplicationSubmission.id)"
+    # The error text up to the read-back result, and the text after it.
+    function script:Get-CreatedText([string]$Answer, [string]$Status, [string]$Want, [string]$Pending) {
+      $tail = switch ($Want) {
+        'Pending' { "pending submission $Pending. Reported by id only: not updated, not committed, not deleted. A person needs to check submission $Pending in Partner Center (look only, change nothing there) or with GET $Base/submissions/$Pending. $ApiOnly" }
+        'None' { "no pending submission yet. That does not mean none was created: the Store may take a while to show the new submission. $Look later. $ApiOnly" }
+        'NoId' { "a pending submission without a usable id. $Look. $ApiOnly" }
+        'Failed' { "failed (fake read-back broke). $Look once the API answers; the Store may take a while to show the new submission. $ApiOnly" }
+      }
+      ("$Answer. Created, id unknown: the Store answered the create with $Status, so it created a submission, but this run did not get the new submission's id. " +
+        "This run stops: it does not update, upload to, commit or delete any submission. Read-back of the app (one GET): $tail")
+    }
+    function script:Get-CreatedWarning([string]$Answer, [string]$Status) {
+      ("::warning title=Store create::Created, id unknown: the Store answered the create with $Status, so it created a submission, but this run did not get its id ($Answer). " +
+        "The run stops; it updates, commits and deletes nothing. Reading the app back once. If this step ends before a result is printed below: $Look; the Store may take a while to show it.")
+    }
+  }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It 'create answered HTTP 201, body lost (<End>), the read-back shows <Case>: the run stops, nothing updated, committed or deleted, no re-run or delete advice' -ForEach @(
+    @{ End = 'Body'; Case = 'the new pending submission'; Want = 'Pending'; Opt = @{} }
+    @{ End = 'Break'; Case = 'the new pending submission'; Want = 'Pending'; Opt = @{} }
+    @{ End = 'Body'; Case = 'no pending submission yet (the Store is slow to show it)'; Want = 'None'; Opt = @{ PendingLag = $true } }
+    @{ End = 'Break'; Case = 'no pending submission yet (the Store is slow to show it)'; Want = 'None'; Opt = @{ PendingLag = $true } }
+    @{ End = 'Body'; Case = 'a pending submission without a usable id'; Want = 'NoId'; Opt = @{ PendingAfterCreate = 'x1' } }
+  ) {
+    $o = $Opt.Clone(); $s = New-FakeStore @o -DripOn Create -DripSeconds 30 -DripEnd $End; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $lost = if ($End -eq 'Break') { $LostBroken } else { $LostLimit -f 600 }
+    $answer = "Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $lost"
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape((Get-CreatedWarning $answer 'HTTP 201')) + '$')
+    $r.Err | Should -BeExactly (Get-CreatedText $answer 'HTTP 201' $Want $NewId)
+    $r.Value | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match "$NotCreated|$DeleteAdvice|$RetryAdvice|$Leak"
+    # One read-back of the app; no PUT, upload, commit or DELETE.
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Blob | Should -BeNullOrEmpty
+    $s.Sub.id | Should -Be $NewId
+    $s.Sub.status | Should -Be 'PendingCommit'
+  }
+  It 'create answered HTTP 201, body lost, and the read-back fails: the run stops, a person checks once the API answers, no re-run or delete advice' {
+    $s = New-FakeStore -DripOn Create -DripSeconds 30; Use-FakeStore $s
+    Mock -ModuleName MsStoreRunner Get-StoreApp { throw 'fake read-back broke' }
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App -ReadBackTimeoutSec 7 }
+    $answer = "Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $($LostLimit -f 600)"
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape((Get-CreatedWarning $answer 'HTTP 201')) + '$')
+    $r.Err | Should -BeExactly (Get-CreatedText $answer 'HTTP 201' 'Failed')
+    $r.All | Should -Not -Match "$NotCreated|$DeleteAdvice|$RetryAdvice|$Leak"
+    Should -Invoke -ModuleName MsStoreRunner Get-StoreApp -Times 1 -Exactly -ParameterFilter { $ProductId -ceq $App -and $TimeoutSec -eq 7 }
+    @($s.Log) | Should -Be @("POST $Base/submissions")
+  }
+  It 'create answered HTTP 201 with a body without a usable id (<Case>): created, id unknown, read back once, the run stops' -ForEach @(
+    @{ Case = 'no id, the new submission shown'; Want = 'Pending'; Opt = @{ CreateWithoutId = $true } }
+    @{ Case = 'no id, the new submission not shown yet'; Want = 'None'; Opt = @{ CreateWithoutId = $true; PendingLag = $true } }
+  ) {
+    $o = $Opt.Clone(); $s = New-FakeStore @o; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $answer = 'the create response (HTTP 2xx) has no usable submission id'
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape((Get-CreatedWarning $answer 'HTTP 2xx')) + '$')
+    $r.Err | Should -BeExactly (Get-CreatedText $answer 'HTTP 2xx' $Want $NewId)
+    $r.All | Should -Not -Match "$NotCreated|$DeleteAdvice|$RetryAdvice|$Leak"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Sub.status | Should -Be 'PendingCommit'
+  }
+  # The status decides, not the body: 2xx is created; 408/5xx unconfirmed;
+  # another status refused; no status (no answer) unconfirmed.
+  It 'create answered HTTP <Status> with its body lost goes down the <Path> path' -ForEach @(
+    @{ Status = 200; Path = 'created, id unknown'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 200; LoseBody = '{}' }; Want = 'Created, id unknown: the Store answered the create with HTTP 200' }
+    @{ Status = 202; Path = 'created, id unknown'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 202; LoseBody = '{}' }; Want = 'Created, id unknown: the Store answered the create with HTTP 202' }
+    @{ Status = 299; Path = 'created, id unknown'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 299; LoseBody = '{}' }; Want = 'Created, id unknown: the Store answered the create with HTTP 299' }
+    @{ Status = 300; Path = 'refused'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'Before'; LoseAsStatus = 300; LoseBody = '{}' }; Want = 'No submission was created and none was deleted' }
+    @{ Status = 199; Path = 'refused'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'Before'; LoseAsStatus = 199; LoseBody = '{}' }; Want = 'No submission was created and none was deleted' }
+    @{ Status = 409; Path = 'refused'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'Before'; LoseAsStatus = 409; LoseBody = '{}' }; Want = 'No submission was created and none was deleted' }
+    @{ Status = 503; Path = 'unconfirmed'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'Before'; LoseAsStatus = 503; LoseBody = '{}' }; Want = 'Result unconfirmed: the create request got no answer' }
+  ) {
+    $o = $Opt.Clone(); $s = New-FakeStore @o -DripOn Create -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP $Status") + '.*' + [regex]::Escape($Want))
+    $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+  It 'create got no answer at all (<When>): unconfirmed, never taken for created' -ForEach @(@{ When = 'After' }, @{ When = 'Before' }) {
+    $s = New-FakeStore -LoseResponse Create -LoseWhen $When; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'Result unconfirmed: the create request got no answer'
+    $r.All | Should -Not -Match "Created, id unknown|$DeleteAdvice|$RetryAdvice|$Leak"
+  }
+}
+
+# Every status a call can end with (2xx with its body read or lost, 4xx, 408,
+# 5xx, no answer, not sent) and the advice printed, for each call that can
+# change something: no re-run or delete advice wherever the call may have
+# been carried out (PR #74 r6 sweep). The pre-commit stops are this run's
+# own draft (its id came from the create response), uncommitted (the commit
+# was not sent): delete-by-id advice there is checked against PendingCommit
+# by Remove-StoreDraftSubmission before anything is deleted.
+Describe 'Advice by status for each call (PR #74 r6 sweep, fake Store)' {
+  BeforeAll {
+    $script:LostLimit = 'body not received (time limit of {0} s for the whole request reached)'
+  }
+  AfterAll { $global:FakeDeleteStatus = $null; $global:FakeDeleteSub = $null }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  # The status mark is read without throwing: a record without it, or one
+  # that cannot be read, is 0 (never an answered 2xx), so a caller's catch
+  # still classifies the original error.
+  It 'Get-StoreErrorStatus reads the status mark, and gives 0 (never throws) for <Case>' -ForEach @(
+    @{ Case = 'a marked 201'; Kind = 'Marked201'; Want = 201 }
+    @{ Case = 'no answer (marked 0)'; Kind = 'NoAnswer'; Want = 0 }
+    @{ Case = 'an error without the mark'; Kind = 'NoMark'; Want = 0 }
+    @{ Case = 'a mark that is not a number'; Kind = 'NotANumber'; Want = 0 }
+    @{ Case = 'no error record at all'; Kind = 'None'; Want = 0 }
+  ) {
+    InModuleScope MsStoreRunner -Parameters @{ Kind = $Kind; Want = $Want } {
+      param($Kind, $Want)
+      $e = switch ($Kind) {
+        'Marked201' { New-StoreError 'x' -OutcomeUnknown -Status 201 }
+        'NoAnswer' { New-StoreError 'x' -OutcomeUnknown }
+        'NoMark' { [System.InvalidOperationException]::new('x') }
+        'NotANumber' { $x = [System.InvalidOperationException]::new('x'); $x.Data['StoreStatus'] = 'x'; $x }
+        default { $null }
+      }
+      $rec = $null
+      if ($e) { try { throw $e } catch { $rec = $_ } }
+      if ($e) { $rec.Exception | Should -BeExactly $e }
+      Get-StoreErrorStatus $rec | Should -Be $Want
+      Test-Store2xx (Get-StoreErrorStatus $rec) | Should -Be ($Want -eq 201)
+    }
+  }
+
+  # The PUT was carried out (HTTP 200) but its answer, with the upload URL,
+  # was not read: the run stops before the upload. The draft is this run's
+  # own and the commit was never sent, so the delete-by-id advice stands; it
+  # deletes only while that id is still PendingCommit.
+  It 'PUT of the submission answered HTTP 200 with its body lost: stops uncommitted before the upload; delete-by-id advice for this run''s own draft only' {
+    $s = New-FakeStore -DripOn Update -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API PUT $Base/submissions/$NewId failed: HTTP 200; $($LostLimit -f 600). Not committed: draft $NewId stays uncommitted."))
+    $r.Err | Should -Match ([regex]::Escape("DELETE /v1.0/my/applications/$App/submissions/$NewId (Remove-StoreDraftSubmission -ProductId $App -SubmissionId $NewId") + '.*' + [regex]::Escape('only while it is still an uncommitted PendingCommit draft'))
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base", "GET $Base/submissions/$NewId", "PUT $Base/submissions/$NewId")
+    $s.Blob | Should -BeNullOrEmpty
+    $s.Sub.status | Should -Be 'PendingCommit'
+    $r.All | Should -Not -Match $Leak
+  }
+
+  It 'manual DELETE answered HTTP 204 with its body lost: deleted (the body is not used)' {
+    $s = New-FakeStore -DripOn Delete -DripSeconds 30; Use-FakeStore $s
+    $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
+    $r = Invoke-Captured { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $SubId }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Out | Should -BeExactly "deleted draft submission $SubId (HTTP 204; the answer's body was not read)"
+    @($s.Log) | Should -Be @("GET $Base/submissions/$SubId", "DELETE $Base/submissions/$SubId")
+    $s.Sub | Should -BeNullOrEmpty
+  }
+  It 'manual DELETE that fails without an answered 2xx (<Case>): the error is thrown, nothing says deleted' -ForEach @(
+    @{ Case = 'no answer'; Status = 0 }, @{ Case = 'HTTP 503, body lost'; Status = 503 }, @{ Case = 'HTTP 409'; Status = 409 }
+  ) {
+    # No parameter filter: Pester 6 does not fall back to the real command
+    # for a call that no filter matches, so both calls are mocked here.
+    $global:FakeDeleteStatus = $Status
+    $global:FakeDeleteSub = "{`"id`":`"$SubId`",`"status`":`"PendingCommit`"}"
+    Mock -ModuleName MsStoreRunner Get-StoreSubmissionJson { $global:FakeDeleteSub }
+    Mock -ModuleName MsStoreRunner Invoke-StoreApi {
+      throw (& (Get-Module MsStoreRunner) { param($st) New-StoreError "fake DELETE failed with $st" -OutcomeUnknown:($st -ne 409) -Status $st } $global:FakeDeleteStatus)
+    }
+    $r = Invoke-Captured { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $SubId }
+    $r.Err | Should -BeExactly "fake DELETE failed with $Status"
+    $r.Out | Should -Not -Match 'deleted draft'
+    Should -Invoke -ModuleName MsStoreRunner Invoke-StoreApi -Times 1 -Exactly -ParameterFilter { $Method -eq 'DELETE' }
+    Should -Invoke -ModuleName MsStoreRunner Invoke-StoreApi -Times 1 -Exactly
   }
 }
 
@@ -1273,9 +1473,10 @@ Describe 'Diagnostics that cannot be formatted never change how an error is clas
         $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
         $r.Err | Should -Not -Match $RetryAdvice
       } else {
-        $r.Err | Should -Match 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up'
+        $r.Err | Should -Match 'no pending submission yet\. That does not show none was created'
       }
-      $r.All | Should -Not -Match "$DeleteAdvice|No submission was created|Cannot convert|$OtherDigits"
+      $r.Err | Should -Not -Match $RetryAdvice
+      $r.All | Should -Not -Match "$DeleteAdvice|No submission was created|none had been created|Cannot convert|$OtherDigits"
       @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     }
     It 'commit gets HTTP <Lost>, error target <Case>, commit carried out: reads it back by id, sees it committed, goes on' -ForEach @(
@@ -1328,13 +1529,14 @@ Describe 'Diagnostics that cannot be formatted never change how an error is clas
       $r.Err | Should -Not -Match $RetryAdvice
       $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|No submission was created|Cannot convert"
     }
-    It 'a create response whose id is in other digits: that id is not used, and the run says how to look the draft up' {
+    It 'a create response whose id is in other digits: that id is not used; created, id unknown, the app read back once' {
       $s = New-FakeStore; Use-FakeStore $s
       $s.NewId = -join ('1152921505000000099'.ToCharArray() | ForEach-Object { [char](0x0660 + [int]"$_") })
       $r = Invoke-Publish $Pkg
-      $r.Err | Should -Match "the create response has no submission id\. A draft may have been created; look it up with GET /v1\.0/my/applications/$App \(pendingApplicationSubmission\.id\)"
-      $r.All | Should -Not -Match "$DeleteAdvice|$OtherDigits"
-      @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions")
+      $r.Err | Should -Match '^the create response \(HTTP 2xx\) has no usable submission id\. Created, id unknown: '
+      $r.Err | Should -Match "Read-back of the app \(one GET\): a pending submission without a usable id\. A person needs to check the app's pending submission in Partner Center \(look only, change nothing there\) or with GET /v1\.0/my/applications/$App \(pendingApplicationSubmission\.id\)\."
+      $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$OtherDigits"
+      @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     }
   }
 }
@@ -1973,7 +2175,6 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   }
   It 'create answered HTTP <Status>, body dripping past its 2 s limit: result unconfirmed by its status, the app read back, no retry or delete advice' -ForEach @(
     @{ Status = 503; Why = 'HTTP 503; hint: the service reported that it is unavailable'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceUnavailable"}'; DripOn = 'Create'; DripSeconds = 15 } }
-    @{ Status = 201; Why = 'HTTP 201'; Opt = @{ DripOn = 'Create'; DripSeconds = 15 } }
   ) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
@@ -1983,6 +2184,31 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
     $r.All | Should -Not -Match "create refused|No submission was created|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Url))"
     @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "POST $Base/submissions", "GET $Base")
+  }
+  # PR #74 r6: over real HTTP, a create answered HTTP 201 whose body never
+  # arrives is "created, id unknown", never "not created".
+  It 'create answered HTTP 201, body <How>, the read-back shows <Case>: created, id unknown, the run stops, no re-run or delete advice' -ForEach @(
+    @{ How = 'dripping past its 2 s limit'; Case = 'the new pending submission'; Opt = @{ DripOn = 'Create'; DripSeconds = 15 } }
+    @{ How = 'cut off'; Case = 'no pending submission yet'; Opt = @{ DripOn = 'Create'; DripSeconds = 1; DripEnd = 'Break'; PendingLag = $true } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $sw.Stop()
+    $lost = if ($Opt.DripEnd -eq 'Break') { 'body not received (the connection broke or the body could not be read)' } else { 'body not received (time limit of 2 s for the whole request reached)' }
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape("::warning title=Store create::Created, id unknown: the Store answered the create with HTTP 201, so it created a submission, but this run did not get its id (Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $lost)."))
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $lost. Created, id unknown: the Store answered the create with HTTP 201"))
+    if ($Opt.PendingLag) {
+      $r.Err | Should -Match 'Read-back of the app \(one GET\): no pending submission yet\. That does not mean none was created'
+    } else {
+      $r.Err | Should -Match "Read-back of the app \(one GET\): pending submission $NewId\. Reported by id only: not updated, not committed, not deleted\."
+    }
+    $r.Value | Should -BeNullOrEmpty
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 12
+    $r.All | Should -Not -Match "Result unconfirmed|create refused|No submission was created|none had been created|nothing to clean up|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Url))"
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "POST $Base/submissions", "GET $Base")
+    $Srv.Sub.status | Should -Be 'PendingCommit'
   }
   It 'commit answered HTTP <Status> (<Case>), body dripping past its 2 s limit: unconfirmed by its status, read back by id' -ForEach @(
     @{ Status = 503; Case = 'carried out'; Done = $true; Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'After'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceUnavailable"}'; DripOn = 'Commit'; DripSeconds = 15 } }
@@ -1996,7 +2222,8 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     if ($Done) {
       $r.Err | Should -BeNullOrEmpty
       $r.Value | Should -Be @($NewId)
-      $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
+      $got = if ($Status -eq 200) { "was accepted (HTTP 200) but its answer's body was not read;" } else { 'got no answer, but' }
+      $r.Out | Should -Match ([regex]::Escape("::warning title=Store commit::The commit request for submission $NewId $got read-back 1 by id shows status Certification: it was committed"))
       @($Srv.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
     } else {
       $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer"

@@ -65,9 +65,10 @@ function ConvertTo-FakeNode([string]$Json) {
 # that lands afterwards gets 409),
 # NoPendingAs ('Null' or 'Omit': how GET app shows no pending submission),
 # PendingAfterCreate (GET app shows this id as pending once the run created
-# its submission), PriceId (NoPricing drops pricing), UploadStatus/UploadBody,
-# UploadBase (where the SAS upload URL points), CreateWithoutId,
-# CreateErrorStatus/CreateErrorBody (the create is refused with that status
+# its submission), PendingLag (GET app does not show the run's new submission
+# yet, as if the Store were slow to show it), PriceId (NoPricing drops
+# pricing), UploadStatus/UploadBody, UploadBase (where the SAS upload URL
+# points), CreateWithoutId, CreateErrorStatus/CreateErrorBody (the create is refused with that status
 # and that raw body; nothing is created). Every create records its query
 # string in CreateQuery; with isMinimalResponse=true the create answers with
 # id and status only, without it with the whole submission.
@@ -94,8 +95,9 @@ function ConvertTo-FakeNode([string]$Json) {
 # HTTP server ignores them). Calls: what the mocked Invoke-StoreHttp was asked
 # to send, with its timeout.
 # DripOn ('AppRead': every GET of the app; 'AppReadAfterCreate': every GET of
-# the app once a create request came in; 'Token', 'Create', 'Commit',
-# 'Upload': the answer to that request, whatever its status) with
+# the app once a create request came in; 'Token', 'Create', 'Update' (the
+# PUT of the submission), 'Commit', 'Upload', 'Delete': the answer to that
+# request, whatever its status) with
 # DripSeconds: Start-FakeStoreServer waits DripHeadSeconds, sends the status,
 # the headers and the first byte of that answer, then a space every 250 ms for
 # DripSeconds, then the rest of the body (a server that answers but drips its
@@ -103,9 +105,10 @@ function ConvertTo-FakeNode([string]$Json) {
 # AnswerContentType: the Content-Type of every answer with a body. Seen:
 # every request Start-FakeStoreServer got (Line 'METHOD /path', Headers).
 # The mocked Invoke-StoreHttp (Use-FakeStore) ignores AppRead and
-# AppReadAfterCreate; it returns a dripping answer to Token, Create, Commit or
-# Upload with its status and its body lost, as the real Invoke-StoreHttp does
-# when the drip outlasts the call's time limit (or breaks).
+# AppReadAfterCreate; it returns a dripping answer to Token, Create, Update,
+# Commit, Upload or Delete with its status and its body lost, as the real
+# Invoke-StoreHttp does when the drip outlasts the call's time limit (or
+# breaks).
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -114,6 +117,7 @@ function New-FakeStore {
     [switch]$HidePending,
     [string]$OtherDraftAfterCheck = '',
     [string]$PendingAfterCreate = '',
+    [switch]$PendingLag,
     [string]$TargetPublishMode = 'Manual',
     [ValidateSet('Null', 'Omit')][string]$NoPendingAs = 'Null',
     [string]$PriceId = 'Free',
@@ -137,7 +141,7 @@ function New-FakeStore {
     [ValidateSet('', 'Commit', 'ReadBack')][string]$HangOn = '',
     [ValidateRange(0, 100000)][int]$CallSeconds = 0,
     [ValidateRange(0, 100000)][int]$UploadSeconds = 0,
-    [ValidateSet('', 'AppRead', 'AppReadAfterCreate', 'Token', 'Create', 'Commit', 'Upload')][string]$DripOn = '',
+    [ValidateSet('', 'AppRead', 'AppReadAfterCreate', 'Token', 'Create', 'Update', 'Commit', 'Upload', 'Delete')][string]$DripOn = '',
     [ValidateRange(0, 600)][int]$DripSeconds = 0,
     [ValidateRange(0, 600)][int]$DripHeadSeconds = 0,
     [ValidateSet('Body', 'Break')][string]$DripEnd = 'Body',
@@ -149,7 +153,7 @@ function New-FakeStore {
   if ($NoPricing) { [void]$f.Remove('pricing') } else { $f['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create($PriceId) }
   [hashtable]::Synchronized(@{
     AppId = $AppId; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
-    OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; NoPendingAs = $NoPendingAs
+    OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; PendingLag = [bool]$PendingLag; NoPendingAs = $NoPendingAs
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
     CreateErrorStatus = $CreateErrorStatus; CreateErrorBody = $CreateErrorBody; CreateQuery = $null
     KeepOldPackage = [bool]$KeepOldPackage; CommitStatus = $CommitStatus; BaseUrl = $BaseUrl; Served = $false
@@ -218,6 +222,8 @@ function Invoke-FakeStoreRequest {
     'Create' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions$' }
     'Commit' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+/commit$' }
     'Upload' { $Method -eq 'PUT' -and $path -eq '/blob/upload.zip' }
+    'Update' { $Method -eq 'PUT' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$' }
+    'Delete' { $Method -eq 'DELETE' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$' }
     default { $false }
   }
   if ($on -and $r.StatusCode -gt 0) { $r.DripSeconds = $Store.DripSeconds }
@@ -290,7 +296,7 @@ function Invoke-FakeStoreRoute {
 function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Text, [string]$App) {
   if ($Path -match "^/v1\.0/my/applications/$App$" -and $Method -eq 'GET') {
     $o = [ordered]@{ id = $Store.AppId; primaryName = 'JerisLink'; lastPublishedApplicationSubmission = @{ id = '1152921505000000001'; resourceLocation = 'x' } }
-    $shown = if ($Store.Sub -and $Store.PendingAfterCreate) { $Store.PendingAfterCreate } elseif ($Store.HidePending -and -not $Store.Sub) { '' } else { $Store.PendingId }
+    $shown = if ($Store.Sub -and $Store.PendingAfterCreate) { $Store.PendingAfterCreate } elseif ($Store.HidePending -and -not $Store.Sub) { '' } elseif ($Store.PendingLag -and $Store.Sub) { '' } else { $Store.PendingId }
     if ($shown) { $o.pendingApplicationSubmission = @{ id = $shown; resourceLocation = 'y' } }
     elseif ($Store.NoPendingAs -eq 'Null') { $o.pendingApplicationSubmission = $null }
     # Someone else creates a draft right after this (the run's pending check).

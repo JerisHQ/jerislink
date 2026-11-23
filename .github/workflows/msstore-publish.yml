@@ -33,11 +33,17 @@ name: msstore-publish
 #   1. GET the app: stop if any submission is pending. This run never deletes
 #      a submission it did not create;
 #   2. POST a new submission; its id comes from that response. If the service
-#      refuses (HTTP 409, e.g. a submission appeared after step 1), stop. If
-#      the POST gets no answer, the result is unconfirmed: read the app back
-#      and stop, reporting only what it shows. Without an id from a create
-#      response a pending submission there is of unconfirmed origin (someone
-#      may have created it after step 1), so no delete advice is given;
+#      refuses (any status but 2xx, 408 and 5xx, e.g. HTTP 409 when a
+#      submission appeared after step 1), stop. If the POST gets no answer,
+#      HTTP 408 or 5xx, the result is unconfirmed: read the app back and stop,
+#      reporting only what it shows. Without an id from a create response a
+#      pending submission there is of unconfirmed origin (someone may have
+#      created it after step 1). If it answers HTTP 2xx but its id cannot be
+#      read (the body was lost, or has no usable id), a submission was
+#      created with an unknown id: read the app back once and stop, reporting
+#      a pending submission by its id only; none shown yet (the Store may be
+#      slow to show it) or a failed read-back is left to a person to check.
+#      None of these gives re-run or delete advice;
 #   3. GET the app again: its pending submission must be that id;
 #   4. GET the submission, check its price can be sent back unchanged, PUT it
 #      with every old package PendingDelete and the new .msixupload
@@ -50,13 +56,14 @@ name: msstore-publish
 #      (Test-DraftReadyToCommit);
 #   6. print the submission id and how to check it by hand, then POST
 #      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
-#      gets no answer, print at once that the result is unconfirmed, with that
-#      id, then read that id back up to 10 times, 30 s apart, each GET waiting
-#      up to 30 s, all within 300 s (the commit API is asynchronous):
-#      CommitStarted or a committed status means carry on; any other status
-#      stops; still PendingCommit or no read-back means the result stays
-#      unconfirmed, so stop with no delete or retry advice and ask a person
-#      to check that id;
+#      gets no answer, HTTP 408 or 5xx, or an HTTP 2xx whose body is lost
+#      (accepted, its status not read), print at once that the result is
+#      unconfirmed, with that id, then read that id back up to 10 times, 30 s
+#      apart, each GET waiting up to 30 s, all within 300 s (the commit API
+#      is asynchronous): CommitStarted or a committed status means carry on;
+#      any other status stops; still PendingCommit or no read-back means the
+#      result stays unconfirmed, so stop with no delete or retry advice and
+#      ask a person to check that id;
 #   7. the next step reads that id back until it reaches a committed status
 #      (Published included) with exactly one Uploaded package, the release's
 #      version, and no other Uploaded package.
@@ -69,10 +76,10 @@ name: msstore-publish
 #   call in steps 1-5 (the upload too) waits at most until that time starts,
 #   and once it has started the commit is not sent (stop uncommitted, with the
 #   DELETE for that id). The id and how to check it by hand are printed before
-#   the commit is sent and again as soon as it gets no answer, so they are in
-#   the log even if the step is killed. Every step of the publish job has a
-#   timeout, and they add up to the job's, so the job timeout cannot cut the
-#   submit step short.
+#   the commit is sent and again as soon as its result is unconfirmed, so they
+#   are in the log even if the step is killed. Every step of the publish job
+#   has a timeout, and they add up to the job's, so the job timeout cannot cut
+#   the submit step short.
 #   A submission this workflow creates is changed, committed or deleted only
 #   through the API, never in the Partner Center UI: Microsoft only takes in
 #   the uploaded package on an API commit, and a submission changed in the UI

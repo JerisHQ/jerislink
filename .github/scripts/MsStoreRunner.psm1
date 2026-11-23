@@ -146,13 +146,26 @@ $script:UriRule = @{ Token = 'https://login.microsoftonline.com'; Api = 'https:/
 # An exception whose message is fixed text that is safe to print. OutcomeUnknown:
 # the request may have reached the service and no answer says what it did.
 # NotSent: refused before anything was sent.
-function New-StoreError([string]$Message, [switch]$OutcomeUnknown, [switch]$NotSent) {
+function New-StoreError([string]$Message, [switch]$OutcomeUnknown, [switch]$NotSent, [int]$Status = 0) {
   $e = [System.InvalidOperationException]::new($Message)
   $e.Data['StoreText'] = $Message
   $e.Data['StoreOutcomeUnknown'] = [bool]$OutcomeUnknown
   $e.Data['StoreNotSent'] = [bool]$NotSent
+  $e.Data['StoreStatus'] = $Status
   $e
 }
+
+# The HTTP status a failed Invoke-StoreApi call got (New-StoreError -Status),
+# or 0 when it got none (no answer, or not sent). Never throws: a mark that
+# cannot be read is 0, which is never taken for an answered 2xx.
+function Get-StoreErrorStatus($ErrorRecord) {
+  try {
+    $d = $ErrorRecord.Exception.Data
+    if ($d.Contains('StoreStatus')) { return [int]$d['StoreStatus'] }
+  } catch { }
+  0
+}
+function Test-Store2xx([int]$Status) { $Status -ge 200 -and $Status -lt 300 }
 
 # Fixed text printed instead of the diagnostics of a failed call when they
 # cannot be formatted (Get-StoreErrorText, Get-StoreFailureText). Formatting
@@ -601,7 +614,9 @@ function Connect-StoreApi {
 # that status alone (Pepper, PR #74 r4): 408 and 5xx OutcomeUnknown, another
 # error status (400, 409, ...) refused; the text is the status, its hint and
 # the fixed BodyLost text. A 2xx whose body was lost is OutcomeUnknown: the
-# service did it, but what it answered (a create's new id) is not known.
+# service did it, but what it answered (a create's new id) is not known. The
+# status goes with the error (Get-StoreErrorStatus), so a caller can tell an
+# answered 2xx (done, answer unread) from no answer at all.
 # The access token is checked (Test-StoreBearerToken) before anything is sent.
 function Invoke-StoreApi {
   param(
@@ -632,7 +647,7 @@ function Invoke-StoreApi {
   $unknown = $ok -or $r.StatusCode -eq 408 -or $r.StatusCode -ge 500
   $t = if ($ok) { "HTTP $($r.StatusCode)" } else { Get-StoreErrorText $r.StatusCode $r.Body -Detail }
   if ($lost) { $t += "; $lost" }
-  throw (New-StoreError "Store API $what failed: $t" -OutcomeUnknown:$unknown)
+  throw (New-StoreError "Store API $what failed: $t" -OutcomeUnknown:$unknown -Status $r.StatusCode)
 }
 
 function Assert-ProductId([string]$ProductId) {
@@ -715,12 +730,17 @@ function Assert-NoPendingSubmission {
 # call, reports whether a submission is pending (Get-RefusedCreateReadBack),
 # and the error is thrown with that report. When no answer came back (or HTTP
 # 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the app
-# back and reports what it shows.
+# back and reports what it shows. An HTTP 2xx means the service created a
+# submission; when its id cannot be read (the body was lost, or it has no
+# usable id) that is "created, id unknown", never "not created":
+# Resolve-CreatedIdUnknown reads the app back and the run stops.
 function New-StoreSubmission {
   param([Parameter(Mandatory)][string]$ProductId, [ValidateRange(1, 600)][int]$ReadBackTimeoutSec = 30)
   Assert-ProductId $ProductId
   try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions?isMinimalResponse=true" }
   catch {
+    $status = Get-StoreErrorStatus $_
+    if (Test-Store2xx $status) { throw (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "$_" -Status "HTTP $status" -TimeoutSec $ReadBackTimeoutSec) }
     if (Test-StoreOutcomeUnknown $_) { throw (Resolve-UnconfirmedCreate -ProductId $ProductId -Failure "$_") }
     $refused = "$_. No submission was created and none was deleted."
     Write-Host "create refused: $refused"
@@ -733,7 +753,7 @@ function New-StoreSubmission {
   try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
   $json = $null
   if ($id -cnotmatch $script:SafeId) {
-    throw "the create response has no submission id. A draft may have been created; look it up with GET /v1.0/my/applications/$ProductId (pendingApplicationSubmission.id). $script:ApiOnlyNote"
+    throw (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "the create response (HTTP 2xx) has no usable submission id" -Status 'HTTP 2xx' -TimeoutSec $ReadBackTimeoutSec)
   }
   Write-Host "created submission id=$id (from the create response)"
   $id
@@ -755,24 +775,57 @@ function Get-RefusedCreateReadBack([string]$ProductId, [int]$TimeoutSec) {
   "$h pendingApplicationSubmission id $pending. This run did not create it."
 }
 
+# The create was answered with HTTP 2xx, so the service created a submission,
+# but this run did not get its id: the answer's body was lost or has no usable
+# id (Pepper, PR #74 r5). Prints a warning first (so the facts are in the log
+# even if the step is killed during the read-back), then reads the app back
+# once (one GET, at most TimeoutSec) and returns the error text to throw, so
+# the run stops. A pending submission is reported by its id only; none yet,
+# none with a usable id, or a failed read-back (the Store may show a new
+# submission only after a while) is left to a person to check. Never updates,
+# uploads to, commits or deletes a submission, and gives no re-run or delete
+# advice.
+function Resolve-CreatedIdUnknown([string]$ProductId, [string]$Answer, [string]$Status, [int]$TimeoutSec) {
+  $app = "GET /v1.0/my/applications/$ProductId"
+  $look = "A person needs to check the app's pending submission in Partner Center (look only, change nothing there) or with $app (pendingApplicationSubmission.id)"
+  Write-Host ("::warning title=Store create::Created, id unknown: the Store answered the create with $Status, so it created " +
+    "a submission, but this run did not get its id ($Answer). The run stops; it updates, commits and deletes nothing. " +
+    "Reading the app back once. If this step ends before a result is printed below: $look; the Store may take a while to show it.")
+  $head = ("$Answer. Created, id unknown: the Store answered the create with $Status, so it created a submission, but this " +
+    "run did not get the new submission's id. This run stops: it does not update, upload to, commit or delete any submission. " +
+    "Read-back of the app (one GET):")
+  try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId -TimeoutSec $TimeoutSec) -ProductId $ProductId }
+  catch { return "$head failed ($_). $look once the API answers; the Store may take a while to show the new submission. $script:ApiOnlyNote" }
+  if (-not $pending) {
+    return ("$head no pending submission yet. That does not mean none was created: the Store may take a while to show the " +
+      "new submission. $look later. $script:ApiOnlyNote")
+  }
+  if ($pending -ceq '(no usable id)') { return "$head a pending submission without a usable id. $look. $script:ApiOnlyNote" }
+  ("$head pending submission $pending. Reported by id only: not updated, not committed, not deleted. A person needs to " +
+    "check submission $pending in Partner Center (look only, change nothing there) or with $app/submissions/$pending. $script:ApiOnlyNote")
+}
+
 # The create request got no answer. This run has no submission id of its own
 # (that comes only from a create response), so a pending submission on the
 # read-back cannot be tied to this run: someone else (a person in the Partner
 # Center UI, another tool) may have created it after Assert-NoPendingSubmission
 # while this run's POST failed or never landed. Reports only what the
 # read-back shows. Returns the error text to throw; deletes nothing and gives
-# no delete advice.
+# no delete or re-run advice: the create may have been carried out, and the
+# Store may show a new submission only after a while, so a read-back without
+# one does not show none was created (Pepper, PR #74 r5).
 function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
   $head = "$Failure. Result unconfirmed: the create request got no answer, so a submission may or may not have been created. Read-back of the app:"
   try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId) -ProductId $ProductId }
   catch {
-    return ("$head failed too ($_). The result stays unknown: do not delete anything. Once the API answers, read " +
-      "GET /v1.0/my/applications/${ProductId}: no pendingApplicationSubmission means none is pending (re-run this workflow); " +
-      "a pending submission there is of unconfirmed origin, since this run never got a submission id to compare. $script:ApiOnlyNote")
+    return ("$head failed too ($_). The result stays unknown: do not delete anything. A person needs to read " +
+      "GET /v1.0/my/applications/${ProductId} once the API answers; a pending submission there is of unconfirmed origin, " +
+      "since this run never got a submission id to compare. $script:ApiOnlyNote")
   }
   if (-not $pending) {
-    return ("$head no pending submission, so none had been created when the app was read back, and there is nothing to clean up. " +
-      "Re-run this workflow; its pending-submission check stops before creating anything if a submission appears in the meantime.")
+    return ("$head no pending submission yet. That does not show none was created: the Store may take a while to show a new " +
+      "submission. This run changes and deletes nothing. A person needs to read GET /v1.0/my/applications/$ProductId later; " +
+      "a pending submission there is of unconfirmed origin, since this run never got a submission id to compare. $script:ApiOnlyNote")
   }
   if ($pending -ceq '(no usable id)') {
     return "$head it shows a pending submission without a usable id, origin unconfirmed. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote"
@@ -924,7 +977,9 @@ function Invoke-SubmissionCommit {
   Write-Host "submission $SubmissionId commit requested through the API: status=$(Get-SafeValue $st $script:SafeWord)"
 }
 
-# The commit request got no answer. The commit API is asynchronous
+# The commit request got no answer, or an HTTP 2xx whose body was lost (Status:
+# the commit was accepted, but whether it has started is not read; the text
+# says which). The commit API is asynchronous
 # (https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission),
 # so a PendingCommit read-back does not show the commit did not happen: the
 # request may still be on its way or being processed. First prints (an
@@ -944,15 +999,19 @@ function Resolve-UnconfirmedCommit {
     [Parameter(Mandatory)][string]$ProductId,
     [Parameter(Mandatory)][string]$SubmissionId,
     [Parameter(Mandatory)][string]$Failure,
+    [int]$Status = 0,
     [ValidateRange(1, 100)][int]$Attempts = 10,
     [ValidateRange(0, 600)][int]$IntervalSeconds = 30,
     [ValidateRange(1, 600)][int]$TimeoutSeconds = 30,
     [ValidateRange(1, 3600)][int]$BudgetSeconds = 300,
     [datetime]$DeadlineUtc = [datetime]::MaxValue
   )
-  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId got no answer, so it may or may not have been committed."
+  $accepted = Test-Store2xx $Status
+  $got = if ($accepted) { "was accepted (HTTP $Status) but its answer's body was not read" } else { 'got no answer' }
+  $may = if ($accepted) { 'so whether the commit has started is not confirmed' } else { 'so it may or may not have been committed' }
+  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId $got, $may."
   $get = "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
-  Write-Host ("::warning title=Store commit::Result unconfirmed: the commit request for submission $SubmissionId got no answer " +
+  Write-Host ("::warning title=Store commit::Result unconfirmed: the commit request for submission $SubmissionId $got " +
     "($Failure). Reading it back by id for up to $BudgetSeconds s. If this step ends before a result is printed below, check " +
     "$get by hand: CommitStarted or a later status means it was committed. Do not delete, edit, commit or re-submit it, " +
     "and do not re-run this workflow for it.")
@@ -977,7 +1036,8 @@ function Resolve-UnconfirmedCommit {
       if ($readErr) { $last = "read-back $i of ${Attempts} failed ($readErr)"; continue }
       if (-not $sub -or $sub.Id -cne $SubmissionId) { $last = "read-back $i of ${Attempts} did not return that submission"; continue }
       if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
-        Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but read-back " +
+        $but = if ($accepted) { ';' } else { ', but' }
+        Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId $got$but read-back " +
           "$i by id shows status $($sub.Status): it was committed. The next step checks its package.")
         return
       }
@@ -993,13 +1053,20 @@ function Resolve-UnconfirmedCommit {
 
 # Deletes one submission by id, only while it is an uncommitted draft
 # (PendingCommit). For recovery by hand; the publish workflow never deletes.
+# An HTTP 2xx whose body was lost counts as deleted (the body is not used).
 function Remove-StoreDraftSubmission {
   param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
   $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId)
   if (-not $sub -or $sub.Id -cne $SubmissionId) { throw "GET submission $SubmissionId did not return that submission; not deleting" }
   if ($sub.Status -cne 'PendingCommit') { throw "submission $SubmissionId is '$($sub.Status)', not an uncommitted PendingCommit draft; not deleting" }
-  Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" | Out-Null
-  Write-Host "deleted draft submission $SubmissionId"
+  $note = ''
+  try { Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" | Out-Null }
+  catch {
+    $status = Get-StoreErrorStatus $_
+    if (-not (Test-Store2xx $status)) { throw }
+    $note = " (HTTP $status; the answer's body was not read)"
+  }
+  Write-Host "deleted draft submission $SubmissionId$note"
 }
 # Parses submission JSON into safe fields only: Id, Status, TargetPublishMode,
 # and FileName, Version, FileStatus per package, each passed through
@@ -1218,7 +1285,7 @@ function Publish-StoreSubmission {
   try { Invoke-SubmissionCommit -ProductId $ProductId -SubmissionId $id -TimeoutSec $CommitTimeoutSeconds }
   catch {
     if (Test-StoreOutcomeUnknown $_) {
-      Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" `
+      Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" -Status (Get-StoreErrorStatus $_) `
         -Attempts $CommitReadBackAttempts -IntervalSeconds $CommitReadBackIntervalSeconds `
         -TimeoutSeconds $CommitReadBackTimeoutSeconds -BudgetSeconds $CommitReadBackBudgetSeconds -DeadlineUtc $DeadlineUtc
     }
