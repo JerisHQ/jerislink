@@ -1,6 +1,8 @@
 # Pester 5 tests for MsStoreRunner.psm1: the checks on submission JSON, and the
 # Store submission API flow against FakeStoreApi.psm1 (an in-memory stand-in;
-# Invoke-StoreHttp, the module's only network call, is mocked to reach it).
+# Invoke-StoreHttp, the module's only network call, is mocked to reach it),
+# and, in the last block, the real HTTP path against the same stand-in served
+# on 127.0.0.1 (redirects, verbose and debug output).
 # Run: Invoke-Pester -Path .github/scripts/tests -Output Detailed
 # The fixtures are made up, not captured from Partner Center. They use
 # PascalCase names; the API sends camelCase, and the checks read both (PowerShell
@@ -16,8 +18,10 @@ BeforeAll {
   $script:App = '9NM3VWQ9MD7N'
   $script:File = 'Jerislink-0.4.1.0-x64.msixupload'
   $script:Secret = 'dummy-client-secret-Zx9'
-  # Never in any output: the fake SAS signature, the blob URL, the client secret.
-  $script:Leak = 'FAKE\+SAS|FAKE%2BSAS|SIGNATURE-0123456789|fake-store\.invalid|/blob/|dummy-client-secret|fake-access-token'
+  # Never in any output: the fake SAS signature, the blob URL, the client secret, the token.
+  $script:Leak = 'FAKE\+SAS|FAKE%2BSAS|SIGNATURE-0123456789|jlfakeupload|/blob/|dummy-client-secret|fake-access-token'
+  # Lines that must never be printed from API strings (workflow commands, line breaks).
+  $script:Injected = '::error::|::warning::|::set-output|::add-mask|pwned'
 
   # Runs a command, returns its pipeline output, everything it printed
   # (Write-Host) and the error text it threw ('' if none).
@@ -30,7 +34,9 @@ BeforeAll {
     [pscustomobject]@{ Value = $value; Out = ($printed -join "`n"); Err = $err; All = (($printed -join "`n") + "`n" + $err) }
   }
 
-  # Routes the module's HTTP calls to $global:FakeStore.
+  # Routes the module's HTTP calls to $global:FakeStore. Signs in with the
+  # production hosts (the mock sends nothing). A request the fake answers with
+  # status 0 throws what HttpClient throws when no answer comes back.
   function script:Use-FakeStore([hashtable]$Store) {
     $global:FakeStore = $Store
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
@@ -38,9 +44,15 @@ BeforeAll {
       if ($Headers) { foreach ($k in $Headers.Keys) { $h[$k] = $Headers[$k] } }
       if ($ContentType) { $h['Content-Type'] = $ContentType }
       $bytes = if ($InFile) { [IO.File]::ReadAllBytes($InFile) } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
-      Invoke-FakeStoreRequest -Store $global:FakeStore -Method $Method -Uri $Uri -Headers $h -BodyBytes $bytes
+      $r = Invoke-FakeStoreRequest -Store $global:FakeStore -Method $Method -Uri $Uri -Headers $h -BodyBytes $bytes
+      if ($r.StatusCode -eq 0) {
+        $sock = [System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::ConnectionReset)
+        $io = [System.IO.IOException]::new("Unable to read data from the transport connection ($Uri)", $sock)
+        throw [System.Net.Http.HttpRequestException]::new("An error occurred while sending the request to $Uri", $io)
+      }
+      [pscustomobject]@{ StatusCode = $r.StatusCode; Body = $r.Body }
     }
-    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost 'https://login.fake.invalid' -ApiBase 'https://fake-store.invalid' 6>$null
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret 6>$null
     $Store.Log.Clear()
   }
 
@@ -234,19 +246,17 @@ Describe 'Protect-StoreText' {
 
 Describe 'Connect-StoreApi' {
   It 'never prints the secret or the token, also when the token request fails' {
-    $s = New-FakeStore
-    $global:FakeStore = $s
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
-      [pscustomobject]@{ StatusCode = 401; Body = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret dummy-client-secret-Zx9 provided. https://login.microsoftonline.com/error?code=7000215"}' }
+      [pscustomobject]@{ StatusCode = 401; Body = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret dummy-client-secret-Zx9 provided. https://login.microsoftonline.com/error?code=7000215","error_codes":[7000215]}' }
     }
-    $r = Invoke-Captured { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret $Secret -AuthorityHost 'https://login.fake.invalid' }
-    $r.Err | Should -Match 'could not get a Partner Center access token: HTTP 401'
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret $Secret }
+    $r.Err | Should -BeExactly 'could not get a Partner Center access token: HTTP 401 (invalid_client, AADSTS7000215)'
     $r.All | Should -Not -Match $Leak
   }
-  It 'masks a network error that names the URL' {
-    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw "No connection could be made (https://login.fake.invalid/t/oauth2/v2.0/token?x=dummy-client-secret-Zx9)" }
+  It 'prints only exception type names for a network error that names the URL' {
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw "No connection could be made (https://login.microsoftonline.com/t/oauth2/v2.0/token?x=dummy-client-secret-Zx9)" }
     $r = Invoke-Captured { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret $Secret }
-    $r.Err | Should -Match 'could not get a Partner Center access token'
+    $r.Err | Should -BeExactly 'could not get a Partner Center access token: no response (RuntimeException)'
     $r.All | Should -Not -Match $Leak
   }
   It 'refuses an empty secret without calling out' {
@@ -254,10 +264,136 @@ Describe 'Connect-StoreApi' {
     { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret '' } | Should -Throw '*empty*'
     Should -Invoke -ModuleName MsStoreRunner Invoke-StoreHttp -Times 0 -Exactly
   }
+  It 'refuses <Case> before the client secret is sent' -ForEach @(
+    @{ Case = 'another sign-in host'; Opt = @{ AuthorityHost = 'https://login.fake.invalid' } }
+    @{ Case = 'plain-HTTP sign-in'; Opt = @{ AuthorityHost = 'http://login.microsoftonline.com' } }
+    @{ Case = 'another sign-in port'; Opt = @{ AuthorityHost = 'https://login.microsoftonline.com:8443' } }
+    @{ Case = 'another API host'; Opt = @{ ApiBase = 'https://evil.invalid' } }
+    @{ Case = 'a look-alike API host'; Opt = @{ ApiBase = 'https://manage.devcenter.microsoft.com.evil.invalid' } }
+    @{ Case = 'a loopback stand-in without -LoopbackTestServer'; Opt = @{ AuthorityHost = 'http://127.0.0.1:9'; ApiBase = 'http://127.0.0.1:9' } }
+  ) {
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw 'called' }
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret $Secret @Opt }
+    $r.Err | Should -Match '^refused: sign-in goes only to https://login\.microsoftonline\.com and API calls only to https://manage\.devcenter\.microsoft\.com .*the client secret was not sent$'
+    Should -Invoke -ModuleName MsStoreRunner Invoke-StoreHttp -Times 0 -Exactly
+  }
   It 'asks for a client-credentials token for the Store API scope' {
     $s = New-FakeStore; Use-FakeStore $s
     $s.TokenRequest | Should -Match '(^|&)grant_type=client_credentials(&|$)'
     $s.TokenRequest | Should -Match 'scope=https%3A%2F%2Fmanage\.devcenter\.microsoft\.com%2F\.default'
+  }
+}
+
+Describe 'Test-StoreUri and Invoke-StoreHttp (where requests may go)' {
+  BeforeEach { InModuleScope MsStoreRunner { $script:LoopbackTestServer = $false } }
+  AfterAll { InModuleScope MsStoreRunner { $script:LoopbackTestServer = $false } }
+
+  It 'allows <Kind> <Uri>' -ForEach @(
+    @{ Kind = 'Token'; Uri = 'https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token' }
+    @{ Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N' }
+    @{ Kind = 'Upload'; Uri = 'https://productingestionbin1.blob.core.windows.net/ingestion/x?sv=1&sig=a' }
+    @{ Kind = 'Upload'; Uri = 'HTTPS://PRODUCTINGESTIONBIN1.BLOB.CORE.WINDOWS.NET/ingestion/x' }
+  ) {
+    Test-StoreUri -Uri $Uri -Kind $Kind | Should -BeTrue
+  }
+  It 'refuses <Kind> <Uri>' -ForEach @(
+    @{ Kind = 'Upload'; Uri = 'http://productingestionbin1.blob.core.windows.net/ingestion/x' }
+    @{ Kind = 'Upload'; Uri = 'https://evil.invalid/ingestion/x' }
+    @{ Kind = 'Upload'; Uri = 'https://acct.blob.core.windows.net.evil.invalid/x' }
+    @{ Kind = 'Upload'; Uri = 'https://evil.invalid/acct.blob.core.windows.net' }
+    @{ Kind = 'Upload'; Uri = 'https://a.b.blob.core.windows.net/x' }
+    @{ Kind = 'Upload'; Uri = 'https://acct.blob.core.windows.net:8443/x' }
+    @{ Kind = 'Upload'; Uri = 'https://user:pw@acct.blob.core.windows.net/x' }
+    @{ Kind = 'Upload'; Uri = 'http://127.0.0.1:8080/blob/upload.zip' }
+    @{ Kind = 'Upload'; Uri = 'https://manage.devcenter.microsoft.com/x' }
+    @{ Kind = 'Api'; Uri = 'https://acct.blob.core.windows.net/x' }
+    @{ Kind = 'Api'; Uri = 'http://manage.devcenter.microsoft.com/v1.0/my/' }
+    @{ Kind = 'Token'; Uri = 'https://manage.devcenter.microsoft.com/t/oauth2/v2.0/token' }
+    @{ Kind = 'Api'; Uri = 'file:///etc/passwd' }
+    @{ Kind = 'Api'; Uri = 'not a url' }
+    @{ Kind = 'Api'; Uri = '' }
+  ) {
+    Test-StoreUri -Uri $Uri -Kind $Kind | Should -BeFalse
+  }
+  It 'allows loopback only after Connect-StoreApi -LoopbackTestServer, and nothing else extra' {
+    InModuleScope MsStoreRunner { $script:LoopbackTestServer = $true }
+    Test-StoreUri -Uri 'http://127.0.0.1:1234/blob/upload.zip' -Kind Upload | Should -BeTrue
+    Test-StoreUri -Uri 'http://localhost:1234/v1.0/my/' -Kind Api | Should -BeTrue
+    Test-StoreUri -Uri 'https://evil.invalid/x' -Kind Upload | Should -BeFalse
+    Test-StoreUri -Uri 'http://10.0.0.1/x' -Kind Api | Should -BeFalse
+  }
+  It 'refuses, before sending anything, a request to a URL that is not allowed for its kind' -ForEach @(
+    @{ Kind = 'Api'; Uri = 'http://127.0.0.1:9/v1.0/my/applications' }
+    @{ Kind = 'Upload'; Uri = 'https://evil.invalid/blob/upload.zip?sig=FAKE+SAS' }
+    @{ Kind = 'Token'; Uri = 'https://manage.devcenter.microsoft.com/t/oauth2/v2.0/token' }
+  ) {
+    $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri $Uri -Kind $Kind }
+    $r.Err | Should -Match "^refused: $Kind requests go only to https://.*; nothing was sent$"
+    $r.All | Should -Not -Match $Leak
+  }
+}
+
+Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
+  It 'returns <Want> for <Case>' -ForEach @(
+    @{ Case = 'a blob storage XML error'; Code = 403; Want = 'HTTP 403 (AuthenticationFailed)'
+       Body = '<?xml version="1.0"?><Error><Code>AuthenticationFailed</Code><Message>Signature did not match. https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sig=FAKE+SAS%2FSIGNATURE-0123456789</Message></Error>' }
+    @{ Case = 'a Store API error'; Code = 400; Want = 'HTTP 400 (InvalidParameterValue)'
+       Body = '{"code":"InvalidParameterValue","message":"bad value at https://evil.invalid/?sig=FAKE+SAS","target":"applicationPackages"}' }
+    @{ Case = 'a nested error object'; Code = 400; Want = 'HTTP 400 (BadRequest)'; Body = '{"error":{"code":"BadRequest","message":"see https://evil.invalid"}}' }
+    @{ Case = 'a token endpoint error'; Code = 401; Want = 'HTTP 401 (invalid_client, AADSTS7000215)'
+       Body = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret dummy-client-secret-Zx9","error_codes":[7000215]}' }
+    @{ Case = 'a code with a line break and a workflow command'; Code = 500; Want = 'HTTP 500'; Body = "{`"code`":`"Bad`n::error::pwned`"}" }
+    @{ Case = 'a code that is a URL'; Code = 400; Want = 'HTTP 400'; Body = '{"code":"https://evil.invalid/x?sig=FAKE+SAS"}' }
+    @{ Case = 'an HTML page'; Code = 502; Want = 'HTTP 502'; Body = '<html><body>Bad gateway https://evil.invalid ::error::pwned</body></html>' }
+    @{ Case = 'an empty body'; Code = 404; Want = 'HTTP 404'; Body = '' }
+  ) {
+    $t = Get-StoreErrorText -StatusCode $Code -Body $Body
+    $t | Should -BeExactly $Want
+  }
+}
+
+Describe 'Strings from the API are printed only when they are plain values' {
+  BeforeAll {
+    $script:Evil = '{"Id":"1152921505000000004\n::error::pwned","Status":"Certification\r\n::warning::pwned","TargetPublishMode":"Manual\n::add-mask::x",' +
+      '"ApplicationPackages":[{"FileName":"Jerislink-0.4.1.0-x64.msixupload\n::error::pwned","FileStatus":"Uploaded\n::set-output name=x::pwned","Version":"0.4.1.0\n::error::pwned"}]}'
+  }
+  It 'turns every field that is not a plain value into [invalid] in the check results' {
+    $a = Test-SubmissionHasPackage -SubmissionJson $Evil -ExpectedVersion '0.4.1.0'
+    $b = Test-DraftReadyToCommit -SubmissionJson $Evil -SubmissionId $SubId -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
+    foreach ($r in $a, $b) {
+      $r.Result | Should -Be 'Fail'
+      $r.Id | Should -BeExactly '[invalid]'
+      $r.Status | Should -BeExactly '[invalid]'
+      $r.TargetPublishMode | Should -BeExactly '[invalid]'
+      $r.Packages[0].FileName | Should -BeExactly '[invalid]'
+      $r.Packages[0].Version | Should -BeExactly '[invalid]'
+      $r.Packages[0].FileStatus | Should -BeExactly '[invalid]'
+      ($r | ConvertTo-Json -Depth 5) | Should -Not -Match $Injected
+    }
+  }
+  It 'prints no injected text while checking a committed submission' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $s.Sub = @{ id = $SubId; status = "Certification`n::error::pwned"; applicationPackages = @(@{ fileName = "$File`n::warning::pwned"; fileStatus = 'Uploaded'; version = '0.4.1.0' }) }
+    $r = Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 -IntervalSeconds 0 }
+    $r.Err | Should -Match "status is '\[invalid\]', not a committed status"
+    $r.All | Should -Not -Match $Injected
+    $r.Out | Should -Match 'package fileName=\[invalid\] version=0\.4\.1\.0 fileStatus=Uploaded'
+  }
+  It 'prints no injected commit status' {
+    $s = New-FakeStore; Use-FakeStore $s
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = 200; Body = "{`"status`":`"CommitStarted`n::error::pwned`"}" } }
+    $r = Invoke-Captured { Invoke-SubmissionCommit -ProductId $App -SubmissionId $SubId }
+    $r.Out | Should -BeExactly "submission $SubId commit requested through the API: status=[invalid]"
+  }
+  It 'prints no injected priceId' {
+    $r = Test-SubmissionPricing -SubmissionJson "{`"pricing`":{`"priceId`":`"Free`n::error::pwned`"}}"
+    $r.Reason | Should -BeExactly 'pricing.priceId=[invalid] is kept as is'
+  }
+  It 'prints no injected pending submission id' {
+    $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1`n::error::pwned`"}}"
+    $r = Invoke-Captured { Test-NoPendingSubmission -AppJson $appJson -ProductId $App }
+    $r.Err | Should -Match 'pending submission \(no usable id\)'
+    $r.All | Should -Not -Match $Injected
   }
 }
 
@@ -282,7 +418,50 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $s.Sub.status | Should -Be 'Certification'
     $r.Out | Should -Match "created submission id=$NewId \(from the create response\)"
     $r.Out | Should -Match 'package uploaded: Jerislink-0\.4\.1\.0-x64\.msixupload in Upload\.zip \(\d+ bytes\), HTTP 201'
+    $r.Out | Should -Match 'fields unchanged: 20 submission fields other than applicationPackages read back as before the update'
     $r.All | Should -Not -Match $Leak
+  }
+
+  # Item r3-1: the docs require these on every package object of the update.
+  It 'sends minimumDirectXVersion and minimumSystemRam None on the new package entry' {
+    $s = New-FakeStore; Use-FakeStore $s
+    (Invoke-Publish $Pkg).Err | Should -BeNullOrEmpty
+    $put = $s.LastPut | ConvertFrom-Json
+    $new = @($put.applicationPackages | Where-Object { $_.fileStatus -ceq 'PendingUpload' })
+    $new.Count | Should -Be 1
+    $new[0].fileName | Should -BeExactly $File
+    $new[0].minimumDirectXVersion | Should -BeExactly 'None'
+    $new[0].minimumSystemRam | Should -BeExactly 'None'
+  }
+
+  # Item r3-2: everything but the packages must read back as it was.
+  It 'stops uncommitted when the update changed <Case>' -ForEach @(
+    @{ Case = 'the pricing'; Drift = 'Pricing'; Field = 'pricing' }, @{ Case = 'the listings (one dropped)'; Drift = 'DropListing'; Field = 'listings' }
+  ) {
+    $s = New-FakeStore -DriftOnPut $Drift; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "submission fields changed after this run's update: $Field\. Only applicationPackages may change"
+    $r.Err | Should -Match "Not committed: draft $NewId stays uncommitted"
+    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
+    @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+    $s.Sub.status | Should -Be 'PendingCommit'
+    $r.All | Should -Not -Match $Leak
+  }
+
+  # Item r3-3b: the upload goes only to https on a blob storage account.
+  It 'does not upload, and stops uncommitted, when the upload URL is <Case>' -ForEach @(
+    @{ Case = 'plain HTTP'; UploadBase = 'http://jlfakeupload.blob.core.windows.net' }
+    @{ Case = 'another host'; UploadBase = 'https://evil.invalid' }
+    @{ Case = 'a look-alike host'; UploadBase = 'https://jlfakeupload.blob.core.windows.net.evil.invalid' }
+  ) {
+    $s = New-FakeStore -UploadBase $UploadBase; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'package upload refused: the upload URL is not https://<account>\.blob\.core\.windows\.net; nothing was sent'
+    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
+    @($s.Log) | Should -Not -Contain 'PUT /blob/upload.zip'
+    @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+    $s.Blob | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match "$Leak|evil\.invalid"
   }
 
   It 'uploads a block-blob zip holding only the package, at the zip root, with + escaped in the SAS URL' {
@@ -364,30 +543,191 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   }
 
   It 'masks the SAS URL when the upload fails with an error body' {
-    $s = New-FakeStore -UploadStatus 403 -UploadBody '<?xml version="1.0"?><Error><Code>AuthenticationFailed</Code><Message>Signature did not match. https://fake-store.invalid/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789</Message></Error>'
+    $s = New-FakeStore -UploadStatus 403 -UploadBody '<?xml version="1.0"?><Error><Code>AuthenticationFailed</Code><Message>Signature did not match. https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789</Message></Error>'
     Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'package upload failed: HTTP 403 .*AuthenticationFailed'
-    $r.All | Should -Not -Match $Leak
+    $r.Err | Should -Match 'package upload failed: HTTP 403 \(AuthenticationFailed\)\. Not committed'
+    $r.All | Should -Not -Match "$Leak|Signature did not match"
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
   }
 
   It 'masks the SAS URL when the upload throws an error that names it' {
     $s = New-FakeStore; Use-FakeStore $s
-    Mock -ModuleName MsStoreRunner Invoke-StoreHttp -ParameterFilter { $Uri -like '*/blob/*' } {
-      throw "The SSL connection could not be established, see inner exception. ($Uri)"
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp -ParameterFilter { $Kind -eq 'Upload' } {
+      throw [System.Net.Http.HttpRequestException]::new("The SSL connection could not be established, see inner exception. ($Uri)")
     }
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'package upload failed: The SSL connection could not be established'
-    $r.All | Should -Not -Match $Leak
+    $r.Err | Should -Match 'package upload failed: no response \(HttpRequestException( Unknown)?\)\. Not committed'
+    $r.All | Should -Not -Match "$Leak|SSL connection"
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
   }
 
   It 'prints one fixed line for a successful upload and nothing from the URL' {
     $s = New-FakeStore; Use-FakeStore $s
-    $r = Invoke-Captured { Send-StorePackage -UploadUrl "https://fake-store.invalid/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl "https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg }
     $r.Err | Should -BeNullOrEmpty
     $r.Out | Should -Match "^package uploaded: $([regex]::Escape($File)) in Upload\.zip \(\d+ bytes\), HTTP 201$"
+  }
+
+  It 'refuses a plain-HTTP upload URL before zipping or sending anything' {
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { throw 'called' }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl "http://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE+SAS%2FSIGNATURE-0123456789" -PackagePath $Pkg }
+    $r.Err | Should -Match '^package upload refused'
+    $r.All | Should -Not -Match $Leak
+    Should -Invoke -ModuleName MsStoreRunner Invoke-StoreHttp -Times 0 -Exactly
+  }
+}
+
+# Item r3-4: no answer to create or commit. LoseAsStatus 0 is no response at
+# all (HttpRequestException), 504 a gateway timeout; either way the service
+# may have carried the request out, so the run reads back before advising.
+Describe 'No answer to create or commit (fake Store)' {
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It 'create carried out, answer lost (<Lost>): finds the new pending submission and names it for deletion by id' -ForEach @(
+    @{ Lost = 0; Why = 'no response \(HttpRequestException Unknown <- IOException <- SocketException ConnectionReset\)' }, @{ Lost = 504; Why = 'HTTP 504' }
+  ) {
+    $s = New-FakeStore -LoseResponse Create -LoseWhen After -LoseAsStatus $Lost; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions failed: $Why\. Result unconfirmed: the create request got no answer"
+    $r.Err | Should -Match "submission $NewId is pending now and was not before this run's create"
+    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Sub.status | Should -Be 'PendingCommit'
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'create not carried out, no answer: reads the app back and says nothing was created' {
+    $s = New-FakeStore -LoseResponse Create -LoseWhen Before; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'Result unconfirmed: .* no pending submission, so none was created and there is nothing to clean up'
+    $r.Err | Should -Not -Match 'DELETE /v1'
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Sub | Should -BeNullOrEmpty
+  }
+  It 'create with no answer and a failing read-back: result stays unknown, no delete advice' {
+    $s = New-FakeStore -LoseResponse Create -LoseWhen After -FailAfterLoss; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. The result stays unknown: do not delete anything yet'
+    $r.Err | Should -Not -Match 'DELETE /v1'
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+  It 'commit carried out, answer lost (<Lost>): reads it back by id, sees it committed, and goes on' -ForEach @(@{ Lost = 0 }, @{ Lost = 504 }) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen After -LoseAsStatus $Lost; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value | Should -Be @($NewId)
+    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but the read-back by id shows status Certification: it was committed"
+    @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'commit not carried out, no answer: read-back shows PendingCommit, so it says delete by id' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer.* status is still PendingCommit, so it was not committed"
+    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
+    @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+    $s.Sub.status | Should -Be 'PendingCommit'
+  }
+  It 'commit with no answer and a failing read-back: result stays unknown, no delete advice' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen After -FailAfterLoss; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'Result unconfirmed: the commit request .* failed too \(.*HTTP 503.*\)\. The result stays unknown: do not delete, edit or commit anything yet'
+    $r.Err | Should -Not -Match 'DELETE /v1'
+  }
+  It 'commit with no answer and a read-back status that is neither: no delete advice' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen After -CommitStatus CommitFailed; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "status is 'CommitFailed'\. Nothing is deleted or retried"
+    $r.Err | Should -Not -Match 'DELETE /v1'
+  }
+  It 'commit refused with an answer (HTTP 409): no read-back, says how to check and delete by id' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus 409; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "failed: HTTP 409\. Commit of submission $NewId was not accepted"
+    $r.Err | Should -Not -Match 'Result unconfirmed'
+    @($s.Log)[-1] | Should -Be "POST $Base/submissions/$NewId/commit"
+  }
+}
+
+Describe 'Compare-SubmissionFields' {
+  BeforeAll {
+    $s = New-FakeStore
+    $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @(@{ fileName = 'a.msixupload'; fileStatus = 'Uploaded' }) }
+    $script:Before = Get-FakeSubmission $s
+    $script:Kept = Get-SubmissionComparedFields -SubmissionJson $Before
+    function script:Edit-Submission([scriptblock]$Change) {
+      $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+      $n = [System.Text.Json.Nodes.JsonNode]::Parse($Before, $o)
+      & $Change $n
+      $n.ToJsonString()
+    }
+  }
+  It 'keeps no upload URL' {
+    $Kept | Should -Not -Match 'fileUploadUrl|sig=|blob\.core|applicationPackages'
+  }
+  It 'reports nothing when only id, status, statusDetails, fileUploadUrl and the packages changed' {
+    $after = Edit-Submission {
+      param($n)
+      $n['id'] = [System.Text.Json.Nodes.JsonValue]::Create('1'); $n['status'] = [System.Text.Json.Nodes.JsonValue]::Create('CommitStarted')
+      $n['statusDetails'] = [System.Text.Json.Nodes.JsonValue]::Create('x'); $n['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create('https://other')
+      $n['applicationPackages'] = [System.Text.Json.Nodes.JsonArray]::new()
+    }
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
+    $d.Changed | Should -BeNullOrEmpty
+    $d.Compared | Should -Be 20
+  }
+  It 'reports nothing for other key order and key case' {
+    $after = '{"Trailers":[],' + $Before.Substring(1).Replace('"pricing"', '"Pricing"')
+    $after = $after.Replace(',"trailers":[]', '')
+    (Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after).Changed | Should -BeNullOrEmpty
+  }
+  It 'reports <Field> when <Case>' -ForEach @(
+    @{ Case = 'the price changed'; Field = 'pricing'; Change = { param($n) $n['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') } }
+    @{ Case = 'a market price changed'; Field = 'pricing'; Change = { param($n) $n['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Free') } }
+    @{ Case = 'a listing was dropped'; Field = 'listings'; Change = { param($n) [void]$n['listings'].AsObject().Remove('zh-hk') } }
+    @{ Case = 'a listing title changed'; Field = 'listings'; Change = { param($n) $n['listings']['en-us']['baseListing']['title'] = [System.Text.Json.Nodes.JsonValue]::Create('X') } }
+    @{ Case = 'visibility is gone'; Field = 'visibility'; Change = { param($n) [void]$n.Remove('visibility') } }
+    @{ Case = 'the publish mode changed'; Field = 'targetPublishMode'; Change = { param($n) $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate') } }
+    @{ Case = 'the publish date changed'; Field = 'targetPublishDate'; Change = { param($n) $n['targetPublishDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00Z') } }
+    @{ Case = 'a device family changed'; Field = 'allowTargetFutureDeviceFamilies'; Change = { param($n) $n['allowTargetFutureDeviceFamilies']['Xbox'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'a field was added'; Field = 'newSetting'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a field with an odd name was added'; Field = '[unexpected field name]'; Change = { param($n) $n["x`n::error::pwned"] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+  ) {
+    $after = Edit-Submission $Change
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
+    @($d.Changed) | Should -Be @($Field)
+  }
+  It 'throws on JSON that is not an object' {
+    { Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson 'Error' } | Should -Throw '*not an object*'
+    { Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson '[1]' } | Should -Throw '*not an object*'
+  }
+}
+
+Describe 'Fake Store package rules' {
+  # The fake must refuse what the real service refuses, or the dry run proves nothing.
+  It 'refuses a PUT whose new package lacks <Field>' -ForEach @(
+    @{ Field = 'minimumDirectXVersion'; Value = $null }, @{ Field = 'minimumSystemRam'; Value = $null },
+    @{ Field = 'minimumDirectXVersion'; Value = 'DirectX12' }, @{ Field = 'minimumSystemRam'; Value = 'Memory4GB' }
+  ) {
+    $s = New-FakeStore
+    $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
+    $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+    $n = [System.Text.Json.Nodes.JsonNode]::Parse((Set-SubmissionPackage -SubmissionJson (Get-FakeSubmission $s) -FileName $File), $o)
+    $last = $n['applicationPackages'][$n['applicationPackages'].Count - 1]
+    if ($null -eq $Value) { [void]$last.AsObject().Remove($Field) } else { $last[$Field] = [System.Text.Json.Nodes.JsonValue]::Create($Value) }
+    $r = Invoke-FakeStoreRequest -Store $s -Method PUT -Uri "https://manage.devcenter.microsoft.com$Base/submissions/$SubId" `
+      -Headers @{ Authorization = "Bearer $($s.Token)" } -BodyBytes ([Text.Encoding]::UTF8.GetBytes($n.ToJsonString()))
+    $r.StatusCode | Should -Be 400
+    $r.Body | Should -Match 'InvalidParameterValue'
+  }
+  It 'accepts the PUT that Set-SubmissionPackage builds' {
+    $s = New-FakeStore
+    $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
+    $body = Set-SubmissionPackage -SubmissionJson (Get-FakeSubmission $s) -FileName $File
+    $r = Invoke-FakeStoreRequest -Store $s -Method PUT -Uri "https://manage.devcenter.microsoft.com$Base/submissions/$SubId" `
+      -Headers @{ Authorization = "Bearer $($s.Token)" } -BodyBytes ([Text.Encoding]::UTF8.GetBytes($body))
+    $r.StatusCode | Should -Be 200
   }
 }
 
@@ -430,7 +770,8 @@ Describe 'Set-SubmissionPackage and Test-SubmissionPricing' {
     $out = Set-SubmissionPackage -SubmissionJson $in -FileName $File
     $out | Should -BeExactly ('{"id":"1","targetPublishDate":"1601-01-01T00:00:00Z","x":1.50,"pricing":{"priceId":"Free"},"applicationPackages":[' +
           '{"fileName":"a.msixupload","fileStatus":"PendingDelete","version":"1.0.0.0"},{"fileName":"b.msix","fileStatus":"PendingDelete"},' +
-          '{"fileName":"d.appx","fileStatus":"PendingDelete"},{"fileName":"' + $File + '","fileStatus":"PendingUpload"}]}')
+          '{"fileName":"d.appx","fileStatus":"PendingDelete"},{"fileName":"' + $File + '","fileStatus":"PendingUpload",' +
+          '"minimumDirectXVersion":"None","minimumSystemRam":"None"}]}')
   }
   It 'passes a priced submission and fails <Case>' -ForEach @(
     @{ Case = 'no pricing'; Json = '{"id":"1"}' }, @{ Case = 'null pricing'; Json = '{"pricing":null}' },
@@ -481,5 +822,72 @@ Describe 'Assert-SubmissionHasPackage (fake Store)' {
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = 200; Body = (Get-Content -Raw (Join-Path $PSScriptRoot 'fixtures/submission-new-package-only.json')) } }
     (Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId '1152921505000000003' -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 -IntervalSeconds 0 }).Err |
       Should -Match 'not submission 1152921505000000003 that this run created'
+  }
+}
+
+# The real HTTP path (Invoke-StoreHttp is not mocked) against the fake Store
+# served on 127.0.0.1, signed in with -LoopbackTestServer.
+Describe 'HTTP path (fake Store on 127.0.0.1)' {
+  BeforeEach {
+    $script:Pkg = New-TestPackage
+    $o = if ($Opt) { $Opt } else { @{} }
+    $script:Srv = New-FakeStore @o
+    $script:Url = Start-FakeStoreServer $Srv
+  }
+  AfterEach {
+    Stop-FakeStoreServer $Srv
+    Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force
+    InModuleScope MsStoreRunner { $script:LoopbackTestServer = $false; $script:Token = '' }
+  }
+
+  # Item r3-3a: PowerShell 7.6 writes request URLs, headers and bodies to the
+  # debug stream, 7.4/7.5 write request lines to the verbose stream.
+  It 'writes no request detail to any stream with verbose and debug output on' {
+    $saved = $global:VerbosePreference, $global:DebugPreference
+    $records = [System.Collections.Generic.List[object]]::new()
+    $err = ''
+    try {
+      $global:VerbosePreference = 'Continue'; $global:DebugPreference = 'Continue'
+      $all = & {
+        Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer -Verbose -Debug
+        $id = Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
+        Assert-SubmissionHasPackage -ProductId $App -SubmissionId $id -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 -IntervalSeconds 0
+      } *>&1
+      foreach ($x in $all) { $records.Add($x) }
+    } catch { $err = "$_" } finally { $global:VerbosePreference, $global:DebugPreference = $saved }
+    $err | Should -BeNullOrEmpty
+    $text = ($records | ForEach-Object { if ($_ -is [System.Management.Automation.InformationRecord]) { [string]$_.MessageData } else { "$_" } }) -join "`n"
+    $text | Should -Match "verified submission ${NewId}"
+    $text | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))"
+    $noisy = @($records | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] -or $_ -is [System.Management.Automation.DebugRecord] } |
+      Where-Object { "$_" -match 'HTTP/|payload|https?://|Bearer|client_secret|sig=' })
+    $sample = @($noisy | Select-Object -First 3 | ForEach-Object { $t = ("$_" -replace '[^ -~]', '?'); $t.Substring(0, [Math]::Min(80, $t.Length)) }) -join ' | '
+    $noisy.Count | Should -Be 0 -Because "no verbose or debug record may describe a request ($sample)"
+  }
+
+  # Item r3-3b: no redirect is followed (it could carry the secret, the token
+  # or the package to another host).
+  It 'does not follow a redirect of the token request' -ForEach @(@{ Opt = @{ Redirect = 'Token' } }) {
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer }
+    $r.Err | Should -BeExactly 'could not get a Partner Center access token: HTTP 302'
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token')
+  }
+  It 'does not follow a redirect of the package upload' -ForEach @(@{ Opt = @{ Redirect = 'Upload' } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'package upload failed: HTTP 302\. Not committed'
+    @($Srv.Log) | Should -Not -Match '/redirected/'
+    @($Srv.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+  }
+  It 'does not follow a redirect of an API call' -ForEach @(@{ Opt = @{ Redirect = 'Api' } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "GET $([regex]::Escape($Base)) failed: HTTP 302"
+    @($Srv.Log) | Should -Not -Match '/redirected/'
+  }
+  It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }
+    $r.Err | Should -Match '^refused: '
+    @($Srv.Log).Count | Should -Be 0
   }
 }

@@ -33,14 +33,23 @@ name: msstore-publish
 #   1. GET the app: stop if any submission is pending. This run never deletes
 #      a submission it did not create;
 #   2. POST a new submission; its id comes from that response. If the service
-#      refuses (HTTP 409, e.g. a submission appeared after step 1), stop;
+#      refuses (HTTP 409, e.g. a submission appeared after step 1), stop. If
+#      the POST gets no answer, the result is unconfirmed: read the app's
+#      pending submission back and stop with advice for what it shows;
 #   3. GET the app again: its pending submission must be that id;
 #   4. GET the submission, check its price can be sent back unchanged, PUT it
 #      with every old package PendingDelete and the new .msixupload
-#      PendingUpload, then PUT the zipped package to its SAS upload URL;
-#   5. GET it again and stop, uncommitted, unless only the new package would
-#      remain (Test-DraftReadyToCommit);
-#   6. POST .../submissions/{id}/commit;
+#      PendingUpload (minimumDirectXVersion and minimumSystemRam None), then
+#      PUT the zipped package to its SAS upload URL;
+#   5. GET it again and stop, uncommitted, unless every field other than
+#      applicationPackages (pricing, listings, visibility, publish mode and
+#      date, device families, ...) reads back as in step 4's GET
+#      (Compare-SubmissionFields) and only the new package would remain
+#      (Test-DraftReadyToCommit);
+#   6. POST .../submissions/{id}/commit. If it gets no answer, read that id
+#      back: still PendingCommit means not committed (delete by id); a
+#      committed status means carry on; no read-back means unknown, so stop
+#      and change nothing;
 #   7. the next step reads that id back until it reaches a committed status
 #      (Published included) with exactly one Uploaded package, the release's
 #      version, and no other Uploaded package.
@@ -60,7 +69,14 @@ name: msstore-publish
 #   draft, `msstore submission publish|delete` act on whatever is pending, and
 #   it logs the SAS upload URL (see MsStoreRunner.psm1).
 # - No step prints a token, the client secret, the SAS upload URL or raw
-#   submission JSON (it holds that URL); API and upload errors are masked.
+#   submission JSON (it holds that URL). API and upload errors are fixed text:
+#   the HTTP status and allowlisted error codes, never the response body.
+#   Status strings and file names from the API are checked against a pattern
+#   before they are printed.
+# - Web calls go only over https to login.microsoftonline.com,
+#   manage.devcenter.microsoft.com and <account>.blob.core.windows.net, follow
+#   no redirects, and run with verbose and debug output off (PowerShell 7.6
+#   writes request URLs, headers and bodies to the debug stream).
 # - Secrets reach the API only through step env vars of the two steps that
 #   sign in; the token stays in that step's PowerShell session. Nothing is
 #   written to disk or put in the repo. msstore-publish-check.yml runs the same

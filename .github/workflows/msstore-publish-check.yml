@@ -9,16 +9,21 @@ name: msstore-publish-check
 #   and that the package is printed from an `inspect` job outside the `store`
 #   environment (and without secrets), so the approver sees it before approving.
 # - runs that flow with the real package over real HTTP against a stand-in for
-#   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1):
-#   the calls and their order, every call after create on the created id, the
-#   uploaded zip (only the package, same SHA-256), no DELETE, the read-back, a
-#   pending submission stopping the run before create, and no token, secret or
-#   SAS URL in the output.
+#   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1,
+#   allowed only through Connect-StoreApi -LoopbackTestServer): the calls and
+#   their order, every call after create on the created id, the uploaded zip
+#   (only the package, same SHA-256), no DELETE, the read-back, and no token,
+#   secret or SAS URL in any output stream with verbose and debug output on.
+#   Also: a pending submission stops the run before create; a PUT that changes
+#   the pricing stops it uncommitted; without -LoopbackTestServer nothing is
+#   sent to the stand-in.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
 # The `pester` job runs .github/scripts/tests (the same flow with a mocked HTTP
-# layer, the draft check, the read-back, masking, pricing and delete-by-id).
+# layer, the draft check, the field comparison, the read-back, unconfirmed
+# create and commit, URL rules, redirects, fixed error text, pricing and
+# delete-by-id).
 
 on:
   pull_request:
@@ -72,7 +77,7 @@ jobs:
             $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
           }
           Import-Module $pester.Path -Force
-          Write-Host "Pester $($pester.Version)"
+          Write-Host "PowerShell $($PSVersionTable.PSVersion), Pester $($pester.Version)"
           $cfg = New-PesterConfiguration
           $cfg.Run.Path = '.github/scripts/tests'
           $cfg.Run.PassThru = $true
@@ -97,7 +102,7 @@ jobs:
           $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
           if ($code -match '(?m)^\s*msstore\s|microsoft-store-apppublisher|STORE_CLI_VERSION') { throw "msstore-publish.yml still uses the Store CLI" }
-          if ($code -match '-ApiBase|-AuthorityHost') { throw "msstore-publish.yml must use the default Store API and sign-in hosts" }
+          if ($code -match '-ApiBase|-AuthorityHost|-LoopbackTestServer') { throw "msstore-publish.yml must use the default Store API and sign-in hosts" }
           $connect = 'Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET'
           $steps = @(
             $connect,
@@ -179,13 +184,23 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Import-Module ./.github/scripts/tests/FakeStoreApi.psm1
           $secret = 'dry-run-secret-' + [guid]::NewGuid().ToString('N')
-          # Runs a command, shows what it printed, returns value, text and error.
+          # Runs a command with verbose and debug output on, shows what it
+          # printed (Write-Host), returns value, text of every stream and error.
+          # Verbose and debug records are counted, not shown: none may describe
+          # a request (PowerShell 7.6 writes URL, headers and body there).
           function Invoke-Shown([scriptblock]$b) {
-            $printed = [Collections.Generic.List[string]]::new(); $value = @(); $err = ''
+            $printed = [Collections.Generic.List[string]]::new(); $value = @(); $err = ''; $noisy = 0
+            $saved = $global:VerbosePreference, $global:DebugPreference
             try {
-              $value = @(& $b 6>&1 | ForEach-Object {
-                if ($_ -is [Management.Automation.InformationRecord]) { $printed.Add([string]$_.MessageData); Write-Host "  | $($_.MessageData)" } else { $_ } })
+              $global:VerbosePreference = 'Continue'; $global:DebugPreference = 'Continue'
+              $value = @(& $b *>&1 | ForEach-Object {
+                if ($_ -is [Management.Automation.InformationRecord]) { $printed.Add([string]$_.MessageData); Write-Host "  | $($_.MessageData)" }
+                elseif ($_ -is [Management.Automation.VerboseRecord] -or $_ -is [Management.Automation.DebugRecord] -or $_ -is [Management.Automation.WarningRecord]) {
+                  $printed.Add("$_"); if ("$_" -match 'HTTP/|payload|https?://|Bearer|client_secret|sig=') { $noisy++ } }
+                else { $_ } })
             } catch { $err = "$_"; Write-Host "  ! $err" }
+            finally { $global:VerbosePreference, $global:DebugPreference = $saved }
+            if ($noisy) { throw "$noisy verbose or debug record(s) describe a request" }
             [pscustomobject]@{ Value = $value; Text = (($printed -join "`n") + "`n" + $err); Err = $err }
           }
           function Assert-NoLeak([string]$text, $store) {
@@ -200,11 +215,12 @@ jobs:
           $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION
           $url = Start-FakeStoreServer -Store $s
           try {
-            $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url }
+            $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer }
             if ($r.Err) { throw "sign-in to the stand-in failed" }
             $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
             if ($r.Err) { throw "publish flow failed against the stand-in" }
             Assert-NoLeak $r.Text $s
+            if ($r.Text -notmatch 'fields unchanged: \d+ submission fields') { throw "the fields were not compared before commit" }
             $id = $s.NewId
             if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
             $want = @("POST /tenant-dry-run/oauth2/v2.0/token", "GET $base", "POST $base/submissions", "GET $base", "GET $base/submissions/$id",
@@ -227,21 +243,40 @@ jobs:
           $s = New-FakeStore -AppId $app -PendingId '1152921505000000007'
           $url = Start-FakeStoreServer -Store $s
           try {
-            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url } | Out-Null
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
             $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
             if ($r.Err -notmatch "already has a pending submission 1152921505000000007" -or $r.Err -notmatch "DELETE $([regex]::Escape($base))/submissions/1152921505000000007 ") { throw "pending submission did not stop the run with delete-by-id guidance" }
             if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base") { throw "calls after the pending check: $(@($s.Log) -join ', ')" }
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
 
-          # 3. Dead port: sign-in and the pending check fail closed, masked.
-          $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost 'http://127.0.0.1:9' }
-          if ($r.Err -notmatch '^could not get a Partner Center access token: ' -or $r.Text.Contains($secret)) { throw "sign-in on a dead port did not fail closed and masked" }
+          # 3. Dead port: sign-in and the pending check fail closed, with fixed text.
+          $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost 'http://127.0.0.1:9' -ApiBase 'http://127.0.0.1:9' -LoopbackTestServer }
+          if ($r.Err -notmatch '^could not get a Partner Center access token: no response \(' -or $r.Text.Contains($secret)) { throw "sign-in on a dead port did not fail closed with fixed text" }
           $s = New-FakeStore -AppId $app
           $url = Start-FakeStoreServer -Store $s
-          try { Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase 'http://127.0.0.1:9' } | Out-Null }
+          try { Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase 'http://127.0.0.1:9' -LoopbackTestServer } | Out-Null }
           finally { Stop-FakeStoreServer -Store $s }
           $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
-          if ($r.Err -notmatch "Store API GET /v1\.0/my/applications/$app failed: .*cannot check for a pending submission; not publishing") { throw "pending check on a dead port did not fail closed" }
+          if ($r.Err -notmatch "Store API GET /v1\.0/my/applications/$app failed: no response \(.*cannot check for a pending submission; not publishing") { throw "pending check on a dead port did not fail closed" }
           Assert-NoLeak $r.Text $s
+
+          # 4. The PUT changes the pricing: stop uncommitted, delete-by-id guidance, no commit.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -DriftOnPut Pricing
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            if ($r.Err -notmatch "submission fields changed after this run's update: pricing\." -or $r.Err -notmatch "DELETE $([regex]::Escape($base))/submissions/$($s.NewId) ") { throw "a pricing change did not stop the run uncommitted with delete-by-id guidance" }
+            if (@($s.Log) -contains "POST $base/submissions/$($s.NewId)/commit") { throw "committed after a pricing change" }
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+
+          # 5. Without -LoopbackTestServer nothing goes to the stand-in.
+          $s = New-FakeStore -AppId $app
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url }
+            if ($r.Err -notmatch '^refused: ' -or @($s.Log).Count -ne 0) { throw "a loopback stand-in was used without -LoopbackTestServer" }
+          } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"
