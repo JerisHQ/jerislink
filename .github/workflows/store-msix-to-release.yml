@@ -8,9 +8,11 @@ name: store-msix-to-release
 # - fetch (ubuntu, contents: read): .github/scripts/store-msix-fetch.mjs asks
 #   DCAT for the x64 package (version, SHA-256, size), gets the download URL from
 #   FE3 (TLS pinned to Microsoft Root Certificate Authority 2011) and downloads
-#   it over https only, from delivery.mp.microsoft.com hosts on port 443, the
-#   same check on every redirect (store-msix-url.mjs, unit-tested first). The
-#   file must match the DCAT size and SHA-256 or the job fails. No third-party
+#   it. Every hop, redirects included, must be on a delivery.mp.microsoft.com
+#   host, https:443 or http:80, no userinfo (store-msix-url.mjs, unit-tested
+#   first). Microsoft serves this file over plain http only, so integrity rests
+#   on the hashes: the file must match the DCAT size and SHA-256 or the job
+#   fails. No third-party
 #   action or tool is involved.
 # - verify (windows, contents: read): same SHA-256 as fetch; Identity
 #   jerisHQ.JerisLink x64 from publisher CN=89A018EB-...; Authenticode status

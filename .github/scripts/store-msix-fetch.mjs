@@ -8,9 +8,9 @@
 //    ends at Microsoft Root Certificate Authority 2011, which Linux CA bundles
 //    do not carry, so FE3 requests trust exactly that root (embedded below,
 //    fingerprint checked at start-up) and nothing else.
-// 3. Download. FE3 returns the URL as http; it is moved to https (same host
-//    and path). That URL and every redirect hop must be https, on a
-//    delivery.mp.microsoft.com host, on port 443 (store-msix-url.mjs); the
+// 3. Download. The FE3 URL and every redirect hop must be on a
+//    delivery.mp.microsoft.com host, https:443 or http:80, no userinfo
+//    (store-msix-url.mjs, which also says why plain http is allowed); the
 //    request is not sent otherwise. The file is accepted only if its size and
 //    SHA-256 equal the DCAT values; otherwise nothing is written and the script
 //    exits non-zero.
@@ -29,7 +29,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { checkDownloadUrl, fe3DownloadUrl } from './store-msix-url.mjs';
+import { checkDownloadUrl } from './store-msix-url.mjs';
 
 const [productId, familyName, outDir] = process.argv.slice(2);
 if (!/^[0-9A-Z]{12}$/.test(productId ?? '') || !/^[\w.-]+_[a-z0-9]{13}$/.test(familyName ?? '') || !outDir) {
@@ -217,11 +217,12 @@ log(`Download host: ${new URL(loc[0].url).hostname}`);
 // ---- 3. Download and check against DCAT ------------------------------------
 fs.mkdirSync(outDir, { recursive: true });
 const out = path.join(outDir, 'store.msix');
-// Every request, the first and each redirect hop, goes through downloadUrl():
-// https only, a delivery.mp.microsoft.com host, default port. Anything else
-// stops the run before the request is sent.
-let url, res;
-try { url = fe3DownloadUrl(loc[0].url); } catch (e) { fail(e.message); }
+// Every request, the first and each redirect hop, goes through downloadUrl()
+// before it is sent. Microsoft serves this file over plain http only (https on
+// these hosts presents another name's certificate); integrity comes from the
+// DCAT SHA-256 and size below and the Authenticode check in verify. See
+// store-msix-url.mjs.
+let url = downloadUrl(loc[0].url), res;
 for (let hop = 0; ; hop++) {
   if (hop > 5) fail('too many redirects');
   try { res = await request(url, { limit: expSize + 1 }); }
