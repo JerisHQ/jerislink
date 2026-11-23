@@ -26,8 +26,10 @@ name: store-msix-to-release
 #   dispatch from main, only when verify said ready. It finds the release by
 #   ID (drafts included; releases/tags/<tag> 404s on a draft) and lists its
 #   assets by that ID, so draft and published get the same checks. It uploads
-#   one new asset, Jerislink-<ver>-windows-x64-store-signed.msix, without
-#   --clobber, and reads it back from that release ID. If an asset
+#   one new asset, Jerislink-<ver>-windows-x64-store-signed.msix, to that
+#   release ID (its upload_url; no second lookup by tag, no --clobber), then
+#   downloads it back by asset ID and requires the verified SHA-256 (and the
+#   GitHub digest, when present). If an asset
 #   of that name is already there, the job ends green only when it is state
 #   uploaded and its SHA-256 (GitHub digest, or downloaded and hashed when there
 #   is no digest) equals the verified one; any other existing asset fails the
@@ -285,15 +287,31 @@ jobs:
             echo "::error::$TAG already has $ASSET (asset $id) with SHA-256 $have ($how), not the verified $SHA256. Not overwriting or deleting it; check which file is right and remove the wrong one by hand."
             exit 1
           fi
-          # gh release upload finds draft releases too (it falls back to the
-          # release list when the tag lookup 404s). The check below reads the
-          # asset back from release $rid, so a wrong target or a partial upload
-          # fails the run.
-          gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+          # Upload to release $rid itself, never by tag again: take its
+          # upload_url, drop the {?name,label} template and POST the file. The
+          # token goes to curl through a header file on stdin, not argv.
+          [[ "$ASSET" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::asset name '$ASSET' has characters that need URL encoding"; exit 1; }
+          up=$(gh api "repos/$GITHUB_REPOSITORY/releases/$rid" --jq .upload_url)
+          up=${up%%\{*}
+          [ "$up" = "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$rid/assets" ] || { echo "::error::upload_url '$up' is not the assets URL of release $rid"; exit 1; }
+          printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl -sS --fail-with-body -X POST \
+            -H @- -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/octet-stream' \
+            --data-binary @"$f" "$up?name=$ASSET" -o "$RUNNER_TEMP/upload.json" \
+            || { echo "::error::upload of $ASSET to release $rid failed: $(head -c 300 "$RUNNER_TEMP/upload.json" 2>/dev/null)"; exit 1; }
+          uid=$(jq -r '.id' "$RUNNER_TEMP/upload.json")
+          [[ "$uid" =~ ^[0-9]+$ ]] || { echo "::error::upload response has no asset id"; exit 1; }
+          # Done only when the asset read back from release $rid is that one
+          # asset, state uploaded, its bytes (downloaded by ID) hash to the
+          # verified SHA-256, and its digest, when GitHub gives one, matches
+          # too. Anything else fails the run; nothing is deleted.
           after=$(assets)
           [ "$(jq length <<<"$after")" -eq 1 ] || { echo "::error::after upload, release $rid has $(jq length <<<"$after") assets named $ASSET"; exit 1; }
-          [ "$(jq -r '.[0].state' <<<"$after")" = uploaded ] || { echo "::error::uploaded $ASSET is in state $(jq -r '.[0].state' <<<"$after")"; exit 1; }
+          [ "$(jq -r '.[0].id' <<<"$after")" = "$uid" ] || { echo "::error::asset $ASSET on release $rid is not the uploaded asset $uid"; exit 1; }
+          [ "$(jq -r '.[0].state' <<<"$after")" = uploaded ] || { echo "::error::uploaded $ASSET (asset $uid) is in state $(jq -r '.[0].state' <<<"$after")"; exit 1; }
           d=$(jq -r '.[0].digest // ""' <<<"$after")
-          if [ -n "$d" ] && [ "$d" != "sha256:$SHA256" ]; then echo "::error::uploaded $ASSET digest $d is not sha256:$SHA256"; exit 1; fi
-          echo "Uploaded $ASSET to $TAG" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$d" ] && [ "$d" != "sha256:$SHA256" ]; then echo "::error::uploaded $ASSET (asset $uid) digest $d is not sha256:$SHA256"; exit 1; fi
+          gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$uid" > "$RUNNER_TEMP/uploaded.msix"
+          back=$(sha256sum "$RUNNER_TEMP/uploaded.msix" | cut -d' ' -f1)
+          [ "$back" = "$SHA256" ] || { echo "::error::uploaded $ASSET (asset $uid) downloads with SHA-256 $back, not the verified $SHA256. Not deleting it; check it by hand."; exit 1; }
+          echo "Uploaded $ASSET to $TAG (release $rid, asset $uid); downloaded back and SHA-256 matches${d:+, digest matches}" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$SHA256  $ASSET\`" >> "$GITHUB_STEP_SUMMARY"
