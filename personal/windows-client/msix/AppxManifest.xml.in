@@ -51,7 +51,7 @@
           (Directory). Windows 11 shows it in the first-level menu, Windows 10
           1903+ in the classic menu; older Windows ignores these entries.
           The Clsid is the IExplorerCommand in JerisLinkSendTo.dll
-          (send_to_shell.cpp, kClsid); it starts Jerislink.exe --send-to.
+          (send_to_shell.cpp, kClsid); it starts Jerislink.exe with the send-to option.
         -->
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>

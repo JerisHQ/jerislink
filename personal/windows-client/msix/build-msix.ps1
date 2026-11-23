@@ -59,6 +59,8 @@ Copy-Item (Join-Path $here 'Assets\*.png') (Join-Path $stage 'Assets')
 Copy-Item (Join-Path $here '..\..\third_party\opus\COPYING') (Join-Path $stage 'COPYING-opus.txt')
 $manifest = (Get-Content (Join-Path $here 'AppxManifest.xml.in') -Raw).Replace('@MSIX_VERSION@', $msixVersion)
 if ($manifest -match '@[A-Z_]+@') { throw "unfilled placeholder in AppxManifest: $($Matches[0])" }
+# makepri only says "manifest not found or is invalid"; parse here for the real error.
+try { [void][xml]$manifest } catch { throw "AppxManifest is not well-formed XML: $($_.Exception.Message)" }
 [IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'), $manifest, (New-Object Text.UTF8Encoding $false))
 
 # The assets carry MRT qualifiers (scale-*, targetsize-*, altform-unplated), so
