@@ -36,17 +36,26 @@ namespace JerisLinkCheck {
         uint GetFlags();
         [PreserveSig] int EnumSubCommands(out IntPtr commands);
     }
+
+    // The class is served out of process, so the object PowerShell gets is a
+    // plain __ComObject. A C# cast does the QueryInterface; a PowerShell cast
+    // does not, so the calls are made here.
+    public static class Probe {
+        public static string[] Read(object o) {
+            var c = (IExplorerCommand)o;
+            return new[] { c.GetTitle(IntPtr.Zero), c.GetIcon(IntPtr.Zero),
+                           c.GetCanonicalName().ToString(), c.GetFlags().ToString() };
+        }
+    }
 }
 '@
 
 $clsid = [Guid]'8C96D31C-0D45-435B-B555-9465096C2E8A'
 $type = [Type]::GetTypeFromCLSID($clsid, $true)
-$cmd = [JerisLinkCheck.IExplorerCommand][Activator]::CreateInstance($type)
-
-$title = $cmd.GetTitle([IntPtr]::Zero)
-$icon = $cmd.GetIcon([IntPtr]::Zero)
-$name = $cmd.GetCanonicalName()
-$flags = $cmd.GetFlags()
+$cmd = [Activator]::CreateInstance($type)
+$title, $icon, $nameText, $flagsText = [JerisLinkCheck.Probe]::Read($cmd)
+$name = [Guid]$nameText
+$flags = [uint32]$flagsText
 Write-Host "title: $title"
 Write-Host "icon: $icon"
 Write-Host "canonical name: $name, flags: $flags"
