@@ -93,6 +93,22 @@ BeforeAll {
   # not advice to re-run.
   $script:DeleteAdvice = 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly'
   $script:RetryAdvice = '(?<!do not )re-run this workflow|\bretry\b|commit (it )?again'
+  # A Store API error body whose message carries every kind of secret the
+  # output must never show (a SAS URL, scheme-less query strings with several
+  # and with one pair, bare SAS pairs, sig=, a bearer token, the current access
+  # token, the client secret, a JWT, a long opaque key), a line break with a
+  # workflow command and double quotes; and the one line Get-StoreErrorText
+  # -Detail must make of it.
+  function script:New-PlantedErrorBody([string]$Token, [string]$Target = 'applicationCategory') {
+    $msg = "Bad.`n::error::injected https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
+      "acct.blob.core.windows.net/c/x.zip?sv=2020-08-04&sp=w c/y.zip?skoid=Zq9 sv=2020-08-04&sr=b sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer abc.def-ghi " +
+      "token $Token client_secret=$Secret eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl AbCdEfGh0123456789AbCdEfGh0123456789xyz " +
+      "0f8fad5b-d9cb-469f-a165-70867728950e $File `"quoted`""
+    @{ code = 'InvalidParameterValue'; target = $Target; message = $msg; source = 'Ingestion Api' } | ConvertTo-Json -Compress
+  }
+  $script:PlantedText = 'HTTP 400 (InvalidParameterValue); target: applicationCategory; message: "Bad. :error:injected [url] ' +
+    'acct.blob.core.windows.net/c/x.zip?[query] c/y.zip?[query] [query] sig=[redacted] Bearer [redacted] token [token] client_secret=[redacted] ' +
+    "[token] [redacted] 0f8fad5b-d9cb-469f-a165-70867728950e $File 'quoted'" + '"'
   # Index of the first line from From on that matches Pattern, or -1.
   function script:Get-LineIndex([string[]]$Lines, [string]$Pattern, [int]$From = 0) {
     for ($i = $From; $i -lt $Lines.Count; $i++) { if ($Lines[$i] -match $Pattern) { return $i } }
@@ -319,6 +335,7 @@ Describe 'Test-StoreUri and Invoke-StoreHttp (where requests may go)' {
   It 'allows <Kind> <Uri>' -ForEach @(
     @{ Kind = 'Token'; Uri = 'https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token' }
     @{ Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N' }
+    @{ Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N/submissions?isMinimalResponse=true' }
     @{ Kind = 'Upload'; Uri = 'https://productingestionbin1.blob.core.windows.net/ingestion/x?sv=1&sig=a' }
     @{ Kind = 'Upload'; Uri = 'HTTPS://PRODUCTINGESTIONBIN1.BLOB.CORE.WINDOWS.NET/ingestion/x' }
   ) {
@@ -377,6 +394,60 @@ Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
   ) {
     $t = Get-StoreErrorText -StatusCode $Code -Body $Body
     $t | Should -BeExactly $Want
+  }
+}
+
+# The create in run 45185550541 got HTTP 400 (InvalidParameterValue) and the
+# log showed nothing else. Store API errors now add the API's target and its
+# message, sanitized and capped (Get-StoreErrorText -Detail); the token
+# endpoint and the blob upload keep the fixed text above.
+Describe 'Get-StoreErrorText -Detail (Store API target and sanitized message)' {
+  It 'prints the target and the message on one line with every planted secret masked' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $t = Get-StoreErrorText -StatusCode 400 -Body (New-PlantedErrorBody $s.Token) -Detail
+    $t | Should -BeExactly $PlantedText
+    $t | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|eyJ|AbCdEfGh|sv=2020|[\r\n]"
+  }
+  It 'prints nothing of the body without -Detail' {
+    $s = New-FakeStore; Use-FakeStore $s
+    Get-StoreErrorText -StatusCode 400 -Body (New-PlantedErrorBody $s.Token) | Should -BeExactly 'HTTP 400 (InvalidParameterValue)'
+  }
+  It 'returns <Want> for <Case>' -ForEach @(
+    @{ Case = 'a nested error object'; Want = 'HTTP 400 (BadRequest); target: pricing; message: "see [url] now"'
+       Body = '{"error":{"code":"BadRequest","target":"pricing","message":"see https://evil.invalid/x?a=1 now"}}' }
+    @{ Case = 'a target that is not a plain name'; Want = 'HTTP 400 (InvalidParameterValue); target: [invalid]; message: "bad"'
+       Body = '{"code":"InvalidParameterValue","target":"x\n::error::pwned","message":"bad"}' }
+    @{ Case = 'a target and message that are not strings'; Want = 'HTTP 400 (InvalidParameterValue)'
+       Body = '{"code":"InvalidParameterValue","target":{"a":1},"message":["https://evil.invalid"]}' }
+    @{ Case = 'only a message'; Want = 'HTTP 409 (InvalidState); message: "The application has a pending submission."'
+       Body = '{"code":"InvalidState","message":"The application has a pending submission."}' }
+    @{ Case = 'a message of only control characters'; Want = 'HTTP 400 (InvalidParameterValue)'; Body = '{"code":"InvalidParameterValue","message":"\r\n\t"}' }
+    @{ Case = 'an XML body'; Want = 'HTTP 403 (AuthenticationFailed)'
+       Body = '<Error><Code>AuthenticationFailed</Code><Message>sig=FAKE+SAS</Message></Error>' }
+  ) {
+    Get-StoreErrorText -StatusCode ([int]($Want.Substring(5, 3))) -Body $Body -Detail | Should -BeExactly $Want
+  }
+  It 'cuts a long message to 300 characters and does not print one over 4096 characters' {
+    $long = ('word ' * 200).Trim()
+    $t = Get-SafeErrorMessage $long
+    $t | Should -BeExactly ($long.Substring(0, 300) + '...')
+    Get-SafeErrorMessage ('x ' * 2100) | Should -BeExactly '[4200 characters, not printed]'
+    $body = @{ code = 'InvalidParameterValue'; message = ('word ' * 200) } | ConvertTo-Json -Compress
+    (Get-StoreErrorText -StatusCode 400 -Body $body -Detail).Length | Should -Be ('HTTP 400 (InvalidParameterValue); message: ""'.Length + 303)
+  }
+  It 'keeps the fixed text for a failed token request' {
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
+      [pscustomobject]@{ StatusCode = 401; Body = '{"error":"invalid_client","target":"client","message":"Invalid client secret dummy-client-secret-Zx9 provided","error_codes":[7000215]}' }
+    }
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 't' -ClientId 'c' -ClientSecret $Secret }
+    $r.Err | Should -BeExactly 'could not get a Partner Center access token: HTTP 401 (invalid_client, AADSTS7000215)'
+  }
+  It 'keeps the fixed text for a failed package upload' {
+    $s = New-FakeStore -UploadStatus 403 -UploadBody '{"code":"AuthenticationFailed","target":"blob","message":"denied for sig=FAKE+SAS%2FSIGNATURE-0123456789"}'
+    Use-FakeStore $s
+    $pkg = New-TestPackage
+    try { { Send-StorePackage -UploadUrl 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $pkg 6>$null } | Should -Throw -ExpectedMessage 'package upload failed: HTTP 403 (AuthenticationFailed)' }
+    finally { Remove-Item -LiteralPath (Split-Path $pkg) -Recurse -Force }
   }
 }
 
@@ -524,9 +595,51 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   It 'stops, and deletes nothing, when create is refused because a submission appeared after the check' {
     $s = New-FakeStore -PendingId '1152921505000000007' -HidePending; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions failed: HTTP 409"
-    $r.Err | Should -Match 'No submission was created and none was deleted'
-    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions")
+    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: HTTP 409 \(InvalidState\); message: ""The application has a pending submission\.""\. No submission was created and none was deleted"
+    $r.Err | Should -Match 'Read-back of the app after the refused create \(one GET; nothing changed or deleted\): no pendingApplicationSubmission\.'
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+
+  It 'sends the create with isMinimalResponse=true and needs only the id from its answer' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    $s.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
+    $r.Out | Should -Match "created submission id=$NewId \(from the create response\)"
+    $r.Value | Should -Be @($NewId)
+  }
+
+  # Run 45185550541: the create got HTTP 400 and the log showed only the code.
+  It 'create refused with HTTP 400: prints the target and the sanitized message, reads the app once, deletes nothing' {
+    $s = New-FakeStore -CreateErrorStatus 400; Use-FakeStore $s
+    $s.CreateErrorBody = New-PlantedErrorBody $s.Token
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted. "))
+    $r.Err | Should -Match 'Read-back of the app after the refused create \(one GET; nothing changed or deleted\): no pendingApplicationSubmission\.$'
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|eyJ|AbCdEfGh|sv=2020"
+    $s.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    @($s.Calls)[-1] | Should -BeExactly "GET $Base timeout=30"
+    $s.Sub | Should -BeNullOrEmpty
+  }
+  It 'create refused because another publisher made a draft after the check: the read-back logs that id only, no delete advice' {
+    $other = '1152921505000000077'
+    $s = New-FakeStore -OtherDraftAfterCheck $other; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "failed: HTTP 409 \(InvalidState\);.* No submission was created and none was deleted\."
+    $r.Err | Should -Match "Read-back of the app after the refused create \(one GET; nothing changed or deleted\): pendingApplicationSubmission id $other\. This run did not create it\.$"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.PendingId | Should -Be $other
+  }
+  It 'create refused and the read-back fails: says so, deletes nothing' {
+    $s = New-FakeStore -CreateErrorStatus 400 -CreateErrorBody '{"code":"InvalidParameterValue","target":"submission"}' -FailAfterLoss; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match 'failed: HTTP 400 \(InvalidParameterValue\); target: submission\. No submission was created'
+    $r.Err | Should -Match "Read-back of the app after the refused create \(one GET; nothing changed or deleted\): failed \(Store API GET $([regex]::Escape($Base)) failed: HTTP 503 \(ServiceUnavailable\)\)\.$"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
 
   It 'treats a missing pendingApplicationSubmission field as nothing pending' {
@@ -620,7 +733,7 @@ Describe 'No answer to create or commit (fake Store)' {
   ) {
     $s = New-FakeStore -LoseResponse Create -LoseWhen After -LoseAsStatus $Lost; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions failed: $Why\. Result unconfirmed: the create request got no answer"
+    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: $Why\. Result unconfirmed: the create request got no answer"
     $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed\. This run never got a submission id from a create response"
     $r.Err | Should -Not -Match $DeleteAdvice
     $r.Err | Should -Not -Match $RetryAdvice
@@ -1135,6 +1248,16 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match "GET $([regex]::Escape($Base)) failed: HTTP 302"
     @($Srv.Log) | Should -Not -Match '/redirected/'
+  }
+  # Run 45185550541 over HTTP: the create gets a 400 whose message carries secrets.
+  It 'prints the target and sanitized message of a create refused with HTTP 400, sends the query, deletes nothing' -ForEach @(@{ Opt = @{ CreateErrorStatus = 400 } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $Srv.CreateErrorBody = New-PlantedErrorBody $Srv.Token
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted. ") + '.*' + [regex]::Escape(': no pendingApplicationSubmission.') + '$')
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|eyJ|AbCdEfGh|sv=2020"
+    $Srv.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
+    @($Srv.Log) | Should -Be @("POST /tenant-1/oauth2/v2.0/token", "GET $Base", "POST $Base/submissions", "GET $Base")
   }
   # Item r4-2 over HTTP: the commit gets a 504 while it is still processing.
   It 'reads a commit that got a 504 back by id until it shows CommitStarted, then goes on' -ForEach @(@{ Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Delayed'; LoseAsStatus = 504; CommitDelayReads = 1 } }) {

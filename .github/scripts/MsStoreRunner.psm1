@@ -34,10 +34,13 @@
 # request is sent and again as soon as it gets no answer.
 #
 # Nothing here prints the token, the client secret, a SAS URL or a raw
-# submission JSON (it holds fileUploadUrl). HTTP errors are reported as fixed
-# text: the status code, a plain error code, or the exception type names
-# (Get-StoreErrorText, Get-StoreFailureText); strings from the API are printed
-# only when they match a plain pattern (Get-SafeValue). All HTTP goes through
+# submission JSON (it holds fileUploadUrl). HTTP errors are reported as the
+# status code, plain error codes, or the exception type names (Get-StoreErrorText,
+# Get-StoreFailureText); a Store API error response also adds the API's target
+# (a plain name) and its message, one line with URLs, query strings,
+# signatures, tokens and secrets masked and at most 300 characters
+# (Get-SafeErrorMessage). Other strings from the API are printed only when they
+# match a plain pattern (Get-SafeValue). All HTTP goes through
 # Invoke-StoreHttp (the Pester tests mock it): https to the Store hosts only,
 # no redirects, no verbose or debug output. The token lives only in this
 # PowerShell session; nothing is written to disk.
@@ -223,13 +226,43 @@ function Get-CallTimeout([int]$Requested) {
   [Math]::Min($Requested, $left)
 }
 
-# Fixed diagnostics for an HTTP error response: the status code and, when the
-# body has them, error codes that are plain identifiers (the Store API's code,
-# the token endpoint's error and AADSTS numbers, blob storage's <Code>). No
-# message text, URL or other part of the body is printed.
+# The Store API's error message, made safe to print: one line with no control
+# or format characters and no "::" (no workflow command can start), with
+# URLs, query strings, SAS signatures, bearer tokens, the access token, JWTs,
+# name=value secrets and long opaque strings masked, double quotes turned into
+# single quotes, and at most Max characters. A message of more than 4096
+# characters is not printed at all. Pure apart from the current token.
+$script:SafeTarget = '^[A-Za-z0-9_][A-Za-z0-9_.\[\]/ -]{0,99}\z'
+function Get-SafeErrorMessage {
+  param([AllowNull()][AllowEmptyString()][string]$Message, [ValidateRange(20, 1000)][int]$Max = 300)
+  if (-not $Message) { return '' }
+  if ($Message.Length -gt 4096) { return "[$($Message.Length) characters, not printed]" }
+  $t = $Message -replace '[\p{C}\p{Zl}\p{Zp}]+', ' '
+  # URLs, sig=, Bearer <token>, the current access token.
+  $t = Protect-StoreText $t
+  # A query string without a scheme (host/path?a=b) and bare a=b&c=d pairs.
+  $t = $t -replace '\?[^\s"''<>]*=[^\s"''<>]*', '?[query]'
+  $t = $t -replace '[A-Za-z0-9_.-]+=[^\s&"''<>]*(?:&[A-Za-z0-9_.-]+=[^\s&"''<>]*)+', '[query]'
+  $t = $t -replace '(?i)\b(access_token|refresh_token|id_token|client_secret|secret|password|pwd|accountkey|sharedaccesskey|apikey|api_key|assertion)(\s*[=:]\s*)[^\s&"'',;]+', '$1=[redacted]'
+  $t = $t -replace '\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*', '[token]'
+  # 32+ characters of letters and digits (with + / _ ~ = -), not a GUID.
+  $t = $t -replace '(?<![A-Za-z0-9+/_~=-])(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![A-Za-z0-9+/_~=-]))(?=[A-Za-z0-9+/_~=-]*\d)(?=[A-Za-z0-9+/_~=-]*[A-Za-z])[A-Za-z0-9+/_~=-]{32,}', '[redacted]'
+  $t = ($t -replace ':{2,}', ':' -replace '"', "'" -replace ' {2,}', ' ').Trim()
+  if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
+  $t
+}
+
+# Diagnostics for an HTTP error response: the status code and, when the body
+# has them, error codes that are plain identifiers (the Store API's code, the
+# token endpoint's error and AADSTS numbers, blob storage's <Code>). Without
+# Detail nothing else of the body is printed (the token endpoint and the blob
+# upload). With Detail (Store API calls only), also the API's target, when it
+# is a plain name, and its message through Get-SafeErrorMessage; both are read
+# from the top level of the JSON body or from its error object.
 function Get-StoreErrorText {
-  param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body)
+  param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body, [switch]$Detail)
   $codes = [System.Collections.Generic.List[string]]::new()
+  $target = ''; $message = ''
   if ($Body) {
     $j = $null
     try { $j = $Body | ConvertFrom-Json -ErrorAction Stop } catch { }
@@ -242,13 +275,27 @@ function Get-StoreErrorText {
       }
       $ec = $j.PSObject.Properties['error_codes']
       if ($ec -and $null -ne $ec.Value) { foreach ($c in @($ec.Value)) { if ("$c" -cmatch '^\d{1,9}\z') { $codes.Add("AADSTS$c") } } }
+      if ($Detail) {
+        $e = $j.PSObject.Properties['error']
+        foreach ($o in @($j, $(if ($e -and $e.Value -is [System.Management.Automation.PSCustomObject]) { $e.Value }))) {
+          if ($null -eq $o) { continue }
+          $p = $o.PSObject.Properties['target']
+          if (-not $target -and $p -and $p.Value -is [string]) { $target = $p.Value }
+          $p = $o.PSObject.Properties['message']
+          if (-not $message -and $p -and $p.Value -is [string]) { $message = $p.Value }
+        }
+      }
     } else {
       $m = [regex]::Match($Body, '<Code>([^<]{1,64})</Code>')
       if ($m.Success) { $codes.Add($m.Groups[1].Value) }
     }
   }
   $safe = @($codes | Where-Object { $_ -cmatch '^[A-Za-z][A-Za-z0-9_.]{0,63}\z' } | Select-Object -Unique | Select-Object -First 3)
-  if ($safe.Count) { "HTTP $StatusCode ($($safe -join ', '))" } else { "HTTP $StatusCode" }
+  $t = if ($safe.Count) { "HTTP $StatusCode ($($safe -join ', '))" } else { "HTTP $StatusCode" }
+  if ($target) { $t += "; target: $(Get-SafeValue $target $script:SafeTarget)" }
+  $message = Get-SafeErrorMessage $message
+  if ($message) { $t += "; message: `"$message`"" }
+  $t
 }
 
 function Get-JsonField($Object, [string]$Name) {
@@ -311,9 +358,11 @@ function Connect-StoreApi {
   Write-Host "signed in to the Store submission API (token kept in memory, not printed)"
 }
 
-# One Store submission API call. Path is relative to /v1.0/my/. Returns the
-# response body; throws a New-StoreError with fixed text on a network error or
-# a non-2xx status. OutcomeUnknown is set when no answer came back (except a
+# One Store submission API call. Path is relative to /v1.0/my/ and may end in a
+# query string. Returns the response body; throws a New-StoreError on a network
+# error (fixed text) or a non-2xx status (status, error codes and the API's
+# target and sanitized message: Get-StoreErrorText -Detail). OutcomeUnknown is
+# set when no answer came back (except a
 # refusal before sending) or the status is 408 or 5xx: the service may have
 # carried the request out.
 function Invoke-StoreApi {
@@ -333,7 +382,7 @@ function Invoke-StoreApi {
     throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $_)" -OutcomeUnknown:(-not $notSent))
   }
   if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) {
-    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body)" -OutcomeUnknown:($r.StatusCode -eq 408 -or $r.StatusCode -ge 500))
+    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body -Detail)" -OutcomeUnknown:($r.StatusCode -eq 408 -or $r.StatusCode -ge 500))
   }
   [string]$r.Body
 }
@@ -391,9 +440,9 @@ function Test-NoPendingSubmission {
   Write-Host "No pending submission for $ProductId; safe to create a new one."
 }
 
-function Get-StoreApp([string]$ProductId) {
+function Get-StoreApp([string]$ProductId, [int]$TimeoutSec = 600) {
   Assert-ProductId $ProductId
-  Invoke-StoreApi -Method GET -Path "applications/$ProductId"
+  Invoke-StoreApi -Method GET -Path "applications/$ProductId" -TimeoutSec $TimeoutSec
 }
 
 function Get-StoreSubmissionJson([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec = 600) {
@@ -409,19 +458,23 @@ function Assert-NoPendingSubmission {
   Test-NoPendingSubmission -AppJson $json -ProductId $ProductId
 }
 
-# POST /applications/{productId}/submissions. Returns the new submission's id,
-# taken from the create response. When the service answered with an error,
-# nothing was created and nothing is deleted. When no answer came back (or
-# HTTP 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the
-# app back and reports what it shows.
+# POST /applications/{productId}/submissions?isMinimalResponse=true (the query
+# the msstore CLI and StoreBroker send). Returns the new submission's id, the
+# only field read from the create response. When the service answered with an
+# error, nothing was created and nothing is deleted; one read-only GET of the
+# app then reports whether a submission is pending (Get-RefusedCreateReadBack).
+# When no answer came back (or HTTP 408/5xx), the result is unconfirmed:
+# Resolve-UnconfirmedCreate reads the app back and reports what it shows.
 function New-StoreSubmission {
   param([Parameter(Mandatory)][string]$ProductId)
   Assert-ProductId $ProductId
-  try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions" }
+  try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions?isMinimalResponse=true" }
   catch {
     if (Test-StoreOutcomeUnknown $_) { throw (Resolve-UnconfirmedCreate -ProductId $ProductId -Failure "$_") }
-    throw ("$_. No submission was created and none was deleted. HTTP 409 means the app's current state does not " +
-      "allow a new submission, for example because another submission is pending; see the pending-submission check above.")
+    $failure = "$_"
+    throw ("$failure. No submission was created and none was deleted. HTTP 409 means the app's current state does not " +
+      "allow a new submission, for example because another submission is pending; see the pending-submission check above. " +
+      (Get-RefusedCreateReadBack $ProductId))
   }
   $id = ''
   try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
@@ -431,6 +484,21 @@ function New-StoreSubmission {
   }
   Write-Host "created submission id=$id (from the create response)"
   $id
+}
+
+# The service answered the create with an error, so nothing was created. For
+# the log only: one read-only GET of the app (waiting at most TimeoutSec, and
+# no longer than the call deadline) and a sentence saying whether a submission
+# is pending, by id only. Changes and deletes nothing and gives no delete
+# advice: the pending check before create found none, so a pending submission
+# now did not come from this run.
+function Get-RefusedCreateReadBack([string]$ProductId, [int]$TimeoutSec = 30) {
+  $h = 'Read-back of the app after the refused create (one GET; nothing changed or deleted):'
+  try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId -TimeoutSec $TimeoutSec) -ProductId $ProductId }
+  catch { return "$h failed ($_)." }
+  if (-not $pending) { return "$h no pendingApplicationSubmission." }
+  if ($pending -ceq '(no usable id)') { return "$h pendingApplicationSubmission exists, without a usable id. This run did not create it." }
+  "$h pendingApplicationSubmission id $pending. This run did not create it."
 }
 
 # The create request got no answer. This run has no submission id of its own
@@ -948,4 +1016,4 @@ function Assert-SubmissionHasPackage {
   }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage
+Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Get-SafeErrorMessage, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage

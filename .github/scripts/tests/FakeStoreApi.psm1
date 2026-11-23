@@ -67,6 +67,10 @@ function ConvertTo-FakeNode([string]$Json) {
 # PendingAfterCreate (GET app shows this id as pending once the run created
 # its submission), PriceId (NoPricing drops pricing), UploadStatus/UploadBody,
 # UploadBase (where the SAS upload URL points), CreateWithoutId,
+# CreateErrorStatus/CreateErrorBody (the create is refused with that status
+# and that raw body; nothing is created). Every create records its query
+# string in CreateQuery; with isMinimalResponse=true the create answers with
+# id and status only, without it with the whole submission.
 # KeepOldPackage (the PUT leaves the old .msix Uploaded), CommitStatus (status
 # after commit), TargetPublishMode.
 # DriftOnPut: the PUT changes a field it should keep ('Pricing': priceId
@@ -77,7 +81,8 @@ function ConvertTo-FakeNode([string]$Json) {
 # status sent instead (e.g. 504). LoseWhen Delayed (Commit only): the commit
 # is still being processed; the next CommitDelayReads GETs of that submission
 # still show PendingCommit, the one after shows CommitStarted, later ones
-# CommitStatus. FailAfterLoss: every later API call gets 503.
+# CommitStatus. FailAfterLoss: every API call after a lost answer or a
+# refused create (CreateErrorStatus) gets 503.
 # Redirect ('Token', 'Api' or 'Upload'): those requests get a 302 to
 # /redirected/<kind> on the same host.
 # HangOn: a request that never gets an answer, so the caller waits until its
@@ -104,6 +109,8 @@ function New-FakeStore {
     [string]$UploadBody = '',
     [string]$UploadBase = '',
     [switch]$CreateWithoutId,
+    [int]$CreateErrorStatus = 0,
+    [string]$CreateErrorBody = '',
     [switch]$KeepOldPackage,
     [string]$CommitStatus = 'Certification',
     [ValidateSet('', 'Pricing', 'DropListing')][string]$DriftOnPut = '',
@@ -125,6 +132,7 @@ function New-FakeStore {
     AppId = $AppId; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
     OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; NoPendingAs = $NoPendingAs
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
+    CreateErrorStatus = $CreateErrorStatus; CreateErrorBody = $CreateErrorBody; CreateQuery = $null
     KeepOldPackage = [bool]$KeepOldPackage; CommitStatus = $CommitStatus; BaseUrl = $BaseUrl; Served = $false
     DriftOnPut = $DriftOnPut; LoseResponse = $LoseResponse; LoseWhen = $LoseWhen; LoseAsStatus = $LoseAsStatus
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
@@ -206,6 +214,7 @@ function Invoke-FakeStoreRequest {
   if ($Store.Lost -and $Store.FailAfterLoss) { return New-FakeResponse 503 @{ code = 'ServiceUnavailable' } }
 
   $app = [regex]::Escape($Store.AppId)
+  if ($Method -eq 'POST' -and $path -match "^/v1\.0/my/applications/$app/submissions$") { $Store.CreateQuery = $u.Query }
   if ($Method -eq 'POST' -and $path -match "^/v1\.0/my/applications/$app/submissions/\d+/commit$") {
     $Store.CommitTried = $true
     if ($Store.HangOn -eq 'Commit') { return New-FakeResponse -1 'hang' }
@@ -251,11 +260,16 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
   }
   if ($Path -match "^/v1\.0/my/applications/$App/submissions$" -and $Method -eq 'POST') {
     if ($Store.PendingId) { return New-FakeResponse 409 @{ code = 'InvalidState'; message = 'The application has a pending submission.' } }
+    if ($Store.CreateErrorStatus) {
+      if ($Store.FailAfterLoss) { $Store.Lost = $true }
+      return New-FakeResponse $Store.CreateErrorStatus $Store.CreateErrorBody
+    }
     $Store.Sub = @{ id = $Store.NewId; status = 'PendingCommit'; applicationPackages = @(
       [ordered]@{ id = 'p1'; fileName = 'Jerislink-0.3.0.0-x64.msixupload'; fileStatus = 'Uploaded'; version = '0.3.0.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }
       [ordered]@{ id = 'p2'; fileName = 'Jerislink-0.3.0.0-x64.msix'; fileStatus = 'Uploaded'; version = '0.3.0.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }
     $Store.PendingId = $Store.NewId
     if ($Store.CreateWithoutId) { return New-FakeResponse 201 @{ status = 'PendingCommit'; fileUploadUrl = (Get-FakeSasUrl $Store) } }
+    if ([string]$Store.CreateQuery -match '[?&]isMinimalResponse=true(&|$)') { return New-FakeResponse 201 ([ordered]@{ id = $Store.NewId; status = 'PendingCommit' }) }
     return New-FakeResponse 201 (Get-FakeSubmission $Store)
   }
   if ($Path -match "^/v1\.0/my/applications/$App/submissions/(\d+)(/commit)?$") {

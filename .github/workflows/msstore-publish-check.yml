@@ -247,6 +247,7 @@ jobs:
             if ($r.Text -notmatch 'fields unchanged: \d+ submission fields') { throw "the fields were not compared before commit" }
             $id = $s.NewId
             if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
+            if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
             $want = @("POST /tenant-dry-run/oauth2/v2.0/token", "GET $base", "POST $base/submissions", "GET $base", "GET $base/submissions/$id",
                       "PUT $base/submissions/$id", "PUT /blob/upload.zip", "GET $base/submissions/$id", "POST $base/submissions/$id/commit")
             $got = @($s.Log)
@@ -360,6 +361,29 @@ jobs:
             if (($tail -join "`n") -cne (@("POST $base/submissions/$id/commit", "GET $base/submissions/$id", "GET $base/submissions/$id") -join "`n")) { throw "calls after the commit: $($tail -join ', ')" }
             if ($sw.Elapsed.TotalSeconds -gt 30) { throw "the commit timeout and read-backs took $([int]$sw.Elapsed.TotalSeconds) s" }
             Write-Host "commit with no answer: unconfirmed after $([int]$sw.Elapsed.TotalSeconds) s"
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+          # 9. The create is refused with HTTP 400 and a message that carries a SAS
+          #    URL, sig=, a bearer token, the access token, the client secret and a
+          #    workflow command: the error line shows the target and the message
+          #    with all of them masked; one read-only GET of the app follows;
+          #    nothing is deleted.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -CreateErrorStatus 400
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $planted = "Package rejected.`n::error::injected see https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
+              "sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer $($s.Token) token $($s.Token) client_secret=$secret eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl"
+            $s.CreateErrorBody = @{ code = 'InvalidParameterValue'; target = 'applicationCategory'; message = $planted } | ConvertTo-Json -Compress
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            $line = "Store API POST $base/submissions?isMinimalResponse=true failed: HTTP 400 (InvalidParameterValue); target: applicationCategory; " +
+              'message: "Package rejected. :error:injected see [url] sig=[redacted] Bearer [redacted] token [token] client_secret=[redacted] [token]". ' +
+              'No submission was created and none was deleted.'
+            if (-not $r.Err.StartsWith($line)) { throw "a refused create did not print the target and the sanitized message" }
+            if (-not $r.Err.EndsWith('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.')) { throw "no read-back of the app after the refused create" }
+            if ($r.Text -match '::error::|eyJ|sv=2020|DELETE /v1|Remove-StoreDraftSubmission|Delete exactly') { throw "a workflow command, a JWT, a SAS part or delete advice was printed" }
+            if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
+            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the refused create: $(@($s.Log) -join ', ')" }
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"
