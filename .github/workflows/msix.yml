@@ -76,13 +76,22 @@ jobs:
           $ns = New-Object Xml.XmlNamespaceManager $m.NameTable
           $ns.AddNamespace('d5', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/5')
           $ns.AddNamespace('com', 'http://schemas.microsoft.com/appx/manifest/com/windows10')
-          $verbs = $m.SelectNodes('//d5:ItemType/d5:Verb', $ns)
-          $types = @($m.SelectNodes('//d5:ItemType', $ns) | ForEach-Object Type) -join ','
+          # Exactly one ItemType each for files (*) and folders (Directory), and
+          # in each exactly one Verb: Id SendToJerisLink, Clsid = the surrogate class.
           $class = $m.SelectSingleNode('//com:SurrogateServer/com:Class', $ns)
-          if ($types -ne '*,Directory') { throw "context menu item types are '$types'" }
           if (-not $class -or $class.Path -ne 'JerisLinkSendTo.dll') { throw 'no surrogate class for JerisLinkSendTo.dll' }
-          foreach ($v in $verbs) { if ($v.Clsid -ne $class.Id) { throw "verb $($v.Id) Clsid $($v.Clsid) is not the surrogate class $($class.Id)" } }
-          Write-Host "OK: Send to JerisLink verbs for $types -> $($class.Id) in $($class.Path)"
+          $itemTypes = @($m.SelectNodes('//d5:ItemType', $ns))
+          if ($itemTypes.Count -ne 2) { throw "context menu has $($itemTypes.Count) item types, expected 2 (* and Directory)" }
+          foreach ($t in '*', 'Directory') {
+            $matching = @($itemTypes | Where-Object { $_.Type -eq $t })
+            if ($matching.Count -ne 1) { throw "item type '$t' appears $($matching.Count) times, expected once" }
+            $verbs = @($matching[0].SelectNodes('d5:Verb', $ns))
+            if ($verbs.Count -ne 1) { throw "item type '$t' has $($verbs.Count) verbs, expected exactly 1" }
+            $v = $verbs[0]
+            if ($v.Id -ne 'SendToJerisLink') { throw "item type '$t' verb Id is '$($v.Id)', expected SendToJerisLink" }
+            if ($v.Clsid -ne $class.Id) { throw "item type '$t' verb Clsid $($v.Clsid) is not the surrogate class $($class.Id)" }
+            Write-Host "OK: item type '$t' -> verb SendToJerisLink -> $($class.Id) in $($class.Path)"
+          }
       - name: Install and remove the sideload test package
         run: |
           $side = Join-Path $env:RUNNER_TEMP 'msix\sideload'

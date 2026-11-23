@@ -67,6 +67,10 @@ void commandLines() {
            "cmdline: 300 items of 103 chars fit");
     const auto over = commandLine(exe, std::vector<std::wstring>(400, item));
     expect(over == quoteArg(exe) + L" --send-to-too-many", "cmdline: over 32,766 chars becomes --send-to-too-many");
+    expect(commandLine(exe, std::vector<std::wstring>(1001, L"C:\\a")) == tooManyCommandLine(exe),
+           "cmdline: over 1,000 items becomes --send-to-too-many");
+    expect(commandLine(exe, std::vector<std::wstring>(1000, L"C:\\a")).find(L"--send-to-too-many") == std::wstring::npos,
+           "cmdline: 1,000 short items are passed");
 }
 
 void paths() {
@@ -118,6 +122,11 @@ void texts() {
     expect(exitCode(Reply::TooMany) == 28, "exit: 28 too many");
     expect(pipeName(L"S-1-5-21-1-2-3-1001", 2) == L"\\\\.\\pipe\\JerisLink.SendTo.S-1-5-21-1-2-3-1001.2",
            "pipe: name per user SID and session");
+    expect(pipeName(L"S-1-5-21-1-2-3-1001", 2, L"") == pipeName(L"S-1-5-21-1-2-3-1001", 2),
+           "pipe: installer build (no package) keeps the old name");
+    expect(pipeName(L"S-1-5-21-1-2-3-1001", 2, L"jerisHQ.JerisLink_1cbzj2979sfxw") ==
+               L"\\\\.\\pipe\\JerisLink.SendTo.S-1-5-21-1-2-3-1001.2.pkg.jerisHQ.JerisLink_1cbzj2979sfxw",
+           "pipe: Store build's name adds its package family");
 }
 
 void wire() {

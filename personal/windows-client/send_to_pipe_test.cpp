@@ -1,8 +1,9 @@
 // Windows test for the F5a Send to pipe (send_to_win.cpp): real named pipe,
 // real client. Round trip of paths (non-ASCII, folders), replies passed
 // through, first-instance ownership, this-user-only DACL, corrupt and idle
-// clients, no listener, the quiet "--send-to" exit code, and the Store
-// Explorer command's command line through the real CommandLineToArgvW.
+// clients, no listener, the quiet "--send-to" exit code, the Store
+// Explorer command's command line through the real CommandLineToArgvW, and
+// the Store and installer builds open at once, each reached by its own menu.
 #include "send_to_win.hpp"
 
 #include <aclapi.h>
@@ -217,15 +218,67 @@ void commandLineRoundTrip() {
            "cmdline: a selection over the CreateProcess limit becomes --send-to-too-many");
 }
 
+// The Store and installer builds open at once (pipe names as each build's
+// currentPipeName() makes them). Whichever starts first, both get their own
+// pipe, and each build's "--send-to" run (the Store menu command and the
+// installer's Send to shortcut) reaches its own viewer only.
+void bothBuilds() {
+    const std::wstring sid = currentUserSid() + L".test.both";
+    const unsigned long session = GetCurrentProcessId();
+    const std::wstring installerName = pipeName(sid, session, L"");
+    const std::wstring storeName = pipeName(sid, session, L"jerisHQ.JerisLink_1cbzj2979sfxw");
+    expect(installerName != storeName, "both builds: different pipe names");
+    for (const bool installerFirst : {true, false}) {
+        const std::string order = installerFirst ? " (installer viewer first)" : " (Store viewer first)";
+        std::mutex m;
+        std::vector<std::wstring> toInstaller, toStore;
+        Server installer, store;
+        auto startInstaller = [&] {
+            return installer.start(installerName, [&](std::vector<std::wstring>&& items) {
+                std::lock_guard<std::mutex> lock(m);
+                toInstaller = std::move(items);
+                return Reply::Started;
+            });
+        };
+        auto startStore = [&] {
+            return store.start(storeName, [&](std::vector<std::wstring>&& items) {
+                std::lock_guard<std::mutex> lock(m);
+                toStore = std::move(items);
+                return Reply::NotConnected;  // a different answer, so a mix-up would show
+            });
+        };
+        const bool a = installerFirst ? startInstaller() : startStore();
+        const bool b = installerFirst ? startStore() : startInstaller();
+        expect(a && b && installer.running() && store.running(), "both builds: both viewers listen at once" + order);
+        const Reply fromStoreMenu = sendItems(storeName, {L"C:\\store.txt"});
+        const Reply fromInstallerMenu = sendItems(installerName, {L"C:\\installer.txt"});
+        std::lock_guard<std::mutex> lock(m);
+        expect(fromStoreMenu == Reply::NotConnected && toStore == std::vector<std::wstring>{L"C:\\store.txt"},
+               "both builds: Store menu reaches the Store viewer" + order);
+        expect(fromInstallerMenu == Reply::Started && toInstaller == std::vector<std::wstring>{L"C:\\installer.txt"},
+               "both builds: installer menu reaches the installer viewer" + order);
+    }
+}
+
 }  // namespace
 
 int main() {
     expect(!currentUserSid().empty() && currentUserSid().rfind(L"S-1-", 0) == 0, "sid: current user SID");
     expect(currentPipeName().rfind(L"\\\\.\\pipe\\JerisLink.SendTo.S-1-", 0) == 0, "pipe: real name");
+    {
+        // This test runs without a package, like the installer build: the
+        // name must stay exactly what 0.3.x / 0.4.0 viewers use.
+        std::wstring family = L"x";
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        expect(currentPackageFamily(family) && family.empty(), "pipe: no package family outside a package");
+        expect(currentPipeName() == pipeName(currentUserSid(), session), "pipe: installer build's name unchanged");
+    }
     roundTrip();
     slowViewer();
     quietExit();
     commandLineRoundTrip();
+    bothBuilds();
     std::printf("send to pipe: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

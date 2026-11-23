@@ -49,7 +49,9 @@
         <!--
           Explorer right-click "Send to JerisLink" for files (*) and folders
           (Directory). Windows 11 shows it in the first-level menu, Windows 10
-          1903+ in the classic menu; older Windows ignores these entries.
+          1809 and later in the classic menu (Microsoft's schema docs:
+          desktop5 ItemType and Verb 1809, desktop4 FileExplorerContextMenus
+          1803, com SurrogateServer 1703; Windows 10 itself not tried).
           The Clsid is the IExplorerCommand in JerisLinkSendTo.dll
           (send_to_shell.cpp, kClsid); it starts Jerislink.exe with the send-to option.
         -->

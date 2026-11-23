@@ -102,8 +102,11 @@ Not connected: a dialog says so and nothing is sent.
 
 The Microsoft Store version has its own command instead: right-click files or
 folders and pick Send to JerisLink (Windows 11: in the first menu; Windows 10
-version 1903 or later: in the menu directly). Older Windows 10 and the bare
+version 1809 or later: in the menu directly). Older Windows 10 and the bare
 Jerislink.exe have no Send to entry: drag files onto the viewer instead.
+The Windows 10 menu has been tested only against Microsoft's documentation,
+not on a real Windows 10 machine; it has been tried on Windows 11 only.
+With both versions open, each one's entry sends to its own viewer.
 
 Logs
 ----

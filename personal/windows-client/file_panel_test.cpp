@@ -80,7 +80,7 @@ void cards() {
     st = sendToRows(SendToSetup::StoreMenu, true);
     expect(st.size() == 2 && !st[1].muted, "card 2: Store menu build shows the Mac line");
     st = sendToRows(SendToSetup::StorePackage);
-    expectEq(st[0].text, "Needs Windows 10 version 1903 or later. Drag files onto this window instead.",
+    expectEq(st[0].text, "Needs Windows 10 version 1809 or later. Drag files onto this window instead.",
              "card 2: Store build on Windows 10 1809 degrades to drag");
     expect(st[0].muted && st.size() == 1, "card 2: Store line is grey");
     st = sendToRows(SendToSetup::StorePackage, true);

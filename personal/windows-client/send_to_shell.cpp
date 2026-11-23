@@ -6,7 +6,7 @@
 // the Store build declares an IExplorerCommand instead
 // (msix/AppxManifest.xml.in: desktop4:FileExplorerContextMenus for files and
 // folders, com:SurrogateServer for this DLL). Windows 11 shows it in the first
-// level of the right-click menu, Windows 10 1903+ in the classic menu.
+// level of the right-click menu, Windows 10 1809+ in the classic menu.
 //
 // Explorer loads the DLL out of process, in dllhost.exe with the package's
 // identity. Invoke() does no transfer work itself: it collects the selected
@@ -14,6 +14,12 @@
 // short-lived run the installer's shortcut starts (send_to_win.cpp), and
 // returns. So Explorer never waits on the pipe or the Mac, and every check,
 // limit and dialog stays in one place.
+//
+// No C++ exception leaves this DLL: every method Explorer or COM calls runs
+// inside guarded(), which turns std::bad_alloc into E_OUTOFMEMORY and any
+// other exception into E_UNEXPECTED, and everything it holds (shell items,
+// strings, process handles) is released by RAII on the way out. A throw
+// across the COM boundary would end dllhost.exe.
 
 #include "send_to.hpp"
 
@@ -22,6 +28,7 @@
 #include <shobjidl.h>
 
 #include <atomic>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -34,6 +41,33 @@ constexpr wchar_t kTitle[] = L"Send to JerisLink";
 constexpr int kIconId = 101;  // IDI_JERISLINK in resource.h, inside Jerislink.exe
 
 HMODULE gModule = nullptr;
+
+// Runs one COM method body; no exception gets out.
+template <class F>
+HRESULT guarded(F&& body) noexcept {
+    try {
+        return body();
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (...) {
+        return E_UNEXPECTED;
+    }
+}
+
+struct ReleaseUnknown {
+    void operator()(IUnknown* p) const { p->Release(); }
+};
+using ShellItem = std::unique_ptr<IShellItem, ReleaseUnknown>;
+
+struct FreeCoTask {
+    void operator()(wchar_t* p) const { CoTaskMemFree(p); }
+};
+using CoTaskString = std::unique_ptr<wchar_t, FreeCoTask>;
+
+struct CloseHandles {
+    void operator()(HANDLE h) const { CloseHandle(h); }
+};
+using Handle = std::unique_ptr<void, CloseHandles>;
 std::atomic<long> gObjects{0};  // live commands and factories
 std::atomic<long> gLocks{0};    // IClassFactory::LockServer
 
@@ -48,30 +82,39 @@ std::wstring viewerExe() {
     return path.substr(0, slash + 1) + L"Jerislink.exe";
 }
 
+struct Selection {
+    bool tooMany = false;            // over kMaxItems: only the count was read
+    std::vector<std::wstring> paths;
+};
+
 // The file system path of every selected item. An item without one (a zip
 // member, a library root) is passed as "?" so the --send-to run refuses the
 // whole request with its "couldn't read the selected items" dialog instead of
-// quietly sending fewer items than were selected.
-std::vector<std::wstring> selectedPaths(IShellItemArray* items) {
-    std::vector<std::wstring> paths;
+// quietly sending fewer items than were selected. Over kMaxItems nothing is
+// read or allocated per item: the run shows "too many" from the flag alone.
+Selection selectedPaths(IShellItemArray* items) {
+    Selection sel;
     DWORD count = 0;
-    if (!items || FAILED(items->GetCount(&count))) return paths;
-    // Over the limit: the run answers "too many" from the count alone.
-    if (count > jl::sendto::kMaxItems) return std::vector<std::wstring>(count, L"?");
-    paths.reserve(count);
-    for (DWORD i = 0; i < count; ++i) {
-        IShellItem* item = nullptr;
-        PWSTR path = nullptr;
-        if (SUCCEEDED(items->GetItemAt(i, &item)) && item && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) &&
-            path) {
-            paths.emplace_back(path);
-        } else {
-            paths.emplace_back(L"?");
-        }
-        if (path) CoTaskMemFree(path);
-        if (item) item->Release();
+    if (!items || FAILED(items->GetCount(&count))) return sel;
+    if (count > jl::sendto::kMaxItems) {
+        sel.tooMany = true;
+        return sel;
     }
-    return paths;
+    sel.paths.reserve(count);
+    for (DWORD i = 0; i < count; ++i) {
+        IShellItem* raw = nullptr;
+        const HRESULT got = items->GetItemAt(i, &raw);
+        ShellItem item(raw);
+        PWSTR rawPath = nullptr;
+        if (SUCCEEDED(got) && item && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) && rawPath) {
+            CoTaskString path(rawPath);
+            sel.paths.emplace_back(path.get());
+        } else {
+            if (rawPath) CoTaskMemFree(rawPath);
+            sel.paths.emplace_back(L"?");
+        }
+    }
+    return sel;
 }
 
 class SendToCommand final : public IExplorerCommand {
@@ -97,56 +140,71 @@ public:
     }
 
     // IExplorerCommand
-    IFACEMETHODIMP GetTitle(IShellItemArray*, LPWSTR* name) override { return SHStrDupW(kTitle, name); }
+    IFACEMETHODIMP GetTitle(IShellItemArray*, LPWSTR* name) override {
+        if (!name) return E_POINTER;
+        *name = nullptr;
+        return SHStrDupW(kTitle, name);
+    }
     IFACEMETHODIMP GetIcon(IShellItemArray*, LPWSTR* icon) override {
-        const std::wstring exe = viewerExe();
-        if (exe.empty()) {
-            *icon = nullptr;
-            return E_FAIL;
-        }
-        return SHStrDupW((exe + L",-" + std::to_wstring(kIconId)).c_str(), icon);
+        if (!icon) return E_POINTER;
+        *icon = nullptr;
+        return guarded([&]() -> HRESULT {
+            const std::wstring exe = viewerExe();
+            if (exe.empty()) return E_FAIL;
+            return SHStrDupW((exe + L",-" + std::to_wstring(kIconId)).c_str(), icon);
+        });
     }
     IFACEMETHODIMP GetToolTip(IShellItemArray*, LPWSTR* tip) override {
+        if (!tip) return E_POINTER;
         *tip = nullptr;
         return E_NOTIMPL;
     }
     IFACEMETHODIMP GetCanonicalName(GUID* guid) override {
+        if (!guid) return E_POINTER;
         *guid = kClsid;
         return S_OK;
     }
     // Shown for files and folders (the manifest's ItemTypes); hidden when the
     // selection has items with no file system path, which cannot be sent.
     IFACEMETHODIMP GetState(IShellItemArray* items, BOOL, EXPCMDSTATE* state) override {
+        if (!state) return E_POINTER;
         *state = ECS_ENABLED;
-        SFGAOF attrs = 0;
-        if (items && items->GetAttributes(SIATTRIBFLAGS_AND, SFGAO_FILESYSTEM, &attrs) == S_FALSE) *state = ECS_HIDDEN;
-        return S_OK;
+        return guarded([&]() -> HRESULT {
+            SFGAOF attrs = 0;
+            if (items && items->GetAttributes(SIATTRIBFLAGS_AND, SFGAO_FILESYSTEM, &attrs) == S_FALSE) *state = ECS_HIDDEN;
+            return S_OK;
+        });
     }
     IFACEMETHODIMP Invoke(IShellItemArray* items, IBindCtx*) override {
-        const std::wstring exe = viewerExe();
-        if (exe.empty()) return E_FAIL;
-        std::wstring line = jl::sendto::commandLine(exe, selectedPaths(items));
-        const size_t slash = exe.find_last_of(L'\\');
-        const std::wstring dir = exe.substr(0, slash);
-        STARTUPINFOW si{sizeof(si)};
-        PROCESS_INFORMATION pi{};
-        // Suspended until it may take the foreground, so a "nothing was
-        // sent" dialog comes up in front of Explorer, not behind it.
-        if (!CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, dir.c_str(), &si,
-                            &pi)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
-        AllowSetForegroundWindow(pi.dwProcessId);
-        ResumeThread(pi.hThread);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return S_OK;
+        return guarded([&]() -> HRESULT {
+            const std::wstring exe = viewerExe();
+            if (exe.empty()) return E_FAIL;
+            const Selection sel = selectedPaths(items);
+            std::wstring line =
+                sel.tooMany ? jl::sendto::tooManyCommandLine(exe) : jl::sendto::commandLine(exe, sel.paths);
+            const size_t slash = exe.find_last_of(L'\\');
+            const std::wstring dir = exe.substr(0, slash);
+            STARTUPINFOW si{sizeof(si)};
+            PROCESS_INFORMATION pi{};
+            // Suspended until it may take the foreground, so a "nothing was
+            // sent" dialog comes up in front of Explorer, not behind it.
+            if (!CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr,
+                                dir.c_str(), &si, &pi)) {
+                return HRESULT_FROM_WIN32(GetLastError());
+            }
+            const Handle process(pi.hProcess), thread(pi.hThread);
+            AllowSetForegroundWindow(pi.dwProcessId);
+            ResumeThread(pi.hThread);
+            return S_OK;
+        });
     }
     IFACEMETHODIMP GetFlags(EXPCMDFLAGS* flags) override {
+        if (!flags) return E_POINTER;
         *flags = ECF_DEFAULT;
         return S_OK;
     }
     IFACEMETHODIMP EnumSubCommands(IEnumExplorerCommand** out) override {
+        if (!out) return E_POINTER;
         *out = nullptr;
         return E_NOTIMPL;
     }
@@ -181,11 +239,10 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
-        auto* cmd = new (std::nothrow) SendToCommand();
-        if (!cmd) return E_OUTOFMEMORY;
-        const HRESULT hr = cmd->QueryInterface(riid, out);
-        cmd->Release();
-        return hr;
+        return guarded([&]() -> HRESULT {
+            std::unique_ptr<SendToCommand, ReleaseUnknown> cmd(new SendToCommand());
+            return cmd->QueryInterface(riid, out);
+        });
     }
     IFACEMETHODIMP LockServer(BOOL lock) override {
         if (lock) ++gLocks;
@@ -212,11 +269,10 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (clsid != kClsid) return CLASS_E_CLASSNOTAVAILABLE;
-    auto* factory = new (std::nothrow) Factory();
-    if (!factory) return E_OUTOFMEMORY;
-    const HRESULT hr = factory->QueryInterface(riid, out);
-    factory->Release();
-    return hr;
+    return guarded([&]() -> HRESULT {
+        std::unique_ptr<Factory, ReleaseUnknown> factory(new Factory());
+        return factory->QueryInterface(riid, out);
+    });
 }
 
 STDAPI DllCanUnloadNow() { return gObjects.load() == 0 && gLocks.load() == 0 ? S_OK : S_FALSE; }

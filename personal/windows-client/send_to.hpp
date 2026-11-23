@@ -91,12 +91,15 @@ inline std::wstring quoteArg(const std::wstring& s) {
 // "<exe>" --send-to "<item>"... When it would not fit in CreateProcessW's
 // limit, "<exe>" --send-to-too-many instead, so the user still gets the
 // "too many" dialog rather than a silently cut list.
+inline std::wstring tooManyCommandLine(const std::wstring& exe) { return quoteArg(exe) + L" " + kTooManyFlag; }
+
 inline std::wstring commandLine(const std::wstring& exe, const std::vector<std::wstring>& items) {
+    if (items.size() > kMaxItems) return tooManyCommandLine(exe);
     std::wstring line = quoteArg(exe) + L" " + kFlag;
     for (const auto& p : items) {
         line += L" ";
         line += quoteArg(p);
-        if (line.size() > kMaxCommandLineChars) return quoteArg(exe) + L" " + kTooManyFlag;
+        if (line.size() > kMaxCommandLineChars) return tooManyCommandLine(exe);
     }
     return line;
 }
@@ -292,6 +295,17 @@ inline bool decodeReply(const uint8_t* p, size_t n, Reply& r) {
 // user and session owns it (first instance), other users cannot open it.
 inline std::wstring pipeName(const std::wstring& userSid, unsigned long sessionId) {
     return L"\\\\.\\pipe\\JerisLink.SendTo." + userSid + L"." + std::to_wstring(sessionId);
+}
+
+// The pipe for one build. The installer build (no package) keeps the name
+// above. The Store (MSIX) build adds ".pkg.<package family name>", so when
+// both builds run at once each Explorer entry reaches its own viewer, which
+// may be connected to a different Mac. The viewer and its "--send-to" run
+// (started by the package's Explorer command, so it has the package's
+// identity) work the name out the same way.
+inline std::wstring pipeName(const std::wstring& userSid, unsigned long sessionId, const std::wstring& packageFamily) {
+    const std::wstring base = pipeName(userSid, sessionId);
+    return packageFamily.empty() ? base : base + L".pkg." + packageFamily;
 }
 
 }  // namespace jl::sendto

@@ -74,7 +74,7 @@ inline std::vector<CardRow> copyPasteRows() {
 enum class SendToSetup {
     NotInstalled,  // e.g. the bare exe from a zip, or the shortcut was deleted
     Installed,     // the installer's JerisLink shortcut is in the user's SendTo folder
-    StorePackage,  // the Microsoft Store (MSIX) build on Windows older than 10 1903: no menu command
+    StorePackage,  // the Microsoft Store (MSIX) build on Windows older than 10 1809: no menu command
     StoreMenu,     // the Microsoft Store (MSIX) build: its own Explorer command (JerisLinkSendTo.dll)
 };
 
@@ -95,7 +95,7 @@ inline std::vector<CardRow> sendToRows(SendToSetup setup, bool macPush = false) 
                         false});
         break;
     case SendToSetup::StorePackage:
-        rows.push_back({pcToMac(), "Needs Windows 10 version 1903 or later. Drag files onto this window instead.", true});
+        rows.push_back({pcToMac(), "Needs Windows 10 version 1809 or later. Drag files onto this window instead.", true});
         break;
     default:
         rows.push_back({pcToMac(), "Not set up on this PC. Install JerisLink with its installer to add it.", true});

@@ -5,6 +5,8 @@
 // to a copy of this test exe named Jerislink.exe: started with --send-to,
 // that copy writes the arguments it got to a file, so the test sees exactly
 // what the real viewer would get (paths with spaces, a folder, a drive root).
+// Fake selections check that over 1,000 items go straight to
+// --send-to-too-many and that C++ exceptions become HRESULTs.
 #include "send_to.hpp"
 
 #include <windows.h>
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -72,6 +75,70 @@ IShellItemArray* arrayOf(const std::vector<std::wstring>& paths) {
     for (auto id : ids) CoTaskMemFree(id);
     return arr;
 }
+
+// A selection Explorer never makes, to drive the DLL's edge cases: a huge
+// item count, or a shell that throws a C++ exception out of GetItemAt or
+// GetAttributes. The DLL must not allocate per counted item, and must turn
+// any exception into an HRESULT instead of letting it end the process.
+class FakeArray final : public IShellItemArray {
+public:
+    enum class Mode { Count, ThrowBadAlloc, ThrowOther };
+    FakeArray(Mode mode, DWORD count) : mode_(mode), count_(count) {}
+    long itemCalls = 0;
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == IID_IUnknown || riid == __uuidof(IShellItemArray)) {
+            *out = static_cast<IShellItemArray*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    IFACEMETHODIMP_(ULONG) Release() override { return --refs_; }  // lives on the test's stack
+    IFACEMETHODIMP BindToHandler(IBindCtx*, REFGUID, REFIID, void** out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    IFACEMETHODIMP GetPropertyStore(GETPROPERTYSTOREFLAGS, REFIID, void** out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    IFACEMETHODIMP GetPropertyDescriptionList(REFPROPERTYKEY, REFIID, void** out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    IFACEMETHODIMP GetAttributes(SIATTRIBFLAGS, SFGAOF, SFGAOF* attrs) override {
+        throwIfAsked();
+        *attrs = SFGAO_FILESYSTEM;
+        return S_OK;
+    }
+    IFACEMETHODIMP GetCount(DWORD* n) override {
+        *n = count_;
+        return S_OK;
+    }
+    IFACEMETHODIMP GetItemAt(DWORD, IShellItem** item) override {
+        ++itemCalls;
+        *item = nullptr;
+        throwIfAsked();
+        return E_FAIL;  // no path: the DLL passes "?"
+    }
+    IFACEMETHODIMP EnumItems(IEnumShellItems** out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+
+private:
+    void throwIfAsked() {
+        if (mode_ == Mode::ThrowBadAlloc) throw std::bad_alloc();
+        if (mode_ == Mode::ThrowOther) throw 42;
+    }
+    Mode mode_;
+    DWORD count_;
+    ULONG refs_ = 1;
+};
 
 std::wstring readAll(const std::wstring& path) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -188,6 +255,46 @@ int runTests(const std::wstring& dllPath) {
         DeleteFileW(outFile.c_str());
         virt->Release();
     }
+
+    // Over 1,000 items: straight to --send-to-too-many from the count alone,
+    // without reading an item or sizing anything to the count.
+    for (const DWORD count : {DWORD{1001}, DWORD{0xFFFFFFFF}}) {
+        FakeArray many(FakeArray::Mode::Count, count);
+        const std::string n = std::to_string(count);
+        expect(SUCCEEDED(cmd->Invoke(&many, nullptr)), "too many: invoke with " + n + " items succeeds");
+        expect(waitFor(outFile) == std::wstring(jl::sendto::kTooManyFlag) + L"\n",
+               "too many: " + n + " items start --send-to-too-many only");
+        expect(many.itemCalls == 0, "too many: no item read for " + n + " items");
+        DeleteFileW(outFile.c_str());
+    }
+    {
+        FakeArray limit(FakeArray::Mode::Count, 1000);
+        expect(SUCCEEDED(cmd->Invoke(&limit, nullptr)), "limit: invoke with 1000 items succeeds");
+        const std::wstring got1000 = waitFor(outFile);
+        size_t lines = 0;
+        for (wchar_t c : got1000) lines += c == L'\n';
+        expect(got1000.rfind(std::wstring(jl::sendto::kFlag) + L"\n", 0) == 0 && lines == 1001 && limit.itemCalls == 1000,
+               "limit: 1000 items are each read and passed (as ? without a path)");
+        DeleteFileW(outFile.c_str());
+    }
+
+    // C++ exceptions from the shell stop at the COM boundary as HRESULTs.
+    {
+        FakeArray oom(FakeArray::Mode::ThrowBadAlloc, 2);
+        expect(cmd->Invoke(&oom, nullptr) == E_OUTOFMEMORY, "exceptions: bad_alloc in Invoke becomes E_OUTOFMEMORY");
+        FakeArray odd(FakeArray::Mode::ThrowOther, 2);
+        expect(cmd->Invoke(&odd, nullptr) == E_UNEXPECTED, "exceptions: other exception in Invoke becomes E_UNEXPECTED");
+        EXPCMDSTATE st = ECS_HIDDEN;
+        expect(cmd->GetState(&odd, FALSE, &st) == E_UNEXPECTED, "exceptions: exception in GetState becomes E_UNEXPECTED");
+        expect(cmd->GetState(&oom, FALSE, &st) == E_OUTOFMEMORY, "exceptions: bad_alloc in GetState becomes E_OUTOFMEMORY");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        expect(GetFileAttributesW(outFile.c_str()) == INVALID_FILE_ATTRIBUTES, "exceptions: no run started after a throw");
+        LPWSTR t2 = nullptr;
+        expect(SUCCEEDED(cmd->GetTitle(nullptr, &t2)) && t2, "exceptions: command still works afterwards");
+        CoTaskMemFree(t2);
+    }
+    expect(cmd->GetTitle(nullptr, nullptr) == E_POINTER && cmd->GetState(nullptr, FALSE, nullptr) == E_POINTER,
+           "command: null out pointers refused");
     if (items) items->Release();
     cmd->Release();
     expect(canUnload() == S_OK, "dll: can unload once every object is released");
@@ -204,7 +311,9 @@ int runTests(const std::wstring& dllPath) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc >= 2 && std::wstring(argv[1]) == jl::sendto::kFlag) return recordArgs(argc, argv);
+    if (argc >= 2 && (std::wstring(argv[1]) == jl::sendto::kFlag || std::wstring(argv[1]) == jl::sendto::kTooManyFlag)) {
+        return recordArgs(argc, argv);
+    }
     if (argc < 2) {
         std::printf("usage: JerislinkSendToShellTest <path to JerisLinkSendTo.dll>\n");
         return 2;

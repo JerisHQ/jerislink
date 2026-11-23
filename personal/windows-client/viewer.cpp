@@ -3404,14 +3404,17 @@ static fp::SendToSetup detectSendToSetup() {
     UINT32 len = 0;
     if (GetCurrentPackageFullName(&len, nullptr) != APPMODEL_ERROR_NO_PACKAGE) {
         // The package's Explorer command (desktop4/desktop5 manifest entries
-        // and JerisLinkSendTo.dll next to the exe) needs Windows 10 1903.
+        // and JerisLinkSendTo.dll next to the exe) needs Windows 10 1809
+        // (build 17763): desktop5:ItemType and desktop5:Verb need 1809,
+        // desktop4:FileExplorerContextMenus 1803, com:SurrogateServer 1703
+        // (Microsoft's manifest schema docs). Tested on Windows 11 only.
         wchar_t exe[MAX_PATH] = {};
         const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::wstring dll(exe, n > 0 && n < MAX_PATH ? n : 0);
         const size_t slash = dll.find_last_of(L'\\');
         dll = slash == std::wstring::npos ? std::wstring() : dll.substr(0, slash + 1) + L"JerisLinkSendTo.dll";
         const bool hasDll = !dll.empty() && GetFileAttributesW(dll.c_str()) != INVALID_FILE_ATTRIBUTES;
-        return hasDll && windowsBuild() >= 18362 ? fp::SendToSetup::StoreMenu : fp::SendToSetup::StorePackage;
+        return hasDll && windowsBuild() >= 17763 ? fp::SendToSetup::StoreMenu : fp::SendToSetup::StorePackage;
     }
     PWSTR dir = nullptr;
     fp::SendToSetup s = fp::SendToSetup::NotInstalled;
@@ -3810,9 +3813,12 @@ static void sendToServerStart(HWND hwnd) {
     gSendToHwnd = hwnd;
     const std::wstring name = st::currentPipeName();
     const bool ok = !name.empty() && gSendToServer.start(name, sendToFromPipe);
-    // Taken: another JerisLink viewer of this user already gets Send to.
+    // Taken: another JerisLink viewer of this build and user already gets
+    // Send to. The Store and installer builds have their own pipes.
+    std::wstring family;
+    const bool packaged = st::currentPackageFamily(family) && !family.empty();
     logLine(std::string("file.send_to_pipe=") + (ok ? "listening" : "unavailable") +
-            " error=" + std::to_string(ok ? 0 : gSendToServer.error()));
+            " build=" + (packaged ? "store" : "installer") + " error=" + std::to_string(ok ? 0 : gSendToServer.error()));
 }
 
 static void sendToServerStop() {
