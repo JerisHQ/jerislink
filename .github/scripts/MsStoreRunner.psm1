@@ -37,10 +37,12 @@
 # submission JSON (it holds fileUploadUrl). HTTP errors are reported as the
 # status code, plain error codes, or the exception type names (Get-StoreErrorText,
 # Get-StoreFailureText); a Store API error response also adds the API's target
-# (a plain name) and its message, one line with URLs, query strings,
-# signatures, tokens and secrets masked and at most 300 characters
-# (Get-SafeErrorMessage). Other strings from the API are printed only when they
-# match a plain pattern (Get-SafeValue). All HTTP goes through
+# when it is a documented submission field name (printed as this module spells
+# it) and a hint written here for the code or status. The API's message text is
+# never printed. Other strings from the API are printed only when they match a
+# plain pattern (Get-SafeValue). The error line and every value that passes
+# Get-SafeValue also go through Protect-WorkflowCommand, so neither "::" nor
+# "##[" workflow command syntax reaches the log. All HTTP goes through
 # Invoke-StoreHttp (the Pester tests mock it): https to the Store hosts only,
 # no redirects, no verbose or debug output. The token lives only in this
 # PowerShell session; nothing is written to disk.
@@ -226,43 +228,110 @@ function Get-CallTimeout([int]$Requested) {
   [Math]::Min($Requested, $left)
 }
 
-# The Store API's error message, made safe to print: one line with no control
-# or format characters and no "::" (no workflow command can start), with
-# URLs, query strings, SAS signatures, bearer tokens, the access token, JWTs,
-# name=value secrets and long opaque strings masked, double quotes turned into
-# single quotes, and at most Max characters. A message of more than 4096
-# characters is not printed at all. Pure apart from the current token.
-$script:SafeTarget = '^[A-Za-z0-9_][A-Za-z0-9_.\[\]/ -]{0,99}\z'
-function Get-SafeErrorMessage {
-  param([AllowNull()][AllowEmptyString()][string]$Message, [ValidateRange(20, 1000)][int]$Max = 300)
-  if (-not $Message) { return '' }
-  if ($Message.Length -gt 4096) { return "[$($Message.Length) characters, not printed]" }
-  $t = $Message -replace '[\p{C}\p{Zl}\p{Zp}]+', ' '
-  # URLs, sig=, Bearer <token>, the current access token.
-  $t = Protect-StoreText $t
-  # A query string without a scheme (host/path?a=b) and bare a=b&c=d pairs.
-  $t = $t -replace '\?[^\s"''<>]*=[^\s"''<>]*', '?[query]'
-  $t = $t -replace '[A-Za-z0-9_.-]+=[^\s&"''<>]*(?:&[A-Za-z0-9_.-]+=[^\s&"''<>]*)+', '[query]'
-  $t = $t -replace '(?i)\b(access_token|refresh_token|id_token|client_secret|secret|password|pwd|accountkey|sharedaccesskey|apikey|api_key|assertion)(\s*[=:]\s*)[^\s&"'',;]+', '$1=[redacted]'
-  $t = $t -replace '\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*', '[token]'
-  # 32+ characters of letters and digits (with + / _ ~ = -), not a GUID.
-  $t = $t -replace '(?<![A-Za-z0-9+/_~=-])(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![A-Za-z0-9+/_~=-]))(?=[A-Za-z0-9+/_~=-]*\d)(?=[A-Za-z0-9+/_~=-]*[A-Za-z])[A-Za-z0-9+/_~=-]{32,}', '[redacted]'
-  $t = ($t -replace ':{2,}', ':' -replace '"', "'" -replace ' {2,}', ' ').Trim()
-  if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
-  $t
+# Makes text inert for the GitHub Actions runner, which reads workflow commands
+# from every output line: "::name::" at the start of a line, and the legacy
+# "##[name]" anywhere in a line (actions/runner ActionCommand.cs). Line breaks
+# and other control or format characters become spaces, runs of ":" become one
+# ":" and runs of "#" before "[" become one "#". Used on the error line
+# (Get-StoreErrorText) and on every value that passes Get-SafeValue.
+function Protect-WorkflowCommand([AllowNull()][AllowEmptyString()][string]$Text) {
+  if (-not $Text) { return '' }
+  $t = $Text -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+', ' '
+  $t = $t -replace ':{2,}', ':'
+  $t -replace '#{2,}\[', '#['
 }
+
+# Field names of the app submission resource and the resources inside it, as
+# documented in "Manage app submissions" (learn.microsoft.com, Windows Store
+# submission API). The only target names an error line prints.
+$script:StoreTargetNames = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($n in @(
+    # app submission
+    'id', 'applicationCategory', 'pricing', 'visibility', 'targetPublishMode', 'targetPublishDate', 'listings',
+    'hardwarePreferences', 'automaticBackupEnabled', 'canInstallOnRemovableMedia', 'isGameDvrEnabled', 'gamingOptions',
+    'hasExternalInAppProducts', 'meetAccessibilityGuidelines', 'notesForCertification', 'status', 'statusDetails',
+    'fileUploadUrl', 'applicationPackages', 'packageDeliveryOptions', 'enterpriseLicensing',
+    'allowMicrosoftDecideAppAvailabilityToFutureDeviceFamilies', 'allowTargetFutureDeviceFamilies', 'friendlyName', 'trailers',
+    # pricing, sale
+    'trialPeriod', 'marketSpecificPricings', 'sales', 'priceId', 'isAdvancedPricingModel', 'name', 'basePriceId', 'startDate', 'endDate',
+    # listing, base listing, image
+    'baseListing', 'platformOverrides', 'copyrightAndTrademarkInfo', 'keywords', 'licenseTerms', 'privacyPolicy', 'supportContact',
+    'websiteUrl', 'description', 'features', 'releaseNotes', 'images', 'recommendedHardware', 'minimumHardware', 'title',
+    'shortDescription', 'shortTitle', 'sortTitle', 'voiceTitle', 'devStudio', 'fileName', 'fileStatus', 'imageType',
+    # gaming options
+    'genres', 'isLocalMultiplayer', 'isLocalCooperative', 'isOnlineMultiplayer', 'isOnlineCooperative', 'localMultiplayerMinPlayers',
+    'localMultiplayerMaxPlayers', 'localCooperativeMinPlayers', 'localCooperativeMaxPlayers', 'isBroadcastingPrivilegeGranted',
+    'isCrossPlayEnabled', 'kinectDataForExternal',
+    # status details, certification report
+    'errors', 'warnings', 'certificationReports', 'code', 'details', 'date', 'reportUrl',
+    # application package
+    'version', 'architecture', 'languages', 'capabilities', 'minimumDirectXVersion', 'minimumSystemRam', 'targetDeviceFamilies',
+    # package delivery options, package rollout
+    'packageRollout', 'isMandatoryUpdate', 'mandatoryUpdateEffectiveDate', 'isPackageRollout', 'packageRolloutPercentage',
+    'packageRolloutStatus', 'fallbackSubmissionId',
+    # trailers
+    'videoFileName', 'videoFileId', 'trailerAssets', 'imageList')) { $script:StoreTargetNames[$n] = $n }
+
+# The target of a Store API error as this module spells it: a listed field
+# name, or a path of up to 8 of them joined by "." with an optional [index]
+# (applicationPackages[0].fileName). Anything else is "[unlisted target]".
+function Get-ListedTarget([AllowNull()][AllowEmptyString()][string]$Target) {
+  $no = '[unlisted target]'
+  if (-not $Target -or $Target.Length -gt 300) { return $no }
+  $segments = $Target.Split('.')
+  if ($segments.Count -gt 8) { return $no }
+  $out = [System.Collections.Generic.List[string]]::new()
+  foreach ($seg in $segments) {
+    $m = [regex]::Match($seg, '^([A-Za-z]{1,64})(?:\[(\d{1,4})\])?\z')
+    $name = ''
+    if (-not $m.Success -or -not $script:StoreTargetNames.TryGetValue($m.Groups[1].Value, [ref]$name)) { return $no }
+    $out.Add($(if ($m.Groups[2].Success) { "$name[$([int]$m.Groups[2].Value)]" } else { $name }))
+  }
+  $out -join '.'
+}
+
+# Hints written here, picked by the Store API error code (the submission
+# status codes in "Manage app submissions") or else by the HTTP status (the
+# error code tables of the create, update and commit pages). They say what kind
+# of error it is; none of them advises deleting or retrying, and none says
+# whether a request that timed out or got a 5xx was carried out (that stays
+# unconfirmed).
+$script:StoreCodeHint = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+$script:StoreCodeHint['InvalidParameterValue'] = 'a parameter in the request body is invalid'
+$script:StoreCodeHint['InvalidOperation'] = 'the operation is not valid'
+$script:StoreCodeHint['InvalidState'] = 'the operation is not valid for the current state of the app or submission'
+$script:StoreCodeHint['ResourceNotFound'] = 'the app or submission was not found'
+$script:StoreCodeHint['ServiceError'] = 'the service reported an internal error'
+$script:StoreCodeHint['InvalidArchive'] = 'the package ZIP archive is invalid'
+$script:StoreCodeHint['MissingFiles'] = 'the package ZIP archive lacks files the submission lists'
+$script:StoreCodeHint['PackageValidationFailed'] = 'a package failed validation'
+$script:StoreStatusHint = @{
+  400 = 'the request is invalid'
+  401 = 'the access token was not accepted'
+  403 = 'the Entra app is not allowed to do this'
+  404 = 'the app or submission was not found'
+  408 = 'the request timed out'
+  409 = 'the current state of the app does not allow this, or the app uses a Partner Center feature the submission API does not support'
+  429 = 'too many requests'
+  500 = 'the service reported an internal error'
+  502 = 'a gateway in front of the service reported an error'
+  503 = 'the service reported that it is unavailable'
+  504 = 'a gateway in front of the service timed out'
+}
+$script:StoreUnknownHint = 'no description of this error is known here (the API''s message text is not printed)'
 
 # Diagnostics for an HTTP error response: the status code and, when the body
 # has them, error codes that are plain identifiers (the Store API's code, the
 # token endpoint's error and AADSTS numbers, blob storage's <Code>). Without
 # Detail nothing else of the body is printed (the token endpoint and the blob
-# upload). With Detail (Store API calls only), also the API's target, when it
-# is a plain name, and its message through Get-SafeErrorMessage; both are read
-# from the top level of the JSON body or from its error object.
+# upload). With Detail (Store API calls only), also the API's target through
+# Get-ListedTarget (read from the top level of the JSON body or from its error
+# object) and a hint from the tables above. No message text from the body is
+# ever printed.
 function Get-StoreErrorText {
   param([int]$StatusCode, [AllowNull()][AllowEmptyString()][string]$Body, [switch]$Detail)
   $codes = [System.Collections.Generic.List[string]]::new()
-  $target = ''; $message = ''
+  $target = $null
   if ($Body) {
     $j = $null
     try { $j = $Body | ConvertFrom-Json -ErrorAction Stop } catch { }
@@ -280,9 +349,7 @@ function Get-StoreErrorText {
         foreach ($o in @($j, $(if ($e -and $e.Value -is [System.Management.Automation.PSCustomObject]) { $e.Value }))) {
           if ($null -eq $o) { continue }
           $p = $o.PSObject.Properties['target']
-          if (-not $target -and $p -and $p.Value -is [string]) { $target = $p.Value }
-          $p = $o.PSObject.Properties['message']
-          if (-not $message -and $p -and $p.Value -is [string]) { $message = $p.Value }
+          if ($null -eq $target -and $p -and $null -ne $p.Value -and "$($p.Value)" -ne '') { $target = $p.Value }
         }
       }
     } else {
@@ -292,10 +359,14 @@ function Get-StoreErrorText {
   }
   $safe = @($codes | Where-Object { $_ -cmatch '^[A-Za-z][A-Za-z0-9_.]{0,63}\z' } | Select-Object -Unique | Select-Object -First 3)
   $t = if ($safe.Count) { "HTTP $StatusCode ($($safe -join ', '))" } else { "HTTP $StatusCode" }
-  if ($target) { $t += "; target: $(Get-SafeValue $target $script:SafeTarget)" }
-  $message = Get-SafeErrorMessage $message
-  if ($message) { $t += "; message: `"$message`"" }
-  $t
+  if ($Detail) {
+    if ($null -ne $target) { $t += "; target: $(if ($target -is [string]) { Get-ListedTarget $target } else { '[unlisted target]' })" }
+    $hint = ''
+    foreach ($c in $safe) { if ($script:StoreCodeHint.TryGetValue($c, [ref]$hint)) { break } }
+    if (-not $hint) { $hint = if ($script:StoreStatusHint.ContainsKey($StatusCode)) { $script:StoreStatusHint[$StatusCode] } else { $script:StoreUnknownHint } }
+    $t += "; hint: $hint"
+  }
+  Protect-WorkflowCommand $t
 }
 
 function Get-JsonField($Object, [string]$Name) {
@@ -306,7 +377,9 @@ function Get-JsonField($Object, [string]$Name) {
 
 # Strings from the API are printed (and compared) only when they match a plain
 # pattern; anything else (a newline, a workflow command, a URL) becomes
-# [invalid]. Empty stays empty.
+# [invalid]. Empty stays empty. A value that passes still goes through
+# Protect-WorkflowCommand (no pattern here lets ":" or "#" through; that is a
+# second line of defence).
 $script:SafeWord = '^[A-Za-z]{1,40}\z'
 $script:SafeId = '^\d{1,20}\z'
 $script:SafeVersion = '^\d{1,5}(\.\d{1,5}){0,3}\z'
@@ -314,7 +387,7 @@ $script:SafePriceId = '^[A-Za-z][A-Za-z0-9]{0,39}\z'
 $script:SafeFileName = '^[A-Za-z0-9_][A-Za-z0-9_.()+ -]{0,199}\z'
 function Get-SafeValue([AllowNull()][AllowEmptyString()][string]$Value, [string]$Pattern) {
   if (-not $Value) { return '' }
-  if ($Value -cmatch $Pattern) { $Value } else { '[invalid]' }
+  if ($Value -cmatch $Pattern) { Protect-WorkflowCommand $Value } else { '[invalid]' }
 }
 
 # Gets an access token for the Store submission API with the Entra app's client
@@ -361,7 +434,7 @@ function Connect-StoreApi {
 # One Store submission API call. Path is relative to /v1.0/my/ and may end in a
 # query string. Returns the response body; throws a New-StoreError on a network
 # error (fixed text) or a non-2xx status (status, error codes and the API's
-# target and sanitized message: Get-StoreErrorText -Detail). OutcomeUnknown is
+# listed target and a hint: Get-StoreErrorText -Detail). OutcomeUnknown is
 # set when no answer came back (except a
 # refusal before sending) or the status is 408 or 5xx: the service may have
 # carried the request out.
@@ -1016,4 +1089,4 @@ function Assert-SubmissionHasPackage {
   }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Get-SafeErrorMessage, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage
+Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage

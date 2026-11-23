@@ -93,22 +93,23 @@ BeforeAll {
   # not advice to re-run.
   $script:DeleteAdvice = 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly'
   $script:RetryAdvice = '(?<!do not )re-run this workflow|\bretry\b|commit (it )?again'
-  # A Store API error body whose message carries every kind of secret the
-  # output must never show (a SAS URL, scheme-less query strings with several
-  # and with one pair, bare SAS pairs, sig=, a bearer token, the current access
-  # token, the client secret, a JWT, a long opaque key), a line break with a
-  # workflow command and double quotes; and the one line Get-StoreErrorText
-  # -Detail must make of it.
+  # A Store API error body whose message carries every kind of secret and
+  # text the output must never show (a SAS URL, scheme-less query strings,
+  # sig=, a bearer token, the current access token, the client secret in
+  # quotes, a JWT, a long opaque key, delete and retry advice, both workflow
+  # command syntaxes mid-line and after a line break), and the one line
+  # Get-StoreErrorText -Detail makes of it: the code, the listed target and
+  # the module's own hint. Nothing of the message is printed.
   function script:New-PlantedErrorBody([string]$Token, [string]$Target = 'applicationCategory') {
-    $msg = "Bad.`n::error::injected https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
+    $msg = "Bad.`n::error::injected see ##[error]injected https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
       "acct.blob.core.windows.net/c/x.zip?sv=2020-08-04&sp=w c/y.zip?skoid=Zq9 sv=2020-08-04&sr=b sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer abc.def-ghi " +
-      "token $Token client_secret=$Secret eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl AbCdEfGh0123456789AbCdEfGh0123456789xyz " +
-      "0f8fad5b-d9cb-469f-a165-70867728950e $File `"quoted`""
+      "token $Token client_secret=`"$Secret`" eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl AbCdEfGh0123456789AbCdEfGh0123456789xyz " +
+      "0f8fad5b-d9cb-469f-a165-70867728950e $File. Delete submission 1152921505000000007 and retry.`n##[set-output name=x;]injected"
     @{ code = 'InvalidParameterValue'; target = $Target; message = $msg; source = 'Ingestion Api' } | ConvertTo-Json -Compress
   }
-  $script:PlantedText = 'HTTP 400 (InvalidParameterValue); target: applicationCategory; message: "Bad. :error:injected [url] ' +
-    'acct.blob.core.windows.net/c/x.zip?[query] c/y.zip?[query] [query] sig=[redacted] Bearer [redacted] token [token] client_secret=[redacted] ' +
-    "[token] [redacted] 0f8fad5b-d9cb-469f-a165-70867728950e $File 'quoted'" + '"'
+  $script:PlantedText = 'HTTP 400 (InvalidParameterValue); target: applicationCategory; hint: a parameter in the request body is invalid'
+  # Words of the planted message (and its source); none may be printed.
+  $script:PlantedWords = 'Bad\.|injected|Ingestion|acct\.blob|skoid|Bearer|client_secret|0f8fad5b|Delete submission|retry|set-output'
   # Index of the first line from From on that matches Pattern, or -1.
   function script:Get-LineIndex([string[]]$Lines, [string]$Pattern, [int]$From = 0) {
     for ($i = $From; $i -lt $Lines.Count; $i++) { if ($Lines[$i] -match $Pattern) { return $i } }
@@ -398,42 +399,132 @@ Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
 }
 
 # The create in run 45185550541 got HTTP 400 (InvalidParameterValue) and the
-# log showed nothing else. Store API errors now add the API's target and its
-# message, sanitized and capped (Get-StoreErrorText -Detail); the token
+# log showed nothing else. Store API errors now add the target when it is a
+# documented submission field name, and a hint written in the module for the
+# code or the status (Get-StoreErrorText -Detail). The API's message is never
+# printed: masking it could be bypassed (Pepper, PR #74 r1). The token
 # endpoint and the blob upload keep the fixed text above.
-Describe 'Get-StoreErrorText -Detail (Store API target and sanitized message)' {
-  It 'prints the target and the message on one line with every planted secret masked' {
+Describe 'Get-StoreErrorText -Detail (listed target and local hint, never the API message)' {
+  It 'prints the code, the listed target and the hint, and nothing of a message full of planted secrets, advice and commands' {
     $s = New-FakeStore; Use-FakeStore $s
     $t = Get-StoreErrorText -StatusCode 400 -Body (New-PlantedErrorBody $s.Token) -Detail
     $t | Should -BeExactly $PlantedText
-    $t | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|eyJ|AbCdEfGh|sv=2020|[\r\n]"
+    $t | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|::|##\[|[\r\n]"
   }
   It 'prints nothing of the body without -Detail' {
     $s = New-FakeStore; Use-FakeStore $s
     Get-StoreErrorText -StatusCode 400 -Body (New-PlantedErrorBody $s.Token) | Should -BeExactly 'HTTP 400 (InvalidParameterValue)'
   }
-  It 'returns <Want> for <Case>' -ForEach @(
-    @{ Case = 'a nested error object'; Want = 'HTTP 400 (BadRequest); target: pricing; message: "see [url] now"'
-       Body = '{"error":{"code":"BadRequest","target":"pricing","message":"see https://evil.invalid/x?a=1 now"}}' }
-    @{ Case = 'a target that is not a plain name'; Want = 'HTTP 400 (InvalidParameterValue); target: [invalid]; message: "bad"'
-       Body = '{"code":"InvalidParameterValue","target":"x\n::error::pwned","message":"bad"}' }
-    @{ Case = 'a target and message that are not strings'; Want = 'HTTP 400 (InvalidParameterValue)'
-       Body = '{"code":"InvalidParameterValue","target":{"a":1},"message":["https://evil.invalid"]}' }
-    @{ Case = 'only a message'; Want = 'HTTP 409 (InvalidState); message: "The application has a pending submission."'
-       Body = '{"code":"InvalidState","message":"The application has a pending submission."}' }
-    @{ Case = 'a message of only control characters'; Want = 'HTTP 400 (InvalidParameterValue)'; Body = '{"code":"InvalidParameterValue","message":"\r\n\t"}' }
-    @{ Case = 'an XML body'; Want = 'HTTP 403 (AuthenticationFailed)'
-       Body = '<Error><Code>AuthenticationFailed</Code><Message>sig=FAKE+SAS</Message></Error>' }
+  It 'never prints the message: <Case>' -ForEach @(
+    @{ Case = 'delete advice'; Message = 'Delete submission 1152921505000000007 with DELETE /v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007, then create it again.' }
+    @{ Case = 'retry advice'; Message = 'Try the request again, or re-run this workflow and commit it again.' }
+    @{ Case = 'secrets inside quotes'; Message = 'client_secret="dummy-client-secret-Zx9" sig=''FAKE+SAS%2FSIGNATURE-0123456789'' "Bearer fake-access-token"' }
+    @{ Case = 'free-form AAD diagnostic text'; Message = 'AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value, not the client secret ID, for a secret added to app ''client-1''. Trace ID: 0f8fad5b-d9cb-469f-a165-70867728950e Correlation ID: 7c9e6679-7425-40de-944b-e07fc1f90ae7' }
+    @{ Case = 'workflow commands mid-line and after a line break'; Message = "see ::error::pwned and ##[error]pwned`n::add-mask::pwned`n##[set-output name=x]pwned" }
   ) {
-    Get-StoreErrorText -StatusCode ([int]($Want.Substring(5, 3))) -Body $Body -Detail | Should -BeExactly $Want
+    foreach ($body in @(
+        (@{ code = 'InvalidParameterValue'; target = 'pricing'; message = $Message } | ConvertTo-Json -Compress),
+        (@{ error = @{ code = 'InvalidParameterValue'; target = 'pricing'; message = $Message } } | ConvertTo-Json -Compress))) {
+      $t = Get-StoreErrorText -StatusCode 400 -Body $body -Detail
+      $t | Should -BeExactly 'HTTP 400 (InvalidParameterValue); target: pricing; hint: a parameter in the request body is invalid'
+    }
   }
-  It 'cuts a long message to 300 characters and does not print one over 4096 characters' {
-    $long = ('word ' * 200).Trim()
-    $t = Get-SafeErrorMessage $long
-    $t | Should -BeExactly ($long.Substring(0, 300) + '...')
-    Get-SafeErrorMessage ('x ' * 2100) | Should -BeExactly '[4200 characters, not printed]'
-    $body = @{ code = 'InvalidParameterValue'; message = ('word ' * 200) } | ConvertTo-Json -Compress
-    (Get-StoreErrorText -StatusCode 400 -Body $body -Detail).Length | Should -Be ('HTTP 400 (InvalidParameterValue); message: ""'.Length + 303)
+
+  # Allowlist: field names of the submission resource and the resources in it
+  # (learn.microsoft.com "Manage app submissions"), spelled as the module has them.
+  It 'target allowlist: prints the listed field name <Target> as <Want>' -ForEach @(
+    @{ Target = 'applicationCategory'; Want = 'applicationCategory' }
+    @{ Target = 'pricing'; Want = 'pricing' }
+    @{ Target = 'listings'; Want = 'listings' }
+    @{ Target = 'applicationPackages'; Want = 'applicationPackages' }
+    @{ Target = 'allowTargetFutureDeviceFamilies'; Want = 'allowTargetFutureDeviceFamilies' }
+    @{ Target = 'allowMicrosoftDecideAppAvailabilityToFutureDeviceFamilies'; Want = 'allowMicrosoftDecideAppAvailabilityToFutureDeviceFamilies' }
+    @{ Target = 'APPLICATIONCATEGORY'; Want = 'applicationCategory' }
+    @{ Target = 'Pricing.PriceId'; Want = 'pricing.priceId' }
+    @{ Target = 'applicationPackages[0].fileName'; Want = 'applicationPackages[0].fileName' }
+    @{ Target = 'applicationPackages[007].version'; Want = 'applicationPackages[7].version' }
+    @{ Target = 'listings.baseListing.images[2].imageType'; Want = 'listings.baseListing.images[2].imageType' }
+  ) {
+    Get-ListedTarget $Target | Should -BeExactly $Want
+    $body = @{ code = 'InvalidParameterValue'; target = $Target } | ConvertTo-Json -Compress
+    Get-StoreErrorText -StatusCode 400 -Body $body -Detail | Should -BeExactly "HTTP 400 (InvalidParameterValue); target: $Want; hint: a parameter in the request body is invalid"
+  }
+  It 'target allowlist: prints [unlisted target] for <Case>' -ForEach @(
+    @{ Case = 'a plain word that is not a submission field'; Target = 'submission' }
+    @{ Case = 'a plain word that could be a value'; Target = 'Free' }
+    @{ Case = 'the client secret'; Target = 'dummy-client-secret-Zx9' }
+    @{ Case = 'a long opaque key'; Target = 'AbCdEfGh0123456789AbCdEfGh0123456789xyz' }
+    @{ Case = 'a JWT'; Target = 'eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl' }
+    @{ Case = 'a SAS URL'; Target = 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' }
+    @{ Case = 'delete advice'; Target = 'delete submission 1152921505000000007' }
+    @{ Case = 'a listed name with a mid-line "::" command'; Target = 'applicationCategory::error::pwned' }
+    @{ Case = 'a listed name with a line break and a "::" command'; Target = "applicationCategory`n::error::pwned" }
+    @{ Case = 'a listed name with a mid-line "##[" command'; Target = 'applicationCategory##[error]pwned' }
+    @{ Case = 'a listed name with a token appended'; Target = 'pricingeyJhbGciOi' }
+    @{ Case = 'a listed name with a leading space'; Target = ' pricing' }
+    @{ Case = 'a listed name with a Cyrillic look-alike letter'; Target = "applicationCategor$([char]0x0443)" }
+    @{ Case = 'an empty path segment'; Target = 'pricing..priceId' }
+    @{ Case = 'a trailing dot'; Target = 'pricing.' }
+    @{ Case = 'an index of 5 digits'; Target = 'applicationPackages[12345]' }
+    @{ Case = 'more than 8 path segments'; Target = (@('pricing') * 9) -join '.' }
+  ) {
+    Get-ListedTarget $Target | Should -BeExactly '[unlisted target]'
+    $body = @{ code = 'InvalidParameterValue'; target = $Target } | ConvertTo-Json -Compress
+    Get-StoreErrorText -StatusCode 400 -Body $body -Detail | Should -BeExactly 'HTTP 400 (InvalidParameterValue); target: [unlisted target]; hint: a parameter in the request body is invalid'
+  }
+  It 'target allowlist: prints [unlisted target] for a target that is not a string: <Body>' -ForEach @(
+    @{ Body = '{"code":"InvalidParameterValue","target":{"name":"pricing"}}' }
+    @{ Body = '{"code":"InvalidParameterValue","target":["pricing"]}' }
+    @{ Body = '{"code":"InvalidParameterValue","target":42}' }
+    @{ Body = '{"code":"InvalidParameterValue","target":false}' }
+  ) {
+    Get-StoreErrorText -StatusCode 400 -Body $Body -Detail | Should -BeExactly 'HTTP 400 (InvalidParameterValue); target: [unlisted target]; hint: a parameter in the request body is invalid'
+  }
+  It 'returns <Want> for <Case>' -ForEach @(
+    @{ Case = 'a nested error object'; Code = 400; Want = 'HTTP 400 (BadRequest); target: pricing; hint: the request is invalid'
+       Body = '{"error":{"code":"BadRequest","target":"pricing","message":"see https://evil.invalid/x?a=1 now"}}' }
+    @{ Case = 'an empty target'; Code = 400; Want = 'HTTP 400 (InvalidParameterValue); hint: a parameter in the request body is invalid'
+       Body = '{"code":"InvalidParameterValue","target":"","message":"bad"}' }
+    @{ Case = 'a null target'; Code = 409; Want = 'HTTP 409 (InvalidState); hint: the operation is not valid for the current state of the app or submission'
+       Body = '{"code":"InvalidState","target":null,"message":"The application has a pending submission."}' }
+    @{ Case = 'an XML body'; Code = 403; Want = 'HTTP 403 (AuthenticationFailed); hint: the Entra app is not allowed to do this'
+       Body = '<Error><Code>AuthenticationFailed</Code><Message>sig=FAKE+SAS</Message></Error>' }
+    @{ Case = 'an HTML page with workflow commands'; Code = 502; Want = 'HTTP 502; hint: a gateway in front of the service reported an error'
+       Body = '<html><body>Bad gateway ::error::pwned ##[error]pwned</body></html>' }
+  ) {
+    Get-StoreErrorText -StatusCode $Code -Body $Body -Detail | Should -BeExactly $Want
+  }
+  It 'picks the hint for <Case>' -ForEach @(
+    @{ Case = 'code InvalidParameterValue'; Code = 400; Body = '{"code":"InvalidParameterValue"}'; Hint = 'a parameter in the request body is invalid' }
+    @{ Case = 'code InvalidOperation'; Code = 400; Body = '{"code":"InvalidOperation"}'; Hint = 'the operation is not valid' }
+    @{ Case = 'code InvalidState'; Code = 409; Body = '{"code":"InvalidState"}'; Hint = 'the operation is not valid for the current state of the app or submission' }
+    @{ Case = 'code ResourceNotFound'; Code = 404; Body = '{"code":"ResourceNotFound"}'; Hint = 'the app or submission was not found' }
+    @{ Case = 'code ServiceError'; Code = 500; Body = '{"code":"ServiceError"}'; Hint = 'the service reported an internal error' }
+    @{ Case = 'code InvalidArchive'; Code = 400; Body = '{"code":"InvalidArchive"}'; Hint = 'the package ZIP archive is invalid' }
+    @{ Case = 'code MissingFiles'; Code = 400; Body = '{"code":"MissingFiles"}'; Hint = 'the package ZIP archive lacks files the submission lists' }
+    @{ Case = 'code PackageValidationFailed'; Code = 400; Body = '{"code":"PackageValidationFailed"}'; Hint = 'a package failed validation' }
+    @{ Case = 'status 400 with a code not known here'; Code = 400; Body = '{"code":"SomethingNew"}'; Hint = 'the request is invalid' }
+    @{ Case = 'status 401'; Code = 401; Body = ''; Hint = 'the access token was not accepted' }
+    @{ Case = 'status 403'; Code = 403; Body = ''; Hint = 'the Entra app is not allowed to do this' }
+    @{ Case = 'status 404'; Code = 404; Body = ''; Hint = 'the app or submission was not found' }
+    @{ Case = 'status 408'; Code = 408; Body = ''; Hint = 'the request timed out' }
+    @{ Case = 'status 409'; Code = 409; Body = ''; Hint = 'the current state of the app does not allow this, or the app uses a Partner Center feature the submission API does not support' }
+    @{ Case = 'status 429'; Code = 429; Body = ''; Hint = 'too many requests' }
+    @{ Case = 'status 500'; Code = 500; Body = ''; Hint = 'the service reported an internal error' }
+    @{ Case = 'status 503'; Code = 503; Body = ''; Hint = 'the service reported that it is unavailable' }
+    @{ Case = 'status 504'; Code = 504; Body = ''; Hint = 'a gateway in front of the service timed out' }
+    @{ Case = 'an unknown code and status (fixed hint)'; Code = 418; Body = '{"code":"Teapot","message":"Delete the app and try again"}'; Hint = 'no description of this error is known here (the API''s message text is not printed)' }
+    @{ Case = 'an unknown status and no body (fixed hint)'; Code = 302; Body = ''; Hint = 'no description of this error is known here (the API''s message text is not printed)' }
+  ) {
+    $t = Get-StoreErrorText -StatusCode $Code -Body $Body -Detail
+    $t | Should -Match "^HTTP $Code(?: \([A-Za-z]+\))?; hint: $([regex]::Escape($Hint))\z"
+  }
+  It 'no hint written in the module advises deleting or retrying, or says whether a 408 or 5xx request was carried out' {
+    $hints = InModuleScope MsStoreRunner { @($script:StoreCodeHint.Values) + @($script:StoreStatusHint.Values) + @($script:StoreUnknownHint) }
+    $hints.Count | Should -Be 20
+    $hints | Where-Object { $_ -match "$DeleteAdvice|$RetryAdvice|delet|again|re-?run|::|##\[" } | Should -BeNullOrEmpty
+    $unknown = InModuleScope MsStoreRunner { @(408, 500, 502, 503, 504 | ForEach-Object { $script:StoreStatusHint[$_] }) + $script:StoreCodeHint['ServiceError'] }
+    $unknown | Where-Object { $_ -match 'fail|stop|prevent|succe|not (been )?(carried|done|committed|created)|was (carried|done|committed|created)' } | Should -BeNullOrEmpty
   }
   It 'keeps the fixed text for a failed token request' {
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
@@ -448,6 +539,49 @@ Describe 'Get-StoreErrorText -Detail (Store API target and sanitized message)' {
     $pkg = New-TestPackage
     try { { Send-StorePackage -UploadUrl 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $pkg 6>$null } | Should -Throw -ExpectedMessage 'package upload failed: HTTP 403 (AuthenticationFailed)' }
     finally { Remove-Item -LiteralPath (Split-Path $pkg) -Recurse -Force }
+  }
+}
+
+# The runner reads "::name::" at the start of a line and the legacy "##[name]"
+# anywhere in a line (actions/runner ActionCommand.cs). Masking only "::" left
+# the legacy syntax open (Pepper, PR #74 r1).
+Describe 'Protect-WorkflowCommand (both workflow command syntaxes made inert)' {
+  It 'legacy-command neutralization: <Case>' -ForEach @(
+    @{ Case = 'a "::" command at the start of a line'; In = '::error::pwned'; Want = ':error:pwned' }
+    @{ Case = 'a "::" command mid-line'; In = 'target: x ::error::pwned'; Want = 'target: x :error:pwned' }
+    @{ Case = 'a "::" command after a line break'; In = "x`n::error::pwned"; Want = 'x :error:pwned' }
+    @{ Case = 'a "::" command after CR, NEL, LS or PS'; In = "a`r::error::b$([char]0x85)::warning::c$([char]0x2028)::add-mask::d$([char]0x2029)::notice::e"; Want = 'a :error:b :warning:c :add-mask:d :notice:e' }
+    @{ Case = 'a legacy "##[" command mid-line'; In = 'target: x ##[error]pwned'; Want = 'target: x #[error]pwned' }
+    @{ Case = 'a legacy "##[" set-output mid-line'; In = 'hint: y ##[set-output name=x;]pwned'; Want = 'hint: y #[set-output name=x;]pwned' }
+    @{ Case = 'a legacy "##[" command at the start of a line'; In = '##[warning]pwned'; Want = '#[warning]pwned' }
+    @{ Case = 'a legacy command with three "#"'; In = 'x ###[add-mask]pwned'; Want = 'x #[add-mask]pwned' }
+    @{ Case = 'a legacy command after a line break'; In = "x`n##[warning]pwned"; Want = 'x #[warning]pwned' }
+    @{ Case = 'both syntaxes mid-line in one line'; In = 'a ::error::b ##[warning]c :::d ####[e'; Want = 'a :error:b #[warning]c :d #[e' }
+    @{ Case = 'a format character between the two "#"'; In = "x #$([char]0x200B)#[error]pwned"; Want = 'x # #[error]pwned' }
+    @{ Case = 'a format character between the two ":"'; In = "x :$([char]0x200B):error::pwned"; Want = 'x : :error:pwned' }
+    @{ Case = 'plain text (unchanged)'; In = 'HTTP 400 (InvalidParameterValue); target: applicationPackages[0].fileName; hint: x'; Want = 'HTTP 400 (InvalidParameterValue); target: applicationPackages[0].fileName; hint: x' }
+    @{ Case = 'one ":" and one "#" before "[" (unchanged)'; In = 'a:b #[c] # [d] ## e'; Want = 'a:b #[c] # [d] ## e' }
+  ) {
+    Protect-WorkflowCommand $In | Should -BeExactly $Want
+  }
+  It 'legacy-command neutralization: no "::", no "##[" and no line break is left in 3000 random mixes' {
+    $rng = [System.Random]::new(74)
+    $parts = @(':', '#', '[', ']', 'a', ' ', '::', '##[', "`n", "`r", [string][char]0x85, [string][char]0x2028, [string][char]0x200B)
+    $bad = for ($i = 0; $i -lt 3000; $i++) {
+      $in = -join (1..$rng.Next(1, 25) | ForEach-Object { $parts[$rng.Next($parts.Count)] })
+      if ((Protect-WorkflowCommand $in) -match '::|##\[|[\r\n\u0085  ]') { $in }
+    }
+    @($bad).Count | Should -Be 0
+  }
+  It 'legacy-command neutralization: is applied to the whole error line (a hint that carried both syntaxes prints inert)' {
+    InModuleScope MsStoreRunner { $script:StoreCodeHint['TestOnlyCode'] = "x ::error::pwned ##[warning]pwned`n::add-mask::y" }
+    try {
+      Get-StoreErrorText -StatusCode 400 -Body '{"code":"TestOnlyCode","target":"pricing"}' -Detail |
+        Should -BeExactly 'HTTP 400 (TestOnlyCode); target: pricing; hint: x :error:pwned #[warning]pwned :add-mask:y'
+    } finally { InModuleScope MsStoreRunner { [void]$script:StoreCodeHint.Remove('TestOnlyCode') } }
+  }
+  It 'legacy-command neutralization: is applied to every value that passes Get-SafeValue (even a pattern that let both syntaxes through)' {
+    InModuleScope MsStoreRunner { Get-SafeValue '1 ::error::pwned ##[warning]pwned' '^.*\z' } | Should -BeExactly '1 :error:pwned #[warning]pwned'
   }
 }
 
@@ -595,7 +729,7 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   It 'stops, and deletes nothing, when create is refused because a submission appeared after the check' {
     $s = New-FakeStore -PendingId '1152921505000000007' -HidePending; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: HTTP 409 \(InvalidState\); message: ""The application has a pending submission\.""\. No submission was created and none was deleted"
+    $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions\?isMinimalResponse=true failed: HTTP 409 \(InvalidState\); hint: the operation is not valid for the current state of the app or submission\. No submission was created and none was deleted"
     $r.Err | Should -Match 'Read-back of the app after the refused create \(one GET; nothing changed or deleted\): no pendingApplicationSubmission\.'
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
@@ -610,14 +744,14 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   }
 
   # Run 45185550541: the create got HTTP 400 and the log showed only the code.
-  It 'create refused with HTTP 400: prints the target and the sanitized message, reads the app once, deletes nothing' {
+  It 'create refused with HTTP 400: prints the listed target and the hint, not the message, reads the app once, deletes nothing' {
     $s = New-FakeStore -CreateErrorStatus 400; Use-FakeStore $s
     $s.CreateErrorBody = New-PlantedErrorBody $s.Token
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted. "))
     $r.Err | Should -Match 'Read-back of the app after the refused create \(one GET; nothing changed or deleted\): no pendingApplicationSubmission\.$'
     $r.Err | Should -Not -Match $DeleteAdvice
-    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|eyJ|AbCdEfGh|sv=2020"
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($s.Token))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
     $s.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     @($s.Calls)[-1] | Should -BeExactly "GET $Base timeout=30"
@@ -636,8 +770,8 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   It 'create refused and the read-back fails: says so, deletes nothing' {
     $s = New-FakeStore -CreateErrorStatus 400 -CreateErrorBody '{"code":"InvalidParameterValue","target":"submission"}' -FailAfterLoss; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'failed: HTTP 400 \(InvalidParameterValue\); target: submission\. No submission was created'
-    $r.Err | Should -Match "Read-back of the app after the refused create \(one GET; nothing changed or deleted\): failed \(Store API GET $([regex]::Escape($Base)) failed: HTTP 503 \(ServiceUnavailable\)\)\.$"
+    $r.Err | Should -Match 'failed: HTTP 400 \(InvalidParameterValue\); target: \[unlisted target\]; hint: a parameter in the request body is invalid\. No submission was created'
+    $r.Err | Should -Match "Read-back of the app after the refused create \(one GET; nothing changed or deleted\): failed \(Store API GET $([regex]::Escape($Base)) failed: HTTP 503 \(ServiceUnavailable\); hint: the service reported that it is unavailable\)\.$"
     $r.Err | Should -Not -Match $DeleteAdvice
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
@@ -729,7 +863,7 @@ Describe 'No answer to create or commit (fake Store)' {
   AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
 
   It 'create carried out, answer lost (<Lost>): reports the pending submission, origin unconfirmed, no delete advice' -ForEach @(
-    @{ Lost = 0; Why = 'no response \(HttpRequestException Unknown <- IOException <- SocketException ConnectionReset\)' }, @{ Lost = 504; Why = 'HTTP 504' }
+    @{ Lost = 0; Why = 'no response \(HttpRequestException Unknown <- IOException <- SocketException ConnectionReset\)' }, @{ Lost = 504; Why = 'HTTP 504; hint: a gateway in front of the service timed out' }
   ) {
     $s = New-FakeStore -LoseResponse Create -LoseWhen After -LoseAsStatus $Lost; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
@@ -769,7 +903,7 @@ Describe 'No answer to create or commit (fake Store)' {
   It 'create with no answer and a failing read-back: result stays unknown, no origin claim, no delete advice' {
     $s = New-FakeStore -LoseResponse Create -LoseWhen After -FailAfterLoss; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. The result stays unknown: do not delete anything\.'
+    $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\); hint: the service reported that it is unavailable\)\. The result stays unknown: do not delete anything\.'
     $r.Err | Should -Match 'a pending submission there is of unconfirmed origin'
     $r.Err | Should -Not -Match $DeleteAdvice
     $r.Err | Should -Not -Match "most likely|this run's (uncommitted )?draft"
@@ -825,7 +959,7 @@ Describe 'No answer to create or commit (fake Store)' {
   It 'commit with no answer and a failing read-back: result stays unconfirmed, no delete or retry advice' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen After -FailAfterLoss; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: the commit request .* Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 failed \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. .*The result stays unconfirmed'
+    $r.Err | Should -Match 'Result unconfirmed: the commit request .* Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 failed \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\); hint: the service reported that it is unavailable\)\. .*The result stays unconfirmed'
     $r.Err | Should -Not -Match $DeleteAdvice
     $r.Err | Should -Not -Match $RetryAdvice
     $r.Err | Should -Not -Match 'means it was not'
@@ -842,7 +976,7 @@ Describe 'No answer to create or commit (fake Store)' {
   It 'commit refused with an answer (HTTP 409): no read-back, says how to check and delete by id' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus 409; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "failed: HTTP 409\. Commit of submission $NewId was not accepted"
+    $r.Err | Should -Match "failed: HTTP 409; hint: the current state of the app does not allow this, or the app uses a Partner Center feature the submission API does not support\. Commit of submission $NewId was not accepted"
     $r.Err | Should -Not -Match 'Result unconfirmed'
     @($s.Log)[-1] | Should -Be "POST $Base/submissions/$NewId/commit"
   }
@@ -909,7 +1043,7 @@ Describe 'Time budget: the commit hand-off prints before the step can time out (
     $r = Invoke-TimedPublish $Pkg @{ CommitReadBackTimeoutSeconds = $T; CommitReadBackBudgetSeconds = $B }
     Get-CallsAfterCommit $s | Should -Be @(1..$Reads | ForEach-Object { "GET $Base/submissions/$NewId timeout=$T" })
     ($global:FakeClock - $T0).TotalSeconds | Should -Be $Secs
-    $r.Out | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $EB/submissions/$NewId/commit failed: HTTP 504\)\. Reading it back by id for up to $B s"
+    $r.Out | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $EB/submissions/$NewId/commit failed: HTTP 504; hint: a gateway in front of the service timed out\)\. Reading it back by id for up to $B s"
     $r.Err | Should -Match ("Read back by id $Reads time\(s\), 30 s apart \(stopped: the read-back time budget of $B s is used up\); last: read-back $Reads of 10 " +
       "failed \(Store API GET $EB/submissions/$NewId failed: no response \(TaskCanceledException <- TimeoutException\)\)")
     $r.Err | Should -Match "A person needs to check GET $EB/submissions/$NewId later"
@@ -1249,13 +1383,13 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r.Err | Should -Match "GET $([regex]::Escape($Base)) failed: HTTP 302"
     @($Srv.Log) | Should -Not -Match '/redirected/'
   }
-  # Run 45185550541 over HTTP: the create gets a 400 whose message carries secrets.
-  It 'prints the target and sanitized message of a create refused with HTTP 400, sends the query, deletes nothing' -ForEach @(@{ Opt = @{ CreateErrorStatus = 400 } }) {
+  # Run 45185550541 over HTTP: the create gets a 400 whose message carries secrets, advice and commands.
+  It 'prints the listed target and the hint, not the message, of a create refused with HTTP 400, sends the query, deletes nothing' -ForEach @(@{ Opt = @{ CreateErrorStatus = 400 } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     $Srv.CreateErrorBody = New-PlantedErrorBody $Srv.Token
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted. ") + '.*' + [regex]::Escape(': no pendingApplicationSubmission.') + '$')
-    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|eyJ|AbCdEfGh|sv=2020"
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
     $Srv.CreateQuery | Should -BeExactly '?isMinimalResponse=true'
     @($Srv.Log) | Should -Be @("POST /tenant-1/oauth2/v2.0/token", "GET $Base", "POST $Base/submissions", "GET $Base")
   }
@@ -1298,7 +1432,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $reads.Count | Should -BeGreaterOrEqual 1
     $reads.Count | Should -BeLessOrEqual 3
     $reads | Should -Be @(1..$reads.Count | ForEach-Object { "GET $Base/submissions/$NewId" })
-    $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(.*HTTP 504\)"
+    $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(.*HTTP 504; hint: a gateway in front of the service timed out\)"
     $r.Err | Should -Match "Read back by id $($reads.Count) time\(s\), 1 s apart \(stopped: the read-back time budget of 4 s is used up\); last: read-back $($reads.Count) of 10 failed \(Store API GET .* failed: no response \("
     $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
     $r.All | Should -Not -Match "$DeleteAdvice|$Leak|$([regex]::Escape($Url))"

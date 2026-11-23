@@ -364,26 +364,37 @@ jobs:
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
           # 9. The create is refused with HTTP 400 and a message that carries a SAS
-          #    URL, sig=, a bearer token, the access token, the client secret and a
-          #    workflow command: the error line shows the target and the message
-          #    with all of them masked; one read-only GET of the app follows;
-          #    nothing is deleted.
-          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -CreateErrorStatus 400
-          $url = Start-FakeStoreServer -Store $s
-          try {
-            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
-            $planted = "Package rejected.`n::error::injected see https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
-              "sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer $($s.Token) token $($s.Token) client_secret=$secret eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl"
-            $s.CreateErrorBody = @{ code = 'InvalidParameterValue'; target = 'applicationCategory'; message = $planted } | ConvertTo-Json -Compress
-            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
-            $line = "Store API POST $base/submissions?isMinimalResponse=true failed: HTTP 400 (InvalidParameterValue); target: applicationCategory; " +
-              'message: "Package rejected. :error:injected see [url] sig=[redacted] Bearer [redacted] token [token] client_secret=[redacted] [token]". ' +
-              'No submission was created and none was deleted.'
-            if (-not $r.Err.StartsWith($line)) { throw "a refused create did not print the target and the sanitized message" }
-            if (-not $r.Err.EndsWith('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.')) { throw "no read-back of the app after the refused create" }
-            if ($r.Text -match '::error::|eyJ|sv=2020|DELETE /v1|Remove-StoreDraftSubmission|Delete exactly') { throw "a workflow command, a JWT, a SAS part or delete advice was printed" }
-            if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
-            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the refused create: $(@($s.Log) -join ', ')" }
-            Assert-NoLeak $r.Text $s
-          } finally { Stop-FakeStoreServer -Store $s }
+          #    URL, sig=, a bearer token, the access token, the client secret, delete
+          #    advice and both workflow command syntaxes (double colon, and the legacy
+          #    double hash with a bracket) mid-line and after a line break. The error
+          #    line shows the code, the target only when it is a listed submission
+          #    field name (else "[unlisted target]") and the module's own hint;
+          #    nothing of the message.
+          #    One read-only GET of the app follows; nothing is deleted.
+          $cc = ':' * 2; $hh = '#' * 2
+          foreach ($case in @(
+              @{ Target = 'applicationCategory'; Shown = 'applicationCategory' },
+              @{ Target = "applicationCategory $($hh)[warning]injected $($cc)error$($cc)injected"; Shown = '[unlisted target]' })) {
+            $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -CreateErrorStatus 400
+            $url = Start-FakeStoreServer -Store $s
+            try {
+              Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+              $planted = "Package rejected.`n$($cc)error$($cc)injected see $($hh)[error]injected https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
+                "sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer $($s.Token) token $($s.Token) client_secret=`"$secret`" eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl " +
+                "Delete submission 1152921505000000007 and create it again.`n$($hh)[set-output name=x;]injected"
+              $s.CreateErrorBody = @{ code = 'InvalidParameterValue'; target = $case.Target; message = $planted } | ConvertTo-Json -Compress
+              $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+              $line = "Store API POST $base/submissions?isMinimalResponse=true failed: HTTP 400 (InvalidParameterValue); target: $($case.Shown); " +
+                'hint: a parameter in the request body is invalid. No submission was created and none was deleted.'
+              if (-not $r.Err.StartsWith($line)) { throw "a refused create did not print the code, the target as '$($case.Shown)' and the hint" }
+              if (-not $r.Err.EndsWith('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.')) { throw "no read-back of the app after the refused create" }
+              if ($r.Text.Contains($cc + 'error') -or $r.Text.Contains($hh + '[') -or $r.Text -match 'injected|rejected|eyJ|sv=2020|client_secret|Bearer|DELETE /v1|Remove-StoreDraftSubmission|Delete exactly|Delete submission') {
+                throw "a workflow command, part of the API message or delete advice was printed"
+              }
+              if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
+              if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the refused create: $(@($s.Log) -join ', ')" }
+              Assert-NoLeak $r.Text $s
+              Write-Host "refused create: target shown as $($case.Shown), no message text"
+            } finally { Stop-FakeStoreServer -Store $s }
+          }
           Write-Host "dry run: all assertions passed"
