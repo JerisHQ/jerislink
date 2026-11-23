@@ -1,10 +1,13 @@
 // Windows test for the F5a Send to pipe (send_to_win.cpp): real named pipe,
 // real client. Round trip of paths (non-ASCII, folders), replies passed
 // through, first-instance ownership, this-user-only DACL, corrupt and idle
-// clients, no listener, and the quiet "--send-to" exit code.
+// clients, no listener, the quiet "--send-to" exit code, the Store
+// Explorer command's command line through the real CommandLineToArgvW, and
+// the Store and installer builds open at once, each reached by its own menu.
 #include "send_to_win.hpp"
 
 #include <aclapi.h>
+#include <shellapi.h>
 #include <sddl.h>
 
 #include <atomic>
@@ -180,10 +183,81 @@ void slowViewer() {
 
 void quietExit() {
     SetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", L"1");
-    expect(runSendTo({L"C:\\Windows\\win.ini"}) == exitCode(Reply::NotConnected),
+    expect(runSendTo(parseArgs({L"x.exe", kFlag, L"C:\\Windows\\win.ini"})) == exitCode(Reply::NotConnected),
            "--send-to with no viewer: exit 21, no dialog");
-    expect(runSendTo({}) == exitCode(Reply::NothingSelected), "--send-to with nothing: exit 27");
+    expect(runSendTo(parseArgs({L"x.exe", kFlag})) == exitCode(Reply::NothingSelected), "--send-to with nothing: exit 27");
+    expect(runSendTo(parseArgs({L"x.exe", kTooManyFlag})) == exitCode(Reply::TooMany),
+           "--send-to-too-many: exit 28 without opening the pipe");
     SetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", nullptr);
+}
+
+// The Store build's Explorer command builds its command line with
+// commandLine(); the real CommandLineToArgvW must give every path back
+// exactly (spaces, drive roots ending in a backslash, UNC, non-ASCII).
+void commandLineRoundTrip() {
+    const std::wstring exe = L"C:\\Program Files\\WindowsApps\\jerisHQ.JerisLink_0.3.1.0_x64__1cbzj2979sfxw\\Jerislink.exe";
+    const std::vector<std::wstring> items = {L"C:\\Users\\me\\a b.txt", L"D:\\", L"\\\\nas\\share\\dir\\",
+                                             L"C:\\\x4E2D\x6587\\\x5831\x544A.pdf", L"C:\\x\\\\\\y", L"C:\\ends with space \\"};
+    const std::wstring line = commandLine(exe, items);
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(line.c_str(), &argc);
+    std::vector<std::wstring> got;
+    for (int i = 0; argv && i < argc; ++i) got.emplace_back(argv[i]);
+    if (argv) LocalFree(argv);
+    const Args a = parseArgs(got);
+    expect(got.size() == items.size() + 2 && got[0] == exe, "cmdline: exe path with spaces comes back as argv[0]");
+    expect(a.sendTo && !a.tooMany && a.items == items, "cmdline: every path round trips through CommandLineToArgvW");
+
+    const std::vector<std::wstring> many(800, L"C:\\Users\\someone\\Documents\\a fairly long folder name\\file.bin");
+    const std::wstring tooLong = commandLine(exe, many);
+    argv = CommandLineToArgvW(tooLong.c_str(), &argc);
+    got.clear();
+    for (int i = 0; argv && i < argc; ++i) got.emplace_back(argv[i]);
+    if (argv) LocalFree(argv);
+    expect(tooLong.size() <= kMaxCommandLineChars && parseArgs(got).tooMany,
+           "cmdline: a selection over the CreateProcess limit becomes --send-to-too-many");
+}
+
+// The Store and installer builds open at once (pipe names as each build's
+// currentPipeName() makes them). Whichever starts first, both get their own
+// pipe, and each build's "--send-to" run (the Store menu command and the
+// installer's Send to shortcut) reaches its own viewer only.
+void bothBuilds() {
+    const std::wstring sid = currentUserSid() + L".test.both";
+    const unsigned long session = GetCurrentProcessId();
+    const std::wstring installerName = pipeName(sid, session, L"");
+    const std::wstring storeName = pipeName(sid, session, L"jerisHQ.JerisLink_1cbzj2979sfxw");
+    expect(installerName != storeName, "both builds: different pipe names");
+    for (const bool installerFirst : {true, false}) {
+        const std::string order = installerFirst ? " (installer viewer first)" : " (Store viewer first)";
+        std::mutex m;
+        std::vector<std::wstring> toInstaller, toStore;
+        Server installer, store;
+        auto startInstaller = [&] {
+            return installer.start(installerName, [&](std::vector<std::wstring>&& items) {
+                std::lock_guard<std::mutex> lock(m);
+                toInstaller = std::move(items);
+                return Reply::Started;
+            });
+        };
+        auto startStore = [&] {
+            return store.start(storeName, [&](std::vector<std::wstring>&& items) {
+                std::lock_guard<std::mutex> lock(m);
+                toStore = std::move(items);
+                return Reply::NotConnected;  // a different answer, so a mix-up would show
+            });
+        };
+        const bool a = installerFirst ? startInstaller() : startStore();
+        const bool b = installerFirst ? startStore() : startInstaller();
+        expect(a && b && installer.running() && store.running(), "both builds: both viewers listen at once" + order);
+        const Reply fromStoreMenu = sendItems(storeName, {L"C:\\store.txt"});
+        const Reply fromInstallerMenu = sendItems(installerName, {L"C:\\installer.txt"});
+        std::lock_guard<std::mutex> lock(m);
+        expect(fromStoreMenu == Reply::NotConnected && toStore == std::vector<std::wstring>{L"C:\\store.txt"},
+               "both builds: Store menu reaches the Store viewer" + order);
+        expect(fromInstallerMenu == Reply::Started && toInstaller == std::vector<std::wstring>{L"C:\\installer.txt"},
+               "both builds: installer menu reaches the installer viewer" + order);
+    }
 }
 
 }  // namespace
@@ -191,9 +265,20 @@ void quietExit() {
 int main() {
     expect(!currentUserSid().empty() && currentUserSid().rfind(L"S-1-", 0) == 0, "sid: current user SID");
     expect(currentPipeName().rfind(L"\\\\.\\pipe\\JerisLink.SendTo.S-1-", 0) == 0, "pipe: real name");
+    {
+        // This test runs without a package, like the installer build: the
+        // name must stay exactly what 0.3.x / 0.4.0 viewers use.
+        std::wstring family = L"x";
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        expect(currentPackageFamily(family) && family.empty(), "pipe: no package family outside a package");
+        expect(currentPipeName() == pipeName(currentUserSid(), session), "pipe: installer build's name unchanged");
+    }
     roundTrip();
     slowViewer();
     quietExit();
+    commandLineRoundTrip();
+    bothBuilds();
     std::printf("send to pipe: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

@@ -73,9 +73,17 @@ void cards() {
     expectEq(st[0].text, "Not set up on this PC. Install JerisLink with its installer to add it.",
              "card 2: no shortcut (zip / deleted)");
     expect(st[0].muted, "card 2: not set up is grey");
+    st = sendToRows(SendToSetup::StoreMenu);
+    expectEq(st[0].text,
+             "If you see Send to JerisLink in the right-click menu, choose it; otherwise drag "
+             "files onto this window. They go to Downloads/JerisLink on the Mac.",
+             "card 2: Store build: menu if Explorer shows it, else drag");
+    expect(!st[0].muted && st.size() == 1, "card 2: Store menu line is not grey");
+    st = sendToRows(SendToSetup::StoreMenu, true);
+    expect(st.size() == 2 && !st[1].muted, "card 2: Store menu build shows the Mac line");
     st = sendToRows(SendToSetup::StorePackage);
-    expectEq(st[0].text, "Not in the Microsoft Store version yet. Drag files onto this window instead.",
-             "card 2: Store build degrades to drag");
+    expectEq(st[0].text, "No Explorer menu entry on this Windows version. Drag files onto this window instead.",
+             "card 2: Store build before Windows 10 1809 degrades to drag");
     expect(st[0].muted && st.size() == 1, "card 2: Store line is grey");
     st = sendToRows(SendToSetup::StorePackage, true);
     expect(st.size() == 2 && !st[1].muted, "card 2: Store build still shows the Mac line");

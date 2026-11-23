@@ -2,7 +2,8 @@
 
 // F5a Win32 side of Send to JerisLink (send_to.hpp has the rules and texts).
 //
-// Server: the viewer owns one named pipe per user and logon session,
+// Server: the viewer owns one named pipe per user, logon session and build
+// (the Store build's name adds its package family, see pipeName()),
 // created as the first instance (nobody can sit on the name before it, and
 // a second viewer cannot take it over), message mode, local clients only,
 // DACL = this user only. One client at a time; every read, write and wait is
@@ -23,10 +24,16 @@
 
 namespace jl::sendto {
 
-// This process's user SID ("S-1-5-21-...") and the pipe name for its user
-// and logon session; "" when the token cannot be read.
+// This process's user SID ("S-1-5-21-...") and the pipe name for its user,
+// logon session and build (pipeName() with the package family for the Store
+// build); "" when the token or the package cannot be read.
 std::wstring currentUserSid();
 std::wstring currentPipeName();
+
+// The package family name of this process: "" for the installer build (no
+// package identity). false when the process has a package but its family
+// name cannot be read.
+bool currentPackageFamily(std::wstring& family);
 
 class Server {
 public:
@@ -60,9 +67,9 @@ private:
 // NotTrusted when the listener is not this user's process in this session.
 Reply sendItems(const std::wstring& name, const std::vector<std::wstring>& items, DWORD timeoutMs = 10000);
 
-// The whole "--send-to" run: checks the items, sends them, shows a dialog
-// when nothing was sent (not with JERISLINK_SENDTO_QUIET=1) and returns the
-// process exit code (exitCode()).
-int runSendTo(const std::vector<std::wstring>& items);
+// The whole "--send-to" run (parseArgs() result): checks the items, sends
+// them, shows a dialog when nothing was sent (not with
+// JERISLINK_SENDTO_QUIET=1) and returns the process exit code (exitCode()).
+int runSendTo(const Args& args);
 
 }  // namespace jl::sendto

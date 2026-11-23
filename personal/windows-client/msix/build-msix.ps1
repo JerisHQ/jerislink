@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Packages a built Jerislink.exe as an MSIX for the Microsoft Store.
+  Packages a built Jerislink.exe and JerisLinkSendTo.dll as an MSIX for the
+  Microsoft Store.
 
 .DESCRIPTION
   Produces, in -OutDir:
@@ -16,11 +17,14 @@
   way the private key is removed from the certificate store before the script
   exits. The test certificate never signs the Store package.
 
-  The exe must be built with -DJERISLINK_STATIC_CRT=ON so the package needs no
-  VCLibs framework dependency.
+  The exe and the DLL must be built with -DJERISLINK_STATIC_CRT=ON so the
+  package needs no VCLibs framework dependency. JerisLinkSendTo.dll is
+  Explorer's "Send to JerisLink" command (send_to_shell.cpp); the manifest
+  registers it, so it sits next to Jerislink.exe in the package root.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$ExePath,
+    [Parameter(Mandatory = $true)][string]$SendToDllPath,
     [Parameter(Mandatory = $true)][string]$OutDir,
     [switch]$SideloadTest
 )
@@ -49,11 +53,14 @@ $stage = Join-Path $OutDir 'msix-layout'
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Assets') | Out-Null
 Copy-Item $ExePath (Join-Path $stage 'Jerislink.exe')
+Copy-Item $SendToDllPath (Join-Path $stage 'JerisLinkSendTo.dll')
 Copy-Item (Join-Path $here 'Assets\*.png') (Join-Path $stage 'Assets')
 # libopus is BSD-3-Clause: its notice ships with every binary.
 Copy-Item (Join-Path $here '..\..\third_party\opus\COPYING') (Join-Path $stage 'COPYING-opus.txt')
 $manifest = (Get-Content (Join-Path $here 'AppxManifest.xml.in') -Raw).Replace('@MSIX_VERSION@', $msixVersion)
 if ($manifest -match '@[A-Z_]+@') { throw "unfilled placeholder in AppxManifest: $($Matches[0])" }
+# makepri only says "manifest not found or is invalid"; parse here for the real error.
+try { [void][xml]$manifest } catch { throw "AppxManifest is not well-formed XML: $($_.Exception.Message)" }
 [IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'), $manifest, (New-Object Text.UTF8Encoding $false))
 
 # The assets carry MRT qualifiers (scale-*, targetsize-*, altform-unplated), so

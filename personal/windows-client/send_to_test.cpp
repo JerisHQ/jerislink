@@ -38,6 +38,39 @@ void arguments() {
     expect(!a.sendTo, "args: --send-to only counts as the first argument");
     a = parseArgs({L"Jerislink.exe", L"--send-to", L"C:\\\x4E2D\x6587\\\x5831\x544A.pdf"});
     expect(a.sendTo && a.items.size() == 1 && a.items[0].size() == 12, "args: non-ASCII names stay wide");
+    a = parseArgs({L"Jerislink.exe", L"--send-to-too-many"});
+    expect(a.sendTo && a.tooMany && a.items.empty(), "args: --send-to-too-many is a Send to run");
+    expect(checkArgs(a) == Reply::TooMany, "args: --send-to-too-many answers too many");
+    a = parseArgs({L"Jerislink.exe", L"--send-to-too-many", L"C:\\a.txt"});
+    expect(a.tooMany && a.items.empty() && checkArgs(a) == Reply::TooMany, "args: --send-to-too-many ignores paths");
+    a = parseArgs({L"Jerislink.exe", L"--send-to", L"C:\\a.txt"});
+    expect(!a.tooMany && checkArgs(a) == Reply::Started, "args: plain --send-to is not too many");
+}
+
+// Store build: the Explorer command's command line (send_to_shell.cpp).
+// The real CommandLineToArgvW round trip is in send_to_pipe_test.cpp.
+void commandLines() {
+    expect(quoteArg(L"C:\\a b.txt") == L"\"C:\\a b.txt\"", "quote: spaces inside quotes");
+    expect(quoteArg(L"D:\\") == L"\"D:\\\\\"", "quote: trailing backslash doubled before the closing quote");
+    expect(quoteArg(L"\\\\nas\\s") == L"\"\\\\nas\\s\"", "quote: UNC backslashes kept as they are");
+    expect(quoteArg(L"a\"b") == L"\"a\\\"b\"", "quote: an inner quote is escaped");
+    expect(quoteArg(L"a\\\"b") == L"\"a\\\\\\\"b\"", "quote: backslashes before a quote doubled, plus one");
+    expect(quoteArg(L"") == L"\"\"", "quote: empty argument stays an argument");
+
+    const std::wstring exe = L"C:\\Program Files\\WindowsApps\\J\\Jerislink.exe";
+    expect(commandLine(exe, {L"C:\\a b.txt", L"D:\\"}) ==
+               L"\"C:\\Program Files\\WindowsApps\\J\\Jerislink.exe\" --send-to \"C:\\a b.txt\" \"D:\\\\\"",
+           "cmdline: exe, flag, then each item quoted");
+    const std::wstring item = L"C:\\" + std::wstring(100, L'x');
+    const auto fits = commandLine(exe, std::vector<std::wstring>(300, item));
+    expect(fits.size() <= kMaxCommandLineChars && fits.find(L"--send-to-too-many") == std::wstring::npos,
+           "cmdline: 300 items of 103 chars fit");
+    const auto over = commandLine(exe, std::vector<std::wstring>(400, item));
+    expect(over == quoteArg(exe) + L" --send-to-too-many", "cmdline: over 32,766 chars becomes --send-to-too-many");
+    expect(commandLine(exe, std::vector<std::wstring>(1001, L"C:\\a")) == tooManyCommandLine(exe),
+           "cmdline: over 1,000 items becomes --send-to-too-many");
+    expect(commandLine(exe, std::vector<std::wstring>(1000, L"C:\\a")).find(L"--send-to-too-many") == std::wstring::npos,
+           "cmdline: 1,000 short items are passed");
 }
 
 void paths() {
@@ -86,8 +119,14 @@ void texts() {
     expect(exitCode(Reply::Started) == 0, "exit: 0 when started");
     expect(exitCode(Reply::NotConnected) == 21, "exit: 21 not connected");
     expect(exitCode(Reply::NothingSelected) == 27, "exit: 27 nothing selected");
+    expect(exitCode(Reply::TooMany) == 28, "exit: 28 too many");
     expect(pipeName(L"S-1-5-21-1-2-3-1001", 2) == L"\\\\.\\pipe\\JerisLink.SendTo.S-1-5-21-1-2-3-1001.2",
            "pipe: name per user SID and session");
+    expect(pipeName(L"S-1-5-21-1-2-3-1001", 2, L"") == pipeName(L"S-1-5-21-1-2-3-1001", 2),
+           "pipe: installer build (no package) keeps the old name");
+    expect(pipeName(L"S-1-5-21-1-2-3-1001", 2, L"jerisHQ.JerisLink_1cbzj2979sfxw") ==
+               L"\\\\.\\pipe\\JerisLink.SendTo.S-1-5-21-1-2-3-1001.2.pkg.jerisHQ.JerisLink_1cbzj2979sfxw",
+           "pipe: Store build's name adds its package family");
 }
 
 void wire() {
@@ -139,8 +178,28 @@ void wire() {
 
 }  // namespace
 
+void resumes() {
+    std::vector<std::string> calls;
+    unsigned long last = 5;  // ERROR_ACCESS_DENIED
+    auto run = [&](bool ok) {
+        calls.clear();
+        return resumeOrTerminate([&] { calls.push_back("resume"); return ok; },
+                                 [&] { calls.push_back("terminate"); last = 0; },
+                                 [&] { calls.push_back("error"); return last; });
+    };
+    expect(run(true) == 0 && calls == std::vector<std::string>{"resume"}, "resume: resumed run is left running");
+    expect(run(false) == 5, "resume: failure returns resume's error");
+    expect(calls == std::vector<std::string>{"resume", "error", "terminate"},
+           "resume: error read before the run is terminated");
+    last = 0;
+    expect(run(false) == kResumeFailedUnknown && calls.back() == "terminate",
+           "resume: failure with no error code still fails and terminates");
+}
+
 int main() {
     arguments();
+    commandLines();
+    resumes();
     paths();
     decisions();
     texts();

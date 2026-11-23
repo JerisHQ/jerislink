@@ -3,6 +3,7 @@
 
 #include "send_to_win.hpp"
 
+#include <appmodel.h>
 #include <sddl.h>
 
 #include <algorithm>
@@ -103,11 +104,27 @@ std::wstring currentUserSid() {
     return s;
 }
 
+bool currentPackageFamily(std::wstring& family) {
+    family.clear();
+    UINT32 len = 0;
+    const LONG first = GetCurrentPackageFamilyName(&len, nullptr);
+    if (first == APPMODEL_ERROR_NO_PACKAGE) return true;  // installer build
+    if (first != ERROR_INSUFFICIENT_BUFFER || len == 0) return false;
+    std::wstring name(len, L'\0');
+    if (GetCurrentPackageFamilyName(&len, name.data()) != ERROR_SUCCESS || len == 0) return false;
+    name.resize(len - 1);  // len counts the NUL
+    family = std::move(name);
+    return !family.empty();
+}
+
 std::wstring currentPipeName() {
     const std::wstring sid = currentUserSid();
     DWORD session = 0;
-    if (sid.empty() || !ProcessIdToSessionId(GetCurrentProcessId(), &session)) return {};
-    return pipeName(sid, session);
+    std::wstring family;
+    // A packaged process whose family cannot be read gets no pipe rather
+    // than the installer's.
+    if (sid.empty() || !ProcessIdToSessionId(GetCurrentProcessId(), &session) || !currentPackageFamily(family)) return {};
+    return pipeName(sid, session, family);
 }
 
 bool Server::start(const std::wstring& name, Handler handler) {
@@ -262,11 +279,11 @@ Reply sendItems(const std::wstring& name, const std::vector<std::wstring>& items
     return reply;
 }
 
-int runSendTo(const std::vector<std::wstring>& items) {
-    Reply r = checkItems(items);
+int runSendTo(const Args& args) {
+    Reply r = checkArgs(args);
     if (r == Reply::Started) {
         const std::wstring name = currentPipeName();
-        r = name.empty() ? Reply::Failed : sendItems(name, items);
+        r = name.empty() ? Reply::Failed : sendItems(name, args.items);
     }
     wchar_t quiet[8] = {};
     const bool silent = GetEnvironmentVariableW(L"JERISLINK_SENDTO_QUIET", quiet, 8) == 1 && quiet[0] == L'1';

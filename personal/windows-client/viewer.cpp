@@ -3391,9 +3391,31 @@ static fp::Last gLastUpload;  // this session's last Windows->Mac transfer
 // Card (2) of the Files panel: is "Send to > JerisLink" on this PC?
 static fp::SendToSetup gSendToSetup = fp::SendToSetup::NotInstalled;
 
+// Windows build number from ntdll (GetVersionEx is capped by the manifest).
+static DWORD windowsBuild() {
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto fn = ntdll ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
+    OSVERSIONINFOW v{sizeof(v)};
+    return fn && fn(&v) == 0 ? v.dwBuildNumber : 0;
+}
+
 static fp::SendToSetup detectSendToSetup() {
     UINT32 len = 0;
-    if (GetCurrentPackageFullName(&len, nullptr) != APPMODEL_ERROR_NO_PACKAGE) return fp::SendToSetup::StorePackage;
+    if (GetCurrentPackageFullName(&len, nullptr) != APPMODEL_ERROR_NO_PACKAGE) {
+        // The package's Explorer command (desktop4/desktop5 manifest entries
+        // and JerisLinkSendTo.dll next to the exe) needs Windows 10 1809
+        // (build 17763): desktop5:ItemType and desktop5:Verb need 1809,
+        // desktop4:FileExplorerContextMenus 1803, com:SurrogateServer 1703
+        // (Microsoft's manifest schema docs). Tested on Windows 11 only.
+        wchar_t exe[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dll(exe, n > 0 && n < MAX_PATH ? n : 0);
+        const size_t slash = dll.find_last_of(L'\\');
+        dll = slash == std::wstring::npos ? std::wstring() : dll.substr(0, slash + 1) + L"JerisLinkSendTo.dll";
+        const bool hasDll = !dll.empty() && GetFileAttributesW(dll.c_str()) != INVALID_FILE_ATTRIBUTES;
+        return hasDll && windowsBuild() >= 17763 ? fp::SendToSetup::StoreMenu : fp::SendToSetup::StorePackage;
+    }
     PWSTR dir = nullptr;
     fp::SendToSetup s = fp::SendToSetup::NotInstalled;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SendTo, 0, nullptr, &dir)) && dir) {
@@ -3623,6 +3645,7 @@ static void filePanelShow(const char* source) {
     }
     logLine(std::string("file.panel=shown source=") + source + " host=" + host +
             " send_to=" + (gSendToSetup == fp::SendToSetup::Installed      ? "installed"
+                           : gSendToSetup == fp::SendToSetup::StoreMenu    ? "store_menu"
                            : gSendToSetup == fp::SendToSetup::StorePackage ? "store"
                                                                            : "not_installed"));
 }
@@ -3790,9 +3813,12 @@ static void sendToServerStart(HWND hwnd) {
     gSendToHwnd = hwnd;
     const std::wstring name = st::currentPipeName();
     const bool ok = !name.empty() && gSendToServer.start(name, sendToFromPipe);
-    // Taken: another JerisLink viewer of this user already gets Send to.
+    // Taken: another JerisLink viewer of this build and user already gets
+    // Send to. The Store and installer builds have their own pipes.
+    std::wstring family;
+    const bool packaged = st::currentPackageFamily(family) && !family.empty();
     logLine(std::string("file.send_to_pipe=") + (ok ? "listening" : "unavailable") +
-            " error=" + std::to_string(ok ? 0 : gSendToServer.error()));
+            " build=" + (packaged ? "store" : "installer") + " error=" + std::to_string(ok ? 0 : gSendToServer.error()));
 }
 
 static void sendToServerStop() {
@@ -7581,6 +7607,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
     std::wcout << L"file_panel shown=" << panelShown << L" esc_closes=" << panelClosed << L"\n";
     // Card (2) without the Send to shortcut, and in the Store build.
     for (const auto& [setup, shot] : {std::pair{fp::SendToSetup::NotInstalled, L"file-panel-sendto-missing"},
+                                      std::pair{fp::SendToSetup::StoreMenu, L"file-panel-sendto-store-menu"},
                                       std::pair{fp::SendToSetup::StorePackage, L"file-panel-sendto-store"}}) {
         gSendToSetup = setup;
         overlayActivate(ov::Item::Files, "snapshot");
@@ -7618,6 +7645,7 @@ static int runUiSnapshot(const std::wstring& dir, const std::wstring& accentName
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::Installed, true), "card2_mac_push");
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::NotInstalled), "card2_missing");
         cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::StorePackage), "card2_store");
+        cardFits(pl.sendTo, fp::sendToHeading(), fp::sendToRows(fp::SendToSetup::StoreMenu, true), "card2_store_menu");
         for (fp::Host h : {fp::Host::Full, fp::Host::PasteOnly, fp::Host::None, fp::Host::Unknown}) {
             fits(fp::tipLine(h), pl.tip, gOverlayTheme.smallText, true, "tip");
         }
@@ -7806,7 +7834,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         const auto sendTo = jl::sendto::parseArgs(std::vector<std::wstring>(wideArgv, wideArgv + argc));
         if (sendTo.sendTo) {
             LocalFree(wideArgv);
-            return jl::sendto::runSendTo(sendTo.items);
+            return jl::sendto::runSendTo(sendTo);
         }
     }
 #ifdef JERISLINK_UI_SNAPSHOT

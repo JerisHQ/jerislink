@@ -121,6 +121,11 @@ jobs:
       - name: Send to pipe test (real named pipe, paths round trip, first instance, this-user DACL, corrupt / idle / slow peers, quiet exit)
         timeout-minutes: 3
         run: build\Release\JerislinkSendToPipeTest.exe
+      - name: Build Store Explorer command test
+        run: cmake --build build --config Release --target JerislinkSendToShellTest
+      - name: Store Explorer command test (JerisLinkSendTo.dll COM factory, title, icon, state, Invoke starts Jerislink.exe --send-to with the exact paths)
+        timeout-minutes: 3
+        run: build\Release\JerislinkSendToShellTest.exe build\Release\JerisLinkSendTo.dll
       - name: Build connection password test
         run: cmake --build build --config Release --target JerislinkConnAuthTest
       - name: Connection password test (shared vectors, NFC, mutual check, DPAPI round trip, no file when Remember is off, saved key deleted on fail, locked / blocked / auth_required, 0.3.x host 2 s timeout, transition probe and probe race, every channel on its own, PBKDF2 once, open_ip_only after a proof, HMAC failure, split header, one channel at a time, distrusted saved key, secrets wiped)

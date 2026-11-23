@@ -33,8 +33,7 @@ those two devices JerisLink sends:
   copy), while the viewer is connected with input enabled.
 - **Files you choose to send**, only when you act: copy and paste (Windows
   to Mac or Mac to Windows), drop on the viewer or its Files panel, or
-  "Send to JerisLink" in the Finder or in Explorer (Windows installer version
-  only, not the Microsoft Store version). The file names, sizes and
+  "Send to JerisLink" in the Finder or in Explorer. The file names, sizes and
   contents go to the other device, with a SHA-256 check per file. Nothing is
   sent in the background and JerisLink never opens a received file.
   Files sent from the Mac are received on the PC at once, with no confirm
