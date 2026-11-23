@@ -8,9 +8,12 @@
 //    ends at Microsoft Root Certificate Authority 2011, which Linux CA bundles
 //    do not carry, so FE3 requests trust exactly that root (embedded below,
 //    fingerprint checked at start-up) and nothing else.
-// 3. Download (the URL Microsoft returns may be plain http). The file is
-//    accepted only if its size and SHA-256 equal the DCAT values; otherwise it
-//    is deleted and the script exits non-zero.
+// 3. Download. FE3 returns the URL as http; it is moved to https (same host
+//    and path). That URL and every redirect hop must be https, on a
+//    delivery.mp.microsoft.com host, on port 443 (store-msix-url.mjs); the
+//    request is not sent otherwise. The file is accepted only if its size and
+//    SHA-256 equal the DCAT values; otherwise nothing is written and the script
+//    exits non-zero.
 //
 // Signature, identity and version-vs-tag checks run afterwards on Windows
 // (store-msix-to-release.yml, job verify).
@@ -26,6 +29,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { checkDownloadUrl, fe3DownloadUrl } from './store-msix-url.mjs';
 
 const [productId, familyName, outDir] = process.argv.slice(2);
 if (!/^[0-9A-Z]{12}$/.test(productId ?? '') || !/^[\w.-]+_[a-z0-9]{13}$/.test(familyName ?? '') || !outDir) {
@@ -71,6 +75,10 @@ TclY6ysSXNQ7roxrsIPlAT/4CTL2kzU0Iq/dNw13CYArzUgA8YyZGUcFAenRv9FO
 oijHHKOnNlA8OqTfSm7mhzvO6/DggTedEzxSjr25HTTGHdUKaj2YKXCMiSrRq4IQ
 SB/c9O+lxbtVGjhjhE63bK2VVOxlIhBJF7jAHscPrFRH
 -----END CERTIFICATE-----`;
+
+function downloadUrl(raw, base) {
+  try { return checkDownloadUrl(raw, base); } catch (e) { fail(e.message); }
+}
 
 function fail(msg) { console.error(`::error::${msg}`); process.exit(1); }
 function log(msg) { console.error(msg); }
@@ -157,11 +165,15 @@ async function fe3(url, action, body) {
 }
 
 const cookieXml = await fe3(FE3, 'GetCookie', `<GetCookie xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService"><oldCookie></oldCookie><lastChange>2015-10-21T17:01:07.1472913Z</lastChange><currentTime>${now.toISOString()}</currentTime><protocolVersion>1.40</protocolVersion></GetCookie>`);
+// The cookie for later calls is exactly what GetCookie returned: its
+// Expiration and EncryptedData, checked for shape, never made up.
+const cookieExp = (cookieXml.match(/<Expiration>([^<]+)<\/Expiration>/) || [])[1];
 const cookie = (cookieXml.match(/<EncryptedData>([^<]+)<\/EncryptedData>/) || [])[1];
-if (!cookie) fail('FE3 GetCookie: no EncryptedData');
+if (!cookie || !/^[A-Za-z0-9+/=]+$/.test(cookie)) fail('FE3 GetCookie: no usable EncryptedData');
+if (!cookieExp || !/^\d{4}-\d\d-\d\dT[\d:.]+Z?$/.test(cookieExp) || Number.isNaN(Date.parse(cookieExp))) fail('FE3 GetCookie: no usable Expiration');
 
 const syncXml = xmlUnescape(await fe3(FE3, 'SyncUpdates', `<SyncUpdates xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService">
-<cookie><Expiration>2045-03-11T02:02:48Z</Expiration><EncryptedData>${cookie}</EncryptedData></cookie>
+<cookie><Expiration>${cookieExp}</Expiration><EncryptedData>${cookie}</EncryptedData></cookie>
 <parameters><ExpressQuery>false</ExpressQuery><InstalledNonLeafUpdateIDs><int>1</int><int>2</int><int>3</int><int>11</int><int>19</int><int>544</int><int>549</int><int>2359974</int><int>2359977</int><int>5169044</int><int>8788830</int><int>23110993</int><int>23110994</int><int>54341900</int><int>54343656</int><int>59830006</int><int>59830007</int><int>59830008</int><int>60484010</int><int>62450018</int><int>62450019</int><int>62450020</int><int>66027979</int><int>66053150</int><int>97657898</int><int>98822896</int><int>98959022</int><int>98959023</int><int>98959024</int><int>98959025</int><int>98959026</int><int>104433538</int><int>104900364</int><int>105489019</int><int>117765322</int><int>129905029</int><int>130040031</int><int>132387090</int><int>132393049</int><int>133399034</int><int>138537048</int><int>140377312</int><int>143747671</int><int>158941041</int><int>158941042</int><int>158941043</int><int>158941044</int><int>159123858</int><int>159130928</int><int>164836897</int><int>164847386</int><int>164848327</int><int>164852241</int><int>164852246</int><int>164852252</int><int>164852253</int></InstalledNonLeafUpdateIDs>
 <SkipSoftwareSync>false</SkipSoftwareSync><NeedTwoGroupOutOfScopeUpdates>true</NeedTwoGroupOutOfScopeUpdates>
 <FilterAppCategoryIds><CategoryIdentifier><Id>${wuCategoryId}</Id></CategoryIdentifier></FilterAppCategoryIds>
@@ -200,18 +212,25 @@ const urlXml = xmlUnescape(await fe3(`${FE3}/secured`, 'GetExtendedUpdateInfo2',
 const locs = blocks(urlXml, 'FileLocation').map(b => ({ digest: (b.match(/<FileDigest>([^<]+)<\/FileDigest>/) || [])[1], url: (b.match(/<Url>([^<]+)<\/Url>/) || [])[1] }));
 const loc = locs.filter(l => l.digest && l.digest === match.digest);
 if (loc.length !== 1 || !loc[0].url) fail(`FE3: expected one URL for the package digest, found ${loc.length} (of ${locs.length})`);
-const dlHost = new URL(loc[0].url).hostname;
-if (!/(^|\.)(delivery\.mp\.microsoft\.com|dl\.delivery\.mp\.microsoft\.com)$/.test(dlHost)) fail(`unexpected download host ${dlHost}`);
-log(`Download host: ${dlHost}`);
+log(`Download host: ${new URL(loc[0].url).hostname}`);
 
 // ---- 3. Download and check against DCAT ------------------------------------
 fs.mkdirSync(outDir, { recursive: true });
 const out = path.join(outDir, 'store.msix');
-let url = loc[0].url, res;
+// Every request, the first and each redirect hop, goes through downloadUrl():
+// https only, a delivery.mp.microsoft.com host, default port. Anything else
+// stops the run before the request is sent.
+let url, res;
+try { url = fe3DownloadUrl(loc[0].url); } catch (e) { fail(e.message); }
 for (let hop = 0; ; hop++) {
   if (hop > 5) fail('too many redirects');
-  res = await request(url, { limit: expSize + 1 });
-  if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) { url = new URL(res.headers.location, url).href; continue; }
+  try { res = await request(url, { limit: expSize + 1 }); }
+  catch (e) { fail(`download from ${new URL(url).hostname} failed: ${e.code ?? ''} ${e.message.split('\n')[0]}`); }
+  if ([301, 302, 303, 307, 308].includes(res.status)) {
+    if (!res.headers.location) fail(`download HTTP ${res.status} without Location`);
+    url = downloadUrl(res.headers.location, url);
+    continue;
+  }
   break;
 }
 if (res.status !== 200) fail(`download HTTP ${res.status}`);

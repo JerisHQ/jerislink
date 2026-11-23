@@ -8,8 +8,10 @@ name: store-msix-to-release
 # - fetch (ubuntu, contents: read): .github/scripts/store-msix-fetch.mjs asks
 #   DCAT for the x64 package (version, SHA-256, size), gets the download URL from
 #   FE3 (TLS pinned to Microsoft Root Certificate Authority 2011) and downloads
-#   it. The file must match the DCAT size and SHA-256 or the job fails. No
-#   third-party action or tool is involved.
+#   it over https only, from delivery.mp.microsoft.com hosts on port 443, the
+#   same check on every redirect (store-msix-url.mjs, unit-tested first). The
+#   file must match the DCAT size and SHA-256 or the job fails. No third-party
+#   action or tool is involved.
 # - verify (windows, contents: read): same SHA-256 as fetch; Identity
 #   jerisHQ.JerisLink x64 from publisher CN=89A018EB-...; Authenticode status
 #   Valid on a clean runner; signer subject = publisher, issued by a Microsoft
@@ -19,8 +21,11 @@ name: store-msix-to-release
 #   version, nothing is uploaded and the run ends green with a notice.
 # - upload (ubuntu, the only job with contents: write): runs only for a manual
 #   dispatch from main, only when verify said ready. It uploads one new asset,
-#   Jerislink-<ver>-windows-x64-store-signed.msix, without --clobber, and skips if
-#   that asset is already there.
+#   Jerislink-<ver>-windows-x64-store-signed.msix, without --clobber. If an asset
+#   of that name is already there, the job ends green only when it is state
+#   uploaded and its SHA-256 (GitHub digest, or downloaded and hashed when there
+#   is no digest) equals the verified one; any other existing asset fails the
+#   run. The job never deletes or replaces an asset.
 #
 # SHA256SUMS.txt is not rewritten: GitHub can only replace an asset by deleting
 # it first, which would leave the release without its checksum file if the
@@ -40,6 +45,8 @@ on:
     paths:
       - .github/workflows/store-msix-to-release.yml
       - .github/scripts/store-msix-fetch.mjs
+      - .github/scripts/store-msix-url.mjs
+      - .github/scripts/store-msix-url.test.mjs
 
 permissions:
   contents: read
@@ -69,7 +76,6 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
       asset: ${{ steps.tag.outputs.asset }}
-      skip: ${{ steps.tag.outputs.skip }}
       sha256: ${{ steps.dl.outputs.sha256 }}
     steps:
       - name: Resolve the tag and check the release
@@ -92,24 +98,23 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$ver.0" >> "$GITHUB_OUTPUT"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
-          skip=false
-          if names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null); then
-            if grep -qxF "$asset" <<<"$names"; then skip=true; echo "::notice::$tag already has $asset; nothing to do"; fi
-          elif [ "$EVENT" = workflow_dispatch ]; then
+          # An asset that is already there is judged in upload, against the
+          # verified SHA-256; fetch and verify always run.
+          if [ "$EVENT" = workflow_dispatch ] && ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null; then
             echo "::error::no GitHub release $tag"; exit 1
           fi
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag expected=$ver.0 asset=$asset skip=$skip"
+          echo "tag=$tag expected=$ver.0 asset=$asset"
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        if: steps.tag.outputs.skip != 'true'
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Test the download URL check
+        run: node --test .github/scripts/store-msix-url.test.mjs
+
       - name: Download from the Store and check against DCAT
         id: dl
-        if: steps.tag.outputs.skip != 'true'
         run: |
           set -euo pipefail
           node --version
@@ -119,7 +124,6 @@ jobs:
           sha256sum "$RUNNER_TEMP/out/store.msix"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: steps.tag.outputs.skip != 'true'
         with:
           name: store-msix
           path: ${{ runner.temp }}/out/store.msix
@@ -128,7 +132,6 @@ jobs:
 
   verify:
     needs: fetch
-    if: needs.fetch.outputs.skip != 'true'
     runs-on: windows-latest
     timeout-minutes: 15
     outputs:
@@ -236,8 +239,34 @@ jobs:
           mv "$RUNNER_TEMP/in/store.msix" "$f"
           got=$(sha256sum "$f" | cut -d' ' -f1)
           [ "$got" = "$SHA256" ] || { echo "::error::artifact hash $got is not the verified $SHA256"; exit 1; }
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qxF "$ASSET"; then
-            echo "::notice::$TAG already has $ASSET"; exit 0
+          # An asset of this name that is already there is never deleted or
+          # replaced. It is accepted only if it finished uploading and its
+          # SHA-256 is the verified one; anything else fails the run.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" | jq -c --arg n "$ASSET" '[.assets[] | select(.name == $n)]')
+          n=$(jq length <<<"$existing")
+          if [ "$n" -gt 1 ]; then echo "::error::$TAG has $n assets named $ASSET. Not touching them; check the release by hand."; exit 1; fi
+          if [ "$n" -eq 1 ]; then
+            id=$(jq -r '.[0].id' <<<"$existing")
+            state=$(jq -r '.[0].state' <<<"$existing")
+            digest=$(jq -r '.[0].digest // ""' <<<"$existing")
+            if [ "$state" != uploaded ]; then
+              echo "::error::$TAG already has $ASSET (asset $id) in state '$state', not 'uploaded'. Not overwriting or deleting it; check it and remove it by hand, then run again."
+              exit 1
+            fi
+            if [ -n "$digest" ]; then
+              if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then echo "::error::$TAG asset $ASSET (asset $id) has digest '$digest', not sha256:<hex>. Not touching it."; exit 1; fi
+              have=${digest#sha256:}; how="GitHub digest"
+            else
+              gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$RUNNER_TEMP/existing.msix"
+              have=$(sha256sum "$RUNNER_TEMP/existing.msix" | cut -d' ' -f1); how="downloaded and hashed"
+            fi
+            if [ "$have" = "$SHA256" ]; then
+              echo "::notice::$TAG already has $ASSET with the verified SHA-256 ($how); nothing to do"
+              echo "$TAG already has \`$ASSET\` with the verified SHA-256 \`$SHA256\` ($how); not uploaded again" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::$TAG already has $ASSET (asset $id) with SHA-256 $have ($how), not the verified $SHA256. Not overwriting or deleting it; check which file is right and remove the wrong one by hand."
+            exit 1
           fi
           gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
           echo "Uploaded $ASSET to $TAG" >> "$GITHUB_STEP_SUMMARY"
