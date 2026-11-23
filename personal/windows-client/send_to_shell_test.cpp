@@ -95,8 +95,13 @@ int runTests(const std::wstring& dllPath) {
     // Stage <temp>\jlshell-<pid>\{JerisLinkSendTo.dll, Jerislink.exe = this test}.
     wchar_t tmp[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tmp);
-    const std::wstring stage = std::wstring(tmp) + L"jlshell-" + std::to_wstring(GetCurrentProcessId());
+    std::wstring stage = std::wstring(tmp) + L"jlshell-" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(stage.c_str(), nullptr);
+    // The temp path can be 8.3 (C:\Users\RUNNER~1\...); the shell items give
+    // the long path, so compare against the long form.
+    wchar_t longStage[MAX_PATH] = {};
+    const DWORD longLen = GetLongPathNameW(stage.c_str(), longStage, MAX_PATH);
+    if (longLen > 0 && longLen < MAX_PATH) stage = longStage;
     const std::wstring dll = stage + L"\\JerisLinkSendTo.dll";
     const std::wstring fakeViewer = stage + L"\\Jerislink.exe";
     expect(CopyFileW(dllPath.c_str(), dll.c_str(), FALSE) != 0, "stage: DLL copied");
