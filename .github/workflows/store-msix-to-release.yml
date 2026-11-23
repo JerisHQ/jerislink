@@ -181,6 +181,11 @@ jobs:
           if ($cert.Issuer -notmatch '^CN=Microsoft Marketplace CA G \d+, OU=AOC, O=Microsoft Corporation,') { throw "signer issuer is not a Microsoft Marketplace CA" }
           $chain = New-Object Security.Cryptography.X509Certificates.X509Chain
           $chain.ChainPolicy.RevocationMode = 'NoCheck'
+          # Store signing certificates are short-lived and usually expired by now;
+          # Authenticode above already accepted the timestamped signature. The
+          # chain is only used to prove which root the signer comes from.
+          $chain.ChainPolicy.VerificationFlags = 'IgnoreNotTimeValid'
+          if (-not $sig.TimeStamperCertificate) { throw "signature has no timestamp" }
           if (-not $chain.Build($cert)) { throw "chain does not build: $(($chain.ChainStatus | ForEach-Object Status) -join ', ')" }
           $chain.ChainElements | ForEach-Object { Write-Host "  chain: $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)" }
           $root = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
