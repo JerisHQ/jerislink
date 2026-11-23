@@ -23,8 +23,9 @@
 #   unchanged (Compare-SubmissionFields) and Test-DraftReadyToCommit passes ->
 #   POST .../submissions/{id}/commit. Assert-SubmissionHasPackage then reads
 #   that id back until it is committed with the new package. When create or
-#   commit gets no answer, the run reads the app or the submission back before
-#   it says what happened (Resolve-UnconfirmedCreate/-Commit).
+#   commit gets no answer, the run reads the app or the submission back and
+#   reports what it shows (Resolve-UnconfirmedCreate/-Commit); while the result
+#   is unconfirmed it gives no delete or retry advice.
 #
 # Nothing here prints the token, the client secret, a SAS URL or a raw
 # submission JSON (it holds fileUploadUrl). HTTP errors are reported as fixed
@@ -388,7 +389,7 @@ function Assert-NoPendingSubmission {
 # taken from the create response. When the service answered with an error,
 # nothing was created and nothing is deleted. When no answer came back (or
 # HTTP 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the
-# app back before saying what to do.
+# app back and reports what it shows.
 function New-StoreSubmission {
   param([Parameter(Mandatory)][string]$ProductId)
   Assert-ProductId $ProductId
@@ -408,25 +409,33 @@ function New-StoreSubmission {
   $id
 }
 
-# The create request got no answer. Before this run created anything the app
-# had no pending submission (Assert-NoPendingSubmission), so a pending one now
-# is most likely this run's draft. Returns the error text to throw; deletes
-# nothing.
+# The create request got no answer. This run has no submission id of its own
+# (that comes only from a create response), so a pending submission on the
+# read-back cannot be tied to this run: someone else (a person in the Partner
+# Center UI, another tool) may have created it after Assert-NoPendingSubmission
+# while this run's POST failed or never landed. Reports only what the
+# read-back shows. Returns the error text to throw; deletes nothing and gives
+# no delete advice.
 function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
   $head = "$Failure. Result unconfirmed: the create request got no answer, so a submission may or may not have been created. Read-back of the app:"
   try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId) -ProductId $ProductId }
   catch {
-    return ("$head failed too ($_). The result stays unknown: do not delete anything yet. Once the API answers, read " +
-      "GET /v1.0/my/applications/${ProductId}: no pendingApplicationSubmission means nothing was created (re-run this workflow); " +
-      "a pending submission there is most likely this run's uncommitted draft. $script:ApiOnlyNote")
+    return ("$head failed too ($_). The result stays unknown: do not delete anything. Once the API answers, read " +
+      "GET /v1.0/my/applications/${ProductId}: no pendingApplicationSubmission means none is pending (re-run this workflow); " +
+      "a pending submission there is of unconfirmed origin, since this run never got a submission id to compare. $script:ApiOnlyNote")
   }
-  if (-not $pending) { return "$head no pending submission, so none was created and there is nothing to clean up. Re-run this workflow." }
+  if (-not $pending) {
+    return ("$head no pending submission, so none had been created when the app was read back, and there is nothing to clean up. " +
+      "Re-run this workflow; its pending-submission check stops before creating anything if a submission appears in the meantime.")
+  }
   if ($pending -ceq '(no usable id)') {
-    return "$head it shows a pending submission without a usable id. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote"
+    return "$head it shows a pending submission without a usable id, origin unconfirmed. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote"
   }
-  ("$head submission $pending is pending now and was not before this run's create, so it is most likely this run's draft; " +
-    "it was not committed. Check it with GET /v1.0/my/applications/$ProductId/submissions/$pending (an uncommitted " +
-    "PendingCommit draft), then: $(Get-DeleteByIdText $ProductId $pending) $script:ApiOnlyNote")
+  ("$head a pending submission $pending exists, origin unconfirmed. This run never got a submission id from a create " +
+    "response, so it cannot tell whether $pending is its own draft or one someone else created after the pending-submission " +
+    "check (for example in the Partner Center UI). This run changes and deletes nothing. Find out who created submission " +
+    "$pending (GET /v1.0/my/applications/$ProductId/submissions/$pending shows its status and packages) before anything is " +
+    "done with it. $script:ApiOnlyNote")
 }
 
 # The service rejects or mishandles some pricing on PUT; the CLI refuses the
@@ -564,29 +573,49 @@ function Invoke-SubmissionCommit {
   Write-Host "submission $SubmissionId commit requested through the API: status=$(Get-SafeValue $st $script:SafeWord)"
 }
 
-# The commit request got no answer: reads this submission back by its id.
-# Returns (the caller goes on to the read-back step) only when the read-back
-# shows it committed; throws otherwise, with delete-by-id advice only when the
-# read-back shows it is still an uncommitted PendingCommit draft.
-function Resolve-UnconfirmedCommit([string]$ProductId, [string]$SubmissionId, [string]$Failure) {
-  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId got no answer, so it may or may not have been committed. Read-back by id:"
-  $sub = $null; $readErr = ''
-  try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId) } catch { $readErr = "$_" }
-  if (-not $sub -or $sub.Id -cne $SubmissionId) {
-    $why = if ($readErr) { "failed too ($readErr)" } else { 'did not return that submission' }
-    throw ("$head $why. The result stays unknown: do not delete, edit or commit anything yet. Once the API answers, read " +
-      "GET /v1.0/my/applications/$ProductId/submissions/${SubmissionId}: CommitStarted or a later status means it was committed; " +
-      "PendingCommit means it was not. $script:ApiOnlyNote")
+# The commit request got no answer. The commit API is asynchronous
+# (https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission),
+# so a PendingCommit read-back does not show the commit did not happen: the
+# request may still be on its way or being processed. Reads this submission
+# back by id up to Attempts times, IntervalSeconds apart:
+# - CommitStarted or a committed status: committed; warns and returns (the
+#   caller goes on to the read-back step).
+# - any other status (e.g. CommitFailed): throws; no delete or retry advice.
+# - PendingCommit, a failed read-back or another submission on every attempt:
+#   throws "result unconfirmed" and asks a person to check that id later; no
+#   delete or retry advice.
+function Resolve-UnconfirmedCommit {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [Parameter(Mandatory)][string]$Failure,
+    [ValidateRange(1, 100)][int]$Attempts = 10,
+    [ValidateRange(0, 600)][int]$IntervalSeconds = 30
+  )
+  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId got no answer, so it may or may not have been committed."
+  $get = "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
+  $last = ''
+  for ($i = 1; $i -le $Attempts; $i++) {
+    if ($i -gt 1) {
+      Write-Host "commit of submission $SubmissionId not confirmed yet ($last); reading it back again in $IntervalSeconds s"
+      Start-Sleep -Seconds $IntervalSeconds
+    }
+    $sub = $null; $readErr = ''
+    try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId) } catch { $readErr = "$_" }
+    if ($readErr) { $last = "read-back $i of ${Attempts} failed ($readErr)"; continue }
+    if (-not $sub -or $sub.Id -cne $SubmissionId) { $last = "read-back $i of ${Attempts} did not return that submission"; continue }
+    if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
+      Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but read-back " +
+        "$i by id shows status $($sub.Status): it was committed. The next step checks its package.")
+      return
+    }
+    if ($sub.Status -ceq 'PendingCommit') { $last = "read-back $i of ${Attempts} shows status PendingCommit"; continue }
+    throw "$head Read-back $i by id: status is '$($sub.Status)'. Nothing is deleted or retried; check it with $get. $script:ApiOnlyNote"
   }
-  if ($sub.Status -ceq 'PendingCommit') {
-    throw "$head status is still PendingCommit, so it was not committed. $script:ApiOnlyNote $(Get-DeleteByIdText $ProductId $SubmissionId)"
-  }
-  if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
-    Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but the read-back " +
-      "by id shows status $($sub.Status): it was committed. The next step checks its package.")
-    return
-  }
-  throw "$head status is '$($sub.Status)'. Nothing is deleted or retried; check it with GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId. $script:ApiOnlyNote"
+  throw ("$head Read back by id $Attempts time(s), $IntervalSeconds s apart; last: $last. The commit API is asynchronous, " +
+    "so PendingCommit does not show the commit failed: it may still be processing. The result stays unconfirmed: do not " +
+    "delete, edit, commit or re-submit this submission, and do not re-run this workflow for it. A person needs to check " +
+    "$get later: CommitStarted or a later status means it was committed. $script:ApiOnlyNote")
 }
 
 # Deletes one submission by id, only while it is an uncommitted draft
@@ -721,15 +750,18 @@ function Write-SubmissionSummary {
 
 # The publish job's API flow, every step after create on the id the create
 # response returned (see the header). Returns that submission id once the
-# commit was accepted (or, when the commit got no answer, once the read-back
-# by id shows it committed). Before the commit, any failure leaves this run's
+# commit was accepted (or, when the commit got no answer, once a read-back by
+# id shows it committed within CommitReadBackAttempts read-backs,
+# CommitReadBackIntervalSeconds apart). Before the commit, any failure leaves this run's
 # draft uncommitted and says how to delete exactly that draft.
 function Publish-StoreSubmission {
   param(
     [Parameter(Mandatory)][string]$ProductId,
     [Parameter(Mandatory)][string]$PackagePath,
     [Parameter(Mandatory)][string]$ExpectedFileName,
-    [Parameter(Mandatory)][string]$ExpectedVersion
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [ValidateRange(1, 100)][int]$CommitReadBackAttempts = 10,
+    [ValidateRange(0, 600)][int]$CommitReadBackIntervalSeconds = 30
   )
   Assert-ProductId $ProductId
   if ((Split-Path -Leaf $PackagePath) -cne $ExpectedFileName) { throw "package file is not $ExpectedFileName" }
@@ -781,7 +813,10 @@ function Publish-StoreSubmission {
   }
   try { Invoke-SubmissionCommit -ProductId $ProductId -SubmissionId $id }
   catch {
-    if (Test-StoreOutcomeUnknown $_) { Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" }
+    if (Test-StoreOutcomeUnknown $_) {
+      Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" `
+        -Attempts $CommitReadBackAttempts -IntervalSeconds $CommitReadBackIntervalSeconds
+    }
     else {
       throw ("$_. Commit of submission $id was not accepted. Read it back with GET /v1.0/my/applications/$ProductId/submissions/$id; " +
         "if it is still PendingCommit: $(Get-DeleteByIdText $ProductId $id)")

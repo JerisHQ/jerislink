@@ -34,8 +34,10 @@ name: msstore-publish
 #      a submission it did not create;
 #   2. POST a new submission; its id comes from that response. If the service
 #      refuses (HTTP 409, e.g. a submission appeared after step 1), stop. If
-#      the POST gets no answer, the result is unconfirmed: read the app's
-#      pending submission back and stop with advice for what it shows;
+#      the POST gets no answer, the result is unconfirmed: read the app back
+#      and stop, reporting only what it shows. Without an id from a create
+#      response a pending submission there is of unconfirmed origin (someone
+#      may have created it after step 1), so no delete advice is given;
 #   3. GET the app again: its pending submission must be that id;
 #   4. GET the submission, check its price can be sent back unchanged, PUT it
 #      with every old package PendingDelete and the new .msixupload
@@ -47,13 +49,15 @@ name: msstore-publish
 #      (Compare-SubmissionFields) and only the new package would remain
 #      (Test-DraftReadyToCommit);
 #   6. POST .../submissions/{id}/commit. If it gets no answer, read that id
-#      back: still PendingCommit means not committed (delete by id); a
-#      committed status means carry on; no read-back means unknown, so stop
-#      and change nothing;
+#      back up to 10 times, 30 s apart (the commit API is asynchronous):
+#      CommitStarted or a committed status means carry on; any other status
+#      stops; still PendingCommit or no read-back means the result stays
+#      unconfirmed, so stop with no delete or retry advice and ask a person
+#      to check that id;
 #   7. the next step reads that id back until it reaches a committed status
 #      (Published included) with exactly one Uploaded package, the release's
 #      version, and no other Uploaded package.
-#   Any stop after step 2 leaves this run's draft uncommitted, and the error
+#   Any stop in steps 3-5 leaves this run's draft uncommitted, and the error
 #   gives the exact DELETE for that id (Remove-StoreDraftSubmission).
 #   A submission this workflow creates is changed, committed or deleted only
 #   through the API, never in the Partner Center UI: Microsoft only takes in

@@ -65,11 +65,16 @@ BeforeAll {
   }
 
   function script:Invoke-Publish([string]$Package) {
-    Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
   }
 
   $script:Base = "/v1.0/my/applications/$App"
   $script:NewId = '1152921505000000099'
+  # Advice that must not be given while a result is unconfirmed: delete by id
+  # (Get-DeleteByIdText), or retry (re-run, commit again). "do not re-run" is
+  # not advice to re-run.
+  $script:DeleteAdvice = 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly'
+  $script:RetryAdvice = '(?<!do not )re-run this workflow|\bretry\b|commit (it )?again'
 }
 
 Describe 'Test-SubmissionHasPackage' {
@@ -578,38 +583,60 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   }
 }
 
-# Item r3-4: no answer to create or commit. LoseAsStatus 0 is no response at
-# all (HttpRequestException), 504 a gateway timeout; either way the service
-# may have carried the request out, so the run reads back before advising.
+# Items r3-4 and r4: no answer to create or commit. LoseAsStatus 0 is no
+# response at all (HttpRequestException), 504 a gateway timeout; either way the
+# service may have carried the request out, so the run reads back and reports
+# what it sees. While the result is unconfirmed it gives no delete or retry
+# advice.
 Describe 'No answer to create or commit (fake Store)' {
   BeforeEach { $script:Pkg = New-TestPackage }
   AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
 
-  It 'create carried out, answer lost (<Lost>): finds the new pending submission and names it for deletion by id' -ForEach @(
+  It 'create carried out, answer lost (<Lost>): reports the pending submission, origin unconfirmed, no delete advice' -ForEach @(
     @{ Lost = 0; Why = 'no response \(HttpRequestException Unknown <- IOException <- SocketException ConnectionReset\)' }, @{ Lost = 504; Why = 'HTTP 504' }
   ) {
     $s = New-FakeStore -LoseResponse Create -LoseWhen After -LoseAsStatus $Lost; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match "POST $([regex]::Escape($Base))/submissions failed: $Why\. Result unconfirmed: the create request got no answer"
-    $r.Err | Should -Match "submission $NewId is pending now and was not before this run's create"
-    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
+    $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed\. This run never got a submission id from a create response"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.Err | Should -Not -Match "most likely|this run's draft"
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     $s.Sub.status | Should -Be 'PendingCommit'
     $r.All | Should -Not -Match $Leak
   }
-  It 'create not carried out, no answer: reads the app back and says nothing was created' {
+  # Item r4-1: the pending submission on the read-back is not this run's.
+  It 'another publisher creates a draft after the pending check, create gets no answer (<When>, <Lost>): origin unconfirmed, no delete advice' -ForEach @(
+    @{ When = 'Before'; Lost = 0 }, @{ When = 'After'; Lost = 504 }
+  ) {
+    $other = '1152921505000000077'
+    $s = New-FakeStore -OtherDraftAfterCheck $other -LoseResponse Create -LoseWhen $When -LoseAsStatus $Lost; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "Result unconfirmed: the create request got no answer.* a pending submission $other exists, origin unconfirmed"
+    $r.Err | Should -Match "cannot tell whether $other is its own draft or one someone else created after the pending-submission check"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.Err | Should -Not -Match "most likely|this run's draft"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Sub | Should -BeNullOrEmpty
+    $s.PendingId | Should -Be $other
+  }
+  It 'create not carried out, no answer: reads the app back and says none had been created' {
     $s = New-FakeStore -LoseResponse Create -LoseWhen Before; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: .* no pending submission, so none was created and there is nothing to clean up'
-    $r.Err | Should -Not -Match 'DELETE /v1'
+    $r.Err | Should -Match 'Result unconfirmed: .* no pending submission, so none had been created when the app was read back, and there is nothing to clean up'
+    $r.Err | Should -Not -Match $DeleteAdvice
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
     $s.Sub | Should -BeNullOrEmpty
   }
-  It 'create with no answer and a failing read-back: result stays unknown, no delete advice' {
+  It 'create with no answer and a failing read-back: result stays unknown, no origin claim, no delete advice' {
     $s = New-FakeStore -LoseResponse Create -LoseWhen After -FailAfterLoss; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. The result stays unknown: do not delete anything yet'
-    $r.Err | Should -Not -Match 'DELETE /v1'
+    $r.Err | Should -Match 'Result unconfirmed: .* failed too \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. The result stays unknown: do not delete anything\.'
+    $r.Err | Should -Match 'a pending submission there is of unconfirmed origin'
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match "most likely|this run's (uncommitted )?draft"
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
   }
   It 'commit carried out, answer lost (<Lost>): reads it back by id, sees it committed, and goes on' -ForEach @(@{ Lost = 0 }, @{ Lost = 504 }) {
@@ -617,29 +644,64 @@ Describe 'No answer to create or commit (fake Store)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -BeNullOrEmpty
     $r.Value | Should -Be @($NewId)
-    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but the read-back by id shows status Certification: it was committed"
+    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
     @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
     $r.All | Should -Not -Match $Leak
   }
-  It 'commit not carried out, no answer: read-back shows PendingCommit, so it says delete by id' {
-    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before; Use-FakeStore $s
+  # Item r4-2: the commit API is asynchronous; PendingCommit on a read-back
+  # does not mean the commit failed.
+  It 'commit still processing when its answer was lost (<Lost>, <Delay> PendingCommit read(s)): reads again, sees CommitStarted, goes on' -ForEach @(
+    @{ Lost = 0; Delay = 1 }, @{ Lost = 504; Delay = 2 }
+  ) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Delayed -LoseAsStatus $Lost -CommitDelayReads $Delay; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer.* status is still PendingCommit, so it was not committed"
-    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
-    @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value | Should -Be @($NewId)
+    $r.Out | Should -Match "commit of submission $NewId not confirmed yet \(read-back 1 of 3 shows status PendingCommit\); reading it back again in 0 s"
+    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back $($Delay + 1) by id shows status CommitStarted: it was committed"
+    $r.All | Should -Not -Match $DeleteAdvice
+    $r.All | Should -Not -Match $RetryAdvice
+    $tail = @("POST $Base/submissions/$NewId/commit") + @(1..($Delay + 1) | ForEach-Object { "GET $Base/submissions/$NewId" })
+    @($s.Log)[(-$tail.Count)..-1] | Should -Be $tail
+    $s.Sub.status | Should -Be 'CommitStarted'
+    $v = Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId $NewId -ExpectedVersion '0.4.1.0' -TimeoutMinutes 1 -IntervalSeconds 0 }
+    $v.Err | Should -BeNullOrEmpty
+    $v.Out | Should -Match "verified submission ${NewId}: submission holds exactly one Uploaded package, version 0\.4\.1\.0"
+    @($s.Log) | Should -Not -Match '^DELETE '
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'commit not confirmed within the read-backs (<Case>): stays unconfirmed, a person checks the id, no delete or retry advice' -ForEach @(
+    @{ Case = 'never arrived'; When = 'Before' }, @{ Case = 'still processing'; When = 'Delayed' }
+  ) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen $When -CommitDelayReads 5; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer, so it may or may not have been committed\. Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\. The commit API is asynchronous, so PendingCommit does not show the commit failed"
+    $r.Err | Should -Match "A person needs to check GET /v1\.0/my/applications/$App/submissions/$NewId later"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.Err | Should -Not -Match 'so it was not committed|means it was not|was not committed'
+    $r.Out | Should -Not -Match $DeleteAdvice
+    @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+    @($s.Log | Where-Object { $_ -ceq "GET $Base/submissions/$NewId" }).Count | Should -Be 5 -Because 'two GETs before the commit, then exactly 3 read-backs'
+    @($s.Log) | Should -Not -Match '^DELETE '
     $s.Sub.status | Should -Be 'PendingCommit'
   }
-  It 'commit with no answer and a failing read-back: result stays unknown, no delete advice' {
+  It 'commit with no answer and a failing read-back: result stays unconfirmed, no delete or retry advice' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen After -FailAfterLoss; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'Result unconfirmed: the commit request .* failed too \(.*HTTP 503.*\)\. The result stays unknown: do not delete, edit or commit anything yet'
-    $r.Err | Should -Not -Match 'DELETE /v1'
+    $r.Err | Should -Match 'Result unconfirmed: the commit request .* Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 failed \(Store API GET .* failed: HTTP 503 \(ServiceUnavailable\)\)\. .*The result stays unconfirmed'
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.Err | Should -Not -Match 'means it was not'
+    @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
   }
-  It 'commit with no answer and a read-back status that is neither: no delete advice' {
+  It 'commit with no answer and a read-back status that is neither: stops at once, no delete or retry advice' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen After -CommitStatus CommitFailed; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "status is 'CommitFailed'\. Nothing is deleted or retried"
-    $r.Err | Should -Not -Match 'DELETE /v1'
+    $r.Err | Should -Match "Read-back 1 by id: status is 'CommitFailed'\. Nothing is deleted or retried"
+    $r.Err | Should -Not -Match $DeleteAdvice
+    $r.Err | Should -Not -Match $RetryAdvice
+    @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
   }
   It 'commit refused with an answer (HTTP 409): no read-back, says how to check and delete by id' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus 409; Use-FakeStore $s
@@ -884,6 +946,17 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match "GET $([regex]::Escape($Base)) failed: HTTP 302"
     @($Srv.Log) | Should -Not -Match '/redirected/'
+  }
+  # Item r4-2 over HTTP: the commit gets a 504 while it is still processing.
+  It 'reads a commit that got a 504 back by id until it shows CommitStarted, then goes on' -ForEach @(@{ Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Delayed'; LoseAsStatus = 504; CommitDelayReads = 1 } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value | Should -Be @($NewId)
+    $r.Out | Should -Match "not confirmed yet \(read-back 1 of 3 shows status PendingCommit\)"
+    $r.Out | Should -Match "read-back 2 by id shows status CommitStarted: it was committed"
+    $r.All | Should -Not -Match "$DeleteAdvice|$Leak"
+    @($Srv.Log)[-3..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
   }
   It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
     $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }

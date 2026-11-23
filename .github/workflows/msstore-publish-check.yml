@@ -15,8 +15,11 @@ name: msstore-publish-check
 #   (only the package, same SHA-256), no DELETE, the read-back, and no token,
 #   secret or SAS URL in any output stream with verbose and debug output on.
 #   Also: a pending submission stops the run before create; a PUT that changes
-#   the pricing stops it uncommitted; without -LoopbackTestServer nothing is
-#   sent to the stand-in.
+#   the pricing stops it uncommitted; a commit that gets a 504 while still
+#   processing is read back by id until it shows CommitStarted; a draft someone
+#   else creates after the pending check, with a create that gets a 504, is
+#   reported as of unconfirmed origin with no delete advice; without
+#   -LoopbackTestServer nothing is sent to the stand-in.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
@@ -278,5 +281,40 @@ jobs:
           try {
             $r = Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url }
             if ($r.Err -notmatch '^refused: ' -or @($s.Log).Count -ne 0) { throw "a loopback stand-in was used without -LoopbackTestServer" }
+          } finally { Stop-FakeStoreServer -Store $s }
+          # 6. The commit gets a 504 while the Store is still processing it: read
+          #    that id back (asynchronous commit) until it shows CommitStarted, then
+          #    go on. No DELETE call, no delete text.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -LoseResponse Commit -LoseWhen Delayed -LoseAsStatus 504 -CommitDelayReads 1
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+            if ($r.Err) { throw "a commit that got a 504 and later showed CommitStarted stopped the run" }
+            $id = $s.NewId
+            if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
+            if ($r.Text -notmatch "read-back 2 by id shows status CommitStarted: it was committed") { throw "the commit was not confirmed by reading the id back" }
+            if ($r.Text -match 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly') { throw "delete advice for a commit that may still be processing" }
+            $tail = @($s.Log)[-3..-1]
+            if (($tail -join "`n") -cne (@("POST $base/submissions/$id/commit", "GET $base/submissions/$id", "GET $base/submissions/$id") -join "`n")) { throw "calls after the commit: $($tail -join ', ')" }
+            if (@($s.Log) -match '^DELETE ') { throw "a DELETE was sent" }
+            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 0 -IntervalSeconds 0 }
+            if ($r.Err) { throw "read-back after the delayed commit failed" }
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+
+          # 7. Someone else creates a draft after the pending check and the create
+          #    gets a 504: report the pending id as of unconfirmed origin, no delete
+          #    advice, nothing after the read-back.
+          $other = '1152921505000000077'
+          $s = New-FakeStore -AppId $app -OtherDraftAfterCheck $other -LoseResponse Create -LoseWhen After -LoseAsStatus 504
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            if ($r.Err -notmatch "a pending submission $other exists, origin unconfirmed") { throw "a pending submission after a create with no answer was not reported as of unconfirmed origin" }
+            if ($r.Err -match 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly|this run''s draft') { throw "delete advice or an origin claim for a submission this run cannot tell is its own" }
+            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the read-back: $(@($s.Log) -join ', ')" }
+            Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"

@@ -60,6 +60,9 @@ function ConvertTo-FakeNode([string]$Json) {
 
 # Options: PendingId (a pending submission that exists before the run),
 # HidePending (GET app does not show it, as if it appeared after the check),
+# OtherDraftAfterCheck (someone else creates a pending submission with this id
+# right after the first GET app, i.e. after the run's pending check; a create
+# that lands afterwards gets 409),
 # NoPendingAs ('Null' or 'Omit': how GET app shows no pending submission),
 # PendingAfterCreate (GET app shows this id as pending once the run created
 # its submission), PriceId (NoPricing drops pricing), UploadStatus/UploadBody,
@@ -71,7 +74,10 @@ function ConvertTo-FakeNode([string]$Json) {
 # LoseResponse ('Create' or 'Commit'): that request gets no answer, either
 # After the service carried it out or Before; LoseAsStatus 0 means no
 # response at all (the mocked Invoke-StoreHttp throws), another value is the
-# status sent instead (e.g. 504). FailAfterLoss: every later API call gets 503.
+# status sent instead (e.g. 504). LoseWhen Delayed (Commit only): the commit
+# is still being processed; the next CommitDelayReads GETs of that submission
+# still show PendingCommit, the one after shows CommitStarted, later ones
+# CommitStatus. FailAfterLoss: every later API call gets 503.
 # Redirect ('Token', 'Api' or 'Upload'): those requests get a 302 to
 # /redirected/<kind> on the same host.
 function New-FakeStore {
@@ -80,6 +86,7 @@ function New-FakeStore {
     [string]$Version = '0.4.1.0',
     [string]$PendingId = '',
     [switch]$HidePending,
+    [string]$OtherDraftAfterCheck = '',
     [string]$PendingAfterCreate = '',
     [string]$TargetPublishMode = 'Manual',
     [ValidateSet('Null', 'Omit')][string]$NoPendingAs = 'Null',
@@ -93,8 +100,9 @@ function New-FakeStore {
     [string]$CommitStatus = 'Certification',
     [ValidateSet('', 'Pricing', 'DropListing')][string]$DriftOnPut = '',
     [ValidateSet('', 'Create', 'Commit')][string]$LoseResponse = '',
-    [ValidateSet('After', 'Before')][string]$LoseWhen = 'After',
+    [ValidateSet('After', 'Before', 'Delayed')][string]$LoseWhen = 'After',
     [int]$LoseAsStatus = 0,
+    [int]$CommitDelayReads = 1,
     [switch]$FailAfterLoss,
     [ValidateSet('', 'Token', 'Api', 'Upload')][string]$Redirect = '',
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
@@ -104,11 +112,12 @@ function New-FakeStore {
   if ($NoPricing) { [void]$f.Remove('pricing') } else { $f['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create($PriceId) }
   [hashtable]::Synchronized(@{
     AppId = $AppId; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
-    PendingAfterCreate = $PendingAfterCreate; NoPendingAs = $NoPendingAs
+    OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; NoPendingAs = $NoPendingAs
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
     KeepOldPackage = [bool]$KeepOldPackage; CommitStatus = $CommitStatus; BaseUrl = $BaseUrl; Served = $false
     DriftOnPut = $DriftOnPut; LoseResponse = $LoseResponse; LoseWhen = $LoseWhen; LoseAsStatus = $LoseAsStatus
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
+    CommitDelayReads = $CommitDelayReads; HeldCommit = ''; FinalStatus = ''
     Fields = $f.ToJsonString()
     Token = 'fake-access-token-' + [guid]::NewGuid().ToString('N'); NewId = '1152921505000000099'
     Sub = $null; Log = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -191,7 +200,19 @@ function Invoke-FakeStoreRequest {
   if ($lose) {
     $Store.Lost = $true
     if ($Store.LoseWhen -eq 'Before') { return New-FakeResponse $Store.LoseAsStatus 'lost' }
+    if ($Store.LoseWhen -eq 'Delayed' -and $lose -eq 'Commit') { $Store.HeldCommit = $path; return New-FakeResponse $Store.LoseAsStatus 'lost' }
   }
+  # A held (delayed) commit: GETs of that submission see PendingCommit until
+  # CommitDelayReads have passed, then the commit is processed and the next
+  # GET sees CommitStarted; the GET after that sees the final status.
+  if ($Method -eq 'GET' -and $Store.HeldCommit -and $path -ceq ($Store.HeldCommit -replace '/commit$', '')) {
+    if ($Store.CommitDelayReads -gt 0) { $Store.CommitDelayReads-- }
+    else {
+      [void](Invoke-FakeApiRoute -Store $Store -Method POST -Path $Store.HeldCommit -Text '' -App $app)
+      $Store.HeldCommit = ''
+      $Store.FinalStatus = $Store.Sub.status; $Store.Sub.status = 'CommitStarted'
+    }
+  } elseif ($Method -eq 'GET' -and $Store.FinalStatus -and $Store.Sub) { $Store.Sub.status = $Store.FinalStatus; $Store.FinalStatus = '' }
   $r = Invoke-FakeApiRoute -Store $Store -Method $Method -Path $path -Text $text -App $app
   if ($lose) { return New-FakeResponse $Store.LoseAsStatus 'lost' }
   $r
@@ -203,6 +224,8 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
     $shown = if ($Store.Sub -and $Store.PendingAfterCreate) { $Store.PendingAfterCreate } elseif ($Store.HidePending -and -not $Store.Sub) { '' } else { $Store.PendingId }
     if ($shown) { $o.pendingApplicationSubmission = @{ id = $shown; resourceLocation = 'y' } }
     elseif ($Store.NoPendingAs -eq 'Null') { $o.pendingApplicationSubmission = $null }
+    # Someone else creates a draft right after this (the run's pending check).
+    if ($Store.OtherDraftAfterCheck -and -not $Store.PendingId) { $Store.PendingId = $Store.OtherDraftAfterCheck }
     return New-FakeResponse 200 $o
   }
   if ($Path -match "^/v1\.0/my/applications/$App/submissions$" -and $Method -eq 'POST') {
