@@ -9,11 +9,12 @@ name: store-msix-to-release
 #   DCAT for the x64 package (version, SHA-256, size), gets the download URL from
 #   FE3 (TLS pinned to Microsoft Root Certificate Authority 2011) and downloads
 #   it. Every hop, redirects included, must be on a delivery.mp.microsoft.com
-#   host, https:443 or http:80, no userinfo (store-msix-url.mjs, unit-tested
-#   first). Microsoft serves this file over plain http only, so integrity rests
-#   on the hashes: the file must match the DCAT size and SHA-256 or the job
-#   fails. No third-party
-#   action or tool is involved.
+#   host, https:443 or http:80, no userinfo. http:80 is allowed only while the
+#   chain is still http (the FE3 URL is http); once a hop is https every later
+#   hop must be https:443, so no https -> http downgrade (store-msix-url.mjs,
+#   unit-tested first). Microsoft serves this file over plain http only, so
+#   integrity rests on the hashes: the file must match the DCAT size and
+#   SHA-256 or the job fails. No third-party action or tool is involved.
 # - verify (windows, contents: read): same SHA-256 as fetch; Identity
 #   jerisHQ.JerisLink x64 from publisher CN=89A018EB-...; Authenticode status
 #   Valid on a clean runner; signer subject = publisher, issued by a Microsoft
@@ -22,8 +23,11 @@ name: store-msix-to-release
 #   must equal the tag (v0.4.1 -> 0.4.1.0). If the Store still serves an older
 #   version, nothing is uploaded and the run ends green with a notice.
 # - upload (ubuntu, the only job with contents: write): runs only for a manual
-#   dispatch from main, only when verify said ready. It uploads one new asset,
-#   Jerislink-<ver>-windows-x64-store-signed.msix, without --clobber. If an asset
+#   dispatch from main, only when verify said ready. It finds the release by
+#   ID (drafts included; releases/tags/<tag> 404s on a draft) and lists its
+#   assets by that ID, so draft and published get the same checks. It uploads
+#   one new asset, Jerislink-<ver>-windows-x64-store-signed.msix, without
+#   --clobber, and reads it back from that release ID. If an asset
 #   of that name is already there, the job ends green only when it is state
 #   uploaded and its SHA-256 (GitHub digest, or downloaded and hashed when there
 #   is no digest) equals the verified one; any other existing asset fails the
@@ -241,10 +245,21 @@ jobs:
           mv "$RUNNER_TEMP/in/store.msix" "$f"
           got=$(sha256sum "$f" | cut -d' ' -f1)
           [ "$got" = "$SHA256" ] || { echo "::error::artifact hash $got is not the verified $SHA256"; exit 1; }
+          # Resolve the release once, by ID. releases/tags/{tag} returns 404 for a
+          # draft, and release.yml creates drafts, so list every release
+          # (drafts included, paginated) and match tag_name. Exactly one must
+          # match. Draft and published releases then get the same checks.
+          rels=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq -s -c --arg t "$TAG" '[add // [] | .[] | select(.tag_name == $t) | {id, draft}]')
+          nr=$(jq length <<<"$rels")
+          [ "$nr" -eq 1 ] || { echo "::error::expected exactly one release for $TAG, found $nr"; exit 1; }
+          rid=$(jq -r '.[0].id' <<<"$rels")
+          [[ "$rid" =~ ^[0-9]+$ ]] || { echo "::error::release id '$rid' for $TAG is not numeric"; exit 1; }
+          echo "Release $TAG: id $rid, draft $(jq -r '.[0].draft' <<<"$rels")"
+          assets() { gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$rid/assets?per_page=100" | jq -s -c --arg n "$ASSET" '[add // [] | .[] | select(.name == $n)]'; }
           # An asset of this name that is already there is never deleted or
           # replaced. It is accepted only if it finished uploading and its
           # SHA-256 is the verified one; anything else fails the run.
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" | jq -c --arg n "$ASSET" '[.assets[] | select(.name == $n)]')
+          existing=$(assets)
           n=$(jq length <<<"$existing")
           if [ "$n" -gt 1 ]; then echo "::error::$TAG has $n assets named $ASSET. Not touching them; check the release by hand."; exit 1; fi
           if [ "$n" -eq 1 ]; then
@@ -270,6 +285,15 @@ jobs:
             echo "::error::$TAG already has $ASSET (asset $id) with SHA-256 $have ($how), not the verified $SHA256. Not overwriting or deleting it; check which file is right and remove the wrong one by hand."
             exit 1
           fi
+          # gh release upload finds draft releases too (it falls back to the
+          # release list when the tag lookup 404s). The check below reads the
+          # asset back from release $rid, so a wrong target or a partial upload
+          # fails the run.
           gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+          after=$(assets)
+          [ "$(jq length <<<"$after")" -eq 1 ] || { echo "::error::after upload, release $rid has $(jq length <<<"$after") assets named $ASSET"; exit 1; }
+          [ "$(jq -r '.[0].state' <<<"$after")" = uploaded ] || { echo "::error::uploaded $ASSET is in state $(jq -r '.[0].state' <<<"$after")"; exit 1; }
+          d=$(jq -r '.[0].digest // ""' <<<"$after")
+          if [ -n "$d" ] && [ "$d" != "sha256:$SHA256" ]; then echo "::error::uploaded $ASSET digest $d is not sha256:$SHA256"; exit 1; fi
           echo "Uploaded $ASSET to $TAG" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$SHA256  $ASSET\`" >> "$GITHUB_STEP_SUMMARY"

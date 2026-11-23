@@ -9,7 +9,8 @@
 //    do not carry, so FE3 requests trust exactly that root (embedded below,
 //    fingerprint checked at start-up) and nothing else.
 // 3. Download. The FE3 URL and every redirect hop must be on a
-//    delivery.mp.microsoft.com host, https:443 or http:80, no userinfo
+//    delivery.mp.microsoft.com host, https:443 or http:80, no userinfo, and
+//    never https -> http: http:80 only while the chain is still http
 //    (store-msix-url.mjs, which also says why plain http is allowed); the
 //    request is not sent otherwise. The file is accepted only if its size and
 //    SHA-256 equal the DCAT values; otherwise nothing is written and the script

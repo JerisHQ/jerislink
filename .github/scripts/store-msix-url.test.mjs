@@ -17,10 +17,27 @@ test('accepts the FE3 http URL and https, on allowed hosts and default ports', (
 test('redirects: resolved against the current URL, then the same checks', () => {
   assert.equal(checkDownloadUrl('/other/file', fe3), 'http://tlu.dl.delivery.mp.microsoft.com/other/file');
   assert.equal(checkDownloadUrl('https://7.tlu.dl.delivery.mp.microsoft.com/f', fe3), 'https://7.tlu.dl.delivery.mp.microsoft.com/f');
-  assert.equal(checkDownloadUrl('http://8.tlu.dl.delivery.mp.microsoft.com/f', sec), 'http://8.tlu.dl.delivery.mp.microsoft.com/f');
+  assert.equal(checkDownloadUrl('http://8.tlu.dl.delivery.mp.microsoft.com/f', fe3), 'http://8.tlu.dl.delivery.mp.microsoft.com/f');
+  assert.equal(checkDownloadUrl('/other/file', sec), 'https://tlu.dl.delivery.mp.microsoft.com/other/file');
   assert.throws(() => checkDownloadUrl('https://evil.example/x', fe3), /host/);
   assert.throws(() => checkDownloadUrl('//evil.example/x', fe3), /host/);
   assert.throws(() => checkDownloadUrl('http://tlu.dl.delivery.mp.microsoft.com:8080/x', sec), /port/);
+});
+
+test('refuses an https -> http downgrade', () => {
+  assert.throws(() => checkDownloadUrl('http://8.tlu.dl.delivery.mp.microsoft.com/f', sec), /downgrade/);
+  assert.throws(() => checkDownloadUrl('http://tlu.dl.delivery.mp.microsoft.com:80/f', sec), /downgrade/);
+  assert.throws(() => checkDownloadUrl('http://delivery.mp.microsoft.com/f', 'https://delivery.mp.microsoft.com/x'), /downgrade/);
+});
+
+test('chain: http FE3 -> http -> https -> https ok, then -> http refused', () => {
+  const h1 = checkDownloadUrl(fe3);
+  const h2 = checkDownloadUrl('http://2.tlu.dl.delivery.mp.microsoft.com/f', h1);
+  const h3 = checkDownloadUrl('https://3.tlu.dl.delivery.mp.microsoft.com/f', h2);
+  const h4 = checkDownloadUrl('https://4.tlu.dl.delivery.mp.microsoft.com/f', h3);
+  assert.equal(h4, 'https://4.tlu.dl.delivery.mp.microsoft.com/f');
+  assert.throws(() => checkDownloadUrl('http://5.tlu.dl.delivery.mp.microsoft.com/f', h3), /downgrade/);
+  assert.throws(() => checkDownloadUrl('http://5.tlu.dl.delivery.mp.microsoft.com/f', h4), /downgrade/);
 });
 
 test('rejects other schemes', () => {
