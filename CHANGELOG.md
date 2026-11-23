@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.1
+
+The Microsoft Store (MSIX) viewer gets "Send to JerisLink" in the Explorer right-click menu (GitHub #70, Gitea #65).
+
+Windows viewer, Microsoft Store (MSIX) build:
+
+- Right-click files or folders in Explorer and pick "Send to JerisLink" (Windows 11: in the first menu, no Show more options). They go to `Downloads/JerisLink` on the Mac, the same as dragging them onto the viewer. Tested on Windows 11. Windows 10 1809 or later meets Microsoft's manifest requirements, but the menu has not been verified on Windows 10; where the entry does not appear, drag files onto the viewer instead.
+- The command is an `IExplorerCommand` shell extension (`JerisLinkSendTo.dll`, served by the package's COM surrogate). It only starts `Jerislink.exe --send-to <paths>` and returns, so Explorer never waits on a transfer; the viewer sends through its existing named pipe and dialogs.
+- A selection too long for one command line shows the "too many items" dialog. The entry is hidden for a selection that is not all on disk, and an item without a file system path makes the run refuse the whole request.
+- With both the installer and the Store version open, each one's entry sends to its own viewer. The installer's Send to > JerisLink entry is unchanged.
+- The Files panel hint for the Store build points at the right-click command (on Windows older than 10 1809: drag files instead).
+
+CI (GitHub `msix` and `windows` workflows):
+
+- The package build checks the DLL's CRT imports, exports and its hash inside the package, then installs the package and activates the command through the COM surrogate. A new shell extension test (COM factory, title, icon, state, and Invoke starting the exe with the exact paths) runs in the `windows` workflow.
+
+Docs:
+
+- `README-Windows.txt`, `INSTALL-SIDELOAD.txt`, `PRIVACY.md` and the Mac host deploy README no longer say the Store version has no Send to entry.
+
+Packaging:
+
+- Version 0.4.1 everywhere: `VERSION`, the macOS bundle versions, and MSIX `0.4.1.0` (GitHub `msix` workflow).
+
 ## v0.4.0
 
 Connection password: the Mac host can require a password before a viewer connects, and video, audio and input over UDP are bound to the logged-in session.
