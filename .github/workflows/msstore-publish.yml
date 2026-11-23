@@ -48,8 +48,11 @@ name: msstore-publish
 #      date, device families, ...) reads back as in step 4's GET
 #      (Compare-SubmissionFields) and only the new package would remain
 #      (Test-DraftReadyToCommit);
-#   6. POST .../submissions/{id}/commit. If it gets no answer, read that id
-#      back up to 10 times, 30 s apart (the commit API is asynchronous):
+#   6. print the submission id and how to check it by hand, then POST
+#      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
+#      gets no answer, print at once that the result is unconfirmed, with that
+#      id, then read that id back up to 10 times, 30 s apart, each GET waiting
+#      up to 30 s, all within 300 s (the commit API is asynchronous):
 #      CommitStarted or a committed status means carry on; any other status
 #      stops; still PendingCommit or no read-back means the result stays
 #      unconfirmed, so stop with no delete or retry advice and ask a person
@@ -59,6 +62,17 @@ name: msstore-publish
 #      version, and no other Uploaded package.
 #   Any stop in steps 3-5 leaves this run's draft uncommitted, and the error
 #   gives the exact DELETE for that id (Remove-StoreDraftSubmission).
+#   Time budget: when a step times out the runner is killed and nothing more
+#   is printed. The submit step therefore gives Publish-StoreSubmission a
+#   deadline 2 min before its timeout. The last 6 min before that deadline are
+#   kept for step 6 (60 s for the commit, 300 s for its read-backs): every
+#   call in steps 1-5 (the upload too) waits at most until that time starts,
+#   and once it has started the commit is not sent (stop uncommitted, with the
+#   DELETE for that id). The id and how to check it by hand are printed before
+#   the commit is sent and again as soon as it gets no answer, so they are in
+#   the log even if the step is killed. Every step of the publish job has a
+#   timeout, and they add up to the job's, so the job timeout cannot cut the
+#   submit step short.
 #   A submission this workflow creates is changed, committed or deleted only
 #   through the API, never in the Partner Center UI: Microsoft only takes in
 #   the uploaded package on an API commit, and a submission changed in the UI
@@ -208,8 +222,10 @@ jobs:
     needs: inspect
     runs-on: windows-latest
     environment: store
-    # Create, upload and commit (up to 20 min) + read-back (up to 35 min).
-    timeout-minutes: 65
+    # The step timeouts add up to this (checked by msstore-publish-check.yml):
+    # checkout 5 + download 10 + package check 5 + create, upload and commit 20
+    # + read-back 35 min.
+    timeout-minutes: 75
     defaults:
       run:
         shell: pwsh
@@ -217,12 +233,14 @@ jobs:
       EXPECTED_VERSION: ${{ needs.inspect.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 5
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 10
         with:
           name: jerislink-msix-store
           run-id: ${{ needs.inspect.outputs.run_id }}
@@ -231,6 +249,7 @@ jobs:
 
       - name: Check it is the package the approver saw
         id: pkg
+        timeout-minutes: 5
         env:
           EXPECTED_FILE: ${{ needs.inspect.outputs.file_name }}
           EXPECTED_SHA256: ${{ needs.inspect.outputs.sha256 }}
@@ -254,9 +273,13 @@ jobs:
           PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
           PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
         run: |
+          # No call waits past this deadline, 2 min before timeout-minutes (20)
+          # above, so the result and the id are printed before the runner is
+          # killed (checked by msstore-publish-check.yml).
+          $deadline = [DateTime]::UtcNow.AddMinutes(18)
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
-          $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION
+          $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
           if ($id -notmatch '^\d+$') { throw "submission id is not a number" }
           "submission_id=$id" >> $env:GITHUB_OUTPUT
 

@@ -7,7 +7,10 @@ name: msstore-publish-check
 #   Publish-StoreSubmission, then the read-back (Assert-SubmissionHasPackage) on
 #   the submission id the publish step returned; default API and sign-in hosts;
 #   and that the package is printed from an `inspect` job outside the `store`
-#   environment (and without secrets), so the approver sees it before approving.
+#   environment (and without secrets), so the approver sees it before approving;
+#   that the publish step sets its deadline first, at least 2 min before its
+#   timeout, and passes it on; and that every step of the publish job has a
+#   timeout and they add up to at most the job's.
 # - runs that flow with the real package over real HTTP against a stand-in for
 #   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1,
 #   allowed only through Connect-StoreApi -LoopbackTestServer): the calls and
@@ -18,7 +21,9 @@ name: msstore-publish-check
 #   the pricing stops it uncommitted; a commit that gets a 504 while still
 #   processing is read back by id until it shows CommitStarted; a draft someone
 #   else creates after the pending check, with a create that gets a 504, is
-#   reported as of unconfirmed origin with no delete advice; without
+#   reported as of unconfirmed origin with no delete advice; a commit that
+#   never answers prints the id before it is sent and "result unconfirmed"
+#   before the first read-back, then stops unconfirmed; without
 #   -LoopbackTestServer nothing is sent to the stand-in.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
@@ -109,7 +114,7 @@ jobs:
           $connect = 'Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET'
           $steps = @(
             $connect,
-            'Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION',
+            'Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline',
             $connect,
             'Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION'
           )
@@ -122,13 +127,29 @@ jobs:
           if (([regex]::Matches($code, 'Publish-StoreSubmission ')).Count -ne 1) { throw "msstore-publish.yml must run Publish-StoreSubmission exactly once" }
           if ($code -notmatch 'SUBMISSION_ID: \$\{\{ steps\.submit\.outputs\.submission_id \}\}') { throw "the read-back does not use the submission id the publish step returned" }
           if ($code -notmatch 'PKG_NAME: \$\{\{ needs\.inspect\.outputs\.file_name \}\}') { throw "the publish step does not check the file name inspect showed" }
+          # Time budget: a step that times out prints nothing more. The publish
+          # step sets its deadline before anything else, at least 2 min before
+          # its timeout; every step of the publish job has a timeout, and they
+          # add up to at most the job's, so the job cannot cut that step short.
+          $submit = [regex]::Match($code, '(?ms)^      - name: Create the submission[^\n]*\n(?:(?!^      - ).)*').Value
+          $stepMin = [regex]::Match($submit, '(?m)^        timeout-minutes: (\d+)\s*$')
+          $dl = [regex]::Match($submit, '(?m)^          \$deadline = \[DateTime\]::UtcNow\.AddMinutes\((\d+)\)\s*$')
+          if (-not $stepMin.Success -or -not $dl.Success) { throw 'the publish step must have timeout-minutes and set $deadline = [DateTime]::UtcNow.AddMinutes(N)' }
+          if ([int]$dl.Groups[1].Value -gt [int]$stepMin.Groups[1].Value - 2) { throw "the publish step's deadline must be at least 2 min before its timeout" }
+          if ($submit.IndexOf('$deadline = ') -gt $submit.IndexOf('Import-Module ')) { throw "the publish step must set its deadline before anything else" }
+          $job = [regex]::Match($code, '(?ms)^  publish:\s*\n(?:(?!^  \S).)*').Value
+          $jobMin = [regex]::Match($job, '(?m)^    timeout-minutes: (\d+)\s*$')
+          $mins = @([regex]::Matches($job, '(?m)^        timeout-minutes: (\d+)\s*$') | ForEach-Object { [int]$_.Groups[1].Value })
+          $count = [regex]::Matches($job, '(?m)^      - ').Count
+          if (-not $jobMin.Success -or $count -lt 1 -or $mins.Count -ne $count) { throw "the publish job and each of its $count steps need timeout-minutes" }
+          if (($mins | Measure-Object -Sum).Sum -gt [int]$jobMin.Groups[1].Value) { throw "the publish job's step timeouts add up to more than its timeout-minutes" }
           # The approver must see the package before approving: the job that
           # prints it must not be in the store environment or see its secrets.
           $inspect = [regex]::Match($wf, '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*').Value
           if ($inspect -notmatch 'Package to publish after approval') { throw "inspect job does not print the package before approval" }
           if ($inspect -match '(?m)^\s+environment:' -or $inspect -match 'secrets\.') { throw "inspect job must not use an environment or secrets" }
           if ($wf -notmatch '(?ms)^  publish:\s*\n(?:(?!^  \S).)*?^\s+needs: inspect\s*$(?:(?!^  \S).)*?^\s+environment: store\s*$') { throw "publish job must need inspect and run in the store environment" }
-          Write-Host "msstore-publish.yml: publish job order and package gate OK"
+          Write-Host "msstore-publish.yml: publish job order, package gate and time budget OK"
 
       - name: Find the msix run
         id: src
@@ -315,6 +336,30 @@ jobs:
             if ($r.Err -notmatch "a pending submission $other exists, origin unconfirmed") { throw "a pending submission after a create with no answer was not reported as of unconfirmed origin" }
             if ($r.Err -match 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly|this run''s draft') { throw "delete advice or an origin claim for a submission this run cannot tell is its own" }
             if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the read-back: $(@($s.Log) -join ', ')" }
+            Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+          # 8. The commit never answers: the id and how to check it are printed
+          #    before the commit is sent, "result unconfirmed" with the id right
+          #    after its timeout and before the first read-back; then the run stops
+          #    unconfirmed with no delete or retry advice.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -HangOn Commit
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -CommitTimeoutSeconds 3 -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 5 -CommitReadBackBudgetSeconds 20 }
+            $sw.Stop()
+            $id = $s.NewId
+            $pre = $r.Text.IndexOf("committing submission $id (waiting up to 3 s for the answer). If this step ends before a commit result is printed below, the result is unconfirmed: check GET $base/submissions/$id by hand")
+            $warn = $r.Text.IndexOf("::warning title=Store commit::Result unconfirmed: the commit request for submission $id got no answer (Store API POST $base/submissions/$id/commit failed: no response (")
+            $next = $r.Text.IndexOf("commit of submission $id not confirmed yet (read-back 1 of 2 shows status PendingCommit)")
+            if ($pre -lt 0 -or $warn -le $pre -or $next -le $warn) { throw "the id and the hand-check text were not printed before the commit and before the read-backs ($pre, $warn, $next)" }
+            if ($r.Err -notmatch "Read back by id 2 time\(s\), 1 s apart; last: read-back 2 of 2 shows status PendingCommit\..*A person needs to check GET $([regex]::Escape($base))/submissions/$id later") { throw "a commit that never answered did not stop unconfirmed" }
+            if ($r.Text -match 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly|(?<!do not )re-run this workflow|\bretry\b|commit (it )?again') { throw "delete or retry advice while the commit result is unconfirmed" }
+            $tail = @($s.Log)[-3..-1]
+            if (($tail -join "`n") -cne (@("POST $base/submissions/$id/commit", "GET $base/submissions/$id", "GET $base/submissions/$id") -join "`n")) { throw "calls after the commit: $($tail -join ', ')" }
+            if ($sw.Elapsed.TotalSeconds -gt 30) { throw "the commit timeout and read-backs took $([int]$sw.Elapsed.TotalSeconds) s" }
+            Write-Host "commit with no answer: unconfirmed after $([int]$sw.Elapsed.TotalSeconds) s"
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"

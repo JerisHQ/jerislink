@@ -26,6 +26,12 @@
 #   commit gets no answer, the run reads the app or the submission back and
 #   reports what it shows (Resolve-UnconfirmedCreate/-Commit); while the result
 #   is unconfirmed it gives no delete or retry advice.
+# Time budget: the publish step has one timeout, and nothing prints once the
+# runner kills it. Publish-StoreSubmission works to a deadline set before that
+# timeout: the commit and its read-backs keep their own time at the end, every
+# call before the commit is cut short so it cannot eat that time, and the
+# submission id and how to check it by hand are printed before the commit
+# request is sent and again as soon as it gets no answer.
 #
 # Nothing here prints the token, the client secret, a SAS URL or a raw
 # submission JSON (it holds fileUploadUrl). HTTP errors are reported as fixed
@@ -43,6 +49,9 @@ $script:DefaultApiBase = 'https://manage.devcenter.microsoft.com'
 $script:DefaultAuthorityHost = 'https://login.microsoftonline.com'
 $script:ApiScope = 'https://manage.devcenter.microsoft.com/.default'
 $script:ApiBase = $script:DefaultApiBase
+# UTC time no call may wait past (Get-CallTimeout); $null: no limit. Set and
+# cleared by Publish-StoreSubmission and Resolve-UnconfirmedCommit.
+$script:CallDeadline = $null
 $script:Token = ''
 # Set only by Connect-StoreApi -LoopbackTestServer (msstore-publish-check.yml
 # and the HTTP tests): then a stand-in on 127.0.0.1/localhost is also allowed.
@@ -177,12 +186,13 @@ function Invoke-StoreHttp {
     [hashtable]$Headers = @{},
     [string]$Body,
     [string]$ContentType,
-    [string]$InFile
+    [string]$InFile,
+    [ValidateRange(1, 3600)][int]$TimeoutSec = 600
   )
   if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
     throw (New-StoreError "refused: $Kind requests go only to $($script:UriRule[$Kind]); nothing was sent" -NotSent)
   }
-  $a = @{ Method = $Method; Uri = $Uri; Headers = $Headers; SkipHttpErrorCheck = $true; TimeoutSec = 600; MaximumRedirection = 0 }
+  $a = @{ Method = $Method; Uri = $Uri; Headers = $Headers; SkipHttpErrorCheck = $true; TimeoutSec = $TimeoutSec; MaximumRedirection = 0 }
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body }
   if ($ContentType) { $a.ContentType = $ContentType }
   if ($InFile) { $a.InFile = $InFile }
@@ -198,6 +208,19 @@ function Invoke-StoreHttp {
   }
   $text = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
   [pscustomobject]@{ StatusCode = [int]$r.StatusCode; Body = $text }
+}
+
+# The current UTC time (the tests replace it with a fake clock).
+function Get-StoreUtcNow { [datetime]::UtcNow }
+
+# Seconds a call may wait for its answer: Requested, cut to what is left before
+# $script:CallDeadline. Throws (NotSent: nothing goes out) when less than one
+# second is left.
+function Get-CallTimeout([int]$Requested) {
+  if ($null -eq $script:CallDeadline) { return $Requested }
+  $left = [int][Math]::Floor(($script:CallDeadline - (Get-StoreUtcNow)).TotalSeconds)
+  if ($left -lt 1) { throw (New-StoreError "not sent: no time left in this step's time budget" -NotSent) }
+  [Math]::Min($Requested, $left)
 }
 
 # Fixed diagnostics for an HTTP error response: the status code and, when the
@@ -297,13 +320,14 @@ function Invoke-StoreApi {
   param(
     [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PUT', 'DELETE')][string]$Method,
     [Parameter(Mandatory)][string]$Path,
-    [string]$Body
+    [string]$Body,
+    [ValidateRange(1, 3600)][int]$TimeoutSec = 600
   )
   if (-not $script:Token) { throw "not signed in to the Store submission API (Connect-StoreApi)" }
   $what = "$Method /v1.0/my/$Path"
   $a = @{ Method = $Method; Uri = "$script:ApiBase/v1.0/my/$Path"; Kind = 'Api'; Headers = @{ Authorization = "Bearer $script:Token" } }
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
-  try { $r = Invoke-StoreHttp @a }
+  try { $a.TimeoutSec = Get-CallTimeout $TimeoutSec; $r = Invoke-StoreHttp @a }
   catch {
     $notSent = $_.Exception.Data.Contains('StoreNotSent') -and $_.Exception.Data['StoreNotSent']
     throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $_)" -OutcomeUnknown:(-not $notSent))
@@ -372,9 +396,9 @@ function Get-StoreApp([string]$ProductId) {
   Invoke-StoreApi -Method GET -Path "applications/$ProductId"
 }
 
-function Get-StoreSubmissionJson([string]$ProductId, [string]$SubmissionId) {
+function Get-StoreSubmissionJson([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec = 600) {
   Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
-  Invoke-StoreApi -Method GET -Path "applications/$ProductId/submissions/$SubmissionId"
+  Invoke-StoreApi -Method GET -Path "applications/$ProductId/submissions/$SubmissionId" -TimeoutSec $TimeoutSec
 }
 
 # Asks Partner Center whether the app has a pending submission; throws unless
@@ -553,7 +577,8 @@ function Send-StorePackage {
     $len = (Get-Item -LiteralPath $zip).Length
     # The CLI escapes '+' in the SAS URL the same way before uploading.
     try {
-      $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip
+      $wait = Get-CallTimeout 600
+      $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip -TimeoutSec $wait
     } catch { throw "package upload failed: $(Get-StoreFailureText $_)" }
     if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)" }
     Write-Host "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)"
@@ -565,9 +590,9 @@ function Send-StorePackage {
 # POST /applications/{productId}/submissions/{submissionId}/commit: commits
 # exactly this submission, whatever else the app has.
 function Invoke-SubmissionCommit {
-  param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
+  param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId, [ValidateRange(1, 600)][int]$TimeoutSec = 600)
   Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
-  $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions/$SubmissionId/commit"
+  $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions/$SubmissionId/commit" -TimeoutSec $TimeoutSec
   $st = ''
   try { $st = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'status' } catch { }
   Write-Host "submission $SubmissionId commit requested through the API: status=$(Get-SafeValue $st $script:SafeWord)"
@@ -576,43 +601,65 @@ function Invoke-SubmissionCommit {
 # The commit request got no answer. The commit API is asynchronous
 # (https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission),
 # so a PendingCommit read-back does not show the commit did not happen: the
-# request may still be on its way or being processed. Reads this submission
-# back by id up to Attempts times, IntervalSeconds apart:
+# request may still be on its way or being processed. First prints (an
+# annotation) that the result is unconfirmed, with the id and how to check it
+# by hand, so that text is in the log even if the step is killed during the
+# read-backs. Then reads this submission back by id up to Attempts times,
+# IntervalSeconds apart, each GET waiting at most TimeoutSeconds, all of them
+# within BudgetSeconds and before DeadlineUtc:
 # - CommitStarted or a committed status: committed; warns and returns (the
 #   caller goes on to the read-back step).
 # - any other status (e.g. CommitFailed): throws; no delete or retry advice.
-# - PendingCommit, a failed read-back or another submission on every attempt:
-#   throws "result unconfirmed" and asks a person to check that id later; no
-#   delete or retry advice.
+# - PendingCommit, a failed read-back or another submission on every attempt,
+#   or the budget used up: throws "result unconfirmed" and asks a person to
+#   check that id later; no delete or retry advice.
 function Resolve-UnconfirmedCommit {
   param(
     [Parameter(Mandatory)][string]$ProductId,
     [Parameter(Mandatory)][string]$SubmissionId,
     [Parameter(Mandatory)][string]$Failure,
     [ValidateRange(1, 100)][int]$Attempts = 10,
-    [ValidateRange(0, 600)][int]$IntervalSeconds = 30
+    [ValidateRange(0, 600)][int]$IntervalSeconds = 30,
+    [ValidateRange(1, 600)][int]$TimeoutSeconds = 30,
+    [ValidateRange(1, 3600)][int]$BudgetSeconds = 300,
+    [datetime]$DeadlineUtc = [datetime]::MaxValue
   )
   $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId got no answer, so it may or may not have been committed."
   $get = "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
-  $last = ''
-  for ($i = 1; $i -le $Attempts; $i++) {
-    if ($i -gt 1) {
-      Write-Host "commit of submission $SubmissionId not confirmed yet ($last); reading it back again in $IntervalSeconds s"
-      Start-Sleep -Seconds $IntervalSeconds
+  Write-Host ("::warning title=Store commit::Result unconfirmed: the commit request for submission $SubmissionId got no answer " +
+    "($Failure). Reading it back by id for up to $BudgetSeconds s. If this step ends before a result is printed below, check " +
+    "$get by hand: CommitStarted or a later status means it was committed. Do not delete, edit, commit or re-submit it, " +
+    "and do not re-run this workflow for it.")
+  $end = (Get-StoreUtcNow).AddSeconds($BudgetSeconds)
+  $why = "the read-back time budget of $BudgetSeconds s is used up"
+  if ($DeadlineUtc -ne [datetime]::MaxValue) { $DeadlineUtc = $DeadlineUtc.ToUniversalTime() }
+  if ($DeadlineUtc -lt $end) { $end = $DeadlineUtc; $why = "the step's deadline $($DeadlineUtc.ToString('u')) is near" }
+  $saved = $script:CallDeadline
+  $script:CallDeadline = $end
+  $last = ''; $done = 0; $stopped = ''
+  try {
+    for ($i = 1; $i -le $Attempts; $i++) {
+      if ($i -gt 1) {
+        # The next read-back needs the interval plus at least one second.
+        if ((Get-StoreUtcNow).AddSeconds($IntervalSeconds + 1) -ge $end) { $stopped = " (stopped: $why)"; break }
+        Write-Host "commit of submission $SubmissionId not confirmed yet ($last); reading it back again in $IntervalSeconds s"
+        Start-Sleep -Seconds $IntervalSeconds
+      }
+      $done = $i
+      $sub = $null; $readErr = ''
+      try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSeconds) } catch { $readErr = "$_" }
+      if ($readErr) { $last = "read-back $i of ${Attempts} failed ($readErr)"; continue }
+      if (-not $sub -or $sub.Id -cne $SubmissionId) { $last = "read-back $i of ${Attempts} did not return that submission"; continue }
+      if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
+        Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but read-back " +
+          "$i by id shows status $($sub.Status): it was committed. The next step checks its package.")
+        return
+      }
+      if ($sub.Status -ceq 'PendingCommit') { $last = "read-back $i of ${Attempts} shows status PendingCommit"; continue }
+      throw "$head Read-back $i by id: status is '$($sub.Status)'. Nothing is deleted or retried; check it with $get. $script:ApiOnlyNote"
     }
-    $sub = $null; $readErr = ''
-    try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId) } catch { $readErr = "$_" }
-    if ($readErr) { $last = "read-back $i of ${Attempts} failed ($readErr)"; continue }
-    if (-not $sub -or $sub.Id -cne $SubmissionId) { $last = "read-back $i of ${Attempts} did not return that submission"; continue }
-    if ($sub.Status -ceq 'CommitStarted' -or $sub.Status -cin $script:CommittedStatuses) {
-      Write-Host ("::warning title=Store commit::The commit request for submission $SubmissionId got no answer, but read-back " +
-        "$i by id shows status $($sub.Status): it was committed. The next step checks its package.")
-      return
-    }
-    if ($sub.Status -ceq 'PendingCommit') { $last = "read-back $i of ${Attempts} shows status PendingCommit"; continue }
-    throw "$head Read-back $i by id: status is '$($sub.Status)'. Nothing is deleted or retried; check it with $get. $script:ApiOnlyNote"
-  }
-  throw ("$head Read back by id $Attempts time(s), $IntervalSeconds s apart; last: $last. The commit API is asynchronous, " +
+  } finally { $script:CallDeadline = $saved }
+  throw ("$head Read back by id $done time(s), $IntervalSeconds s apart$stopped; last: $last. The commit API is asynchronous, " +
     "so PendingCommit does not show the commit failed: it may still be processing. The result stays unconfirmed: do not " +
     "delete, edit, commit or re-submit this submission, and do not re-run this workflow for it. A person needs to check " +
     "$get later: CommitStarted or a later status means it was committed. $script:ApiOnlyNote")
@@ -754,6 +801,14 @@ function Write-SubmissionSummary {
 # id shows it committed within CommitReadBackAttempts read-backs,
 # CommitReadBackIntervalSeconds apart). Before the commit, any failure leaves this run's
 # draft uncommitted and says how to delete exactly that draft.
+# Time budget: DeadlineUtc is the last moment a call may still wait for an
+# answer; msstore-publish.yml sets it some minutes before the step's timeout so
+# the error text still prints. The last CommitTimeoutSeconds +
+# CommitReadBackBudgetSeconds before it are kept for the commit and its
+# read-backs: every call before the commit waits at most until then (an upload
+# or a GET that would run into it is cut short and stops the run uncommitted),
+# and the commit is not sent when that point has passed. Each read-back GET
+# waits at most CommitReadBackTimeoutSeconds.
 function Publish-StoreSubmission {
   param(
     [Parameter(Mandatory)][string]$ProductId,
@@ -761,11 +816,26 @@ function Publish-StoreSubmission {
     [Parameter(Mandatory)][string]$ExpectedFileName,
     [Parameter(Mandatory)][string]$ExpectedVersion,
     [ValidateRange(1, 100)][int]$CommitReadBackAttempts = 10,
-    [ValidateRange(0, 600)][int]$CommitReadBackIntervalSeconds = 30
+    [ValidateRange(0, 600)][int]$CommitReadBackIntervalSeconds = 30,
+    [ValidateRange(1, 600)][int]$CommitTimeoutSeconds = 60,
+    [ValidateRange(1, 600)][int]$CommitReadBackTimeoutSeconds = 30,
+    [ValidateRange(1, 3600)][int]$CommitReadBackBudgetSeconds = 300,
+    [datetime]$DeadlineUtc = (Get-StoreUtcNow).AddMinutes(18)
   )
   Assert-ProductId $ProductId
   if ((Split-Path -Leaf $PackagePath) -cne $ExpectedFileName) { throw "package file is not $ExpectedFileName" }
   if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) { throw "package file missing" }
+  $DeadlineUtc = $DeadlineUtc.ToUniversalTime()
+  $reserve = $CommitTimeoutSeconds + $CommitReadBackBudgetSeconds
+  $commitBy = $DeadlineUtc.AddSeconds(-$reserve)
+  if ($commitBy -le (Get-StoreUtcNow).AddSeconds(60)) {
+    throw ("not publishing: the deadline $($DeadlineUtc.ToString('u')) leaves less than 60 s for the work before the commit " +
+      "($reserve s are kept for the commit and its read-backs); nothing was sent")
+  }
+  # try/finally clears the call deadline however this ends (body kept at its
+  # old indent to keep the diff small).
+  try {
+  $script:CallDeadline = $commitBy
 
   Assert-NoPendingSubmission -ProductId $ProductId
   $id = New-StoreSubmission -ProductId $ProductId
@@ -808,14 +878,23 @@ function Publish-StoreSubmission {
     }
     Write-Host "fields unchanged: $($diff.Compared) submission fields other than applicationPackages read back as before the update"
     Write-Host "draft verified: $($check.Reason)"
+    if ((Get-StoreUtcNow) -ge $commitBy) {
+      throw ("no time left for the commit: it and its read-backs need the last $reserve s before the deadline " +
+        "$($DeadlineUtc.ToString('u')), and that time has started")
+    }
   } catch {
     throw "$_. Not committed: draft $id stays uncommitted. $script:ApiOnlyNote $(Get-DeleteByIdText $ProductId $id)"
   }
-  try { Invoke-SubmissionCommit -ProductId $ProductId -SubmissionId $id }
+  $script:CallDeadline = $commitBy.AddSeconds($CommitTimeoutSeconds)
+  Write-Host ("committing submission $id (waiting up to $CommitTimeoutSeconds s for the answer). If this step ends before a " +
+    "commit result is printed below, the result is unconfirmed: check GET /v1.0/my/applications/$ProductId/submissions/$id " +
+    "by hand (CommitStarted or a later status means it was committed); do not delete or re-submit it.")
+  try { Invoke-SubmissionCommit -ProductId $ProductId -SubmissionId $id -TimeoutSec $CommitTimeoutSeconds }
   catch {
     if (Test-StoreOutcomeUnknown $_) {
       Resolve-UnconfirmedCommit -ProductId $ProductId -SubmissionId $id -Failure "$_" `
-        -Attempts $CommitReadBackAttempts -IntervalSeconds $CommitReadBackIntervalSeconds
+        -Attempts $CommitReadBackAttempts -IntervalSeconds $CommitReadBackIntervalSeconds `
+        -TimeoutSeconds $CommitReadBackTimeoutSeconds -BudgetSeconds $CommitReadBackBudgetSeconds -DeadlineUtc $DeadlineUtc
     }
     else {
       throw ("$_. Commit of submission $id was not accepted. Read it back with GET /v1.0/my/applications/$ProductId/submissions/$id; " +
@@ -823,6 +902,7 @@ function Publish-StoreSubmission {
     }
   }
   $id
+  } finally { $script:CallDeadline = $null }
 }
 
 # Runs after the commit: reads submission SubmissionId back by its id and

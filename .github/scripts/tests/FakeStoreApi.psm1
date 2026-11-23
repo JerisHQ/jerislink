@@ -80,6 +80,14 @@ function ConvertTo-FakeNode([string]$Json) {
 # CommitStatus. FailAfterLoss: every later API call gets 503.
 # Redirect ('Token', 'Api' or 'Upload'): those requests get a 302 to
 # /redirected/<kind> on the same host.
+# HangOn: a request that never gets an answer, so the caller waits until its
+# own timeout ('Commit': the commit request, which is not carried out;
+# 'ReadBack': every GET of a submission once a commit request came in). The
+# handler returns status -1 for it; Start-FakeStoreServer keeps the connection
+# open without answering. CallSeconds/UploadSeconds: how long an API call and
+# the upload take, for the mocked Invoke-StoreHttp and its fake clock (the
+# HTTP server ignores them). Calls: what the mocked Invoke-StoreHttp was asked
+# to send, with its timeout.
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -105,6 +113,9 @@ function New-FakeStore {
     [int]$CommitDelayReads = 1,
     [switch]$FailAfterLoss,
     [ValidateSet('', 'Token', 'Api', 'Upload')][string]$Redirect = '',
+    [ValidateSet('', 'Commit', 'ReadBack')][string]$HangOn = '',
+    [ValidateRange(0, 100000)][int]$CallSeconds = 0,
+    [ValidateRange(0, 100000)][int]$UploadSeconds = 0,
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
   $f = ConvertTo-FakeNode $script:FieldsTemplate
@@ -118,6 +129,9 @@ function New-FakeStore {
     DriftOnPut = $DriftOnPut; LoseResponse = $LoseResponse; LoseWhen = $LoseWhen; LoseAsStatus = $LoseAsStatus
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
     CommitDelayReads = $CommitDelayReads; HeldCommit = ''; FinalStatus = ''
+    HangOn = $HangOn; CallSeconds = $CallSeconds; UploadSeconds = $UploadSeconds; CommitTried = $false
+    Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Fields = $f.ToJsonString()
     Token = 'fake-access-token-' + [guid]::NewGuid().ToString('N'); NewId = '1152921505000000099'
     Sub = $null; Log = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -192,6 +206,13 @@ function Invoke-FakeStoreRequest {
   if ($Store.Lost -and $Store.FailAfterLoss) { return New-FakeResponse 503 @{ code = 'ServiceUnavailable' } }
 
   $app = [regex]::Escape($Store.AppId)
+  if ($Method -eq 'POST' -and $path -match "^/v1\.0/my/applications/$app/submissions/\d+/commit$") {
+    $Store.CommitTried = $true
+    if ($Store.HangOn -eq 'Commit') { return New-FakeResponse -1 'hang' }
+  }
+  if ($Store.HangOn -eq 'ReadBack' -and $Store.CommitTried -and $Method -eq 'GET' -and $path -match "^/v1\.0/my/applications/$app/submissions/\d+$") {
+    return New-FakeResponse -1 'hang'
+  }
   $lose = ''
   if ($Method -eq 'POST' -and $Store.LoseResponse -and -not $Store.Lost) {
     if ($Store.LoseResponse -eq 'Create' -and $path -match "^/v1\.0/my/applications/$app/submissions$") { $lose = 'Create' }
@@ -304,11 +325,14 @@ function Start-FakeStoreServer {
     $Store.Listener = $l
     while ($l.IsListening) {
       try { $ctx = $l.GetContext() } catch { break }
+      $hold = $false
       try {
         $h = @{}
         foreach ($k in $ctx.Request.Headers.AllKeys) { $h[$k] = $ctx.Request.Headers[$k] }
         $ms = [IO.MemoryStream]::new(); $ctx.Request.InputStream.CopyTo($ms)
         $r = Invoke-FakeStoreRequest -Store $Store -Method $ctx.Request.HttpMethod -Uri $ctx.Request.Url.AbsoluteUri -Headers $h -BodyBytes $ms.ToArray()
+        # No answer at all: keep the connection open until the client gives up.
+        if ($r.StatusCode -eq -1) { $hold = $true; [void]$Store.Held.Add($ctx); continue }
         # No answer cannot be sent reliably over HttpListener; 504 stands in.
         $ctx.Response.StatusCode = if ($r.StatusCode -eq 0) { 504 } else { $r.StatusCode }
         if ($r.Location) { $ctx.Response.RedirectLocation = $r.Location }
@@ -317,7 +341,7 @@ function Start-FakeStoreServer {
       } catch {
         [void]$Store.Log.Add("SERVER ERROR $_")
         $ctx.Response.StatusCode = 500
-      } finally { $ctx.Response.Close() }
+      } finally { if (-not $hold) { $ctx.Response.Close() } }
     }
   }
   $deadline = (Get-Date).AddSeconds(20)
@@ -331,6 +355,8 @@ function Start-FakeStoreServer {
 
 function Stop-FakeStoreServer {
   param([Parameter(Mandatory)]$Store)
+  foreach ($c in @($Store.Held)) { try { $c.Response.Abort() } catch { } }
+  $Store.Held.Clear()
   if ($Store.ContainsKey('Listener')) { $Store.Listener.Stop(); $Store.Listener.Close() }
   if ($Store.ContainsKey('Job')) { $Store.Job | Wait-Job -Timeout 10 | Out-Null; $Store.Job | Remove-Job -Force }
 }

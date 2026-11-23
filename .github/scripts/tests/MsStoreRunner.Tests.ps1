@@ -36,15 +36,33 @@ BeforeAll {
 
   # Routes the module's HTTP calls to $global:FakeStore. Signs in with the
   # production hosts (the mock sends nothing). A request the fake answers with
-  # status 0 throws what HttpClient throws when no answer comes back.
+  # status 0 throws what HttpClient throws when no answer comes back. Each call
+  # is logged in $Store.Calls with its timeout (and printed as "[http] ..."
+  # when $global:FakeTrace is set). A call that takes longer than its timeout
+  # (CallSeconds, UploadSeconds; a hung one, status -1, never ends) throws what
+  # HttpClient throws on its timeout; with $global:FakeClock set, the call moves
+  # that clock on by the time it took.
   function script:Use-FakeStore([hashtable]$Store) {
     $global:FakeStore = $Store
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
       $h = @{}
       if ($Headers) { foreach ($k in $Headers.Keys) { $h[$k] = $Headers[$k] } }
       if ($ContentType) { $h['Content-Type'] = $ContentType }
+      # A mock does not get the default of a parameter the caller left out.
+      $wait = if ($TimeoutSec) { $TimeoutSec } else { 600 }
+      $line = "$Method $(if ($Kind -eq 'Upload') { '(upload)' } else { ([uri]$Uri).AbsolutePath }) timeout=$wait"
+      [void]$global:FakeStore.Calls.Add($line)
+      if ($global:FakeTrace) { Write-Host "[http] $line" }
       $bytes = if ($InFile) { [IO.File]::ReadAllBytes($InFile) } elseif ($Body) { [Text.Encoding]::UTF8.GetBytes($Body) } else { [byte[]]@() }
       $r = Invoke-FakeStoreRequest -Store $global:FakeStore -Method $Method -Uri $Uri -Headers $h -BodyBytes $bytes
+      $took = if ($r.StatusCode -eq -1) { [int]::MaxValue } elseif ($Kind -eq 'Upload') { $global:FakeStore.UploadSeconds } else { $global:FakeStore.CallSeconds }
+      if ($took -gt $wait) {
+        if ($null -ne $global:FakeClock) { $global:FakeClock = $global:FakeClock.AddSeconds($wait) }
+        throw [System.Threading.Tasks.TaskCanceledException]::new(
+          "The request was canceled due to the configured HttpClient.Timeout of $wait seconds elapsing ($Uri).",
+          [System.TimeoutException]::new('The operation was canceled.'))
+      }
+      if ($null -ne $global:FakeClock) { $global:FakeClock = $global:FakeClock.AddSeconds($took) }
       if ($r.StatusCode -eq 0) {
         $sock = [System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::ConnectionReset)
         $io = [System.IO.IOException]::new("Unable to read data from the transport connection ($Uri)", $sock)
@@ -53,7 +71,7 @@ BeforeAll {
       [pscustomobject]@{ StatusCode = $r.StatusCode; Body = $r.Body }
     }
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret 6>$null
-    $Store.Log.Clear()
+    $Store.Log.Clear(); $Store.Calls.Clear()
   }
 
   function script:New-TestPackage {
@@ -75,6 +93,11 @@ BeforeAll {
   # not advice to re-run.
   $script:DeleteAdvice = 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly'
   $script:RetryAdvice = '(?<!do not )re-run this workflow|\bretry\b|commit (it )?again'
+  # Index of the first line from From on that matches Pattern, or -1.
+  function script:Get-LineIndex([string[]]$Lines, [string]$Pattern, [int]$From = 0) {
+    for ($i = $From; $i -lt $Lines.Count; $i++) { if ($Lines[$i] -match $Pattern) { return $i } }
+    -1
+  }
 }
 
 Describe 'Test-SubmissionHasPackage' {
@@ -712,6 +735,172 @@ Describe 'No answer to create or commit (fake Store)' {
   }
 }
 
+# Item r5: the publish step has one timeout, and nothing prints once the runner
+# kills it. A fake clock stands in for time: the mocked Invoke-StoreHttp moves
+# it on by what each call takes (or its timeout), Start-Sleep moves it on too.
+Describe 'Time budget: the commit hand-off prints before the step can time out (fake Store, fake clock)' {
+  BeforeAll {
+    $script:T0 = [datetime]::new(2026, 11, 23, 1, 0, 0, [DateTimeKind]::Utc)
+    $script:EB = [regex]::Escape($Base)
+    Mock -ModuleName MsStoreRunner Get-StoreUtcNow { $global:FakeClock }
+    Mock -ModuleName MsStoreRunner Start-Sleep { $global:FakeClock = $global:FakeClock.AddSeconds($Seconds) }
+    # Publish, starting at T0, with the deadline msstore-publish.yml sets (18
+    # minutes) unless Set overrides it; a $null value leaves that parameter out.
+    function script:Invoke-TimedPublish([string]$Package, [hashtable]$Set = @{}) {
+      $global:FakeClock = $T0
+      $p = @{ ProductId = $App; PackagePath = $Package; ExpectedFileName = $File; ExpectedVersion = '0.4.1.0'; DeadlineUtc = $T0.AddMinutes(18) }
+      foreach ($k in $Set.Keys) { if ($null -eq $Set[$k]) { $p.Remove($k) } else { $p[$k] = $Set[$k] } }
+      Invoke-Captured { Publish-StoreSubmission @p }
+    }
+    function script:Get-CallsAfterCommit($Store) {
+      $calls = @($Store.Calls)
+      $c = [array]::IndexOf($calls, "POST $Base/submissions/$NewId/commit timeout=60")
+      if ($c -lt 0) { return }
+      $calls | Select-Object -Skip ($c + 1)
+    }
+  }
+  BeforeEach { $script:Pkg = New-TestPackage; $global:FakeClock = $T0; $global:FakeTrace = $true }
+  AfterEach {
+    Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force; $global:FakeTrace = $false
+    InModuleScope MsStoreRunner { $script:CallDeadline = $null }
+  }
+  AfterAll { $global:FakeClock = $null }
+
+  It 'prints the id and how to check it before the commit is sent, and "result unconfirmed" before the first read-back (the commit hangs)' {
+    $s = New-FakeStore -HangOn Commit; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg
+    $lines = @($r.Out -split "`n")
+    $pre = Get-LineIndex $lines ("^committing submission $NewId \(waiting up to 60 s for the answer\)\. If this step ends before a commit result is " +
+      "printed below, the result is unconfirmed: check GET $EB/submissions/$NewId by hand \(CommitStarted or a later status means it was committed\)")
+    $post = Get-LineIndex $lines "^\[http\] POST $EB/submissions/$NewId/commit timeout=60$"
+    $warn = Get-LineIndex $lines ("^::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer " +
+      "\(Store API POST $EB/submissions/$NewId/commit failed: no response \(TaskCanceledException <- TimeoutException\)\)\. Reading it back by id " +
+      "for up to 300 s\. If this step ends before a result is printed below, check GET $EB/submissions/$NewId by hand")
+    $read = Get-LineIndex $lines "^\[http\] GET $EB/submissions/$NewId timeout=30$"
+    $pre | Should -BeGreaterOrEqual 0
+    $post | Should -BeGreaterThan $pre -Because 'the hand-off text is printed before the commit request is sent'
+    $warn | Should -BeGreaterThan $post
+    $read | Should -BeGreaterThan $warn -Because '"result unconfirmed" is printed before the first read-back'
+    Get-CallsAfterCommit $s | Should -Be @(1..10 | ForEach-Object { "GET $Base/submissions/$NewId timeout=30" })
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 330 -Because 'the commit waits 60 s, then 10 read-backs 30 s apart'
+    $r.Err | Should -Match "Read back by id 10 time\(s\), 30 s apart; last: read-back 10 of 10 shows status PendingCommit\."
+    $r.All | Should -Not -Match $DeleteAdvice
+    $r.All | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match $Leak
+    $s.Sub.status | Should -Be 'PendingCommit'
+  }
+  It 'read-backs that hang: each GET waits at most <T> s and they stop within the <B> s budget (<Reads> read-back(s), <Secs> s)' -ForEach @(
+    @{ T = 30; B = 300; Reads = 5; Secs = 270 }, @{ T = 5; B = 20; Reads = 1; Secs = 5 }
+  ) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus 504 -HangOn ReadBack; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ CommitReadBackTimeoutSeconds = $T; CommitReadBackBudgetSeconds = $B }
+    Get-CallsAfterCommit $s | Should -Be @(1..$Reads | ForEach-Object { "GET $Base/submissions/$NewId timeout=$T" })
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be $Secs
+    $r.Out | Should -Match "Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $EB/submissions/$NewId/commit failed: HTTP 504\)\. Reading it back by id for up to $B s"
+    $r.Err | Should -Match ("Read back by id $Reads time\(s\), 30 s apart \(stopped: the read-back time budget of $B s is used up\); last: read-back $Reads of 10 " +
+      "failed \(Store API GET $EB/submissions/$NewId failed: no response \(TaskCanceledException <- TimeoutException\)\)")
+    $r.Err | Should -Match "A person needs to check GET $EB/submissions/$NewId later"
+    $r.All | Should -Not -Match $DeleteAdvice
+    $r.All | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'read-backs stop before DeadlineUtc when it comes before the end of the budget' {
+    $s = New-FakeStore -HangOn ReadBack; Use-FakeStore $s
+    $s.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @() }; $s.CommitTried = $true
+    $r = Invoke-Captured { & (Get-Module MsStoreRunner) { param($a, $i, $d)
+      $script:CallDeadline = $d.AddHours(1)
+      Resolve-UnconfirmedCommit -ProductId $a -SubmissionId $i -Failure 'Store API POST x failed: HTTP 504' -DeadlineUtc $d } $App $NewId $T0.AddSeconds(100) }
+    @($s.Calls) | Should -Be @("GET $Base/submissions/$NewId timeout=30", "GET $Base/submissions/$NewId timeout=30")
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 90
+    $r.Err | Should -Match "Read back by id 2 time\(s\), 30 s apart \(stopped: the step's deadline 2026-11-23 01:01:40Z is near\)"
+    InModuleScope MsStoreRunner { $script:CallDeadline } | Should -Be $T0.AddSeconds(3700) -Because "the caller's call deadline is put back"
+  }
+  It 'upload close to 10 minutes, then a commit that hangs: the commit and every read-back still end before the deadline' {
+    $s = New-FakeStore -UploadSeconds 599 -HangOn Commit; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg
+    @($s.Calls) | Should -Contain 'PUT (upload) timeout=600'
+    Get-CallsAfterCommit $s | Should -Be @(1..10 | ForEach-Object { "GET $Base/submissions/$NewId timeout=30" })
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 929 -Because 'upload 599 s, commit 60 s, read-backs 270 s'
+    $global:FakeClock | Should -BeLessOrEqual $T0.AddMinutes(18)
+    $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId"
+    $r.Err | Should -Match 'Read back by id 10 time\(s\), 30 s apart; last: read-back 10 of 10 shows status PendingCommit\.'
+  }
+  It 'cuts an upload that would run into the time kept for the commit, and stops uncommitted with delete-by-id advice' {
+    $s = New-FakeStore -UploadSeconds 2000; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $T0.AddSeconds(860) }
+    @($s.Calls) | Should -Contain 'PUT (upload) timeout=500' -Because '860 s minus the 360 s kept for the commit and its read-backs'
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 500
+    $r.Err | Should -Match "package upload failed: no response \(TaskCanceledException <- TimeoutException\)\. Not committed: draft $NewId stays uncommitted"
+    $r.Err | Should -Match $DeleteAdvice
+    @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+  }
+  It 'does not send the commit once the time kept for it has started, and stops uncommitted with delete-by-id advice' {
+    $s = New-FakeStore -CallSeconds 5 -UploadSeconds 470; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $T0.AddSeconds(860) }
+    @($s.Calls)[-2..-1] | Should -Be @('PUT (upload) timeout=475', "GET $Base/submissions/$NewId timeout=5")
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 500 -Because 'the last call before the commit ends exactly where the kept time starts'
+    $r.Err | Should -Match ("no time left for the commit: it and its read-backs need the last 360 s before the deadline 2026-11-23 01:14:20Z, " +
+      "and that time has started\. Not committed: draft $NewId stays uncommitted")
+    $r.Err | Should -Match $DeleteAdvice
+    $r.Out | Should -Not -Match '^committing submission'
+    @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+  }
+  It 'a commit sent just before the time kept for it still waits its full 60 s, and its read-backs end before the deadline' {
+    $s = New-FakeStore -CallSeconds 5 -UploadSeconds 465 -HangOn Commit; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $T0.AddSeconds(860) }
+    $s.Calls | Should -Contain "POST $Base/submissions/$NewId/commit timeout=60" -Because 'the commit is sent at 495 s, 5 s before the kept time starts'
+    Get-CallsAfterCommit $s | Should -Be (@(1..8 | ForEach-Object { "GET $Base/submissions/$NewId timeout=30" }) + "GET $Base/submissions/$NewId timeout=20")
+    ($global:FakeClock - $T0).TotalSeconds | Should -Be 840 -Because 'commit 495-555 s, then 9 read-backs (5 s each, 30 s apart) inside the 300 s budget'
+    $global:FakeClock | Should -BeLessOrEqual $T0.AddSeconds(860)
+    $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer"
+    $r.Err | Should -Match ('Read back by id 9 time\(s\), 30 s apart \(stopped: the read-back time budget of 300 s is used up\); ' +
+      'last: read-back 9 of 10 shows status PendingCommit\.')
+    $r.All | Should -Not -Match $DeleteAdvice
+  }
+  It 'sends nothing when the deadline leaves no time for the work before the commit' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $T0.AddSeconds(400) }
+    $r.Err | Should -BeExactly ('not publishing: the deadline 2026-11-23 01:06:40Z leaves less than 60 s for the work before the commit ' +
+      '(360 s are kept for the commit and its read-backs); nothing was sent')
+    @($s.Calls).Count | Should -Be 0
+  }
+  It 'without DeadlineUtc, the deadline is 18 minutes from the start' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-TimedPublish $Pkg @{ DeadlineUtc = $null; CommitReadBackBudgetSeconds = 1000 }
+    $r.Err | Should -BeExactly ('not publishing: the deadline 2026-11-23 01:18:00Z leaves less than 60 s for the work before the commit ' +
+      '(1060 s are kept for the commit and its read-backs); nothing was sent')
+    @($s.Calls).Count | Should -Be 0
+  }
+  It 'refuses, before sending, a call with less than a second left before the call deadline, and marks it not sent' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $e = & (Get-Module MsStoreRunner) { param($a, $now)
+      $script:CallDeadline = $now.AddMilliseconds(500)
+      try { Get-StoreApp $a; $null } catch { $_ } finally { $script:CallDeadline = $null }
+    } $App $global:FakeClock 6>$null
+    "$e" | Should -BeExactly "Store API GET $Base failed: not sent: no time left in this step's time budget"
+    $e.Exception.Data['StoreOutcomeUnknown'] | Should -BeFalse
+    @($s.Calls).Count | Should -Be 0
+  }
+  It 'cuts a call timeout to the whole seconds left before the call deadline' {
+    $s = New-FakeStore; Use-FakeStore $s
+    & (Get-Module MsStoreRunner) { param($a, $now)
+      $script:CallDeadline = $now.AddSeconds(42.7)
+      try { $null = Get-StoreApp $a } finally { $script:CallDeadline = $null }
+    } $App $global:FakeClock 6>$null
+    @($s.Calls) | Should -Be @("GET $Base timeout=42")
+  }
+  It 'leaves no call deadline behind after a run (<Case>)' -ForEach @(
+    @{ Case = 'committed'; Opt = @{} }, @{ Case = 'stopped before the commit'; Opt = @{ UploadStatus = 403 } }, @{ Case = 'commit unconfirmed'; Opt = @{ HangOn = 'Commit' } }
+  ) {
+    $s = New-FakeStore @Opt; Use-FakeStore $s
+    $null = Invoke-TimedPublish $Pkg
+    InModuleScope MsStoreRunner { $script:CallDeadline } | Should -BeNullOrEmpty
+    $global:FakeClock = $T0.AddHours(1); $s.Calls.Clear(); $s.HangOn = ''
+    $null = & (Get-Module MsStoreRunner) { param($a, $i) Get-StoreSubmissionJson $a $i } $App $NewId 6>$null
+    @($s.Calls) | Should -Be @("GET $Base/submissions/$NewId timeout=600")
+  }
+}
+
 Describe 'Compare-SubmissionFields' {
   BeforeAll {
     $s = New-FakeStore
@@ -957,6 +1146,39 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r.Out | Should -Match "read-back 2 by id shows status CommitStarted: it was committed"
     $r.All | Should -Not -Match "$DeleteAdvice|$Leak"
     @($Srv.Log)[-3..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+  }
+  # Item r5 over HTTP: real HttpClient timeouts on calls that never get an answer.
+  It 'commit that never answers: prints the hand-off first, gives up after its timeout, says "result unconfirmed", then reads back' -ForEach @(@{ Opt = @{ HangOn = 'Commit' } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 5 -CommitReadBackBudgetSeconds 20 }
+    $sw.Stop()
+    $lines = @($r.Out -split "`n")
+    $pre = Get-LineIndex $lines "^committing submission $NewId \(waiting up to 2 s for the answer\)\. If this step ends before a commit result is printed below, the result is unconfirmed"
+    $warn = Get-LineIndex $lines "^::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(Store API POST $([regex]::Escape($Base))/submissions/$NewId/commit failed: no response \("
+    $pre | Should -BeGreaterOrEqual 0
+    $warn | Should -BeGreaterThan $pre
+    $r.Err | Should -Match "Read back by id 2 time\(s\), 1 s apart; last: read-back 2 of 2 shows status PendingCommit\."
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 20
+    @($Srv.Log)[-3..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+    $r.All | Should -Not -Match "$DeleteAdvice|$Leak|$([regex]::Escape($Url))"
+    $seen = [regex]::Match($r.Out, 'commit failed: (no response \([^()]*\))').Groups[1].Value
+    Write-Host "    commit timeout reported as: $seen"
+  }
+  It 'read-backs that never answer: each GET gives up after its timeout and they stop within the budget' -ForEach @(@{ Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Before'; LoseAsStatus = 504; HangOn = 'ReadBack' } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackIntervalSeconds 1 -CommitReadBackTimeoutSeconds 1 -CommitReadBackBudgetSeconds 4 }
+    $sw.Stop()
+    $log = @($Srv.Log)
+    $reads = @($log | Select-Object -Skip ([array]::IndexOf($log, "POST $Base/submissions/$NewId/commit") + 1))
+    $reads.Count | Should -BeGreaterOrEqual 1
+    $reads.Count | Should -BeLessOrEqual 3
+    $reads | Should -Be @(1..$reads.Count | ForEach-Object { "GET $Base/submissions/$NewId" })
+    $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer \(.*HTTP 504\)"
+    $r.Err | Should -Match "Read back by id $($reads.Count) time\(s\), 1 s apart \(stopped: the read-back time budget of 4 s is used up\); last: read-back $($reads.Count) of 10 failed \(Store API GET .* failed: no response \("
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
+    $r.All | Should -Not -Match "$DeleteAdvice|$Leak|$([regex]::Escape($Url))"
   }
   It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
     $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }
