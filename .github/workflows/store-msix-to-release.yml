@@ -5,18 +5,18 @@ name: store-msix-to-release
 # a signed Windows build without the Store and without trusting a test cert.
 #
 # How
-# - fetch (ubuntu, contents: read): builds JasonWei512/Upload-Microsoft-Store-
-#   MSIX-Package-to-GitHub-Release from a pinned commit and runs it with
-#   --dry-run. In dry-run it asks the Store (StoreLib, unofficial endpoints) for
-#   the newest package and downloads it, but never writes to GitHub. The action
-#   is not used with `uses:` because then it uploads by itself, before anything
-#   here could check what it downloaded.
-# - verify (windows, contents: read): the package must be jerisHQ.JerisLink x64
-#   from publisher CN=89A018EB-..., Authenticode status Valid on a clean runner,
-#   signed by a Microsoft Marketplace CA certificate that chains to a Microsoft
-#   root, and not by our self-signed sideload test certificate. Then its version
+# - fetch (ubuntu, contents: read): .github/scripts/store-msix-fetch.mjs asks
+#   DCAT for the x64 package (version, SHA-256, size), gets the download URL from
+#   FE3 (TLS pinned to Microsoft Root Certificate Authority 2011) and downloads
+#   it. The file must match the DCAT size and SHA-256 or the job fails. No
+#   third-party action or tool is involved.
+# - verify (windows, contents: read): same SHA-256 as fetch; Identity
+#   jerisHQ.JerisLink x64 from publisher CN=89A018EB-...; Authenticode status
+#   Valid on a clean runner; signer subject = publisher, issued by a Microsoft
+#   Marketplace CA, chain root = Microsoft Root Certificate Authority 2011 (by
+#   thumbprint); not our self-signed sideload test certificate. Then its version
 #   must equal the tag (v0.4.1 -> 0.4.1.0). If the Store still serves an older
-#   version, nothing is uploaded and the run ends green with a note.
+#   version, nothing is uploaded and the run ends green with a notice.
 # - upload (ubuntu, the only job with contents: write): runs only for a manual
 #   dispatch from main, only when verify said ready. It uploads one new asset,
 #   Jerislink-<ver>-windows-x64-store-signed.msix, without --clobber, and skips if
@@ -26,7 +26,7 @@ name: store-msix-to-release
 # it first, which would leave the release without its checksum file if the
 # re-upload failed. The SHA-256 of the MSIX is in the run summary instead.
 #
-# Pull requests that touch this file run fetch and verify against the current
+# Pull requests that touch these files run fetch and verify against the live
 # Store package (read-only; upload never runs on pull_request).
 
 on:
@@ -39,6 +39,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/store-msix-to-release.yml
+      - .github/scripts/store-msix-fetch.mjs
 
 permissions:
   contents: read
@@ -52,16 +53,15 @@ env:
   EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
   EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
   EXPECTED_ARCH: x64
+  STORE_PFN: jerisHQ.JerisLink_1cbzj2979sfxw
   # SHA-1 of personal/windows-client/msix/JerisLink-sideload-test.cer
   TEST_CERT_THUMBPRINT: 5E6E211F60E17FFD44F7772BE0E8C11E40DD6661
-  UPSTREAM_REPO: JasonWei512/Upload-Microsoft-Store-MSIX-Package-to-GitHub-Release
-  UPSTREAM_SHA: 80b980b3065f16557b6c450e9efe2144344b589f # v1.0.2, 2024-03-13
+  # SHA-1 of Microsoft Root Certificate Authority 2011 (Store signing root)
+  MS_ROOT_2011_THUMBPRINT: 8F43288AD272F3103B6FB1428485EA3014C0BCFE
 
 jobs:
-  # Swap point: `fetch` is the only job that talks to the Store. Its contract is
-  # the outputs below plus one artifact named `store-msix` holding `store.msix`.
-  # To use a fork, change UPSTREAM_REPO / UPSTREAM_SHA; to use our own script,
-  # replace the three upstream steps. verify and upload do not change.
+  # fetch is the only job that talks to the Store. Its contract is the outputs
+  # below plus one artifact named `store-msix` holding `store.msix`.
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -70,6 +70,7 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
       asset: ${{ steps.tag.outputs.asset }}
       skip: ${{ steps.tag.outputs.skip }}
+      sha256: ${{ steps.dl.outputs.sha256 }}
     steps:
       - name: Resolve the tag and check the release
         id: tag
@@ -100,43 +101,21 @@ jobs:
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
           echo "tag=$tag expected=$ver.0 asset=$asset skip=$skip"
 
-      - name: Check out the upstream tool at the pinned commit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: steps.tag.outputs.skip != 'true'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_SHA }}
-          path: upstream
           persist-credentials: false
+          sparse-checkout: .github/scripts
 
-      - name: Build the tool
+      - name: Download from the Store and check against DCAT
+        id: dl
         if: steps.tag.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          head=$(git -C upstream rev-parse HEAD)
-          [ "$head" = "$UPSTREAM_SHA" ] || { echo "::error::upstream HEAD $head is not $UPSTREAM_SHA"; exit 1; }
-          docker build -q -t store-msix-fetch upstream
-
-      - name: Download the newest Store package (dry run, no GitHub writes)
-        if: steps.tag.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          dl="$RUNNER_TEMP/dl"; mkdir -p "$dl"
-          docker run --rm -e GITHUB_REPOSITORY -v "$dl:/tmp" store-msix-fetch \
-            --store-id "$STORE_PRODUCT_ID" --token "$GH_TOKEN" --dry-run | tee "$RUNNER_TEMP/tool.log"
-          # The tool also starts and cancels a download to learn the file name, so
-          # take only the file it reports as finished.
-          p=$(sed -n 's/^File downloaded to: //p' "$RUNNER_TEMP/tool.log" | tr -d '\r')
-          [ "$(printf '%s\n' "$p" | grep -c .)" = 1 ] || { echo "::error::expected one downloaded file, tool reported: '$p'"; exit 1; }
-          case "$p" in /tmp/*) ;; *) echo "::error::download outside /tmp: $p"; exit 1;; esac
-          f="$dl/${p#/tmp/}"
-          case "${f,,}" in *.msix) ;; *) echo "::error::not an .msix: $p"; exit 1;; esac
-          [ -s "$f" ] || { echo "::error::$f missing or empty"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/out"
-          sudo cp "$f" "$RUNNER_TEMP/out/store.msix"
-          sudo chown "$(id -u)" "$RUNNER_TEMP/out/store.msix"
+          node --version
+          node .github/scripts/store-msix-fetch.mjs "$STORE_PRODUCT_ID" "$STORE_PFN" "$RUNNER_TEMP/out" > "$RUNNER_TEMP/fetch.out"
+          cat "$RUNNER_TEMP/fetch.out"
+          grep -E '^(version|sha256|size|full_name)=' "$RUNNER_TEMP/fetch.out" >> "$GITHUB_OUTPUT"
           sha256sum "$RUNNER_TEMP/out/store.msix"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -168,11 +147,13 @@ jobs:
         id: check
         env:
           EXPECTED_VERSION: ${{ needs.fetch.outputs.version }}
+          FETCH_SHA256: ${{ needs.fetch.outputs.sha256 }}
           TAG: ${{ needs.fetch.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
           $f = Join-Path $env:RUNNER_TEMP 'in\store.msix'
           $sha = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:FETCH_SHA256) { throw "artifact SHA-256 $sha is not the DCAT-checked $($env:FETCH_SHA256)" }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [IO.Compression.ZipFile]::OpenRead($f)
@@ -197,13 +178,13 @@ jobs:
           if ($cert.Thumbprint -eq $env:TEST_CERT_THUMBPRINT) { throw "signed with the sideload test certificate" }
           if ($cert.Subject -eq $cert.Issuer) { throw "signer certificate is self-signed" }
           if ($cert.Subject -cne $env:EXPECTED_PUBLISHER) { throw "signer subject is not the package publisher" }
-          if ($cert.Issuer -notmatch '^CN=Microsoft Marketplace CA G \d+,') { throw "signer issuer is not a Microsoft Marketplace CA" }
+          if ($cert.Issuer -notmatch '^CN=Microsoft Marketplace CA G \d+, OU=AOC, O=Microsoft Corporation,') { throw "signer issuer is not a Microsoft Marketplace CA" }
           $chain = New-Object Security.Cryptography.X509Certificates.X509Chain
           $chain.ChainPolicy.RevocationMode = 'NoCheck'
           if (-not $chain.Build($cert)) { throw "chain does not build: $(($chain.ChainStatus | ForEach-Object Status) -join ', ')" }
           $chain.ChainElements | ForEach-Object { Write-Host "  chain: $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)" }
           $root = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
-          if ($root.Subject -notmatch '^CN=Microsoft Root Certificate Authority 20(10|11), O=Microsoft Corporation,') { throw "chain root is not a Microsoft root: $($root.Subject)" }
+          if ($root.Thumbprint -ne $env:MS_ROOT_2011_THUMBPRINT) { throw "chain root is not Microsoft Root Certificate Authority 2011: $($root.Subject) $($root.Thumbprint)" }
 
           $ready = ($id.Version -eq $env:EXPECTED_VERSION)
           "ready=$($ready.ToString().ToLower())" >> $env:GITHUB_OUTPUT
