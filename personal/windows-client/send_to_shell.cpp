@@ -6,7 +6,8 @@
 // the Store build declares an IExplorerCommand instead
 // (msix/AppxManifest.xml.in: desktop4:FileExplorerContextMenus for files and
 // folders, com:SurrogateServer for this DLL). Windows 11 shows it in the first
-// level of the right-click menu, Windows 10 1809+ in the classic menu.
+// level of the right-click menu. Windows 10 1809+ meets the manifest
+// requirements for the classic menu, but that has not been verified on Windows 10.
 //
 // Explorer loads the DLL out of process, in dllhost.exe with the package's
 // identity. Invoke() does no transfer work itself: it collects the selected
@@ -194,8 +195,11 @@ public:
             }
             const Handle process(pi.hProcess), thread(pi.hThread);
             AllowSetForegroundWindow(pi.dwProcessId);
-            ResumeThread(pi.hThread);
-            return S_OK;
+            // A run that cannot be resumed is ended, not left suspended.
+            const unsigned long err = jl::sendto::resumeOrTerminate(
+                [&] { return ResumeThread(pi.hThread) != static_cast<DWORD>(-1); },
+                [&] { TerminateProcess(pi.hProcess, 1); }, [] { return static_cast<unsigned long>(GetLastError()); });
+            return err == 0 ? S_OK : HRESULT_FROM_WIN32(err);
         });
     }
     IFACEMETHODIMP GetFlags(EXPCMDFLAGS* flags) override {

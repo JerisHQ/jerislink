@@ -91,11 +91,12 @@ inline std::vector<CardRow> sendToRows(SendToSetup setup, bool macPush = false) 
         break;
     case SendToSetup::StoreMenu:
         rows.push_back({pcToMac(),
-                        "Right-click files \xE2\x80\xBA Send to JerisLink. They go to Downloads/JerisLink on the Mac.",
+                        "Right-click files \xE2\x80\xBA Send to JerisLink, or drag them onto this window. "
+                        "They go to Downloads/JerisLink on the Mac.",
                         false});
         break;
     case SendToSetup::StorePackage:
-        rows.push_back({pcToMac(), "Needs Windows 10 version 1809 or later. Drag files onto this window instead.", true});
+        rows.push_back({pcToMac(), "No Explorer menu entry on this Windows version. Drag files onto this window instead.", true});
         break;
     default:
         rows.push_back({pcToMac(), "Not set up on this PC. Install JerisLink with its installer to add it.", true});

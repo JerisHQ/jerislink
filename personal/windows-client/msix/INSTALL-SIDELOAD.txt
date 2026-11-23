@@ -43,9 +43,11 @@ Notes
   - The package adds a Windows Firewall rule for inbound UDP 38402 (video).
   - The normal installer version can stay installed side by side.
   - Right-click files or folders in Explorer and pick "Send to JerisLink"
-    to send them to Downloads/JerisLink on the Mac (Windows 10 version 1809
-    or later). The Windows 10 menu has been tested only against Microsoft's
-    documentation, not on a real Windows 10 machine (Windows 11 only).
+    to send them to Downloads/JerisLink on the Mac (tested on Windows 11).
+    Windows 10 version 1809 or later meets Microsoft's manifest
+    requirements for this command, but the Explorer menu has not been
+    verified on Windows 10. If the entry does not appear, drag files onto
+    the viewer window instead.
     If the normal installer version is installed too, its Send to >
     JerisLink entry still works as before, and each entry sends to its
     own viewer when both are open.

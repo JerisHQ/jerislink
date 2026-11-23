@@ -178,9 +178,28 @@ void wire() {
 
 }  // namespace
 
+void resumes() {
+    std::vector<std::string> calls;
+    unsigned long last = 5;  // ERROR_ACCESS_DENIED
+    auto run = [&](bool ok) {
+        calls.clear();
+        return resumeOrTerminate([&] { calls.push_back("resume"); return ok; },
+                                 [&] { calls.push_back("terminate"); last = 0; },
+                                 [&] { calls.push_back("error"); return last; });
+    };
+    expect(run(true) == 0 && calls == std::vector<std::string>{"resume"}, "resume: resumed run is left running");
+    expect(run(false) == 5, "resume: failure returns resume's error");
+    expect(calls == std::vector<std::string>{"resume", "error", "terminate"},
+           "resume: error read before the run is terminated");
+    last = 0;
+    expect(run(false) == kResumeFailedUnknown && calls.back() == "terminate",
+           "resume: failure with no error code still fails and terminates");
+}
+
 int main() {
     arguments();
     commandLines();
+    resumes();
     paths();
     decisions();
     texts();

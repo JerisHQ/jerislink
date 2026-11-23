@@ -93,6 +93,20 @@ inline std::wstring quoteArg(const std::wstring& s) {
 // "too many" dialog rather than a silently cut list.
 inline std::wstring tooManyCommandLine(const std::wstring& exe) { return quoteArg(exe) + L" " + kTooManyFlag; }
 
+// The Store build's Explorer command (send_to_shell.cpp) starts the run
+// suspended, then resumes it. If resuming fails, the run would stay suspended
+// forever: end it instead. Returns 0 when the run was resumed, otherwise the
+// error resume() left (read before terminate() can change it; never 0).
+inline constexpr unsigned long kResumeFailedUnknown = 31;  // ERROR_GEN_FAILURE
+template <class Resume, class Terminate, class LastError>
+unsigned long resumeOrTerminate(Resume resume, Terminate terminate, LastError lastError) {
+    if (resume()) return 0;
+    unsigned long err = lastError();
+    if (err == 0) err = kResumeFailedUnknown;
+    terminate();
+    return err;
+}
+
 inline std::wstring commandLine(const std::wstring& exe, const std::vector<std::wstring>& items) {
     if (items.size() > kMaxItems) return tooManyCommandLine(exe);
     std::wstring line = quoteArg(exe) + L" " + kFlag;
