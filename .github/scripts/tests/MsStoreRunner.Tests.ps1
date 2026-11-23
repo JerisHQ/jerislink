@@ -52,6 +52,10 @@ BeforeAll {
   # (CallSeconds, UploadSeconds; a hung one, status -1, never ends) throws what
   # the real Invoke-StoreHttp throws when its time limit is reached; with
   # $global:FakeClock set, the call moves that clock on by the time it took.
+  # An answer the fake drips (DripOn Token, Create, Commit or Upload) comes
+  # back with its status and its body lost, with the BodyLost text the real
+  # Invoke-StoreHttp returns (time limit reached, or with DripEnd Break the
+  # connection broke).
   function script:Use-FakeStore([hashtable]$Store) {
     $global:FakeStore = $Store
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp {
@@ -75,6 +79,10 @@ BeforeAll {
         $sock = [System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::ConnectionReset)
         $io = [System.IO.IOException]::new("Unable to read data from the transport connection ($Uri)", $sock)
         throw [System.Net.Http.HttpRequestException]::new("An error occurred while sending the request to $Uri", $io)
+      }
+      if ($r.DripSeconds -gt 0) {
+        $lost = & (Get-Module MsStoreRunner) { param($w, $brk) if ($brk) { $script:BodyLostText.Broken } else { $script:BodyLostText.TimeLimit -f $w } } $wait ($global:FakeStore.DripEnd -eq 'Break')
+        return [pscustomobject]@{ StatusCode = $r.StatusCode; Body = ''; BodyLost = $lost }
       }
       [pscustomobject]@{ StatusCode = $r.StatusCode; Body = $r.Body }
     }
@@ -412,6 +420,26 @@ Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
 # code or the status (Get-StoreErrorText -Detail). The API's message is never
 # printed: masking it could be bypassed (Pepper, PR #74 r1). The token
 # endpoint and the blob upload keep the fixed text above.
+# PR #74 r5: the body of an answer is decoded from its bytes, so a charset
+# .NET does not know no longer loses a body that came in (HttpContent's
+# ReadAsStringAsync throws for it; Invoke-WebRequest read it as UTF-8).
+Describe 'ConvertFrom-StoreBodyBytes (an answer body never lost to its charset)' {
+  It 'decodes <Case>' -ForEach @(
+    @{ Case = 'UTF-8 without a charset'; Bytes = [byte[]](0x7B,0x22,0x61,0x22,0x3A,0x22,0xC3,0xA9,0x22,0x7D); CharSet = ''; Want = "{`"a`":`"$([char]0xE9)`"}" }
+    @{ Case = 'UTF-8 with charset utf-8'; Bytes = [byte[]](0x7B,0x22,0x61,0x22,0x3A,0x22,0xC3,0xA9,0x22,0x7D); CharSet = 'utf-8'; Want = "{`"a`":`"$([char]0xE9)`"}" }
+    @{ Case = 'UTF-8 with a quoted charset'; Bytes = [byte[]](0x7B,0x22,0x61,0x22,0x3A,0x22,0xC3,0xA9,0x22,0x7D); CharSet = '"utf-8"'; Want = "{`"a`":`"$([char]0xE9)`"}" }
+    @{ Case = 'ISO-8859-1 by its charset'; Bytes = [byte[]](0x7B,0x22,0x61,0x22,0x3A,0x22,0xE9,0x22,0x7D); CharSet = 'iso-8859-1'; Want = "{`"a`":`"$([char]0xE9)`"}" }
+    @{ Case = 'an unknown charset as UTF-8'; Bytes = [byte[]](0x7B,0x22,0x61,0x22,0x3A,0x22,0xC3,0xA9,0x22,0x7D); CharSet = 'x-bogus-zz'; Want = "{`"a`":`"$([char]0xE9)`"}" }
+    @{ Case = 'a UTF-8 byte order mark (dropped)'; Bytes = [byte[]](0xEF,0xBB,0xBF,0x7B,0x7D); CharSet = ''; Want = '{}' }
+    @{ Case = 'UTF-16 by its byte order mark'; Bytes = [byte[]](0xFF,0xFE,0x7B,0x00,0x7D,0x00); CharSet = ''; Want = '{}' }
+    @{ Case = 'invalid UTF-8 as U+FFFD'; Bytes = [byte[]](0x7B,0xC3,0x7D); CharSet = 'utf-8'; Want = "{$([char]0xFFFD)}" }
+    @{ Case = 'no bytes'; Bytes = [byte[]]@(); CharSet = 'utf-8'; Want = '' }
+  ) {
+    # Not exported: called inside the module.
+    InModuleScope MsStoreRunner -Parameters @{ B = $Bytes; C = $CharSet } { param($B, $C) ConvertFrom-StoreBodyBytes $B $C } | Should -BeExactly $Want
+  }
+}
+
 Describe 'Get-StoreErrorText -Detail (listed target and local hint, never the API message)' {
   It 'prints the code, the listed target and the hint, and nothing of a message full of planted secrets, advice and commands' {
     $s = New-FakeStore; Use-FakeStore $s
@@ -1040,6 +1068,113 @@ Describe 'No answer to create or commit (fake Store)' {
 # down the "refused" path. Now the index is ASCII digits only, the formatters
 # never throw (fixed text instead), and Invoke-StoreApi decides OutcomeUnknown
 # before it formats anything.
+Describe 'An answer whose body is lost is classified by its status (PR #74 r4, fake Store)' {
+  # Pepper, PR #74 r4: the create POST got its HTTP 400 status and headers,
+  # then the body did not arrive in time; the status was dropped and the
+  # create counted as unanswered (result unconfirmed). Invoke-StoreHttp now
+  # returns the status with a fixed BodyLost text, and the status decides.
+  BeforeAll {
+    $script:LostLimit = 'body not received (time limit of {0} s for the whole request reached)'
+    $script:LostBroken = 'body not received (the connection broke or the body could not be read)'
+    function script:Get-StatusHint([int]$Code) { & (Get-Module MsStoreRunner) { param($c) $script:StoreStatusHint[$c] } $Code }
+  }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It 'create answered HTTP <Status>, body lost (<End>): refused by its status, status and fixed text printed first, read back, no retry or delete advice' -ForEach @(
+    @{ Status = 400; End = 'Body' }, @{ Status = 409; End = 'Break' }, @{ Status = 403; End = 'Body' }
+  ) {
+    $s = New-FakeStore -CreateErrorStatus $Status -DripOn Create -DripSeconds 30 -DripEnd $End; Use-FakeStore $s
+    $s.CreateErrorBody = New-PlantedErrorBody $s.Token
+    $r = Invoke-Publish $Pkg
+    $lost = if ($End -eq 'Break') { $LostBroken } else { $LostLimit -f 600 }
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP ${Status}; hint: $(Get-StatusHint $Status); $lost. No submission was created and none was deleted."
+    $r.Out | Should -Match ('(?m)^' + [regex]::Escape("create refused: $refused") + '$')
+    $r.Err | Should -Match ('^' + [regex]::Escape("$refused ") + '.*' + [regex]::Escape('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.') + '$')
+    $r.All | Should -Not -Match "Result unconfirmed|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($s.Token))|$Injected|$PlantedWords"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+    $s.Sub | Should -BeNullOrEmpty
+  }
+  # Carried out: the read-back finds a pending submission of unconfirmed
+  # origin, no advice. Not carried out: the read-back confirms none was
+  # created, and that answer (as before) says the workflow can be re-run.
+  It 'create answered HTTP <Status> (<When> it was carried out), body lost: result unconfirmed by its status, the app read back, no delete advice' -ForEach @(
+    @{ Status = 503; When = 'After'; Shows = "a pending submission 1152921505000000099 exists, origin unconfirmed" }
+    @{ Status = 500; When = 'Before'; Shows = 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up' }
+    @{ Status = 408; When = 'Before'; Shows = 'no pending submission, so none had been created when the app was read back, and there is nothing to clean up' }
+  ) {
+    $s = New-FakeStore -LoseResponse Create -LoseWhen $When -LoseAsStatus $Status -LoseBody '{"code":"ServiceError"}' -DripOn Create -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP ${Status}; hint: $(Get-StatusHint $Status); $($LostLimit -f 600). Result unconfirmed: the create request got no answer"))
+    $r.Err | Should -Match ([regex]::Escape($Shows))
+    $r.All | Should -Not -Match "create refused|No submission was created|$DeleteAdvice|$Leak"
+    if ($When -eq 'After') { $r.All | Should -Not -Match $RetryAdvice }
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+  It 'create answered HTTP 201, body lost: the new id is unknown, so the result is unconfirmed and the app is read back' {
+    $s = New-FakeStore -DripOn Create -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 201; $($LostLimit -f 600). Result unconfirmed: the create request got no answer"))
+    $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
+    $r.All | Should -Not -Match "create refused|has no submission id|$DeleteAdvice|$RetryAdvice|$Leak"
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base")
+  }
+  It 'commit answered HTTP <Status> (carried out), body lost: unconfirmed by its status, read back by id, committed, goes on' -ForEach @(
+    @{ Status = 503; Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'After'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceError"}' } }
+    @{ Status = 200; Opt = @{} }
+  ) {
+    $o = $Opt.Clone(); $s = New-FakeStore @o -DripOn Commit -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value | Should -Be @($NewId)
+    $why = if ($Status -eq 200) { 'HTTP 200' } else { "HTTP ${Status}; hint: $(Get-StatusHint $Status)" }
+    $r.Out | Should -Match ([regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: $why; $($LostLimit -f 60)"))
+    $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
+    $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|$Leak"
+    @($s.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+  }
+  It 'commit answered HTTP <Status> (not carried out), body lost: unconfirmed after 3 read-backs by id, no retry or delete advice' -ForEach @(@{ Status = 503 }, @{ Status = 504 }) {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus $Status -LoseBody '{"code":"ServiceError"}' -DripOn Commit -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Out | Should -Match ('::warning title=Store commit::Result unconfirmed: the commit request for submission ' + $NewId + ' got no answer ' +
+      [regex]::Escape("(Store API POST $Base/submissions/$NewId/commit failed: HTTP ${Status}; hint: $(Get-StatusHint $Status); $($LostLimit -f 60))"))
+    $r.Err | Should -Match "Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\."
+    $r.Err | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|$Leak"
+    @($s.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+  }
+  It 'commit answered HTTP 409, body lost: refused by its status (not accepted), not read back as unconfirmed' {
+    $s = New-FakeStore -LoseResponse Commit -LoseWhen Before -LoseAsStatus 409 -LoseBody '{"code":"InvalidState"}' -DripOn Commit -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: HTTP 409; hint: $(Get-StatusHint 409); $($LostLimit -f 60). Commit of submission $NewId was not accepted."))
+    $r.All | Should -Not -Match "Result unconfirmed|$Leak"
+    @($s.Log)[-1] | Should -Be "POST $Base/submissions/$NewId/commit"
+  }
+  It 'token answered HTTP 200, body lost: not signed in, the status and the fixed text are printed' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $s.DripOn = 'Token'; $s.DripSeconds = 30
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret }
+    $r.Err | Should -BeExactly "could not get a Partner Center access token: HTTP 200; $($LostLimit -f 600)"
+    (& (Get-Module MsStoreRunner) { $script:Token }) | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'package upload answered HTTP 201, body lost: the blob is stored, so the upload counts and the run goes on' {
+    $s = New-FakeStore -UploadBody '<x/>' -DripOn Upload -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    $r.Value | Should -Be @($NewId)
+    $r.Out | Should -Match ([regex]::Escape("package uploaded: $File in Upload.zip (") + '\d+' + [regex]::Escape(" bytes), HTTP 201 (the answer's body was not read: $($LostLimit -f 600))"))
+    $r.All | Should -Not -Match $Leak
+  }
+  It 'package upload answered HTTP 403, body lost: the upload failed with its status and the fixed text, not committed' {
+    $s = New-FakeStore -UploadStatus 403 -UploadBody '<Error><Code>AuthenticationFailed</Code></Error>' -DripOn Upload -DripSeconds 30; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("package upload failed: HTTP 403; $($LostLimit -f 600). Not committed: draft $NewId stays uncommitted"))
+    @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+    $r.All | Should -Not -Match $Leak
+  }
+}
+
 Describe 'Diagnostics that cannot be formatted never change how an error is classified (PR #74 r2)' {
   BeforeAll {
     $script:UnlistedServiceError = 'target: \[unlisted target\]; hint: the service reported an internal error'
@@ -1688,24 +1823,30 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   # PR #74 r3 (Pepper): Invoke-WebRequest -TimeoutSec bounds only the wait for
   # the headers (PowerShell 7.4+); a server that answers in time and then
   # drips its body held a GET with a 2 s limit for about 4.85 s. The limit now
-  # covers the whole call.
-  It 'total time limit: a GET whose answer drips its body for 15 s gives up at its 2 s limit' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15 } }) {
+  # covers the whole call. PR #74 r4: the status that came in is kept and the
+  # body is marked lost with a fixed text (the caller classifies by status).
+  It 'total time limit: a GET whose answer drips its body for 15 s gives up at its 2 s limit, keeping the status' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15 } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 2 }
     $sw.Stop()
     Write-Host "    GET with a 2 s limit and a 15 s body returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
-    $r.Err | Should -BeExactly 'no response (time limit of 2 s for the whole request reached)'
+    $r.Err | Should -BeExactly ''
+    $r.Value[0].StatusCode | Should -Be 200
+    $r.Value[0].Body | Should -BeExactly ''
+    $r.Value[0].BodyLost | Should -BeExactly 'body not received (time limit of 2 s for the whole request reached)'
     $sw.Elapsed.TotalSeconds | Should -BeLessThan 5
     @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base")
   }
-  It 'total time limit: one limit for headers and body together (headers after 3 s, then a 15 s body, 4 s limit: gives up at 4 s, not 3 + 4)' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15; DripHeadSeconds = 3 } }) {
+  It 'total time limit: one limit for headers and body together (headers after 3 s, then a 15 s body, 4 s limit: gives up at 4 s, not 3 + 4, keeping the status)' -ForEach @(@{ Opt = @{ DripOn = 'AppRead'; DripSeconds = 15; DripHeadSeconds = 3 } }) {
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-Captured { Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 4 }
     $sw.Stop()
     Write-Host "    GET with a 4 s limit, headers after 3 s and a 15 s body returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
-    $r.Err | Should -BeExactly 'no response (time limit of 4 s for the whole request reached)'
+    $r.Err | Should -BeExactly ''
+    $r.Value[0].StatusCode | Should -Be 200
+    $r.Value[0].BodyLost | Should -BeExactly 'body not received (time limit of 4 s for the whole request reached)'
     $sw.Elapsed.TotalSeconds | Should -BeGreaterThan 3.5
     $sw.Elapsed.TotalSeconds | Should -BeLessThan 6
   }
@@ -1728,7 +1869,7 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: $PlantedText. No submission was created and none was deleted."
     @($r.Out -split "`n")[0] | Should -BeExactly "create refused: $refused"
     $r.Err | Should -Match ('^' + [regex]::Escape("$refused ") + '.*' + [regex]::Escape(
-        "Read-back of the app after the refused create (one GET; nothing changed or deleted): failed (Store API GET $Base failed: no response (time limit of 2 s for the whole request reached)).") + '$')
+        "Read-back of the app after the refused create (one GET; nothing changed or deleted): failed (Store API GET $Base failed: HTTP 200; body not received (time limit of 2 s for the whole request reached)).") + '$')
     $sw.Elapsed.TotalSeconds | Should -BeLessThan 6
     $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
     @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "POST $Base/submissions", "GET $Base")
@@ -1762,6 +1903,167 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $Srv.BlobHeaders['Content-Type'] | Should -BeExactly 'application/zip'
     $Srv.BlobHeaders['User-Agent'] | Should -BeExactly 'JerisLink-msstore-publish/1.0'
     @(Get-FakeUploadedZip $Srv)[0].Name | Should -BeExactly $File
+  }
+  # PR #74 r5: what differs from Invoke-WebRequest on the wire is checked in
+  # the PR. These pin the parts that matter: a create or commit POST has no
+  # body and no Content-Type (as the msstore CLI sends them; Invoke-WebRequest
+  # added application/x-www-form-urlencoded), every request asks for gzip,
+  # deflate or br as Invoke-WebRequest did, and an answer with an unknown
+  # charset is read as UTF-8 (as Invoke-WebRequest read it), not lost.
+  It 'create and commit POSTs carry no body and no Content-Type; every request asks for gzip, deflate, br' {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+    $r.Err | Should -BeNullOrEmpty
+    $posts = @($Srv.Seen | Where-Object { $_.Line -cmatch '^POST .*/submissions(/\d+/commit)?$' })
+    @($posts | ForEach-Object { $_.Line }) | Should -Be @("POST $Base/submissions", "POST $Base/submissions/$($Srv.NewId)/commit")
+    foreach ($p in $posts) {
+      $p.Headers['Content-Length'] | Should -BeExactly '0'
+      $p.Headers['Content-Type'] | Should -BeNullOrEmpty
+    }
+    @($Srv.Seen).Count | Should -BeGreaterThan 5
+    foreach ($s in $Srv.Seen) { $s.Headers['Accept-Encoding'] | Should -BeExactly 'gzip, deflate, br' }
+  }
+  It 'an answer with the charset <CharSet> is read (<Why>), its body not lost' -ForEach @(
+    @{ CharSet = 'x-bogus-zz'; Why = 'unknown: as UTF-8, as Invoke-WebRequest read it'; Opt = @{ AnswerContentType = 'application/json; charset=x-bogus-zz' } }
+    @{ CharSet = 'utf-8'; Why = 'as UTF-8'; Opt = @{ AnswerContentType = 'application/json; charset=utf-8' } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = "Bearer $($Srv.Token)" } -TimeoutSec 20
+    $r.StatusCode | Should -Be 200
+    $r.BodyLost | Should -BeExactly ''
+    ($r.Body | ConvertFrom-Json).id | Should -BeExactly $App
+    $r = Invoke-Captured { Assert-NoPendingSubmission -ProductId $App }
+    $r.Err | Should -BeNullOrEmpty
+  }
+  # Pepper, PR #74 r4, over HTTP: the answer's status and headers arrive, then
+  # its body drips past the call's time limit (or the connection breaks). The
+  # status decides: 400 refused, 5xx unconfirmed; a 2xx is unconfirmed too.
+  It 'create answered HTTP 400, body dripping past its 2 s limit: refused by its status, printed first, read back, no retry or delete advice, nothing secret' -ForEach @(
+    @{ Opt = @{ CreateErrorStatus = 400; DripOn = 'Create'; DripSeconds = 15 } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $Srv.CreateErrorBody = New-PlantedErrorBody $Srv.Token
+    Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App }
+    $sw.Stop()
+    Write-Host "    create 400 with a dripping body (2 s limit, 15 s body) returned after $([Math]::Round($sw.Elapsed.TotalSeconds, 2)) s"
+    $refused = "Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 400; hint: the request is invalid; " +
+      'body not received (time limit of 2 s for the whole request reached). No submission was created and none was deleted.'
+    @($r.Out -split "`n")[0] | Should -BeExactly "create refused: $refused"
+    $r.Err | Should -Match ('^' + [regex]::Escape("$refused ") + '.*' + [regex]::Escape('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.') + '$')
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 6
+    $r.All | Should -Not -Match "Result unconfirmed|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))|$Injected|$PlantedWords|eyJ|AbCdEfGh|sv=2020|##\["
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "POST $Base/submissions", "GET $Base")
+  }
+  It 'create answered HTTP 400, connection broken while the body is read: refused by its status, the fixed text says the connection broke' -ForEach @(
+    @{ Opt = @{ CreateErrorStatus = 400; DripOn = 'Create'; DripSeconds = 1; DripEnd = 'Break' } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $Srv.CreateErrorBody = New-PlantedErrorBody $Srv.Token
+    Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 20) }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App }
+    $sw.Stop()
+    @($r.Out -split "`n")[0] | Should -BeExactly ("create refused: Store API POST $Base/submissions?isMinimalResponse=true failed: HTTP 400; hint: the request is invalid; " +
+      'body not received (the connection broke or the body could not be read). No submission was created and none was deleted.')
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
+    $Srv.Dripped | Should -BeExactly 'connection broken'
+    $r.All | Should -Not -Match "Result unconfirmed|$DeleteAdvice|$RetryAdvice|$Leak|$Injected|$PlantedWords"
+  }
+  It 'create answered HTTP <Status>, body dripping past its 2 s limit: result unconfirmed by its status, the app read back, no retry or delete advice' -ForEach @(
+    @{ Status = 503; Why = 'HTTP 503; hint: the service reported that it is unavailable'; Opt = @{ LoseResponse = 'Create'; LoseWhen = 'After'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceUnavailable"}'; DripOn = 'Create'; DripSeconds = 15 } }
+    @{ Status = 201; Why = 'HTTP 201'; Opt = @{ DripOn = 'Create'; DripSeconds = 15 } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    Mock -ModuleName MsStoreRunner Get-CallTimeout { [Math]::Min($Requested, 2) }
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App }
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: $Why; body not received (time limit of 2 s for the whole request reached). " +
+      'Result unconfirmed: the create request got no answer'))
+    $r.Err | Should -Match "a pending submission $NewId exists, origin unconfirmed"
+    $r.All | Should -Not -Match "create refused|No submission was created|$DeleteAdvice|$RetryAdvice|$Leak|$([regex]::Escape($Url))"
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "POST $Base/submissions", "GET $Base")
+  }
+  It 'commit answered HTTP <Status> (<Case>), body dripping past its 2 s limit: unconfirmed by its status, read back by id' -ForEach @(
+    @{ Status = 503; Case = 'carried out'; Done = $true; Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'After'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceUnavailable"}'; DripOn = 'Commit'; DripSeconds = 15 } }
+    @{ Status = 503; Case = 'not carried out'; Done = $false; Opt = @{ LoseResponse = 'Commit'; LoseWhen = 'Before'; LoseAsStatus = 503; LoseBody = '{"code":"ServiceUnavailable"}'; DripOn = 'Commit'; DripSeconds = 15 } }
+    @{ Status = 200; Case = 'carried out'; Done = $true; Opt = @{ DripOn = 'Commit'; DripSeconds = 15 } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitTimeoutSeconds 2 -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $why = if ($Status -eq 200) { 'HTTP 200' } else { 'HTTP 503; hint: the service reported that it is unavailable' }
+    $r.Out | Should -Match ([regex]::Escape("Store API POST $Base/submissions/$NewId/commit failed: $why; body not received (time limit of 2 s for the whole request reached)"))
+    if ($Done) {
+      $r.Err | Should -BeNullOrEmpty
+      $r.Value | Should -Be @($NewId)
+      $r.Out | Should -Match "::warning title=Store commit::The commit request for submission $NewId got no answer, but read-back 1 by id shows status Certification: it was committed"
+      @($Srv.Log)[-2..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId")
+    } else {
+      $r.Out | Should -Match "::warning title=Store commit::Result unconfirmed: the commit request for submission $NewId got no answer"
+      $r.Err | Should -Match 'Read back by id 3 time\(s\), 0 s apart; last: read-back 3 of 3 shows status PendingCommit\.'
+      $r.Err | Should -Not -Match $RetryAdvice
+      @($Srv.Log)[-4..-1] | Should -Be @("POST $Base/submissions/$NewId/commit", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
+    }
+    $r.All | Should -Not -Match "$DeleteAdvice|was not accepted|$Leak|$([regex]::Escape($Url))"
+  }
+  # Pepper, PR #74 r4: the header values Invoke-WebRequest checked (through
+  # HttpHeaders.Add) are checked again, and more strictly, before anything is
+  # sent. The error names the header, never its value.
+  It 'refuses an Authorization value with <Case> before sending; the error does not print the value' -ForEach @(
+    @{ Case = 'CR LF and a second header'; V = "Bearer Zq7abc`r`nX-Zq7: 1" }, @{ Case = 'LF'; V = "Bearer Zq7abc`nX-Zq7: 1" }, @{ Case = 'CR'; V = "Bearer Zq7abc`rX-Zq7: 1" }
+    @{ Case = 'NUL'; V = "Bearer Zq7abc$([char]0)Zq7" }, @{ Case = 'SOH'; V = "Bearer Zq7abc$([char]1)Zq7" }, @{ Case = 'TAB'; V = "Bearer Zq7abc`tZq7" }
+    @{ Case = 'DEL'; V = "Bearer Zq7abc$([char]0x7F)Zq7" }, @{ Case = 'NEL'; V = "Bearer Zq7abc$([char]0x85)Zq7" }, @{ Case = 'a non-ASCII letter'; V = "Bearer Zq7abc$([char]0xE9)Zq7" }
+    @{ Case = 'nothing (empty)'; V = '' }, @{ Case = 'only spaces'; V = '   ' }, @{ Case = 'a leading space'; V = ' Bearer Zq7abc' }, @{ Case = 'a trailing space'; V = 'Bearer Zq7abc ' }
+    @{ Case = 'a comma (HttpHeaders.Add refuses it)'; V = 'Bearer Zq7abc,Zq7' }, @{ Case = 'an unclosed quote (HttpHeaders.Add refuses it)'; V = 'Bearer "Zq7abc' }
+  ) {
+    InModuleScope MsStoreRunner { $script:LoopbackTestServer = $true }
+    $caught = $null
+    try { $null = Invoke-StoreHttp -Method GET -Uri "$Url$Base" -Kind Api -Headers @{ Authorization = $V } -TimeoutSec 5 } catch { $caught = $_ }
+    "$caught" | Should -BeExactly 'refused: request header Authorization has an invalid value (not printed); nothing was sent'
+    $caught.Exception.Data['StoreNotSent'] | Should -BeTrue
+    @($Srv.Log).Count | Should -Be 0
+  }
+  It 'refuses <Case> before sending' -ForEach @(
+    @{ Case = 'an x-ms-blob-type value with CR LF'; Kind = 'Upload'; Path = '/blob/upload.zip'; H = @{ 'x-ms-blob-type' = "BlockBlob`r`nX-Zq7: 1" }; Text = 'refused: request header x-ms-blob-type has an invalid value (not printed); nothing was sent' }
+    @{ Case = 'a Date value HttpHeaders.Add does not parse'; Kind = 'Api'; Path = ''; H = @{ Date = 'not a date' }; Text = 'refused: request header Date has an invalid value (not printed); nothing was sent' }
+    @{ Case = 'a header name with a space'; Kind = 'Api'; Path = ''; H = @{ 'X Zq7' = 'v' }; Text = 'refused: a request header name is not valid; nothing was sent' }
+  ) {
+    InModuleScope MsStoreRunner { $script:LoopbackTestServer = $true }
+    $caught = $null
+    $u = if ($Path) { "$Url$Path" } else { "$Url$Base" }
+    try { $null = Invoke-StoreHttp -Method PUT -Uri $u -Kind $Kind -Headers $H -Body 'x' -TimeoutSec 5 } catch { $caught = $_ }
+    "$caught" | Should -BeExactly $Text
+    $caught.Exception.Data['StoreNotSent'] | Should -BeTrue
+    @($Srv.Log).Count | Should -Be 0
+  }
+  It 'refuses an access_token with <Case> from the token endpoint: not signed in, the token is not printed, no API call' -ForEach @(
+    @{ Case = 'CR LF'; T = "Zq7abc`r`nX-Zq7: 1" }, @{ Case = 'a space'; T = 'Zq7abc Zq7' }, @{ Case = 'SOH'; T = "Zq7abc$([char]1)Zq7" }
+    @{ Case = 'a quote'; T = 'Zq7abc"Zq7' }, @{ Case = 'a comma'; T = 'Zq7abc,Zq7' }, @{ Case = 'a non-ASCII letter'; T = "Zq7abc$([char]0xE9)Zq7" }
+    @{ Case = '= before the end'; T = 'Zq7abc=Zq7' }, @{ Case = 'a trailing LF'; T = "Zq7abc`n" }
+  ) {
+    $Srv.Token = $T
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer }
+    $r.Err | Should -BeExactly "the token response's access_token is not a valid bearer token (it is not printed); not signed in"
+    (& (Get-Module MsStoreRunner) { $script:Token }) | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match 'Zq7'
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token')
+  }
+  It 'accepts a JWT-shaped access token (letters, digits, - . _ ~ + / and = padding) and uses it' {
+    $Srv.Token = 'eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiJ4In0.c2ln-_~+/x=='
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $r = Invoke-Captured { Assert-NoPendingSubmission -ProductId $App }
+    $r.Err | Should -BeNullOrEmpty
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base")
+  }
+  It 'does not send an API call when the token in memory is not a valid bearer token (<Case>): fixed text, nothing printed of it' -ForEach @(
+    @{ Case = 'CR LF'; T = "Zq7abc`r`nX-Zq7: 1" }, @{ Case = 'a space'; T = 'Zq7abc Zq7' }, @{ Case = 'DEL'; T = "Zq7abc$([char]0x7F)" }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    & (Get-Module MsStoreRunner) { param($t) $script:Token = $t } $T
+    $r = Invoke-Captured { New-StoreSubmission -ProductId $App }
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API POST $Base/submissions?isMinimalResponse=true failed: not sent: the access token is not a valid bearer token (it is not printed). No submission was created and none was deleted."))
+    $r.All | Should -Not -Match 'Zq7'
+    @($Srv.Log) | Should -Be @('POST /tenant-1/oauth2/v2.0/token')
   }
   It 'sends nothing to a loopback stand-in without -LoopbackTestServer' {
     $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url }

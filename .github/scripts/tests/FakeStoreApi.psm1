@@ -94,11 +94,18 @@ function ConvertTo-FakeNode([string]$Json) {
 # HTTP server ignores them). Calls: what the mocked Invoke-StoreHttp was asked
 # to send, with its timeout.
 # DripOn ('AppRead': every GET of the app; 'AppReadAfterCreate': every GET of
-# the app once a create request came in) with DripSeconds: Start-FakeStoreServer
-# waits DripHeadSeconds, sends the headers and the first byte of that answer,
-# then a space every 250 ms for DripSeconds, then the rest of the body (a
-# server that answers but drips its body). The mocked Invoke-StoreHttp ignores
-# it.
+# the app once a create request came in; 'Token', 'Create', 'Commit',
+# 'Upload': the answer to that request, whatever its status) with
+# DripSeconds: Start-FakeStoreServer waits DripHeadSeconds, sends the status,
+# the headers and the first byte of that answer, then a space every 250 ms for
+# DripSeconds, then the rest of the body (a server that answers but drips its
+# body); DripEnd 'Break' breaks the connection instead of sending the rest.
+# AnswerContentType: the Content-Type of every answer with a body. Seen:
+# every request Start-FakeStoreServer got (Line 'METHOD /path', Headers).
+# The mocked Invoke-StoreHttp (Use-FakeStore) ignores AppRead and
+# AppReadAfterCreate; it returns a dripping answer to Token, Create, Commit or
+# Upload with its status and its body lost, as the real Invoke-StoreHttp does
+# when the drip outlasts the call's time limit (or breaks).
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -130,9 +137,11 @@ function New-FakeStore {
     [ValidateSet('', 'Commit', 'ReadBack')][string]$HangOn = '',
     [ValidateRange(0, 100000)][int]$CallSeconds = 0,
     [ValidateRange(0, 100000)][int]$UploadSeconds = 0,
-    [ValidateSet('', 'AppRead', 'AppReadAfterCreate')][string]$DripOn = '',
+    [ValidateSet('', 'AppRead', 'AppReadAfterCreate', 'Token', 'Create', 'Commit', 'Upload')][string]$DripOn = '',
     [ValidateRange(0, 600)][int]$DripSeconds = 0,
     [ValidateRange(0, 600)][int]$DripHeadSeconds = 0,
+    [ValidateSet('Body', 'Break')][string]$DripEnd = 'Body',
+    [string]$AnswerContentType = 'application/json',
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
   $f = ConvertTo-FakeNode $script:FieldsTemplate
@@ -148,7 +157,9 @@ function New-FakeStore {
     FailAfterLoss = [bool]$FailAfterLoss; Lost = $false; Redirect = $Redirect
     CommitDelayReads = $CommitDelayReads; HeldCommit = ''; FinalStatus = ''
     HangOn = $HangOn; CallSeconds = $CallSeconds; UploadSeconds = $UploadSeconds; CommitTried = $false
-    DripOn = $DripOn; DripSeconds = $DripSeconds; DripHeadSeconds = $DripHeadSeconds; Dripped = ''
+    DripOn = $DripOn; DripSeconds = $DripSeconds; DripHeadSeconds = $DripHeadSeconds; DripEnd = $DripEnd; Dripped = ''
+    AnswerContentType = $AnswerContentType
+    Seen = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Fields = $f.ToJsonString()
@@ -199,6 +210,21 @@ function Test-FakePackageList($Packages) {
 
 # Handles one request. Headers: a hashtable (case-insensitive keys).
 function Invoke-FakeStoreRequest {
+  param($Store, [string]$Method, [string]$Uri, [hashtable]$Headers = @{}, [byte[]]$BodyBytes = @())
+  $r = Invoke-FakeStoreRoute -Store $Store -Method $Method -Uri $Uri -Headers $Headers -BodyBytes $BodyBytes
+  $path = ([uri]$Uri).AbsolutePath
+  $on = switch ($Store.DripOn) {
+    'Token' { $Method -eq 'POST' -and $path -match '^/[^/]+/oauth2/v2\.0/token$' }
+    'Create' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions$' }
+    'Commit' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+/commit$' }
+    'Upload' { $Method -eq 'PUT' -and $path -eq '/blob/upload.zip' }
+    default { $false }
+  }
+  if ($on -and $r.StatusCode -gt 0) { $r.DripSeconds = $Store.DripSeconds }
+  $r
+}
+
+function Invoke-FakeStoreRoute {
   param($Store, [string]$Method, [string]$Uri, [hashtable]$Headers = @{}, [byte[]]$BodyBytes = @())
   if ($null -eq $BodyBytes) { $BodyBytes = [byte[]]::new(0) }
   $u = [uri]$Uri
@@ -256,8 +282,8 @@ function Invoke-FakeStoreRequest {
   } elseif ($Method -eq 'GET' -and $Store.FinalStatus -and $Store.Sub) { $Store.Sub.status = $Store.FinalStatus; $Store.FinalStatus = '' }
   $r = Invoke-FakeApiRoute -Store $Store -Method $Method -Path $path -Text $text -App $app
   if ($lose) { return New-FakeResponse $Store.LoseAsStatus $Store.LoseBody }
-  if ($Store.DripOn -and $Method -eq 'GET' -and $path -match "^/v1\.0/my/applications/$app$" -and
-    ($Store.DripOn -eq 'AppRead' -or $null -ne $Store.CreateQuery)) { $r.DripSeconds = $Store.DripSeconds }
+  if ($Method -eq 'GET' -and $path -match "^/v1\.0/my/applications/$app$" -and
+    ($Store.DripOn -eq 'AppRead' -or ($Store.DripOn -eq 'AppReadAfterCreate' -and $null -ne $Store.CreateQuery))) { $r.DripSeconds = $Store.DripSeconds }
   $r
 }
 
@@ -357,6 +383,7 @@ function Start-FakeStoreServer {
         $h = @{}
         foreach ($k in $ctx.Request.Headers.AllKeys) { $h[$k] = $ctx.Request.Headers[$k] }
         $ms = [IO.MemoryStream]::new(); $ctx.Request.InputStream.CopyTo($ms)
+        [void]$Store.Seen.Add(@{ Line = "$($ctx.Request.HttpMethod) $($ctx.Request.Url.AbsolutePath)"; Headers = $h })
         $r = Invoke-FakeStoreRequest -Store $Store -Method $ctx.Request.HttpMethod -Uri $ctx.Request.Url.AbsoluteUri -Headers $h -BodyBytes $ms.ToArray()
         # No answer at all: keep the connection open until the client gives up.
         if ($r.StatusCode -eq -1) { $hold = $true; [void]$Store.Held.Add($ctx); continue }
@@ -368,7 +395,11 @@ function Start-FakeStoreServer {
           # The headers and the first byte after DripHeadSeconds, then a space
           # every 250 ms (JSON allows them), then the rest. Stops when the
           # client hangs up or the server is stopped.
-          $ctx.Response.ContentType = 'application/json'; $ctx.Response.SendChunked = $true
+          # Break: a Content-Length the server never reaches, so the client
+          # sees the connection end before the body is complete (an aborted
+          # chunked answer can end cleanly on the managed Linux listener).
+          $ctx.Response.ContentType = $Store.AnswerContentType
+          if ($Store.DripEnd -eq 'Break') { $ctx.Response.ContentLength64 = $bytes.Length + 65536 } else { $ctx.Response.SendChunked = $true }
           $o = $ctx.Response.OutputStream
           $sp = [byte[]]@(32)
           try {
@@ -376,14 +407,19 @@ function Start-FakeStoreServer {
             $until = [DateTime]::UtcNow.AddSeconds($r.DripSeconds)
             $o.Write($bytes, 0, 1); $o.Flush()
             while ([DateTime]::UtcNow -lt $until -and $l.IsListening) { Start-Sleep -Milliseconds 250; $o.Write($sp, 0, 1); $o.Flush() }
-            $o.Write($bytes, 1, $bytes.Length - 1)
-            $Store.Dripped = 'whole body sent'
+            if ($Store.DripEnd -eq 'Break') {
+              $Store.Dripped = 'connection broken'
+              $hold = $true; $ctx.Response.Abort()
+            } else {
+              $o.Write($bytes, 1, $bytes.Length - 1)
+              $Store.Dripped = 'whole body sent'
+            }
           } catch {
             $Store.Dripped = 'client hung up'
             $hold = $true; try { $ctx.Response.Abort() } catch { }
           }
         }
-        elseif ($bytes.Length) { $ctx.Response.ContentType = 'application/json'; $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length) }
+        elseif ($bytes.Length) { $ctx.Response.ContentType = $Store.AnswerContentType; $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length) }
       } catch {
         [void]$Store.Log.Add("SERVER ERROR $_")
         $ctx.Response.StatusCode = 500

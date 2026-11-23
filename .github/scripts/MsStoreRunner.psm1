@@ -45,8 +45,12 @@
 # "##[" workflow command syntax reaches the log. All HTTP goes through
 # Invoke-StoreHttp (the Pester tests mock it): https to the Store hosts only,
 # no redirects, no verbose or debug output, and one time limit for the whole
-# call (headers and body). The token lives only in this PowerShell session;
-# nothing is written to disk.
+# call (headers and body). An answer whose status came in but whose body could
+# not be read is classified by that status, with a fixed text for the lost
+# body. Request header values are checked before anything is sent (printable
+# ASCII, then HttpHeaders.Add); the access token must be a plain bearer token
+# (Test-StoreBearerToken) and is never printed when it is refused. The token
+# lives only in this PowerShell session; nothing is written to disk.
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
@@ -192,11 +196,19 @@ function Test-StoreOutcomeUnknown($ErrorRecord) {
   [bool]($d.Contains('StoreOutcomeUnknown') -and $d['StoreOutcomeUnknown'])
 }
 
-# The one place that touches the network. Returns StatusCode and Body (text);
-# an HTTP error status (a redirect too) is returned, not thrown; a network
-# failure throws. Refuses, before sending, a Uri that Test-StoreUri does not
-# allow for Kind. No redirects: a redirect could take the token, the secret or
-# the package elsewhere.
+# The one place that touches the network. Returns StatusCode, Body (text) and
+# BodyLost; an HTTP error status (a redirect too) is returned, not thrown; a
+# network failure before the status arrives throws. Once the status line and
+# headers are in, the status is always returned: if the body then cannot be
+# read (the time limit is reached, the connection breaks), Body is '' and
+# BodyLost is one of two fixed texts ($script:BodyLostText), so the caller
+# still classifies the call by its status (Pepper, PR #74 r4). BodyLost is ''
+# when the body was read. The body is decoded by ConvertFrom-StoreBodyBytes
+# (an unknown charset is read as UTF-8, as Invoke-WebRequest read it).
+# Refuses, before sending, a Uri that Test-StoreUri does not allow for Kind,
+# and a header whose name or value is not valid (Test-StoreHeaderValue, then
+# the validating HttpHeaders.Add that Invoke-WebRequest used). No redirects: a
+# redirect could take the token, the secret or the package elsewhere.
 # TimeoutSec is the time limit for the whole call: connecting, sending, the
 # answer's headers and its body. Invoke-WebRequest -TimeoutSec is not that:
 # since PowerShell 7.4 it bounds only the wait for the headers, so a server
@@ -226,6 +238,8 @@ function Invoke-StoreHttp {
   $handler = [System.Net.Http.SocketsHttpHandler]::new()
   $handler.AllowAutoRedirect = $false
   $handler.UseCookies = $false
+  # As Invoke-WebRequest did: ask for gzip, deflate or br and decompress.
+  $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::All
   $client = [System.Net.Http.HttpClient]::new($handler, $true)
   # The limit is enforced below; HttpClient's own 100 s default must not cut
   # a long upload short.
@@ -235,16 +249,35 @@ function Invoke-StoreHttp {
   $file = $null; $resp = $null
   try {
     # Invoke-WebRequest sent a User-Agent; HttpClient sends none by default.
-    [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'JerisLink-msstore-publish/1.0')
+    $req.Headers.Add('User-Agent', 'JerisLink-msstore-publish/1.0')
     foreach ($k in $Headers.Keys) {
-      if (-not $req.Headers.TryAddWithoutValidation([string]$k, [string]$Headers[$k])) { throw (New-StoreError "refused: request header $k cannot be set; nothing was sent" -NotSent) }
+      # The error names the header (only when the name itself is valid) and
+      # never prints the value: it may be the bearer token.
+      $name = [string]$k
+      $v = [string]$Headers[$k]
+      if ($name -cnotmatch '^[A-Za-z0-9-]{1,64}\z') { throw (New-StoreError "refused: a request header name is not valid; nothing was sent" -NotSent) }
+      if (-not (Test-StoreHeaderValue $v)) { throw (New-StoreError "refused: request header $name has an invalid value (not printed); nothing was sent" -NotSent) }
+      try { $req.Headers.Add($name, $v) }
+      catch { throw (New-StoreError "refused: request header $name has an invalid value (not printed); nothing was sent" -NotSent) }
     }
     if ($InFile) { $file = [System.IO.File]::OpenRead($InFile); $req.Content = [System.Net.Http.StreamContent]::new($file) }
     elseif ($PSBoundParameters.ContainsKey('Body')) { $req.Content = [System.Net.Http.ByteArrayContent]::new([System.Text.UTF8Encoding]::new($false).GetBytes($Body)) }
     if ($req.Content -and $ContentType) { $req.Content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType) }
     $resp = Wait-StoreHttpTask ($client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)) $clock $TimeoutSec $cts
-    $text = Wait-StoreHttpTask ($resp.Content.ReadAsStringAsync($cts.Token)) $clock $TimeoutSec $cts
-    [pscustomobject]@{ StatusCode = [int]$resp.StatusCode; Body = [string]$text }
+    # The status is in: from here on the call has an answer, and a body that
+    # cannot be read does not take the status away.
+    $status = [int]$resp.StatusCode
+    $text = ''; $lost = ''
+    try {
+      $bytes = [byte[]](Wait-StoreHttpTask ($resp.Content.ReadAsByteArrayAsync($cts.Token)) $clock $TimeoutSec $cts)
+      $type = $resp.Content.Headers.ContentType
+      $text = ConvertFrom-StoreBodyBytes $bytes $(if ($type) { $type.CharSet } else { '' })
+    }
+    catch {
+      $text = ''
+      $lost = if ($_.Exception.Data.Contains('StoreText')) { $script:BodyLostText.TimeLimit -f $TimeoutSec } else { $script:BodyLostText.Broken }
+    }
+    [pscustomobject]@{ StatusCode = $status; Body = $text; BodyLost = $lost }
   } finally {
     if ($resp) { $resp.Dispose() }
     $req.Dispose(); $client.Dispose(); $cts.Dispose()
@@ -267,6 +300,57 @@ function Wait-StoreHttpTask($Task, [System.Diagnostics.Stopwatch]$Clock, [int]$T
   }
   if ($Task.IsFaulted) { throw $Task.Exception.InnerException }
   $Task.Result
+}
+
+# The fixed text Invoke-StoreHttp returns as BodyLost when the status and
+# headers arrived but the body did not: the time limit for the whole call was
+# reached while it was read, or the connection broke (or the body could not be
+# decoded). Fixed text only: nothing from the exception is printed.
+$script:BodyLostText = @{
+  TimeLimit = 'body not received (time limit of {0} s for the whole request reached)'
+  Broken = 'body not received (the connection broke or the body could not be read)'
+}
+
+# BodyLost of an Invoke-StoreHttp result, or '' (a result without it, as the
+# Pester mocks return, has its body). Never throws.
+function Get-StoreBodyLost($Response) {
+  try {
+    $p = $Response.PSObject.Properties['BodyLost']
+    if ($p -and $p.Value) { return [string]$p.Value }
+  } catch { }
+  ''
+}
+
+# The text of an answer's body (Bytes): a byte order mark decides first, then
+# the charset of its Content-Type, else UTF-8, as HttpContent.ReadAsStringAsync
+# reads it, except that a charset .NET does not know is read as UTF-8 (as
+# Invoke-WebRequest did) instead of failing, so a body that came in is never
+# lost to its charset. Invalid bytes become U+FFFD; never throws for them.
+function ConvertFrom-StoreBodyBytes([byte[]]$Bytes, [string]$CharSet) {
+  if (-not $Bytes -or $Bytes.Length -eq 0) { return '' }
+  $enc = $null
+  if ($CharSet) { try { $enc = [System.Text.Encoding]::GetEncoding($CharSet.Trim('"', ' ')) } catch { $enc = $null } }
+  if (-not $enc) { $enc = [System.Text.UTF8Encoding]::new($false) }
+  $reader = [System.IO.StreamReader]::new([System.IO.MemoryStream]::new($Bytes), $enc, $true)
+  try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+# A request header value Invoke-StoreHttp sends: printable ASCII (space to ~)
+# only, not empty, not blank, no space at either end. So no CR or LF (a header
+# injection), no other control character (TAB, NUL, DEL, NEL), no non-ASCII.
+# Invoke-WebRequest checked header values only through HttpHeaders.Add, which
+# lets TAB, DEL, NEL and non-ASCII through; Invoke-StoreHttp also calls Add
+# after this check.
+function Test-StoreHeaderValue([AllowNull()][AllowEmptyString()][string]$Value) {
+  [bool]($Value -cmatch '^[!-~]([ -~]*[!-~])?\z')
+}
+
+# An access token Invoke-StoreApi sends: an RFC 6750 b64token (letters,
+# digits, - . _ ~ + /, then = padding). A JWT is one. Checked when the token
+# arrives (Connect-StoreApi) and before every call; the error never prints the
+# token or any part of it.
+function Test-StoreBearerToken([AllowNull()][AllowEmptyString()][string]$Token) {
+  [bool]($Token -cmatch '^[A-Za-z0-9._~+/-]+=*\z')
 }
 
 # The current UTC time (the tests replace it with a fake clock).
@@ -489,10 +573,16 @@ function Connect-StoreApi {
     $r = Invoke-StoreHttp -Method POST -Uri $tokenUri -Kind Token -Body $body -ContentType 'application/x-www-form-urlencoded'
   } catch { throw "could not get a Partner Center access token: $(Get-StoreFailureText $_)" }
   finally { $body = $null }
-  if ($r.StatusCode -ne 200) { throw "could not get a Partner Center access token: $(Get-StoreErrorText $r.StatusCode $r.Body)" }
+  $lost = Get-StoreBodyLost $r
+  if ($r.StatusCode -ne 200 -or $lost) {
+    $t = if ($r.StatusCode -eq 200) { 'HTTP 200' } else { Get-StoreErrorText $r.StatusCode $r.Body }
+    if ($lost) { $t += "; $lost" }
+    throw "could not get a Partner Center access token: $t"
+  }
   $tok = ''
   try { $tok = Get-JsonField ($r.Body | ConvertFrom-Json -ErrorAction Stop) 'access_token' } catch { }
   if (-not $tok) { throw "the token response has no access_token" }
+  if (-not (Test-StoreBearerToken $tok)) { $tok = $null; throw "the token response's access_token is not a valid bearer token (it is not printed); not signed in" }
   $script:Token = $tok
   $script:ApiBase = $base
   Write-Host "signed in to the Store submission API (token kept in memory, not printed)"
@@ -507,6 +597,12 @@ function Connect-StoreApi {
 # carried the request out. That is decided before any diagnostic text is
 # formatted, and a failure while reading the NotSent mark counts as sent, so
 # an unconfirmed outcome stays unconfirmed whatever the text turns out to be.
+# A status whose body was lost (Invoke-StoreHttp BodyLost) is classified by
+# that status alone (Pepper, PR #74 r4): 408 and 5xx OutcomeUnknown, another
+# error status (400, 409, ...) refused; the text is the status, its hint and
+# the fixed BodyLost text. A 2xx whose body was lost is OutcomeUnknown: the
+# service did it, but what it answered (a create's new id) is not known.
+# The access token is checked (Test-StoreBearerToken) before anything is sent.
 function Invoke-StoreApi {
   param(
     [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PUT', 'DELETE')][string]$Method,
@@ -518,7 +614,11 @@ function Invoke-StoreApi {
   $what = "$Method /v1.0/my/$Path"
   $a = @{ Method = $Method; Uri = "$script:ApiBase/v1.0/my/$Path"; Kind = 'Api'; Headers = @{ Authorization = "Bearer $script:Token" } }
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
-  try { $a.TimeoutSec = Get-CallTimeout $TimeoutSec; $r = Invoke-StoreHttp @a }
+  try {
+    if (-not (Test-StoreBearerToken $script:Token)) { throw (New-StoreError "not sent: the access token is not a valid bearer token (it is not printed)" -NotSent) }
+    $a.TimeoutSec = Get-CallTimeout $TimeoutSec
+    $r = Invoke-StoreHttp @a
+  }
   catch {
     $notSent = $false
     $failure = $_
@@ -526,11 +626,13 @@ function Invoke-StoreApi {
     $unknown = -not $notSent
     throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $failure)" -OutcomeUnknown:$unknown)
   }
-  if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) {
-    $unknown = $r.StatusCode -eq 408 -or $r.StatusCode -ge 500
-    throw (New-StoreError "Store API $what failed: $(Get-StoreErrorText $r.StatusCode $r.Body -Detail)" -OutcomeUnknown:$unknown)
-  }
-  [string]$r.Body
+  $lost = Get-StoreBodyLost $r
+  $ok = $r.StatusCode -ge 200 -and $r.StatusCode -lt 300
+  if ($ok -and -not $lost) { return [string]$r.Body }
+  $unknown = $ok -or $r.StatusCode -eq 408 -or $r.StatusCode -ge 500
+  $t = if ($ok) { "HTTP $($r.StatusCode)" } else { Get-StoreErrorText $r.StatusCode $r.Body -Detail }
+  if ($lost) { $t += "; $lost" }
+  throw (New-StoreError "Store API $what failed: $t" -OutcomeUnknown:$unknown)
 }
 
 function Assert-ProductId([string]$ProductId) {
@@ -800,8 +902,12 @@ function Send-StorePackage {
       $wait = Get-CallTimeout 600
       $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip -TimeoutSec $wait
     } catch { throw "package upload failed: $(Get-StoreFailureText $_)" }
-    if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)" }
-    Write-Host "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)"
+    # Put Blob answers 201 with an empty body once the blob is stored, so a
+    # 2xx is success even when the body was lost (BodyLost); an error status
+    # is reported with the fixed BodyLost text when its body was lost.
+    $lost = Get-StoreBodyLost $r
+    if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)$(if ($lost) { "; $lost" })" }
+    Write-Host "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
   } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }
