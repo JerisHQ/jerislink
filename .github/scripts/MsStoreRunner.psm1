@@ -18,6 +18,16 @@
 #   (IStorePackagedAPIExtensions.PublishAsync); with no published submission it
 #   reuses the pending one. Assert-NoPendingSubmission runs `msstore apps get`
 #   first and stops if any pending submission exists, so nothing is deleted.
+# - `msstore publish` without --noCommit commits the submission
+#   (CommitSubmissionAsync), polls its status while it is CommitStarted, and
+#   exits non-zero on CommitFailed. Partner Center only takes in the uploaded
+#   package on that commit. A draft left uncommitted and then submitted from the
+#   Partner Center UI ships the packages cloned from the live submission instead.
+# - `msstore submission get <productId>` takes the product id, not a submission
+#   id. It prints the app's pending submission (or the last published one when
+#   nothing is pending) as JSON with PascalCase names. That JSON holds
+#   FileUploadUrl, a SAS URL with write access, so it is never printed.
+#   Assert-SubmissionHasPackage reads it back after publish.
 # - `msstore reconfigure --reset` always asks a y/n question and throws
 #   "Failed to read input in non-interactive mode" on a runner, so it cannot be
 #   used in CI. Clear-MsStoreCliState removes the same things directly.
@@ -152,7 +162,8 @@ function Set-MsStoreCliDummyState {
 }
 
 # Finds the one Store package in $Dir and checks its identity and version.
-# Returns the full path of the .msixupload, which is what `msstore publish` takes.
+# Returns Path (the full path of the .msixupload, which is what `msstore publish`
+# takes), FileName, Version (the manifest Identity Version) and Sha256.
 function Get-StorePackage {
   param(
     [Parameter(Mandatory)][string]$Dir,
@@ -180,6 +191,7 @@ function Get-StorePackage {
     [xml]$m = Get-Content (Join-Path $work 'pkg\AppxManifest.xml')
     $id = $m.Package.Identity
     Write-Host "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version)"
+    $version = [string]$id.Version
     if ($id.Name -ne $ExpectedName) { throw "unexpected Identity Name" }
     if ($id.Publisher -ne $ExpectedPublisher) { throw "unexpected Identity Publisher" }
     if ($id.Version -notmatch '^\d+\.\d+\.\d+\.0$') { throw "Store versions must end in .0" }
@@ -187,8 +199,9 @@ function Get-StorePackage {
   } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }
-  Write-Host ((Get-FileHash -LiteralPath $upload.FullName -Algorithm SHA256).Hash.ToLower() + '  ' + $upload.Name)
-  $upload.FullName
+  $sha = (Get-FileHash -LiteralPath $upload.FullName -Algorithm SHA256).Hash.ToLower()
+  Write-Host "$sha  $($upload.Name)"
+  [pscustomobject]@{ Path = $upload.FullName; FileName = $upload.Name; Version = $version; Sha256 = $sha }
 }
 
 # Checks the JSON that `msstore apps get <productId>` prints (DevCenterApplication)
@@ -226,4 +239,147 @@ function Assert-NoPendingSubmission {
   Test-NoPendingSubmission -AppJson $out -ProductId $ProductId
 }
 
-Export-ModuleMember -Function Get-StorePackage, Clear-MsStoreCliState, Set-MsStoreCliDummyState, Get-MsStoreCliCredentialTargets, Test-NoPendingSubmission, Assert-NoPendingSubmission
+function Get-JsonField($Object, [string]$Name) {
+  if ($null -eq $Object) { return '' }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { [string]$p.Value } else { '' }
+}
+
+# Checks the JSON that `msstore submission get <productId>` prints after a
+# committed publish. Pure: runs no CLI and prints nothing. Returns Result
+# ('Pass', 'Pending' or 'Fail'), Reason and safe fields only: Id, Status,
+# TargetPublishMode, and FileName, Version, FileStatus for each package.
+# FileUploadUrl (a SAS URL) is never copied into the result.
+# - Fail: no JSON, a different submission id than the pending one, any *Failed
+#   status (CommitFailed, PreProcessingFailed, CertificationFailed, ...), no
+#   packages, an Uploaded package with another version (the old 0.3.0.0 still in,
+#   or a version mismatch), more than one Uploaded package with the expected
+#   version, or no Uploaded/PendingUpload package with the expected version.
+# - Pending: status CommitStarted, an Uploaded package whose version Partner
+#   Center has not filled in yet, or a package still PendingUpload.
+# - Pass: exactly one Uploaded package, it has the expected version, and no other
+#   package is Uploaded.
+function Test-SubmissionHasPackage {
+  param(
+    [Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [string]$ExpectedSubmissionId = ''
+  )
+  $sub = [pscustomobject]@{ Id = ''; Status = ''; TargetPublishMode = '' }
+  $pkgs = @()
+  $result = {
+    param([string]$Result, [string]$Reason)
+    [pscustomobject]@{ Result = $Result; Reason = $Reason; Id = $sub.Id; Status = $sub.Status
+                       TargetPublishMode = $sub.TargetPublishMode; Packages = @($pkgs) }
+  }
+
+  $start = $SubmissionJson.IndexOf('{')
+  if ($start -lt 0) { return & $result 'Fail' 'msstore submission get printed no submission JSON' }
+  try { $raw = $SubmissionJson.Substring($start) | ConvertFrom-Json -ErrorAction Stop }
+  catch { return & $result 'Fail' 'msstore submission get printed JSON that does not parse' }
+
+  $sub = [pscustomobject]@{
+    Id                = Get-JsonField $raw 'Id'
+    Status            = Get-JsonField $raw 'Status'
+    TargetPublishMode = Get-JsonField $raw 'TargetPublishMode'
+  }
+  $pkgProp = $raw.PSObject.Properties['ApplicationPackages']
+  if ($pkgProp -and $null -ne $pkgProp.Value) {
+    $pkgs = @(foreach ($p in @($pkgProp.Value)) {
+      [pscustomobject]@{ FileName = Get-JsonField $p 'FileName'; Version = Get-JsonField $p 'Version'; FileStatus = Get-JsonField $p 'FileStatus' }
+    })
+  }
+
+  if (-not $sub.Id) { return & $result 'Fail' 'submission JSON has no Id' }
+  if ($ExpectedSubmissionId -and $sub.Id -ne $ExpectedSubmissionId) {
+    return & $result 'Fail' "submission get returned submission $($sub.Id), not the pending submission $ExpectedSubmissionId"
+  }
+  if ($sub.Status -like '*Failed') { return & $result 'Fail' "submission status is $($sub.Status)" }
+  if ($pkgs.Count -eq 0) { return & $result 'Fail' 'submission has no application packages' }
+
+  $uploaded = @($pkgs | Where-Object { $_.FileStatus -eq 'Uploaded' })
+  $match    = @($uploaded | Where-Object { $_.Version -eq $ExpectedVersion })
+  $unset    = @($uploaded | Where-Object { -not $_.Version })
+  $other    = @($uploaded | Where-Object { $_.Version -and $_.Version -ne $ExpectedVersion })
+  $pendUp   = @($pkgs | Where-Object { $_.FileStatus -eq 'PendingUpload' })
+
+  if ($other.Count -gt 0) {
+    $v = ($other | ForEach-Object { $_.Version }) -join ', '
+    return & $result 'Fail' "submission still has Uploaded package(s) with version $v; expected only $ExpectedVersion"
+  }
+  if ($match.Count -gt 1) { return & $result 'Fail' "submission has $($match.Count) Uploaded packages with version $ExpectedVersion; expected exactly one" }
+  if ($sub.Status -eq 'CommitStarted') { return & $result 'Pending' 'commit still processing (CommitStarted)' }
+  if ($unset.Count -gt 0) { return & $result 'Pending' 'package version not filled in yet' }
+  if ($pendUp.Count -gt 0) { return & $result 'Pending' 'package still PendingUpload' }
+  if ($match.Count -eq 1) { return & $result 'Pass' "submission holds exactly one Uploaded package, version $ExpectedVersion" }
+  return & $result 'Fail' "submission has no Uploaded package with version $ExpectedVersion"
+}
+
+# Prints only the safe fields of a Test-SubmissionHasPackage result.
+function Write-SubmissionSummary {
+  param([Parameter(Mandatory)]$Check)
+  Write-Host "submission id=$($Check.Id) status=$($Check.Status) targetPublishMode=$($Check.TargetPublishMode)"
+  foreach ($p in $Check.Packages) { Write-Host "  package fileName=$($p.FileName) version=$($p.Version) fileStatus=$($p.FileStatus)" }
+}
+
+# Runs after `msstore publish` committed. Reads the app's pending submission id
+# from `msstore apps get`, then `msstore submission get <productId>`, and throws
+# unless that submission holds the new package (Test-SubmissionHasPackage).
+# Checks again every IntervalSeconds while the result is Pending, and throws
+# "not verified" after TimeoutMinutes. Prints only id, status, targetPublishMode
+# and (fileName, version, fileStatus); never the raw CLI output (SAS URL).
+# targetPublishMode other than Manual is a warning only: the commit has already
+# happened, so failing the job here would stop nothing.
+function Assert-SubmissionHasPackage {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [int]$TimeoutMinutes = 30,
+    [int]$IntervalSeconds = 60
+  )
+  $ErrorActionPreference = 'Continue'
+  $out = (& msstore apps get $ProductId | Out-String)
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  if ($code -ne 0) { throw "msstore apps get failed (exit $code); submission not verified" }
+  $start = $out.IndexOf('{')
+  if ($start -lt 0) { throw "msstore apps get printed no application JSON; submission not verified" }
+  try { $app = $out.Substring($start) | ConvertFrom-Json -ErrorAction Stop }
+  catch { throw "msstore apps get printed JSON that does not parse; submission not verified" }
+  if ((Get-JsonField $app 'Id') -ne $ProductId) { throw "msstore apps get returned a different or empty application id; submission not verified" }
+  $pendingProp = $app.PSObject.Properties['PendingApplicationSubmission']
+  $subId = if ($pendingProp) { Get-JsonField $pendingProp.Value 'Id' } else { '' }
+  if (-not $subId) { throw "Partner Center shows no pending submission for $ProductId after publish; the commit did not land; submission not verified" }
+  Write-Host "pending submission id=$subId"
+
+  $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+  $warned = $false
+  while ($true) {
+    $ErrorActionPreference = 'Continue'
+    $json = (& msstore submission get $ProductId | Out-String)
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) {
+      $check = [pscustomobject]@{ Result = 'Pending'; Reason = "msstore submission get failed (exit $code)"; Id = $subId
+                                  Status = ''; TargetPublishMode = ''; Packages = @() }
+    } else {
+      $check = Test-SubmissionHasPackage -SubmissionJson $json -ExpectedVersion $ExpectedVersion -ExpectedSubmissionId $subId
+    }
+    $json = $null
+    Write-SubmissionSummary -Check $check
+    if ($check.TargetPublishMode -and $check.TargetPublishMode -ne 'Manual' -and -not $warned) {
+      Write-Host ("::warning title=Store publish mode::targetPublishMode is '$($check.TargetPublishMode)', not Manual. " +
+        "This submission goes live by itself once it passes certification. Set Publish to manual in Partner Center if a person should release it.")
+      $warned = $true
+    }
+    if ($check.Result -eq 'Pass') { Write-Host "verified: $($check.Reason)"; return }
+    if ($check.Result -eq 'Fail') { throw "submission check failed: $($check.Reason)" }
+    if ((Get-Date).AddSeconds($IntervalSeconds) -gt $deadline) {
+      throw "submission not verified after $TimeoutMinutes min: $($check.Reason)"
+    }
+    Write-Host "pending: $($check.Reason); checking again in $IntervalSeconds s"
+    Start-Sleep -Seconds $IntervalSeconds
+  }
+}
+
+Export-ModuleMember -Function Get-StorePackage, Clear-MsStoreCliState, Set-MsStoreCliDummyState, Get-MsStoreCliCredentialTargets, Test-NoPendingSubmission, Assert-NoPendingSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage

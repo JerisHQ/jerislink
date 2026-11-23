@@ -9,6 +9,10 @@ name: msstore-publish-check
 #   a dead loopback port. Passing means the CLI accepted the arguments, read the
 #   stored credential and picked its MSIX publisher for the file, then its token
 #   request failed at the loopback proxy.
+# - checks that msstore-publish.yml commits (no --noCommit), reads the
+#   submission back with Assert-SubmissionHasPackage after publish, and prints
+#   the package from an `inspect` job outside the `store` environment, so the
+#   approver sees it before approving `publish`.
 # - checks the pending-submission guard: Test-NoPendingSubmission against sample
 #   `msstore apps get` JSON (with and without a pending draft), and
 #   Assert-NoPendingSubmission against the dead proxy, which must fail closed.
@@ -16,6 +20,7 @@ name: msstore-publish-check
 #   fail the way they did (so the fix is for the real cause).
 # - runs Clear-MsStoreCliState and checks the dummy credential, the CLI folder and
 #   the MSStore.API token cache folder (seeded with a stand-in cache) are gone.
+# The `pester` job runs .github/scripts/tests (submission read-back parsing).
 
 on:
   pull_request:
@@ -23,12 +28,14 @@ on:
       - .github/workflows/msstore-publish.yml
       - .github/workflows/msstore-publish-check.yml
       - .github/scripts/MsStoreRunner.psm1
+      - .github/scripts/tests/**
   push:
     branches: [main]
     paths:
       - .github/workflows/msstore-publish.yml
       - .github/workflows/msstore-publish-check.yml
       - .github/scripts/MsStoreRunner.psm1
+      - .github/scripts/tests/**
   workflow_dispatch:
     inputs:
       msix_run_id:
@@ -46,6 +53,36 @@ env:
   EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
 
 jobs:
+  pester:
+    # Unit tests for the submission read-back (Test-SubmissionHasPackage and
+    # Assert-SubmissionHasPackage with a mocked CLI): .github/scripts/tests.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Run Pester
+        run: |
+          $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0' } | Sort-Object Version -Descending | Select-Object -First 1
+          if (-not $pester) {
+            Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+            $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'5.7.1' } | Select-Object -First 1
+          }
+          Import-Module $pester.Path -Force
+          Write-Host "Pester $($pester.Version)"
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = '.github/scripts/tests'
+          $cfg.Run.PassThru = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          $r = Invoke-Pester -Configuration $cfg
+          if ($r.Result -ne 'Passed' -or $r.PassedCount -lt 1) { throw "Pester: $($r.Result), $($r.FailedCount) failed, $($r.PassedCount) passed" }
+
   dry-run:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -64,12 +101,22 @@ jobs:
           $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
           if ($wf -notmatch '(?m)^\s+STORE_CLI_VERSION:\s*(v\d+\.\d+\.\d+)\s*$') { throw "STORE_CLI_VERSION not pinned in msstore-publish.yml" }
           $ver = $Matches[1]
-          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit'
+          $cmd = 'msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600'
           if (-not $wf.Contains($cmd)) { throw "msstore-publish.yml does not run: $cmd" }
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
           if ($code -match "--inputFile|reconfigure --reset") { throw "msstore-publish.yml still runs --inputFile or reconfigure --reset" }
           $guard = $wf.IndexOf('Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID')
           if ($guard -lt 0 -or $guard -gt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-NoPendingSubmission before msstore publish" }
+          # The submission must be committed by the API: --noCommit left every
+          # release up to v0.4.1 as an uncommitted draft.
+          if ($code -match "--noCommit|(?<![\w-])-nc(?![\w-])") { throw "msstore-publish.yml still runs msstore publish with --noCommit" }
+          $readBack = $wf.IndexOf('Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -ExpectedVersion $env:EXPECTED_VERSION')
+          if ($readBack -lt 0 -or $readBack -lt $wf.IndexOf($cmd)) { throw "msstore-publish.yml does not run Assert-SubmissionHasPackage after msstore publish" }
+          # The approver must see the package before approving: the job that
+          # prints it must not be in the store environment.
+          if ($wf -notmatch '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*?Package to publish after approval') { throw "inspect job does not print the package before approval" }
+          if ($wf -match '(?ms)^  inspect:\s*\n(?:(?!^  \S).)*?^\s+environment:') { throw "inspect job must not use an environment" }
+          if ($wf -notmatch '(?ms)^  publish:\s*\n(?:(?!^  \S).)*?^\s+needs: inspect\s*$(?:(?!^  \S).)*?^\s+environment: store\s*$') { throw "publish job must need inspect and run in the store environment" }
           Write-Host "CLI $ver; publish command: $cmd"
           "cli_version=$ver" >> $env:GITHUB_OUTPUT
 
@@ -110,10 +157,12 @@ jobs:
         run: |
           Get-ChildItem (Join-Path $env:RUNNER_TEMP 'store') | Format-Table Name, Length -AutoSize | Out-String | Write-Host
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          $file = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+          $p = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
             -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
-          Write-Host "PKG_FILE=$file"
-          "file=$file" >> $env:GITHUB_OUTPUT
+          if ($p.Version -ne $env:EXPECTED_VERSION) { throw "Get-StorePackage returned Version $($p.Version)" }
+          if ($p.FileName -ne (Split-Path -Leaf $p.Path) -or $p.Sha256 -notmatch '^[0-9a-f]{64}$') { throw "Get-StorePackage returned unexpected FileName/Sha256" }
+          Write-Host "PKG_FILE=$($p.Path) Version=$($p.Version) SHA256=$($p.Sha256)"
+          "file=$($p.Path)" >> $env:GITHUB_OUTPUT
 
       - name: Set up Microsoft Store Developer CLI
         uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
@@ -136,7 +185,7 @@ jobs:
           function Invoke-Cli([scriptblock]$b) { $ErrorActionPreference = "Continue"; $out = (& $b 2>&1 | Out-String); [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out } }
 
           # 1. The fixed command, exactly as msstore-publish.yml runs it.
-          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit }
+          $r = Invoke-Cli { msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600 }
           Write-Host "--- fixed command, exit $($r.Code) ---`n$($r.Out)"
           if ($r.Out -match 'Unrecognized command or argument') { throw "CLI rejected the arguments" }
           if ($r.Out -match 'could not find a project publisher') { throw "CLI found no publisher for the package file" }

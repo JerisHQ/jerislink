@@ -1,7 +1,8 @@
 name: msstore-publish
 
 # Uploads the .msixupload that the `msix` workflow built for a released commit
-# to Partner Center as a DRAFT submission for Store product 9NM3VWQ9MD7N.
+# to Partner Center for Store product 9NM3VWQ9MD7N and COMMITS the submission:
+# once committed, it goes to certification and then to the Store.
 #
 # Triggers
 # - release `released`: a GitHub release is published as a full release (or a
@@ -10,22 +11,40 @@ name: msstore-publish
 #   that draft by hand is the release decision, and that is what starts this.
 # - workflow_dispatch (fallback): give the run id of a successful `msix` run.
 #
-# Package selection: the job never builds. It finds the successful `msix` push
-# run for exactly the released commit and downloads its jerislink-msix-store
+# Package selection: the jobs never build. They find the successful `msix` push
+# run for exactly the released commit and download its jerislink-msix-store
 # artifact (the bytes CI already checked, WACK-tested and sideload-installed).
 # No matching run means the job fails; it never falls back to another commit.
 # The commit must also be in main's history.
 #
-# - Runs in the `store` environment, so its secrets are only released after the
-#   environment's reviewers approve. The environment's deployment policy must
-#   allow the tag ref (refs/tags/v*) for the release trigger to get past it.
+# Human gate: the `store` environment approval, and nothing after it.
+# - The `inspect` job runs without the environment, before anyone approves. Its
+#   log and the run summary show the package file name, Version= and SHA-256.
+#   Check those before approving the `publish` job.
+# - `publish` runs in the `store` environment, so its secrets are only released
+#   after the environment's reviewers approve. The environment's deployment
+#   policy must allow the tag ref (refs/tags/v*) for the release trigger to get
+#   past it. It re-downloads the same artifact and stops unless the file and its
+#   SHA-256 match what `inspect` showed.
+# - Approving means shipping: `msstore publish` (no --noCommit) commits the
+#   submission through the API. Nobody presses Submit in Partner Center, and
+#   nobody edits the submission this workflow created in the Partner Center UI:
+#   Microsoft only takes in the uploaded package on the API commit, and a
+#   submission changed in the UI can no longer be committed through the API.
+#   (Up to v0.4.1 this workflow used --noCommit; the UI Submit then shipped the
+#   0.3.0.0 package cloned from the live submission, not the uploaded one.)
+# - Whether a certified submission goes live by itself is the submission's
+#   Publish setting in Partner Center (targetPublishMode, cloned from the last
+#   submission). The read-back step prints it and warns if it is not Manual.
+#
 # - Before uploading, the job asks Partner Center whether the app already has a
 #   pending submission and stops if it does. `msstore publish` would otherwise
 #   delete that draft (when a published submission exists) to make room for the
 #   new one. There is no override: resolve the draft in Partner Center and re-run.
-# - `msstore publish --noCommit` keeps the submission in draft state: nothing
-#   goes to certification or the Store until someone presses "Submit" in
-#   Partner Center by hand.
+# - After publish, the job reads the submission back and fails unless it holds
+#   exactly one Uploaded package, with the release's version, and no other
+#   Uploaded package (see Assert-SubmissionHasPackage). It never prints the raw
+#   submission JSON: that holds a SAS upload URL.
 # - Secrets reach msstore only through step env vars in the sign-in step; they
 #   are never echoed, written to disk by this workflow, or put in the repo.
 # - The Store CLI version is pinned (STORE_CLI_VERSION). The publish command
@@ -58,17 +77,24 @@ env:
   STORE_CLI_VERSION: v0.4.4
 
 jobs:
-  publish-draft:
+  # No environment: runs before the approval, so the approver can see exactly
+  # which package the publish job would upload.
+  inspect:
     if: >-
       (github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
         && !github.event.release.draft && !github.event.release.prerelease)
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
-    environment: store
-    timeout-minutes: 30
+    timeout-minutes: 15
     defaults:
       run:
         shell: pwsh
+    outputs:
+      run_id: ${{ steps.src.outputs.run_id }}
+      sha: ${{ steps.src.outputs.sha }}
+      file_name: ${{ steps.pkg.outputs.file_name }}
+      version: ${{ steps.pkg.outputs.version }}
+      sha256: ${{ steps.pkg.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,11 +150,66 @@ jobs:
         id: pkg
         env:
           EXPECTED_VERSION: ${{ steps.src.outputs.version }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           Import-Module ./.github/scripts/MsStoreRunner.psm1
-          $file = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+          $p = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
             -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
-          "file=$file" >> $env:GITHUB_OUTPUT
+          Write-Host "Package to publish after approval: $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+          @(
+            '### Store package waiting for approval'
+            ''
+            "- Tag: ``$(if ($env:TAG) { $env:TAG } else { '(workflow_dispatch)' })``"
+            "- msix run: ${{ steps.src.outputs.run_id }} (commit ``${{ steps.src.outputs.sha }}``)"
+            "- File: ``$($p.FileName)``"
+            "- Version=``$($p.Version)``"
+            "- SHA-256: ``$($p.Sha256)``"
+            ''
+            'Approving the `publish` job uploads this package and commits the Store submission (certification, then the Store). Do not press Submit or edit the submission in Partner Center.'
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+          "file_name=$($p.FileName)" >> $env:GITHUB_OUTPUT
+          "version=$($p.Version)" >> $env:GITHUB_OUTPUT
+          "sha256=$($p.Sha256)" >> $env:GITHUB_OUTPUT
+
+  publish:
+    needs: inspect
+    runs-on: windows-latest
+    environment: store
+    # Upload (up to 10 min) + commit polling + read-back (up to 30 min).
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      EXPECTED_VERSION: ${{ needs.inspect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download the Store package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jerislink-msix-store
+          run-id: ${{ needs.inspect.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/store
+
+      - name: Check it is the package the approver saw
+        id: pkg
+        env:
+          EXPECTED_FILE: ${{ needs.inspect.outputs.file_name }}
+          EXPECTED_SHA256: ${{ needs.inspect.outputs.sha256 }}
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          if (-not $env:EXPECTED_VERSION -or -not $env:EXPECTED_FILE -or -not $env:EXPECTED_SHA256) { throw "inspect job outputs are missing" }
+          $p = Get-StorePackage -Dir (Join-Path $env:RUNNER_TEMP 'store') -ExpectedName $env:EXPECTED_IDENTITY_NAME `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER -ExpectedVersion $env:EXPECTED_VERSION
+          if ($p.FileName -cne $env:EXPECTED_FILE) { throw "package file $($p.FileName) is not the one shown before approval ($env:EXPECTED_FILE)" }
+          if ($p.Sha256 -ne $env:EXPECTED_SHA256) { throw "package SHA-256 differs from the one shown before approval" }
+          Write-Host "Publishing $($p.FileName) Version=$($p.Version) SHA256=$($p.Sha256)"
+          "file=$($p.Path)" >> $env:GITHUB_OUTPUT
 
       - name: Set up Microsoft Store Developer CLI
         uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
@@ -155,16 +236,24 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Assert-NoPendingSubmission -ProductId $env:STORE_PRODUCT_ID
 
-      - name: Upload to Partner Center as a draft submission (no commit, no Store release)
+      - name: Upload and commit the Store submission (the store approval was the human gate)
         env:
           PKG_FILE: ${{ steps.pkg.outputs.file }}
         run: |
           # The .msixupload file itself is the pathOrUrl argument; the CLI has no
-          # --inputFile option (see .github/scripts/MsStoreRunner.psm1).
+          # --inputFile option (see .github/scripts/MsStoreRunner.psm1). No
+          # --noCommit: the CLI commits the submission and polls the commit, and
+          # exits non-zero on CommitFailed. --uploadTimeout is in seconds.
           if (-not (Test-Path -LiteralPath $env:PKG_FILE -PathType Leaf)) { throw "package file missing: $env:PKG_FILE" }
-          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --noCommit
+          msstore publish $env:PKG_FILE --appId $env:STORE_PRODUCT_ID --uploadTimeout 600
           if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
-          Write-Host "Draft submission updated. Review and press Submit in Partner Center to send it to certification."
+          Write-Host "Submission committed through the API. Do not press Submit or edit it in Partner Center."
+
+      - name: Read the submission back and fail unless it holds the new package
+        timeout-minutes: 35
+        run: |
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60
 
       - name: Forget the Partner Center credentials on the runner
         if: always()
