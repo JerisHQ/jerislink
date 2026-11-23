@@ -1,0 +1,258 @@
+name: store-msix-to-release
+
+# Attaches the Microsoft Store-signed MSIX of JerisLink (Store product
+# 9NM3VWQ9MD7N) to the GitHub release of the same version, so people can install
+# a signed Windows build without the Store and without trusting a test cert.
+#
+# How
+# - fetch (ubuntu, contents: read): builds JasonWei512/Upload-Microsoft-Store-
+#   MSIX-Package-to-GitHub-Release from a pinned commit and runs it with
+#   --dry-run. In dry-run it asks the Store (StoreLib, unofficial endpoints) for
+#   the newest package and downloads it, but never writes to GitHub. The action
+#   is not used with `uses:` because then it uploads by itself, before anything
+#   here could check what it downloaded.
+# - verify (windows, contents: read): the package must be jerisHQ.JerisLink x64
+#   from publisher CN=89A018EB-..., Authenticode status Valid on a clean runner,
+#   signed by a Microsoft Marketplace CA certificate that chains to a Microsoft
+#   root, and not by our self-signed sideload test certificate. Then its version
+#   must equal the tag (v0.4.1 -> 0.4.1.0). If the Store still serves an older
+#   version, nothing is uploaded and the run ends green with a note.
+# - upload (ubuntu, the only job with contents: write): runs only for a manual
+#   dispatch from main, only when verify said ready. It uploads one new asset,
+#   Jerislink-<ver>-windows-x64-store-signed.msix, without --clobber, and skips if
+#   that asset is already there.
+#
+# SHA256SUMS.txt is not rewritten: GitHub can only replace an asset by deleting
+# it first, which would leave the release without its checksum file if the
+# re-upload failed. The SHA-256 of the MSIX is in the run summary instead.
+#
+# Pull requests that touch this file run fetch and verify against the current
+# Store package (read-only; upload never runs on pull_request).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the Store-signed MSIX to, e.g. v0.4.1'
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/store-msix-to-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-msix-to-release
+  cancel-in-progress: false
+
+env:
+  STORE_PRODUCT_ID: 9NM3VWQ9MD7N
+  EXPECTED_IDENTITY_NAME: jerisHQ.JerisLink
+  EXPECTED_PUBLISHER: CN=89A018EB-5C52-49CB-B478-B462FA6B08DD
+  EXPECTED_ARCH: x64
+  # SHA-1 of personal/windows-client/msix/JerisLink-sideload-test.cer
+  TEST_CERT_THUMBPRINT: 5E6E211F60E17FFD44F7772BE0E8C11E40DD6661
+  UPSTREAM_REPO: JasonWei512/Upload-Microsoft-Store-MSIX-Package-to-GitHub-Release
+  UPSTREAM_SHA: 80b980b3065f16557b6c450e9efe2144344b589f # v1.0.2, 2024-03-13
+
+jobs:
+  # Swap point: `fetch` is the only job that talks to the Store. Its contract is
+  # the outputs below plus one artifact named `store-msix` holding `store.msix`.
+  # To use a fork, change UPSTREAM_REPO / UPSTREAM_SHA; to use our own script,
+  # replace the three upstream steps. verify and upload do not change.
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      asset: ${{ steps.tag.outputs.asset }}
+      skip: ${{ steps.tag.outputs.skip }}
+    steps:
+      - name: Resolve the tag and check the release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          else
+            v=$(gh api "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$GITHUB_SHA" -H 'Accept: application/vnd.github.raw' | tr -d '[:space:]')
+            tag="v$v"
+          fi
+          if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then echo "::error::tag '$tag' is not vMAJOR.MINOR.PATCH"; exit 1; fi
+          ver="${BASH_REMATCH[1]}"
+          asset="Jerislink-$ver-windows-x64-store-signed.msix"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver.0" >> "$GITHUB_OUTPUT"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          skip=false
+          if names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null); then
+            if grep -qxF "$asset" <<<"$names"; then skip=true; echo "::notice::$tag already has $asset; nothing to do"; fi
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            echo "::error::no GitHub release $tag"; exit 1
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag expected=$ver.0 asset=$asset skip=$skip"
+
+      - name: Check out the upstream tool at the pinned commit
+        if: steps.tag.outputs.skip != 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Build the tool
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          head=$(git -C upstream rev-parse HEAD)
+          [ "$head" = "$UPSTREAM_SHA" ] || { echo "::error::upstream HEAD $head is not $UPSTREAM_SHA"; exit 1; }
+          docker build -q -t store-msix-fetch upstream
+
+      - name: Download the newest Store package (dry run, no GitHub writes)
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dl="$RUNNER_TEMP/dl"; mkdir -p "$dl"
+          docker run --rm -e GITHUB_REPOSITORY -v "$dl:/tmp" store-msix-fetch \
+            --store-id "$STORE_PRODUCT_ID" --token "$GH_TOKEN" --dry-run | tee "$RUNNER_TEMP/tool.log"
+          # The tool also starts and cancels a download to learn the file name, so
+          # take only the file it reports as finished.
+          p=$(sed -n 's/^File downloaded to: //p' "$RUNNER_TEMP/tool.log" | tr -d '\r')
+          [ "$(printf '%s\n' "$p" | grep -c .)" = 1 ] || { echo "::error::expected one downloaded file, tool reported: '$p'"; exit 1; }
+          case "$p" in /tmp/*) ;; *) echo "::error::download outside /tmp: $p"; exit 1;; esac
+          f="$dl/${p#/tmp/}"
+          case "${f,,}" in *.msix) ;; *) echo "::error::not an .msix: $p"; exit 1;; esac
+          [ -s "$f" ] || { echo "::error::$f missing or empty"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/out"
+          sudo cp "$f" "$RUNNER_TEMP/out/store.msix"
+          sudo chown "$(id -u)" "$RUNNER_TEMP/out/store.msix"
+          sha256sum "$RUNNER_TEMP/out/store.msix"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.tag.outputs.skip != 'true'
+        with:
+          name: store-msix
+          path: ${{ runner.temp }}/out/store.msix
+          if-no-files-found: error
+          retention-days: 3
+
+  verify:
+    needs: fetch
+    if: needs.fetch.outputs.skip != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      sha256: ${{ steps.check.outputs.sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: store-msix
+          path: ${{ runner.temp }}/in
+
+      - name: Check identity, Store signature and version
+        id: check
+        env:
+          EXPECTED_VERSION: ${{ needs.fetch.outputs.version }}
+          TAG: ${{ needs.fetch.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $f = Join-Path $env:RUNNER_TEMP 'in\store.msix'
+          $sha = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($f)
+          try {
+            $e = $zip.GetEntry('AppxManifest.xml')
+            if (-not $e) { throw "no AppxManifest.xml (bundle or not an MSIX?)" }
+            $r = New-Object IO.StreamReader($e.Open()); [xml]$m = $r.ReadToEnd(); $r.Dispose()
+          } finally { $zip.Dispose() }
+          $id = $m.Package.Identity
+          Write-Host "Identity Name=$($id.Name) Publisher=$($id.Publisher) Version=$($id.Version) Arch=$($id.ProcessorArchitecture)"
+          if ($id.Name -cne $env:EXPECTED_IDENTITY_NAME) { throw "unexpected Identity Name" }
+          if ($id.Publisher -cne $env:EXPECTED_PUBLISHER) { throw "unexpected Identity Publisher" }
+          if ($id.ProcessorArchitecture -ne $env:EXPECTED_ARCH) { throw "unexpected architecture" }
+
+          # Authenticode over the whole package (AppxSip). The runner trusts
+          # Microsoft roots and has never seen our test certificate.
+          $sig = Get-AuthenticodeSignature -LiteralPath $f
+          $cert = $sig.SignerCertificate
+          Write-Host "Authenticode: $($sig.Status) $($sig.StatusMessage)"
+          if ($sig.Status -ne 'Valid' -or -not $cert) { throw "signature status is $($sig.Status), not Valid" }
+          Write-Host "Signer: $($cert.Subject) | issuer $($cert.Issuer) | $($cert.Thumbprint)"
+          if ($cert.Thumbprint -eq $env:TEST_CERT_THUMBPRINT) { throw "signed with the sideload test certificate" }
+          if ($cert.Subject -eq $cert.Issuer) { throw "signer certificate is self-signed" }
+          if ($cert.Subject -cne $env:EXPECTED_PUBLISHER) { throw "signer subject is not the package publisher" }
+          if ($cert.Issuer -notmatch '^CN=Microsoft Marketplace CA G \d+,') { throw "signer issuer is not a Microsoft Marketplace CA" }
+          $chain = New-Object Security.Cryptography.X509Certificates.X509Chain
+          $chain.ChainPolicy.RevocationMode = 'NoCheck'
+          if (-not $chain.Build($cert)) { throw "chain does not build: $(($chain.ChainStatus | ForEach-Object Status) -join ', ')" }
+          $chain.ChainElements | ForEach-Object { Write-Host "  chain: $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)" }
+          $root = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+          if ($root.Subject -notmatch '^CN=Microsoft Root Certificate Authority 20(10|11), O=Microsoft Corporation,') { throw "chain root is not a Microsoft root: $($root.Subject)" }
+
+          $ready = ($id.Version -eq $env:EXPECTED_VERSION)
+          "ready=$($ready.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          $note = if ($ready) { "version matches $env:TAG" } else { "Store serves $($id.Version), not $env:EXPECTED_VERSION yet: nothing uploaded" }
+          if (-not $ready) { Write-Host "::notice::$note" }
+          @(
+            "### Store-signed MSIX for $env:TAG",
+            "",
+            "| | |", "|---|---|",
+            "| Store version | $($id.Version) |",
+            "| Expected | $env:EXPECTED_VERSION |",
+            "| Result | $note |",
+            "| Signer | $($cert.Subject) |",
+            "| Issuer | $($cert.Issuer) |",
+            "| Root | $($root.Subject) |",
+            "| SHA-256 | ``$sha`` |"
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+
+  upload:
+    needs: [fetch, verify]
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      && needs.verify.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: store-msix
+          path: ${{ runner.temp }}/in
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.fetch.outputs.tag }}
+          ASSET: ${{ needs.fetch.outputs.asset }}
+          SHA256: ${{ needs.verify.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/$ASSET"
+          mv "$RUNNER_TEMP/in/store.msix" "$f"
+          got=$(sha256sum "$f" | cut -d' ' -f1)
+          [ "$got" = "$SHA256" ] || { echo "::error::artifact hash $got is not the verified $SHA256"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qxF "$ASSET"; then
+            echo "::notice::$TAG already has $ASSET"; exit 0
+          fi
+          gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+          echo "Uploaded $ASSET to $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$SHA256  $ASSET\`" >> "$GITHUB_STEP_SUMMARY"
