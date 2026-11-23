@@ -45,7 +45,7 @@ You need a Mac with Apple silicon and macOS 14 or later, and Tailscale signed in
    To change it later: `cd ~/Library/Application\ Support/JerisLink && /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy -c 'Set :clientIP 100.a.b.c' listen.plist`. The services pick up the change within a few seconds. Always edit `listen.plist` through `lockf` like this (see "Listen endpoint" below).
 6. On the PC, open JerisLink, type the **Mac's** Tailscale IPv4 on the launch screen, and connect. This PC's address is chosen automatically; both addresses are shown read-only under Connection info.
 
-The Microsoft Store version of the viewer has no "Send to" entry in Explorer. Drag files onto the viewer window or its Files panel instead.
+The Microsoft Store version of the viewer (v0.4.1 and later) has its own "Send to JerisLink" command in the Explorer right-click menu (Windows 11: in the first menu). If the entry does not appear, drag files onto the viewer window or its Files panel instead.
 
 To remove the host: run `~/Applications/JerisLink.app/Contents/MacOS/JerisLinkHost --unregister`, delete `~/Applications/JerisLink.app` and `~/Library/Application Support/JerisLink`, then remove JerisLink from Screen Recording and Accessibility in System Settings.
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.1
+
+The Microsoft Store (MSIX) viewer gets "Send to JerisLink" in the Explorer right-click menu (GitHub #70, Gitea #65).
+
+Windows viewer, Microsoft Store (MSIX) build:
+
+- Right-click files or folders in Explorer and pick "Send to JerisLink" (Windows 11: in the first menu, no Show more options). They go to `~/Downloads/JerisLink` on the Mac by default, the same as dragging them onto the viewer; when access to Downloads is refused, the Mac uses `~/JerisLink Received` instead. Tested on Windows 11. The package needs Windows 10 1809 or later, but the menu has not been tested on Windows 10 yet. If the viewer is installed but the right-click entry does not appear, drag files onto the viewer instead.
+- The command is an `IExplorerCommand` shell extension (`JerisLinkSendTo.dll`, served by the package's COM surrogate). It only starts `Jerislink.exe --send-to <paths>` and returns, so Explorer never waits on a transfer; the viewer sends through its existing named pipe and dialogs.
+- A selection too long for one command line shows the "too many items" dialog. The entry is hidden for a selection that is not all on disk, and an item without a file system path makes the run refuse the whole request.
+- Each menu entry hands off only to its own build: the Store entry to the Store viewer, the installer's Send to > JerisLink entry (unchanged) to the installer viewer. That viewer must already be connected to the Mac; otherwise it says JerisLink is not connected and nothing is sent.
+- The Files panel hint for the Store build points at the right-click command.
+
+CI (GitHub `msix` and `windows` workflows):
+
+- The package build checks the DLL's CRT imports, exports and its hash inside the package, then installs the package and activates the command through the COM surrogate. A new shell extension test (COM factory, title, icon, state, and Invoke starting the exe with the exact paths) runs in the `windows` workflow.
+
+Docs:
+
+- `README-Windows.txt`, `INSTALL-SIDELOAD.txt`, `PRIVACY.md` and the Mac host deploy README no longer say the Store version has no Send to entry.
+
+Packaging:
+
+- Version 0.4.1 everywhere: `VERSION`, the macOS bundle versions, and MSIX `0.4.1.0` (GitHub `msix` workflow).
+
 ## v0.4.0
 
 Connection password: the Mac host can require a password before a viewer connects, and video, audio and input over UDP are bound to the logged-in session.
