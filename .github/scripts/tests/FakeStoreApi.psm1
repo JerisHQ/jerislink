@@ -120,6 +120,21 @@ function ConvertTo-FakeNode([string]$Json) {
 # Update: the unchanged submission, Commit: status PendingCommit, Upload:
 # UploadBody, Delete: no body. Accepted: whether that answer was sent.
 # Combine with DripOn for an accepted answer whose body is lost.
+# FailReadOn ('AppRead' / 'SubmissionRead'): the FailReadAt-th GET of the app
+# / of a submission (default the first) is answered with FailReadStatus
+# instead (any status; 0: no answer, the mocked Invoke-StoreHttp throws what
+# HttpClient throws; -1: no answer before the call's time limit; -2: not
+# sent, nothing reaches the fake and nothing is logged), with FailReadBody as
+# its body ($null: the usual body of that GET; a scriptblock: what it returns
+# for the usual body). FailReadLost: its body is
+# lost (the mocked Invoke-StoreHttp returns the status with the BodyLost text
+# of DripEnd). For the mocked Invoke-StoreHttp only. ReadFailed: whether that
+# answer was sent.
+# EditAnswer: a scriptblock called as & EditAnswer <kind> <answer> for every
+# answer the fake gives to a call of a known kind (Token, Create, Update,
+# Commit, Upload, Delete, AppRead, SubmissionRead), after all the options
+# above; it may change the answer's StatusCode and Body (PR #74 r8: planted
+# credentials).
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -160,6 +175,12 @@ function New-FakeStore {
     [ValidateRange(200, 299)][int]$AcceptStatus = 202,
     [switch]$AcceptNotDone,
     [ValidateRange(1, 100)][int]$AcceptAt = 1,
+    [ValidateSet('', 'AppRead', 'SubmissionRead')][string]$FailReadOn = '',
+    [ValidateRange(1, 100)][int]$FailReadAt = 1,
+    [ValidateRange(-2, 599)][int]$FailReadStatus = 503,
+    $FailReadBody = $null,
+    [switch]$FailReadLost,
+    [scriptblock]$EditAnswer = $null,
     [string]$AnswerContentType = 'application/json',
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
@@ -179,6 +200,8 @@ function New-FakeStore {
     DripOn = $DripOn; DripSeconds = $DripSeconds; DripHeadSeconds = $DripHeadSeconds; DripEnd = $DripEnd; Dripped = ''
     AnswerContentType = $AnswerContentType
     AcceptOn = $AcceptOn; AcceptStatus = $AcceptStatus; AcceptNotDone = [bool]$AcceptNotDone; AcceptAt = $AcceptAt; AcceptSeen = 0; Accepted = $false
+    FailReadOn = $FailReadOn; FailReadAt = $FailReadAt; FailReadStatus = $FailReadStatus; FailReadBody = $FailReadBody
+    FailReadLost = [bool]$FailReadLost; FailReadSeen = 0; ReadFailed = $false; EditAnswer = $EditAnswer
     Seen = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -247,6 +270,20 @@ function Invoke-FakeStoreRequest {
   param($Store, [string]$Method, [string]$Uri, [hashtable]$Headers = @{}, [byte[]]$BodyBytes = @())
   $path = ([uri]$Uri).AbsolutePath
   $kind = Get-FakeCallKind $Method $path
+  if ($Store.FailReadOn -and $kind -ceq $Store.FailReadOn -and -not $Store.ReadFailed) {
+    $Store.FailReadSeen++
+    if ($Store.FailReadSeen -eq $Store.FailReadAt) {
+      $Store.ReadFailed = $true
+      if ($Store.FailReadStatus -eq -2) { return New-FakeResponse -2 '' }
+      $r = Invoke-FakeStoreRoute -Store $Store -Method $Method -Uri $Uri -Headers $Headers -BodyBytes $BodyBytes
+      $r.StatusCode = $Store.FailReadStatus
+      if ($Store.FailReadBody -is [scriptblock]) { $r.Body = [string](& $Store.FailReadBody $r.Body) }
+      elseif ($null -ne $Store.FailReadBody) { $r.Body = [string]$Store.FailReadBody }
+      if ($Store.FailReadLost -and $r.StatusCode -gt 0) { $r.DripSeconds = 1 }
+      if ($Store.EditAnswer -and $r.StatusCode -gt 0) { & $Store.EditAnswer $kind $r }
+      return $r
+    }
+  }
   $accept = $false
   if ($Store.AcceptOn -and $kind -ceq $Store.AcceptOn -and -not $Store.Accepted) { $Store.AcceptSeen++; $accept = $Store.AcceptSeen -eq $Store.AcceptAt }
   if ($accept -and $Store.AcceptNotDone -and $kind -in 'Create', 'Update', 'Commit', 'Upload', 'Delete') {
@@ -272,6 +309,7 @@ function Invoke-FakeStoreRequest {
   }
   $on = $Store.DripOn -and $kind -ceq $Store.DripOn -and $kind -notin 'AppRead', 'SubmissionRead'
   if ($on -and $r.StatusCode -gt 0) { $r.DripSeconds = $Store.DripSeconds }
+  if ($Store.EditAnswer -and $kind -and $r.StatusCode -gt 0) { & $Store.EditAnswer $kind $r }
   $r
 }
 

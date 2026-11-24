@@ -46,7 +46,8 @@ BeforeAll {
 
   # Routes the module's HTTP calls to $global:FakeStore. Signs in with the
   # production hosts (the mock sends nothing). A request the fake answers with
-  # status 0 throws what HttpClient throws when no answer comes back. Each call
+  # status 0 throws what HttpClient throws when no answer comes back; status
+  # -2 throws the module's "not sent" error. Each call
   # is logged in $Store.Calls with its timeout (and printed as "[http] ..."
   # when $global:FakeTrace is set). A call that takes longer than its timeout
   # (CallSeconds, UploadSeconds; a hung one, status -1, never ends) throws what
@@ -75,6 +76,7 @@ BeforeAll {
         throw (& (Get-Module MsStoreRunner) { param($s) New-StoreError "no response (time limit of $s s for the whole request reached)" -OutcomeUnknown } $wait)
       }
       if ($null -ne $global:FakeClock) { $global:FakeClock = $global:FakeClock.AddSeconds($took) }
+      if ($r.StatusCode -eq -2) { throw (& (Get-Module MsStoreRunner) { New-StoreError "not sent: no time left in this step's time budget" -NotSent }) }
       if ($r.StatusCode -eq 0) {
         $sock = [System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::ConnectionReset)
         $io = [System.IO.IOException]::new("Unable to read data from the transport connection ($Uri)", $sock)
@@ -135,15 +137,27 @@ BeforeAll {
 
 Describe 'Test-SubmissionHasPackage' {
   It 'passes when the submission holds only the new package' {
-    $r = Test-SubmissionHasPackage -SubmissionJson (Fixture 'new-package-only') -ExpectedVersion '0.4.1.0' -ExpectedSubmissionId $SubId
+    $r = Test-SubmissionHasPackage -SubmissionJson (Fixture 'new-package-only') -ExpectedVersion '0.4.1.0' -ExpectedSubmissionId $SubId -ExpectedFileName 'Jerislink-0.4.1.0-x64.msix'
     $r.Result | Should -Be 'Pass'
     $r.Id | Should -Be $SubId
     $r.Status | Should -Be 'PreProcessing'
     $r.TargetPublishMode | Should -Be 'Immediate'
     $r.Packages.Count | Should -Be 1
-    $r.Packages[0].FileName | Should -Be 'Jerislink-0.4.1.0-x64.msix'
+    $r.Packages[0].FileName | Should -BeExactly 'Jerislink-0.4.1.0-x64.msix'
     $r.Packages[0].Version | Should -Be '0.4.1.0'
     $r.Packages[0].FileStatus | Should -Be 'Uploaded'
+  }
+  # Pepper, PR #74 r8: a file name from the API is shown only when it is
+  # exactly this run's file; any other name, or no expected name, is
+  # "[file name not shown]".
+  It 'does not show a file name that is not this run''s file (<Case>)' -ForEach @(
+    @{ Case = 'no expected name'; Expected = '' }
+    @{ Case = 'another expected name'; Expected = 'Jerislink-0.4.2.0-x64.msix' }
+    @{ Case = 'the expected name in another case'; Expected = 'JERISLINK-0.4.1.0-X64.MSIX' }
+  ) {
+    $r = Test-SubmissionHasPackage -SubmissionJson (Fixture 'new-package-only') -ExpectedVersion '0.4.1.0' -ExpectedSubmissionId $SubId -ExpectedFileName $Expected
+    $r.Result | Should -Be 'Pass'
+    $r.Packages[0].FileName | Should -BeExactly '[file name not shown]'
   }
 
   It 'fails when the old package is still Uploaded next to the new one' {
@@ -244,13 +258,14 @@ Describe 'Test-DraftReadyToCommit' {
   It 'fails when an old package with another extension stays Uploaded' {
     $r = Test-DraftReadyToCommit -SubmissionJson (Fixture 'draft-old-other-extension') -SubmissionId $SubId -ExpectedFileName $NewFile -ExpectedVersion '0.4.1.0'
     $r.Result | Should -Be 'Fail'
-    $r.Reason | Should -Match '2 package\(s\) would remain after commit .*Jerislink-0\.3\.0\.0-x64\.msix version=0\.3\.0\.0'
+    $r.Reason | Should -Match '2 package\(s\) would remain after commit \(\[file name not shown\] version=0\.3\.0\.0 fileStatus=Uploaded; Jerislink-0\.4\.1\.0-x64\.msixupload version= fileStatus=PendingUpload\)'
   }
 
   It 'fails when a second old package with the same extension stays' {
     $r = Test-DraftReadyToCommit -SubmissionJson (Fixture 'draft-two-old-same-extension') -SubmissionId $SubId -ExpectedFileName $NewFile -ExpectedVersion '0.4.1.0'
     $r.Result | Should -Be 'Fail'
-    $r.Reason | Should -Match '2 package\(s\) would remain after commit .*arm64'
+    $r.Reason | Should -Match '2 package\(s\) would remain after commit \(\[file name not shown\] version=0\.3\.0\.0 fileStatus=Uploaded; '
+    $r.Reason | Should -Not -Match 'arm64'
   }
 
   It 'fails when the only remaining package is not the new file' {
@@ -404,8 +419,8 @@ Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
     @{ Case = 'a nested error object'; Code = 400; Want = 'HTTP 400 (BadRequest)'; Body = '{"error":{"code":"BadRequest","message":"see https://evil.invalid"}}' }
     @{ Case = 'a token endpoint error'; Code = 401; Want = 'HTTP 401 (invalid_client, AADSTS7000215)'
        Body = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret dummy-client-secret-Zx9","error_codes":[7000215]}' }
-    @{ Case = 'a code with a line break and a workflow command'; Code = 500; Want = 'HTTP 500'; Body = "{`"code`":`"Bad`n::error::pwned`"}" }
-    @{ Case = 'a code that is a URL'; Code = 400; Want = 'HTTP 400'; Body = '{"code":"https://evil.invalid/x?sig=FAKE+SAS"}' }
+    @{ Case = 'a code with a line break and a workflow command'; Code = 500; Want = 'HTTP 500 ([unlisted code])'; Body = "{`"code`":`"Bad`n::error::pwned`"}" }
+    @{ Case = 'a code that is a URL'; Code = 400; Want = 'HTTP 400 ([unlisted code])'; Body = '{"code":"https://evil.invalid/x?sig=FAKE+SAS"}' }
     @{ Case = 'an HTML page'; Code = 502; Want = 'HTTP 502'; Body = '<html><body>Bad gateway https://evil.invalid ::error::pwned</body></html>' }
     @{ Case = 'an empty body'; Code = 404; Want = 'HTTP 404'; Body = '' }
   ) {
@@ -553,7 +568,7 @@ Describe 'Get-StoreErrorText -Detail (listed target and local hint, never the AP
     @{ Case = 'an unknown status and no body (fixed hint)'; Code = 302; Body = ''; Hint = 'no description of this error is known here (the API''s message text is not printed)' }
   ) {
     $t = Get-StoreErrorText -StatusCode $Code -Body $Body -Detail
-    $t | Should -Match "^HTTP $Code(?: \([A-Za-z]+\))?; hint: $([regex]::Escape($Hint))\z"
+    $t | Should -Match "^HTTP $Code(?: \((?:[A-Za-z]+|\[unlisted code\])\))?; hint: $([regex]::Escape($Hint))\z"
   }
   It 'no hint written in the module advises deleting or retrying, or says whether a 408 or 5xx request was carried out' {
     $hints = InModuleScope MsStoreRunner { @($script:StoreCodeHint.Values) + @($script:StoreStatusHint.Values) + @($script:StoreUnknownHint) }
@@ -626,17 +641,17 @@ Describe 'Strings from the API are printed only when they are plain values' {
     $script:Evil = '{"Id":"1152921505000000004\n::error::pwned","Status":"Certification\r\n::warning::pwned","TargetPublishMode":"Manual\n::add-mask::x",' +
       '"ApplicationPackages":[{"FileName":"Jerislink-0.4.1.0-x64.msixupload\n::error::pwned","FileStatus":"Uploaded\n::set-output name=x::pwned","Version":"0.4.1.0\n::error::pwned"}]}'
   }
-  It 'turns every field that is not a plain value into [invalid] in the check results' {
-    $a = Test-SubmissionHasPackage -SubmissionJson $Evil -ExpectedVersion '0.4.1.0'
+  It 'turns every field that is not a listed or plain value into a fixed mark in the check results' {
+    $a = Test-SubmissionHasPackage -SubmissionJson $Evil -ExpectedVersion '0.4.1.0' -ExpectedFileName $File
     $b = Test-DraftReadyToCommit -SubmissionJson $Evil -SubmissionId $SubId -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
     foreach ($r in $a, $b) {
       $r.Result | Should -Be 'Fail'
       $r.Id | Should -BeExactly '[invalid]'
-      $r.Status | Should -BeExactly '[invalid]'
-      $r.TargetPublishMode | Should -BeExactly '[invalid]'
-      $r.Packages[0].FileName | Should -BeExactly '[invalid]'
+      $r.Status | Should -BeExactly '[unlisted]'
+      $r.TargetPublishMode | Should -BeExactly '[unlisted]'
+      $r.Packages[0].FileName | Should -BeExactly '[file name not shown]'
       $r.Packages[0].Version | Should -BeExactly '[invalid]'
-      $r.Packages[0].FileStatus | Should -BeExactly '[invalid]'
+      $r.Packages[0].FileStatus | Should -BeExactly '[unlisted]'
       ($r | ConvertTo-Json -Depth 5) | Should -Not -Match $Injected
     }
   }
@@ -644,19 +659,19 @@ Describe 'Strings from the API are printed only when they are plain values' {
     $s = New-FakeStore; Use-FakeStore $s
     $s.Sub = @{ id = $SubId; status = "Certification`n::error::pwned"; applicationPackages = @(@{ fileName = "$File`n::warning::pwned"; fileStatus = 'Uploaded'; version = '0.4.1.0' }) }
     $r = Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 -IntervalSeconds 0 }
-    $r.Err | Should -Match "status is '\[invalid\]', not a committed status"
+    $r.Err | Should -Match "status is '\[unlisted\]', not a committed status"
     $r.All | Should -Not -Match $Injected
-    $r.Out | Should -Match 'package fileName=\[invalid\] version=0\.4\.1\.0 fileStatus=Uploaded'
+    $r.Out | Should -Match 'package fileName=\[file name not shown\] version=0\.4\.1\.0 fileStatus=Uploaded'
   }
   It 'prints no injected commit status' {
     $s = New-FakeStore; Use-FakeStore $s
     Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = 200; Body = "{`"status`":`"CommitStarted`n::error::pwned`"}" } }
     $r = Invoke-Captured { Invoke-SubmissionCommit -ProductId $App -SubmissionId $SubId }
-    $r.Out | Should -BeExactly "submission $SubId commit requested through the API: status=[invalid]"
+    $r.Out | Should -BeExactly "submission $SubId commit requested through the API: status=[unlisted]"
   }
   It 'prints no injected priceId' {
     $r = Test-SubmissionPricing -SubmissionJson "{`"pricing`":{`"priceId`":`"Free`n::error::pwned`"}}"
-    $r.Reason | Should -BeExactly 'pricing.priceId=[invalid] is kept as is'
+    $r.Reason | Should -BeExactly 'pricing.priceId=[unlisted] is kept as is'
   }
   It 'prints no injected pending submission id' {
     $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1`n::error::pwned`"}}"
@@ -1313,8 +1328,10 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
     $script:LostLimit = 'body not received (time limit of {0} s for the whole request reached)'
     $script:LostBroken = 'body not received (the connection broke or the body could not be read)'
     $script:ApiOnly = & (Get-Module MsStoreRunner) { $script:ApiOnlyNote }
-    $script:OldPkgs = 'Jerislink-0.3.0.0-x64.msixupload Uploaded, Jerislink-0.3.0.0-x64.msix Uploaded'
-    $script:PutPkgs = "Jerislink-0.3.0.0-x64.msixupload PendingDelete, Jerislink-0.3.0.0-x64.msix PendingDelete, $File PendingUpload"
+    # The old packages' names come from the API and are not this run's file:
+    # not shown (Pepper, PR #74 r8). This run's file is shown.
+    $script:OldPkgs = '[file name not shown] Uploaded, [file name not shown] Uploaded'
+    $script:PutPkgs = "[file name not shown] PendingDelete, [file name not shown] PendingDelete, $File PendingUpload"
     $script:LookApp = "A person needs to check the app's pending submission later in Partner Center (look only, change nothing there) or with GET $Base (pendingApplicationSubmission.id)"
     $script:ReadOnly200 = '(a read is used only when answered HTTP 200)'
     # Text that says a change was done; never printed for an accepted one
@@ -1351,6 +1368,49 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
       param($S, $D, $A)
       Test-StoreDone $S | Should -Be $D
       Test-StoreAccepted $S | Should -Be $A
+    }
+  }
+
+  # Pepper, PR #74 r8: every 2xx code on its own, 200 through 299, one case
+  # each. A GET is used only on 200; a POST, PUT, DELETE or the package upload
+  # is done on 200, 201 or 204 and accepted, completion unconfirmed, on every
+  # other 2xx.
+  It 'HTTP <Status>, each 2xx on its own: GET <Get>, change <Change>' -ForEach @(
+    foreach ($c in 200..299) {
+      @{ Status = $c; Get = $(if ($c -eq 200) { 'used' } else { 'failed read' }); Change = $(if ($c -in 200, 201, 204) { 'done' } else { 'accepted' }) }
+    }
+  ) {
+    InModuleScope MsStoreRunner -Parameters @{ S = $Status; D = ($Change -eq 'done') } {
+      param($S, $D)
+      Test-StoreDone $S | Should -Be $D
+      Test-StoreAccepted $S | Should -Be (-not $D)
+    }
+    $s = New-FakeStore; Use-FakeStore $s
+    $global:FakeAnswer = @{ S = $Status; Body = '{"id":"1152921505000000099","status":"PendingCommit"}' }
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = $global:FakeAnswer.S; Body = $global:FakeAnswer.Body } }
+    $path = "applications/$App/submissions/$NewId"
+    foreach ($m in 'GET', 'POST', 'PUT', 'DELETE') {
+      $rec = $null; $v = $null
+      try { $v = & (Get-Module MsStoreRunner) { param($m, $p) Invoke-StoreApi -Method $m -Path $p } $m $path } catch { $rec = $_ }
+      $used = if ($m -eq 'GET') { $Get -eq 'used' } else { $Change -eq 'done' }
+      if ($used) {
+        $rec | Should -BeNullOrEmpty
+        $v | Should -BeExactly $global:FakeAnswer.Body
+        continue
+      }
+      $what = "Store API $m /v1.0/my/$path"
+      $want = if ($m -eq 'GET') { "$what failed: HTTP $Status $ReadOnly200" } else { "$what answered HTTP ${Status}: accepted, completion unconfirmed" }
+      "$rec" | Should -BeExactly $want
+      $v | Should -BeNullOrEmpty
+      & (Get-Module MsStoreRunner) { param($r) Get-StoreErrorStatus $r } $rec | Should -Be $Status
+    }
+    $r = Invoke-Captured { Send-StorePackage -UploadUrl 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=1&sig=FAKE%2BSAS' -PackagePath $Pkg }
+    if ($Change -eq 'done') {
+      $r.Err | Should -BeNullOrEmpty
+      $r.Out | Should -Match "^package uploaded: .*, HTTP $Status$"
+    } else {
+      $r.Err | Should -BeExactly "package upload answered HTTP ${Status}: accepted, completion unconfirmed (not confirmed stored)"
+      $r.Out | Should -BeNullOrEmpty
     }
   }
 
@@ -1660,18 +1720,22 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
     $r.Err | Should -BeExactly "Store API GET $Base failed: HTTP $Status $ReadOnly200; cannot check for a pending submission; not publishing"
     @($s.Log) | Should -Be @("GET $Base")
   }
-  It '<Read> answered HTTP 202: a failed read; this run''s own draft (created with its id, <Sent>) stays uncommitted, as for any failed read' -ForEach @(
+  # Pepper, PR #74 r8: such a read cannot verify the draft: "Could not
+  # verify", no delete or re-run advice (every outcome: the Describe after
+  # the r6 sweep).
+  It '<Read> answered HTTP 202: a failed read; this run''s own draft (created with its id, <Sent>) stays uncommitted, could not verify, no delete or re-run advice' -ForEach @(
     @{ Read = 'the pending check after create (GET app)'; On = 'AppRead'; At = 2; Path = ''; Sent = 'nothing sent to it' }
     @{ Read = 'GET of the new submission'; On = 'SubmissionRead'; At = 1; Path = '/submissions/1152921505000000099'; Sent = 'nothing sent to it' }
     @{ Read = 'the draft check (GET of the submission after the upload)'; On = 'SubmissionRead'; At = 2; Path = '/submissions/1152921505000000099'; Sent = 'updated and uploaded to, not committed' }
   ) {
     $s = New-FakeStore -AcceptOn $On -AcceptAt $At; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match ('^' + [regex]::Escape("Store API GET $Base$Path failed: HTTP 202 $ReadOnly200. Not committed: draft $NewId stays uncommitted."))
+    $r.Err | Should -Match ('^' + [regex]::Escape("Store API GET $Base$Path failed: HTTP 202 $ReadOnly200. Could not verify: ") + '.*' +
+      [regex]::Escape(" Not committed: this run stops, draft $NewId stays uncommitted and nothing more is sent to it. A person needs to check submission $NewId (look only, change nothing in Partner Center) with GET $Base/submissions/$NewId. $ApiOnly") + '\z')
     @($s.Log)[-1] | Should -Be "GET $Base$Path"
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
     $s.Sub.status | Should -Be 'PendingCommit'
-    $r.All | Should -Not -Match "Accepted, completion unconfirmed|$Leak"
+    $r.All | Should -Not -Match "Accepted, completion unconfirmed|$DeleteAdvice|$RetryAdvice|$Leak"
   }
   It 'a commit read-back answered HTTP 202 counts as a failed read-back; the next one decides' {
     $s = New-FakeStore -LoseResponse Commit -LoseWhen After -LoseAsStatus 503 -LoseBody '{"code":"ServiceUnavailable"}' -AcceptOn SubmissionRead -AcceptAt 3; Use-FakeStore $s
@@ -1706,6 +1770,505 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
     $r.Err | Should -BeExactly "Store API GET $Base/submissions/$SubId failed: HTTP 202 $ReadOnly200"
     @($s.Log) | Should -Be @("GET $Base/submissions/$SubId")
     $s.Sub.status | Should -Be 'PendingCommit'
+  }
+}
+
+# Pepper, PR #74 r8: a read before the commit that gave no usable answer (a
+# 202 or another 2xx but 200, its body read or lost) stopped the run and
+# advised deleting the draft and re-running. Such a read cannot verify what
+# the draft holds: the run stops with "Could not verify", keeps the draft
+# uncommitted, sends nothing more and says only how to look at it by id.
+# Each of the three reads (the app after create, the new submission before
+# the PUT, the draft after the upload) gets every outcome: each 2xx but 200
+# with its body read, 2xx bodies lost (time limit, broken connection), 200
+# with its body lost, 4xx and 5xx error bodies read and lost, no answer, no
+# answer before the time limit, not sent, and HTTP 200 bodies that cannot be
+# used (not JSON, an invalid literal, keys that differ only in case, a key
+# twice, another app or submission, a pending submission without a usable
+# id). Every string the API sends here carries a planted token, client
+# secret and SAS URL; none is printed.
+Describe 'A read before the commit that gives no usable answer: could not verify, no delete or re-run advice (PR #74 r8, fake Store)' {
+  BeforeAll {
+    $script:ApiOnly = & (Get-Module MsStoreRunner) { $script:ApiOnlyNote }
+    $script:ReadOnly200 = '(a read is used only when answered HTTP 200)'
+    $script:LostText = @{
+      Body = 'body not received (time limit of 600 s for the whole request reached)'
+      Break = 'body not received (the connection broke or the body could not be read)'
+    }
+    $script:PlantedJwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJwbGFudGVkIn0.cGxhbnRlZC1zaWduYXR1cmU'
+    $script:PlantedSecret = 'planted-client-secret-Qw7~x'
+    $script:PlantedSas = 'https://plantedacct.blob.core.windows.net/c/p.zip?sv=2022-11-02&sig=PLANTED%2BSAS%3D'
+    $script:PlantedAny = 'eyJhbGciOiJSUzI1NiJ9|eyJzdWIiOiJwbGFudGVk|cGxhbnRlZC1zaWduYXR1cmU|planted-client-secret|plantedacct|PLANTED|PlantedCode'
+    $script:ReadErrBody = @{ code = 'PlantedCodeAbcDef'; target = $PlantedJwt; message = "$PlantedSecret $PlantedSas"; error = @{ code = $PlantedJwt; message = $PlantedSas } } | ConvertTo-Json -Compress
+    $script:Reads = @{
+      App = @{ On = 'AppRead'; At = 2; Path = $Base; Read = 'the read of the app after create (GET application)'; Log = 3 }
+      Sub = @{ On = 'SubmissionRead'; At = 1; Path = "$Base/submissions/$NewId"; Read = "the read of submission $NewId before the update (GET submission)"; Log = 4 }
+      Draft = @{ On = 'SubmissionRead'; At = 2; Path = "$Base/submissions/$NewId"; Read = "the draft check's read of submission $NewId after the upload (GET submission)"; Log = 7 }
+    }
+    $script:FullLog = @("GET $Base", "POST $Base/submissions", "GET $Base", "GET $Base/submissions/$NewId", "PUT $Base/submissions/$NewId", 'PUT /blob/upload.zip', "GET $Base/submissions/$NewId")
+    # A body for FailReadBody, by name: a string, or a scriptblock that edits
+    # the usual body of that GET.
+    function script:Get-ReadBody([string]$Name) {
+      $j = $PlantedJwt; $sas = $PlantedSas; $sec = $PlantedSecret
+      switch ($Name) {
+        'Error' { $ReadErrBody }
+        'Html' { "<html><body>$sec $sas ::error::pwned</body></html>" }
+        'NotJson' { "$j $sas" }
+        'BadLiteral' { { param($b) $b.Replace('"status":"PendingCommit"', "`"status`":tru,`"x`":`"$j`"") }.GetNewClosure() }
+        'CaseKeys' { { param($b) $b.Replace('"status":', "`"Status`":`"$j`",`"status`":") }.GetNewClosure() }
+        'TopDup' { { param($b) $b.Replace('"status":', "`"$j`":1,`"$j`":2,`"status`":") }.GetNewClosure() }
+        'NestedDup' { { param($b) $b.Replace('"priceId":"Free"', "`"priceId`":`"Free`",`"priceId`":`"$j`"") }.GetNewClosure() }
+        'PackageDup' { { param($b) $b.Replace('"fileStatus":', "`"$j`":1,`"$j`":2,`"fileStatus`":") }.GetNewClosure() }
+        'OtherSub' { { param($b) $b.Replace('"id":"1152921505000000099"', "`"id`":`"$j`"") }.GetNewClosure() }
+        'OtherSubNumber' { { param($b) $b.Replace('"id":"1152921505000000099"', '"id":"1152921505000000123"') } }
+        'OtherApp' { "{`"id`":`"$j`",`"pendingApplicationSubmission`":{`"id`":`"1152921505000000099`"}}" }
+        'PendingNoId' { "{`"id`":`"9NM3VWQ9MD7N`",`"pendingApplicationSubmission`":{`"id`":`"$j`",`"resourceLocation`":`"$sas`"}}" }
+        default { $null }
+      }
+    }
+  }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It '<Step>: <Case>: could not verify; the draft stays uncommitted, look by id only, no delete or re-run advice' -ForEach @(
+    foreach ($step in 'App', 'Sub', 'Draft') {
+      foreach ($st in 201, 202, 203, 204, 205, 206, 207, 208, 226, 250, 299) {
+        @{ Step = $step; Case = "HTTP $st, body read"; Status = $st; Fail = "HTTP $st {R}" }
+      }
+      @{ Step = $step; Case = 'HTTP 202 with an error body carrying the planted strings'; Status = 202; Body = 'Error'; Fail = 'HTTP 202 {R}' }
+      @{ Step = $step; Case = 'HTTP 206 with an HTML page'; Status = 206; Body = 'Html'; Fail = 'HTTP 206 {R}' }
+      @{ Step = $step; Case = 'HTTP 202, body lost (time limit)'; Status = 202; Lost = 'Body'; Fail = 'HTTP 202 {R}; {L}' }
+      @{ Step = $step; Case = 'HTTP 203, body lost (connection broken)'; Status = 203; Lost = 'Break'; Fail = 'HTTP 203 {R}; {L}' }
+      @{ Step = $step; Case = 'HTTP 206, body lost (time limit)'; Status = 206; Lost = 'Body'; Fail = 'HTTP 206 {R}; {L}' }
+      @{ Step = $step; Case = 'HTTP 299, body lost (connection broken)'; Status = 299; Lost = 'Break'; Fail = 'HTTP 299 {R}; {L}' }
+      @{ Step = $step; Case = 'HTTP 200, body lost (time limit)'; Status = 200; Lost = 'Body'; Fail = 'HTTP 200; {L}' }
+      @{ Step = $step; Case = 'HTTP 200, body lost (connection broken)'; Status = 200; Lost = 'Break'; Fail = 'HTTP 200; {L}' }
+      @{ Step = $step; Case = 'HTTP 401 with planted strings'; Status = 401; Body = 'Error'; Fail = 'HTTP 401 ([unlisted code]); target: [unlisted target]; hint: the access token was not accepted' }
+      @{ Step = $step; Case = 'HTTP 404 with planted strings'; Status = 404; Body = 'Error'; Fail = 'HTTP 404 ([unlisted code]); target: [unlisted target]; hint: the app or submission was not found' }
+      @{ Step = $step; Case = 'HTTP 409 with planted strings, body lost'; Status = 409; Body = 'Error'; Lost = 'Break'; Fail = 'HTTP 409; hint: the current state of the app does not allow this, or the app uses a Partner Center feature the submission API does not support; {L}' }
+      @{ Step = $step; Case = 'HTTP 500 with planted strings'; Status = 500; Body = 'Error'; Fail = 'HTTP 500 ([unlisted code]); target: [unlisted target]; hint: the service reported an internal error' }
+      @{ Step = $step; Case = 'HTTP 503 with planted strings'; Status = 503; Body = 'Error'; Fail = 'HTTP 503 ([unlisted code]); target: [unlisted target]; hint: the service reported that it is unavailable' }
+      @{ Step = $step; Case = 'HTTP 503 with planted strings, body lost'; Status = 503; Body = 'Error'; Lost = 'Body'; Fail = 'HTTP 503; hint: the service reported that it is unavailable; {L}' }
+      @{ Step = $step; Case = 'HTTP 502 with an HTML page'; Status = 502; Body = 'Html'; Fail = 'HTTP 502; hint: a gateway in front of the service reported an error' }
+      @{ Step = $step; Case = 'HTTP 302'; Status = 302; Body = 'Error'; Fail = "HTTP 302 ([unlisted code]); target: [unlisted target]; hint: no description of this error is known here (the API's message text is not printed)" }
+      @{ Step = $step; Case = 'no answer'; Status = 0; Fail = 'no response (HttpRequestException Unknown <- IOException <- SocketException ConnectionReset)' }
+      @{ Step = $step; Case = 'no answer before the time limit'; Status = -1; Fail = 'no response (time limit of 600 s for the whole request reached)' }
+      @{ Step = $step; Case = 'not sent'; Status = -2; Fail = "not sent: no time left in this step's time budget" }
+      @{ Step = $step; Case = 'HTTP 200, not JSON'; Status = 200; Body = 'NotJson'; Fail = $(if ($step -eq 'App') { '=GET application returned JSON that does not parse' } else { '=GET submission {Id} returned JSON that does not parse' }) }
+    }
+    @{ Step = 'App'; Case = 'HTTP 200, another app'; Status = 200; Body = 'OtherApp'; Fail = '=GET application returned a different or empty application id' }
+    @{ Step = 'App'; Case = 'HTTP 200, a pending submission without a usable id'; Status = 200; Body = 'PendingNoId'; Fail = "=after create, the app's pending submission has no usable id" }
+    foreach ($step in 'Sub', 'Draft') {
+      @{ Step = $step; Case = 'HTTP 200, an invalid literal'; Status = 200; Body = 'BadLiteral'; Fail = '=GET submission {Id} returned JSON that does not parse' }
+      @{ Step = $step; Case = 'HTTP 200, keys that differ only in case'; Status = 200; Body = 'CaseKeys'; Fail = '=GET submission {Id} returned JSON that does not parse' }
+      @{ Step = $step; Case = 'HTTP 200, another submission (a planted id)'; Status = 200; Body = 'OtherSub'; Fail = '=GET submission {Id} returned another submission' }
+      @{ Step = $step; Case = 'HTTP 200, another submission (another number)'; Status = 200; Body = 'OtherSubNumber'; Fail = '=GET submission {Id} returned another submission' }
+    }
+    @{ Step = 'Sub'; Case = 'HTTP 200, a top-level key twice'; Status = 200; Body = 'TopDup'; Fail = "=submission JSON is not an object that can be read (the parser's message is not printed)" }
+    @{ Step = 'Draft'; Case = 'HTTP 200, a top-level key twice'; Status = 200; Body = 'TopDup'; Fail = "=submission JSON is not an object that can be read (the parser's message is not printed)" }
+    @{ Step = 'Draft'; Case = 'HTTP 200, a key twice in a compared field'; Status = 200; Body = 'NestedDup'; Fail = "=the submission fields could not be compared (the parser's message is not printed)" }
+    # ConvertFrom-Json takes a key given twice in the same case, System.Text.Json
+    # refuses it when the PUT body is built, with a message that quotes the key.
+    @{ Step = 'Sub'; Case = 'HTTP 200, a key twice in a package object'; Status = 200; Body = 'PackageDup'; Fail = "=the submission JSON could not be read to set the packages (the parser's message is not printed)" }
+  ) {
+    $d = $Reads[$Step]
+    $o = @{ FailReadOn = $d.On; FailReadAt = $d.At; FailReadStatus = $Status }
+    if ($Body) { $o.FailReadBody = Get-ReadBody $Body }
+    if ($Lost) { $o.FailReadLost = $true; $o.DripEnd = $Lost }
+    $s = New-FakeStore @o; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $f = $Fail.Replace('{R}', $ReadOnly200).Replace('{Id}', $NewId)
+    if ($Lost) { $f = $f.Replace('{L}', $LostText[$Lost]) }
+    $f = if ($f.StartsWith('=')) { $f.Substring(1) } else { "Store API GET $($d.Path) failed: $f" }
+    $r.Err | Should -BeExactly ("$f. Could not verify: $($d.Read) gave no usable answer, so this run does not know what draft $NewId holds now. " +
+      "Not committed: this run stops, draft $NewId stays uncommitted and nothing more is sent to it. " +
+      "A person needs to check submission $NewId (look only, change nothing in Partner Center) with GET $Base/submissions/$NewId. $ApiOnly")
+    $r.Value | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak|$Injected|$PlantedAny"
+    $r.All | Should -Not -Match 'draft verified|commit requested through the API|deleted draft'
+    $s.ReadFailed | Should -BeTrue
+    # Nothing is sent after the failed read (a read not sent is not logged).
+    $n = if ($Status -eq -2) { $d.Log - 1 } else { $d.Log }
+    @($s.Log) | Should -Be @($FullLog[0..($n - 1)])
+    $s.Sub.status | Should -Be 'PendingCommit'
+  }
+
+  # The readable answers that still give delete-by-id advice for this run's
+  # own draft: they are not failed reads (Remove-StoreDraftSubmission deletes
+  # only while it is PendingCommit).
+  It 'after create, a readable answer (HTTP 200) shows <Case>: delete-by-id advice for this run''s own draft stays' -ForEach @(
+    @{ Case = 'another pending id'; Opt = @{ PendingAfterCreate = '1152921505000000008' }; Want = "after create, the app's pending submission is '1152921505000000008', not 1152921505000000099" }
+    @{ Case = 'no pending submission'; Opt = @{ PendingLag = $true }; Want = "after create, the app's pending submission is '', not 1152921505000000099" }
+  ) {
+    $o = $Opt.Clone(); $s = New-FakeStore @o; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ('^' + [regex]::Escape("$Want. Not committed: draft $NewId stays uncommitted. $ApiOnly Delete exactly this submission through the API: DELETE $Base/submissions/$NewId "))
+    $r.Err | Should -Not -Match 'Could not verify'
+    @($s.Log) | Should -Be @($FullLog[0..2])
+  }
+}
+
+# Pepper, PR #74 r8, point 1: no API content is printed raw. A synthetic token
+# (a JWT), a client secret, a SAS URL, and all three in one string, are each
+# planted at every spot of an answer, one spot at a time: the whole body, each
+# value at any depth (text, number, true, false, null, object or array, so a
+# field of an unexpected type too) and each property name. The run may stop
+# or go on; nothing it prints, returns for printing or throws may show any of
+# the planted text.
+Describe 'Credentials planted at every spot of every API answer are never printed (PR #74 r8)' {
+  BeforeAll {
+    $script:PlantedJwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJwbGFudGVkIn0.cGxhbnRlZC1zaWduYXR1cmU'
+    $script:PlantedSecret = 'planted-client-secret-Qw7~x'
+    $script:PlantedSas = 'https://plantedacct.blob.core.windows.net/c/p.zip?sv=2022-11-02&sig=PLANTED%2BSAS%3D'
+    $script:PlantedAny = 'eyJhbGciOiJSUzI1NiJ9|eyJzdWIiOiJwbGFudGVk|cGxhbnRlZC1zaWduYXR1cmU|planted-client-secret|plantedacct|PLANTED'
+    $script:Plants = [ordered]@{ Jwt = $PlantedJwt; Secret = $PlantedSecret; Sas = $PlantedSas; All = "$PlantedJwt $PlantedSecret $PlantedSas" }
+
+    # Every spot of a body: the whole body (Root), and when it is a JSON
+    # object or array, each value at any depth (Key: property name or array
+    # index of the node at Path) and each property name (Name).
+    function script:Get-PlantSpots([AllowEmptyString()][string]$Json) {
+      $spots = [System.Collections.Generic.List[hashtable]]::new()
+      $spots.Add(@{ Root = $true })
+      $root = $null
+      try { $root = [System.Text.Json.Nodes.JsonNode]::Parse($Json) } catch { }
+      $walk = {
+        param($Node, [object[]]$Path)
+        if ($Node -is [System.Text.Json.Nodes.JsonObject]) {
+          foreach ($kv in @($Node)) {
+            $spots.Add(@{ Path = $Path; Key = $kv.Key; Name = $true })
+            $spots.Add(@{ Path = $Path; Key = $kv.Key; Name = $false })
+            & $walk $kv.Value ($Path + @($kv.Key))
+          }
+        } elseif ($Node -is [System.Text.Json.Nodes.JsonArray]) {
+          for ($i = 0; $i -lt $Node.Count; $i++) {
+            $spots.Add(@{ Path = $Path; Key = $i; Name = $false })
+            & $walk $Node[$i] ($Path + @($i))
+          }
+        }
+      }
+      & $walk $root @()
+      , $spots
+    }
+    # Json with Value planted at Spot.
+    function script:Set-Plant([AllowEmptyString()][string]$Json, [hashtable]$Spot, [string]$Value) {
+      if ($Spot.Root) { return $Value }
+      $root = [System.Text.Json.Nodes.JsonNode]::Parse($Json)
+      $p = $root
+      foreach ($k in $Spot.Path) { $p = $p[$k] }
+      if ($Spot.Name) {
+        $o = $p.AsObject(); $v = $o[$Spot.Key]; [void]$o.Remove($Spot.Key); $o.Add($Value, $v)
+      } else {
+        $p[$Spot.Key] = [System.Text.Json.Nodes.JsonValue]::Create($Value)
+      }
+      $root.ToJsonString()
+    }
+    # The first planted text in Text, with some context, or ''.
+    function script:Get-PlantLeak([AllowEmptyString()][string]$Text) {
+      $m = [regex]::Match($Text, "(?is).{0,60}(?:$PlantedAny).{0,30}")
+      if ($m.Success) { $m.Value -replace '\s+', ' ' } else { '' }
+    }
+    # Fills the lists the fake leaves empty (statusDetails) and adds app
+    # fields the fake leaves out, so those have spots too.
+    function script:Add-PlantFill([string]$Kind, [AllowEmptyString()][string]$Body) {
+      if (-not $Body) { return $Body }
+      $Body = $Body.Replace('"statusDetails":{"errors":[],"warnings":[],"certificationReports":[]}',
+        '"statusDetails":{"errors":[{"code":"InvalidParameterValue","details":"x"}],"warnings":[{"code":"SalesUnsupportedWarning","details":"y"}],"certificationReports":[{"date":"2026-01-01T00:00:00Z","reportUrl":"https://example.invalid/r"}]}')
+      if ($Kind -ceq 'AppRead' -and $Body.StartsWith('{')) { $Body = '{"packageFamilyName":"JerisHQ.JerisLink_0abc","firstPublishedDate":"2026-01-01T00:00:00Z",' + $Body.Substring(1) }
+      $Body
+    }
+    # The fake's EditAnswer: fills the answer (Add-PlantFill), then for an
+    # answer of the kind $global:PlantState.Kind makes it the planted error
+    # body (when Status is set) and plants Value at spot K.
+    $script:PlantSpotCache = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $script:PlantHook = {
+      param([string]$Kind, $R)
+      $p = $global:PlantState
+      if ($null -eq $p) { return }
+      if ($Kind -ceq $p.Kind -and $p.Status) { $R.StatusCode = $p.Status; $R.Body = $p.ErrorBody }
+      $R.Body = Add-PlantFill $Kind ([string]$R.Body)
+      if ($Kind -cne $p.Kind) { return }
+      $spots = $null
+      if (-not $PlantSpotCache.TryGetValue($R.Body, [ref]$spots)) { $spots = Get-PlantSpots $R.Body; $PlantSpotCache[$R.Body] = $spots }
+      if ($spots.Count -gt $p.Max) { $p.Max = $spots.Count }
+      if ($p.K -lt $spots.Count) { $R.Body = Set-Plant $R.Body $spots[$p.K] $p.Value; $p.Planted++ }
+    }
+    # Runs Action (given a new fake Store made with Options, after signing in)
+    # once for each spot K = 0, 1, ... with Value planted at spot K of every
+    # answer of kind Kind (made the error body ErrorBody with HTTP Status
+    # first, when Status is set), until K has passed every spot any such
+    # answer had. Returns the leaks (run and planted text shown), the number
+    # of runs and how many answers were planted.
+    function script:Invoke-PlantRuns {
+      param([string]$Kind, [string]$Value, [hashtable]$Options = @{}, [scriptblock]$Action, [int]$Status = 0, [string]$ErrorBody = '')
+      Use-FakeStore (New-FakeStore)
+      $leaks = [System.Collections.Generic.List[string]]::new()
+      $global:PlantState = @{ Kind = $Kind; K = 0; Max = 0; Value = $Value; Planted = 0; Status = $Status; ErrorBody = $ErrorBody }
+      $k = 0; $planted = 0
+      try {
+        do {
+          $global:PlantState.K = $k; $global:PlantState.Planted = 0
+          $s = New-FakeStore @Options -EditAnswer $PlantHook
+          $global:FakeStore = $s
+          $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret; & $Action $s }
+          $planted += $global:PlantState.Planted
+          $leak = Get-PlantLeak $r.All
+          if ($leak) { $leaks.Add("$Kind spot ${k}: $leak") }
+          $k++
+        } while ($k -lt $global:PlantState.Max)
+      } finally { $global:PlantState = $null }
+      [pscustomobject]@{ Leaks = $leaks; Runs = $k; Planted = $planted }
+    }
+    # Error bodies with every field the module reads (code, error, error
+    # object, error_codes, target) or could read (message, details,
+    # innererror, the token endpoint's fields).
+    $script:StoreErrorTemplate = '{"code":"InvalidParameterValue","message":"m","target":"applicationCategory","source":"Ingestion Api",' +
+      '"details":[{"code":"InvalidState","message":"m","target":"pricing"}],"innererror":{"code":"InvalidState","message":"m","innererror":{"code":"x"}},' +
+      '"error":{"code":"InvalidParameterValue","message":"m","target":"pricing","details":[{"code":"InvalidState","message":"m"}],"innererror":{"code":"x"}},' +
+      '"statusCode":400,"requestId":"0f8fad5b-d9cb-469f-a165-70867728950e"}'
+    $script:OAuthErrorTemplate = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret provided.","error_codes":[7000215],' +
+      '"timestamp":"2026-11-24 00:00:00Z","trace_id":"0f8fad5b-d9cb-469f-a165-70867728950e","correlation_id":"0f8fad5b-d9cb-469f-a165-70867728950f",' +
+      '"error_uri":"https://login.microsoftonline.com/error?code=7000215"}'
+    $script:BlobErrorTemplate = '<?xml version="1.0" encoding="utf-8"?><Error><Code>AuthenticationFailed</Code><Message>Server failed to authenticate the request.</Message>' +
+      '<AuthenticationErrorDetail>Signature did not match.</AuthenticationErrorDetail></Error>'
+    # Each text of the blob error XML replaced with Value, each element name,
+    # and Value as the whole body.
+    function script:Get-BlobErrorPlants([string]$Value) {
+      $t = $BlobErrorTemplate
+      $esc = [Security.SecurityElement]::Escape($Value)
+      @(
+        $t.Replace('>AuthenticationFailed<', ">$esc<"), $t.Replace('>Server failed to authenticate the request.<', ">$esc<"),
+        $t.Replace('>Signature did not match.<', ">$esc<"), $t.Replace('Code>', "Code>$esc "), $t.Replace('<Code>AuthenticationFailed</Code>', "<Code>$esc</Code><Code>$esc</Code>"),
+        $Value, "<html><head><title>$esc</title></head><body>$esc</body></html>", "<Code>$Value</Code>"
+      )
+    }
+    # A submission as Partner Center returns it after this run's update: two
+    # old packages PendingDelete, this run's PendingUpload, statusDetails
+    # filled.
+    $s0 = New-FakeStore
+    $s0.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @(
+      [ordered]@{ id = 'p1'; fileName = 'Jerislink-0.3.0.0-x64.msixupload'; fileStatus = 'PendingDelete'; version = '0.3.0.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }
+      [ordered]@{ id = 'p2'; fileName = 'Jerislink-0.3.0.0-x64.msix'; fileStatus = 'PendingDelete'; version = '0.3.0.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }
+      [ordered]@{ fileName = $File; fileStatus = 'PendingUpload'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }
+    $script:PlantSub = Add-PlantFill 'SubmissionRead' (Get-FakeSubmission $s0)
+    $script:PlantApp = '{"id":"9NM3VWQ9MD7N","primaryName":"JerisLink","packageFamilyName":"JerisHQ.JerisLink_0abc","firstPublishedDate":"2026-01-01T00:00:00Z",' +
+      '"lastPublishedApplicationSubmission":{"id":"1152921505000000001","resourceLocation":"applications/9NM3VWQ9MD7N/submissions/1152921505000000001"},' +
+      '"pendingApplicationSubmission":{"id":"1152921505000000099","resourceLocation":"applications/9NM3VWQ9MD7N/submissions/1152921505000000099"}}'
+    # What an end-to-end run does once signed in (S: its fake Store).
+    $script:PlantPublish = {
+      param($S)
+      Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 2 -CommitReadBackIntervalSeconds 0
+    }
+    $script:PlantVerify = {
+      param($S)
+      $S.Sub = @{ id = $SubId; status = 'Certification'; applicationPackages = @(
+        [ordered]@{ id = 'p3'; fileName = $File; fileStatus = 'Uploaded'; version = '0.4.1.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }
+      Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -ExpectedFileName $File -TimeoutMinutes 0 -IntervalSeconds 0
+    }
+    $script:PlantDelete = {
+      param($S)
+      $S.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @(
+        [ordered]@{ id = 'p1'; fileName = 'Jerislink-0.3.0.0-x64.msixupload'; fileStatus = 'Uploaded'; version = '0.3.0.0'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }
+      Remove-StoreDraftSubmission -ProductId $App -SubmissionId $SubId
+    }
+  }
+  AfterAll { $global:PlantState = $null }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It 'finds every spot: the whole body, each value at any depth and each property name' {
+    $spots = Get-PlantSpots '{"a":"x","b":{"c":1,"d":["y",{"e":null}]}}'
+    $spots.Count | Should -Be 13
+    $all = @(foreach ($sp in $spots) { Set-Plant '{"a":"x","b":{"c":1,"d":["y",{"e":null}]}}' $sp 'P' })
+    $all | Should -Be @('P', '{"b":{"c":1,"d":["y",{"e":null}]},"P":"x"}', '{"a":"P","b":{"c":1,"d":["y",{"e":null}]}}',
+      '{"a":"x","P":{"c":1,"d":["y",{"e":null}]}}', '{"a":"x","b":"P"}', '{"a":"x","b":{"d":["y",{"e":null}],"P":1}}', '{"a":"x","b":{"c":"P","d":["y",{"e":null}]}}',
+      '{"a":"x","b":{"c":1,"P":["y",{"e":null}]}}', '{"a":"x","b":{"c":1,"d":"P"}}', '{"a":"x","b":{"c":1,"d":["P",{"e":null}]}}', '{"a":"x","b":{"c":1,"d":["y","P"]}}',
+      '{"a":"x","b":{"c":1,"d":["y",{"P":null}]}}', '{"a":"x","b":{"c":1,"d":["y",{"e":"P"}]}}')
+    (Get-PlantSpots 'not json').Count | Should -Be 1
+    (Get-PlantSpots $PlantSub).Count | Should -BeGreaterThan 150
+  }
+
+  It 'Get-StoreErrorText prints only the status, listed codes, a listed target and fixed hints (HTTP <Status>, <Plant>)' -ForEach @(
+    foreach ($st in 400, 401, 403, 404, 409, 412, 429, 500, 502, 503, 504) { foreach ($pl in 'Jwt', 'Secret', 'Sas', 'All') { @{ Status = $st; Plant = $pl } } }
+  ) {
+    $v = $Plants[$Plant]
+    $bodies = [System.Collections.Generic.List[string]]::new()
+    foreach ($t in $StoreErrorTemplate, $OAuthErrorTemplate) { foreach ($sp in (Get-PlantSpots $t)) { $bodies.Add((Set-Plant $t $sp $v)) } }
+    foreach ($b in (Get-BlobErrorPlants $v)) { $bodies.Add($b) }
+    $bodies.Count | Should -Be 75
+    $leaks = @(foreach ($b in $bodies) {
+      foreach ($d in $false, $true) {
+        $t = Get-StoreErrorText -StatusCode $Status -Body $b -Detail:$d
+        if ($t -notmatch "^HTTP $Status\b") { "not a status line: $t" }
+        $l = Get-PlantLeak $t
+        if ($l) { $l }
+      }
+    })
+    $leaks | Should -BeNullOrEmpty
+  }
+
+  It 'checks of a submission (read, package, draft, price, compare, summary) show none of it (<Plant>)' -ForEach @(
+    @{ Plant = 'Jwt' }, @{ Plant = 'Secret' }, @{ Plant = 'Sas' }, @{ Plant = 'All' }
+  ) {
+    $v = $Plants[$Plant]
+    $kept = Get-SubmissionComparedFields -SubmissionJson $PlantSub
+    $spots = Get-PlantSpots $PlantSub
+    $leaks = [System.Collections.Generic.List[string]]::new()
+    for ($k = 0; $k -lt $spots.Count; $k++) {
+      $j = Set-Plant $PlantSub $spots[$k] $v
+      $r = Invoke-Captured {
+        $out = [System.Collections.Generic.List[string]]::new()
+        $safe = & (Get-Module MsStoreRunner) { param($j, $f) Read-SubmissionSafe -SubmissionJson $j -ExpectedFileName $f } $j $File
+        $out.Add(($safe | ConvertTo-Json -Depth 6 -Compress))
+        $out.Add((Test-SubmissionHasPackage -SubmissionJson $j -ExpectedVersion '0.4.1.0' -ExpectedFileName $File | ConvertTo-Json -Depth 6 -Compress))
+        $ready = Test-DraftReadyToCommit -SubmissionJson $j -SubmissionId $NewId -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
+        $out.Add(($ready | ConvertTo-Json -Depth 6 -Compress))
+        & (Get-Module MsStoreRunner) { param($c) Write-SubmissionSummary -Check $c } $ready
+        $out.Add((Test-SubmissionPricing -SubmissionJson $j | ConvertTo-Json -Compress))
+        foreach ($c in { Compare-SubmissionFields -ExpectedJson $kept -SubmissionJson $j }, { Compare-SubmissionFields -ExpectedJson $j -SubmissionJson $PlantSub },
+                       { Get-SubmissionComparedFields -SubmissionJson $j | Out-Null }, { Set-SubmissionPackage -SubmissionJson $j -FileName $File | Out-Null },
+                       { & (Get-Module MsStoreRunner) { param($j) Get-SubmissionUploadUrl $j | Out-Null } $j }) {
+          try { $x = & $c; if ($null -ne $x) { $out.Add(($x | ConvertTo-Json -Depth 6 -Compress)) } } catch { $out.Add("$_") }
+        }
+        $out -join "`n"
+      }
+      $leak = Get-PlantLeak $r.All
+      if ($leak) { $leaks.Add("spot ${k}: $leak") }
+    }
+    $spots.Count | Should -BeGreaterThan 150
+    $leaks | Should -BeNullOrEmpty
+  }
+
+  # System.Text.Json refuses a key given twice (also in another case, with
+  # PropertyNameCaseInsensitive) when the object is first read, and its
+  # message quotes the key; ConvertFrom-Json refuses keys that differ only in
+  # case, and takes the same key twice. Every check gets each, with the
+  # planted value as the key, at the top level, in a compared field (pricing)
+  # and in a package object.
+  It 'a planted key given twice at the top level, in pricing or in a package object: no parser message is shown (<Plant>)' -ForEach @(
+    @{ Plant = 'Jwt' }, @{ Plant = 'Secret' }, @{ Plant = 'Sas' }, @{ Plant = 'All' }
+  ) {
+    $v = $Plants[$Plant]
+    $kept = Get-SubmissionComparedFields -SubmissionJson $PlantSub
+    $q = $v | ConvertTo-Json; $qu = $v.ToUpperInvariant() | ConvertTo-Json
+    $variants = [ordered]@{}
+    foreach ($dup in @{ Same = "$($q):1,$($q):2"; Case = "$($qu):1,$($q):2" }.GetEnumerator()) {
+      foreach ($at in @{ Top = '^\{'; Pricing = '"pricing":\{'; Package = '"applicationPackages":\[\{' }.GetEnumerator()) {
+        $m = [regex]::Matches($PlantSub, $at.Value)
+        $m.Count | Should -BeGreaterThan 0
+        $variants["$($at.Key) $($dup.Key)"] = $PlantSub.Substring(0, $m[0].Index + $m[0].Length) + $dup.Value + ',' + $PlantSub.Substring($m[0].Index + $m[0].Length)
+      }
+    }
+    $variants.Count | Should -Be 6
+    $leaks = [System.Collections.Generic.List[string]]::new()
+    $thrown = @{}
+    foreach ($e in $variants.GetEnumerator()) {
+      $j = $e.Value
+      $r = Invoke-Captured {
+        $out = [System.Collections.Generic.List[string]]::new()
+        $safe = & (Get-Module MsStoreRunner) { param($j, $f) Read-SubmissionSafe -SubmissionJson $j -ExpectedFileName $f } $j $File
+        $out.Add(($safe | ConvertTo-Json -Depth 6 -Compress))
+        $out.Add((Test-SubmissionHasPackage -SubmissionJson $j -ExpectedVersion '0.4.1.0' -ExpectedFileName $File | ConvertTo-Json -Depth 6 -Compress))
+        $ready = Test-DraftReadyToCommit -SubmissionJson $j -SubmissionId $NewId -ExpectedFileName $File -ExpectedVersion '0.4.1.0'
+        $out.Add(($ready | ConvertTo-Json -Depth 6 -Compress))
+        & (Get-Module MsStoreRunner) { param($c) Write-SubmissionSummary -Check $c } $ready
+        $out.Add((Test-SubmissionPricing -SubmissionJson $j | ConvertTo-Json -Compress))
+        $n = 0
+        foreach ($c in { Compare-SubmissionFields -ExpectedJson $kept -SubmissionJson $j }, { Compare-SubmissionFields -ExpectedJson $j -SubmissionJson $PlantSub },
+                       { Get-SubmissionComparedFields -SubmissionJson $j | Out-Null }, { Set-SubmissionPackage -SubmissionJson $j -FileName $File | Out-Null },
+                       { & (Get-Module MsStoreRunner) { param($j) Get-SubmissionUploadUrl $j | Out-Null } $j }) {
+          $n++
+          try { $x = & $c; if ($null -ne $x) { $out.Add(($x | ConvertTo-Json -Depth 6 -Compress)) } } catch { $out.Add("$_"); $thrown["$($e.Key) $n"] = "$_" }
+        }
+        $out -join "`n"
+      }
+      $leak = Get-PlantLeak $r.All
+      if ($leak) { $leaks.Add("$($e.Key): $leak") }
+    }
+    $leaks | Should -BeNullOrEmpty
+    # The parser refused each where expected, and only fixed text came out.
+    $thrown['Package Same 4'] | Should -BeExactly "the submission JSON could not be read to set the packages (the parser's message is not printed)"
+    $thrown['Pricing Same 1'] | Should -BeExactly "the submission fields could not be compared (the parser's message is not printed)"
+    $thrown['Top Same 3'] | Should -BeExactly "submission JSON is not an object that can be read (the parser's message is not printed)"
+    $thrown['Top Case 4'] | Should -BeExactly "the submission JSON could not be read to set the packages (the parser's message is not printed)"
+  }
+
+  It 'reads of the app (pending submission id, pending check) show none of it (<Plant>)' -ForEach @(
+    @{ Plant = 'Jwt' }, @{ Plant = 'Secret' }, @{ Plant = 'Sas' }, @{ Plant = 'All' }
+  ) {
+    $v = $Plants[$Plant]
+    $spots = Get-PlantSpots $PlantApp
+    $leaks = @(for ($k = 0; $k -lt $spots.Count; $k++) {
+      $j = Set-Plant $PlantApp $spots[$k] $v
+      $r = Invoke-Captured {
+        try { Read-AppPendingSubmissionId -AppJson $j -ProductId $App } catch { "$_" }
+        Test-NoPendingSubmission -AppJson $j -ProductId $App
+      }
+      $l = Get-PlantLeak (($r.Value -join "`n") + "`n" + $r.All)
+      if ($l) { "spot ${k}: $l" }
+    })
+    $spots.Count | Should -BeGreaterThan 15
+    $leaks | Should -BeNullOrEmpty
+  }
+
+  # End to end on the fake Store: every answer of each kind the scenario
+  # reads, planted at each of its spots in turn, through the whole run as the
+  # workflow makes it (publish, verify, manual delete).
+  It 'end to end: <Name>, planted in every <Kind> answer (<Plant>)' -ForEach @(
+    foreach ($kd in 'Token', 'AppRead', 'Create', 'Upload', 'Commit') { foreach ($pl in 'Jwt', 'Secret', 'Sas', 'All') { @{ Name = 'publish'; Kind = $kd; Plant = $pl } } }
+    foreach ($kd in 'SubmissionRead', 'Update') { @{ Name = 'publish'; Kind = $kd; Plant = 'All' } }
+    @{ Name = 'verify after commit'; Kind = 'SubmissionRead'; Plant = 'All' }
+    foreach ($kd in 'AppRead', 'Create', 'SubmissionRead') { @{ Name = 'publish, create accepted (HTTP 202)'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'AppRead', 'Create') { @{ Name = 'publish, create accepted (HTTP 202), not carried out'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'SubmissionRead', 'Update') { @{ Name = 'publish, update accepted (HTTP 202)'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'SubmissionRead', 'Upload') { @{ Name = 'publish, upload accepted (HTTP 202)'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'SubmissionRead', 'Commit') { @{ Name = 'publish, commit accepted (HTTP 202)'; Kind = $kd; Plant = 'All' } }
+    @{ Name = 'publish, commit answer lost'; Kind = 'SubmissionRead'; Plant = 'All' }
+    @{ Name = 'publish, create answer lost'; Kind = 'AppRead'; Plant = 'All' }
+    foreach ($kd in 'AppRead', 'Create') { @{ Name = 'publish, create refused (HTTP 409)'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'AppRead', 'Create') { @{ Name = 'publish, create answered without an id'; Kind = $kd; Plant = 'All' } }
+    @{ Name = 'publish, another pending submission'; Kind = 'AppRead'; Plant = 'All' }
+    foreach ($kd in 'SubmissionRead', 'Delete') { @{ Name = 'manual delete'; Kind = $kd; Plant = 'All' } }
+    foreach ($kd in 'SubmissionRead', 'Delete') { @{ Name = 'manual delete accepted (HTTP 202)'; Kind = $kd; Plant = 'All' } }
+  ) {
+    $opt = switch ($Name) {
+      'publish, create accepted (HTTP 202)' { @{ AcceptOn = 'Create' } }
+      'publish, create accepted (HTTP 202), not carried out' { @{ AcceptOn = 'Create'; AcceptNotDone = $true } }
+      'publish, update accepted (HTTP 202)' { @{ AcceptOn = 'Update' } }
+      'publish, upload accepted (HTTP 202)' { @{ AcceptOn = 'Upload' } }
+      'publish, commit accepted (HTTP 202)' { @{ AcceptOn = 'Commit' } }
+      'publish, commit answer lost' { @{ LoseResponse = 'Commit' } }
+      'publish, create answer lost' { @{ LoseResponse = 'Create' } }
+      'publish, create refused (HTTP 409)' { @{ CreateErrorStatus = 409; CreateErrorBody = $StoreErrorTemplate } }
+      'publish, create answered without an id' { @{ CreateWithoutId = $true } }
+      'publish, another pending submission' { @{ PendingId = '1152921505000000007' } }
+      'manual delete accepted (HTTP 202)' { @{ AcceptOn = 'Delete' } }
+      default { @{} }
+    }
+    $act = switch -Wildcard ($Name) {
+      'publish*' { $PlantPublish }
+      'verify after commit' { $PlantVerify }
+      'manual delete*' { $PlantDelete }
+    }
+    $res = Invoke-PlantRuns -Kind $Kind -Value $Plants[$Plant] -Options $opt -Action $act
+    $res.Planted | Should -BeGreaterThan 0 -Because "the scenario reaches a $Kind answer"
+    $res.Leaks | Should -BeNullOrEmpty
+  }
+
+  # Error answers on the fake Store: each kind answered with an error status
+  # and an error body planted at each of its spots in turn (the token
+  # endpoint with its own fields, the blob upload with blob storage XML).
+  It 'end to end: <Name>, every <Kind> answered HTTP <Status> with a planted error body (<Plant>)' -ForEach @(
+    foreach ($st in 400, 503) {
+      foreach ($kd in 'Token', 'AppRead', 'Create', 'SubmissionRead', 'Update', 'Upload', 'Commit') { foreach ($pl in 'Jwt', 'All') { @{ Name = 'publish'; Kind = $kd; Status = $st; Plant = $pl } } }
+    }
+    foreach ($st in 400, 409, 503) { foreach ($pl in 'Jwt', 'All') { @{ Name = 'manual delete'; Kind = 'Delete'; Status = $st; Plant = $pl } } }
+    foreach ($st in 404, 503) { @{ Name = 'verify after commit'; Kind = 'SubmissionRead'; Status = $st; Plant = 'All' } }
+  ) {
+    $body = switch ($Kind) { 'Token' { $OAuthErrorTemplate } 'Upload' { $BlobErrorTemplate } default { $StoreErrorTemplate } }
+    $act = switch ($Name) { 'publish' { $PlantPublish } 'manual delete' { $PlantDelete } default { $PlantVerify } }
+    $res = Invoke-PlantRuns -Kind $Kind -Value $Plants[$Plant] -Status $Status -ErrorBody $body -Action $act
+    $res.Planted | Should -BeGreaterThan 0
+    $res.Leaks | Should -BeNullOrEmpty
   }
 }
 
@@ -2167,8 +2730,11 @@ Describe 'Compare-SubmissionFields' {
     @{ Case = 'the publish mode changed'; Field = 'targetPublishMode'; Change = { param($n) $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate') } }
     @{ Case = 'the publish date changed'; Field = 'targetPublishDate'; Change = { param($n) $n['targetPublishDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00Z') } }
     @{ Case = 'a device family changed'; Field = 'allowTargetFutureDeviceFamilies'; Change = { param($n) $n['allowTargetFutureDeviceFamilies']['Xbox'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
-    @{ Case = 'a field was added'; Field = 'newSetting'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
-    @{ Case = 'a field with an odd name was added'; Field = '[unexpected field name]'; Change = { param($n) $n["x`n::error::pwned"] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a listed field was added'; Field = 'fallbackSubmissionId'; Change = { param($n) $n['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
+    @{ Case = 'a listed field was added in another case'; Field = 'fallbackSubmissionId'; Change = { param($n) $n['FALLBACKSUBMISSIONID'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
+    @{ Case = 'a field not listed here was added'; Field = '[unlisted field name]'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a field named like a token was added'; Field = '[unlisted field name]'; Change = { param($n) $n['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a field with an odd name was added'; Field = '[unlisted field name]'; Change = { param($n) $n["x`n::error::pwned"] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
   ) {
     $after = Edit-Submission $Change
     $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
@@ -2757,7 +3323,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (PR
     switch ($How) {
       'read' {
         $r.Err | Should -BeExactly ("${head}Read-back of submission $NewId by id (one GET; nothing changed): status PendingCommit; packages: " +
-          "Jerislink-0.3.0.0-x64.msixupload Uploaded, Jerislink-0.3.0.0-x64.msix Uploaded. A person needs to check submission $NewId later in Partner Center " +
+          "[file name not shown] Uploaded, [file name not shown] Uploaded. A person needs to check submission $NewId later in Partner Center " +
           "(look only, change nothing there) or with GET $Base/submissions/$NewId. $ApiOnly")
         @($Srv.Log) | Should -Be @($Token1, "GET $Base", "POST $Base/submissions", "GET $Base/submissions/$NewId")
       }

@@ -80,9 +80,15 @@ name: msstore-publish
 #   7. the next step reads that id back until it reaches a committed status
 #      (Published included) with exactly one Uploaded package, the release's
 #      version, and no other Uploaded package.
-#   Any stop in steps 3-5 leaves this run's draft uncommitted, and the error
-#   gives the exact DELETE for that id (Remove-StoreDraftSubmission), except
-#   an accepted, unconfirmed PUT or upload (step 4): no delete advice there.
+#   Any stop in steps 3-5 leaves this run's draft uncommitted. When a read in
+#   steps 3-5 shows the draft is wrong (another pending id, a changed field, a
+#   package left over), the error gives the exact DELETE for that id
+#   (Remove-StoreDraftSubmission). When a read in steps 3-5 gives no usable
+#   answer (no answer, HTTP 202 or another 2xx that is not 200, an error
+#   status, an unreadable body, no usable pending id), the draft could not be
+#   verified: the run stops, keeps it, and only says how to look it up by id,
+#   with no delete or re-run advice. An accepted, unconfirmed PUT or upload
+#   (step 4) gets no delete advice either.
 #   Time budget: when a step times out the runner is killed and nothing more
 #   is printed. The submit step therefore gives Publish-StoreSubmission a
 #   deadline 2 min before its timeout. The last 6 min before that deadline are
@@ -178,30 +184,47 @@ jobs:
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
+          # gh writes the API's error message to stderr. It is kept out of the
+          # log, and a failed call stops the job with fixed text (Pepper, PR #74
+          # r8). Each path below holds only values checked before it is built.
+          function Invoke-GitHubApi([string]$Path) {
+            $out = gh api $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
+            $out
+          }
           if ($env:EVENT -eq 'release') {
             if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "release tag '$env:TAG' is not vMAJOR.MINOR.PATCH" }
-            $sha = (gh api "repos/$repo/commits/$env:TAG" | ConvertFrom-Json).sha
+            $sha = [string](Invoke-GitHubApi "repos/$repo/commits/$env:TAG" | ConvertFrom-Json).sha
+            if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "the GitHub API answered no commit sha for tag $env:TAG (its answer is not printed)" }
             if ($sha -ne $env:GITHUB_SHA) { throw "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
-            $runs = (gh api "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20" | ConvertFrom-Json).workflow_runs |
-              Where-Object { $_.head_sha -eq $sha -and $_.head_repository.full_name -eq $repo -and $_.conclusion -eq 'success' } |
+            $runs = (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20" | ConvertFrom-Json).workflow_runs |
+              Where-Object { $_.head_sha -eq $sha -and $_.head_repository.full_name -eq $repo -and $_.event -ceq 'push' -and $_.conclusion -ceq 'success' } |
               Sort-Object { [datetime]$_.created_at } -Descending
             if (-not $runs) { throw "no successful msix push run for $sha yet; re-run this job once it has finished" }
             $run = @($runs)[0]
             $version = $env:TAG.Substring(1) + '.0'
           } else {
             if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-            $run = gh api "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+            $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
             if ($run.name -ne 'msix')          { throw "run is not the msix workflow" }
-            if ($run.event -ne 'push')         { throw "run was not triggered by a push" }
-            if ($run.conclusion -ne 'success') { throw "run did not succeed" }
+            if ($run.event -cne 'push')         { throw "run was not triggered by a push" }
+            if ($run.conclusion -cne 'success') { throw "run did not succeed" }
             if ($run.head_repository.full_name -ne $repo) { throw "run is from another repository" }
             $sha = $run.head_sha
             $version = ''
           }
-          Write-Host "msix run $($run.id): event=$($run.event) ref=$($run.head_branch) sha=$($run.head_sha) conclusion=$($run.conclusion)"
-          $cmp = gh api "repos/$repo/compare/$sha...main" | ConvertFrom-Json
-          Write-Host "main vs $sha : $($cmp.status)"
-          if ($cmp.status -notin @('ahead','identical')) { throw "commit $sha is not in main's history ($($cmp.status))" }
+          # Only values of a fixed shape from the GitHub API reach the log or
+          # the outputs (Pepper, PR #74 r8): anything else stops the job or is
+          # shown as [not shown].
+          if ([string]$run.id -cnotmatch '^[0-9]{1,20}$' -or [string]$sha -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+          }
+          $ref = if ([string]$run.head_branch -cmatch '^[A-Za-z0-9._/-]{1,100}$') { $run.head_branch } else { '[not shown]' }
+          Write-Host "msix run $($run.id): event=push ref=$ref sha=$sha conclusion=success"
+          $cmp = Invoke-GitHubApi "repos/$repo/compare/$sha...main" | ConvertFrom-Json
+          $ahead = if ([string]$cmp.status -cin @('ahead', 'identical', 'behind', 'diverged')) { $cmp.status } else { '[unlisted]' }
+          Write-Host "main vs $sha : $ahead"
+          if ($ahead -cnotin @('ahead', 'identical')) { throw "commit $sha is not in main's history ($ahead)" }
           "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -308,10 +331,13 @@ jobs:
         timeout-minutes: 35
         env:
           SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+          PKG_NAME: ${{ needs.inspect.outputs.file_name }}
           PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
           PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
           PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
         run: |
+          # The file name shown before approval: the log prints a package's
+          # file name only when it is exactly this one.
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
-          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60
+          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes 30 -IntervalSeconds 60
