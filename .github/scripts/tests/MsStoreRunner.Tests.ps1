@@ -2106,6 +2106,34 @@ Describe 'Credentials planted at every spot of every API answer are never printe
     $leaks | Should -BeNullOrEmpty
   }
 
+  # The fallback when the text cannot be formatted: a planted body (and a
+  # planted value in the failure's own message) never reaches it.
+  It 'Get-StoreErrorText, when <Fails> throws, prints the status and a fixed text, never the body (<Plant>)' -ForEach @(
+    foreach ($f in 'Format-StoreErrorText', 'Get-ListedCode', 'Get-ListedTarget', 'Protect-WorkflowCommand') { foreach ($pl in 'Jwt', 'Secret', 'Sas', 'All') { @{ Fails = $f; Plant = $pl } } }
+  ) {
+    $v = $Plants[$Plant]
+    $script:MockPlant = $v
+    Mock -ModuleName MsStoreRunner -CommandName $Fails -MockWith { throw "Cannot convert value `"$script:MockPlant`" to type `"System.Int32`"." }
+    $bodies = [System.Collections.Generic.List[string]]::new()
+    foreach ($t in $StoreErrorTemplate, $OAuthErrorTemplate) { foreach ($sp in (Get-PlantSpots $t)) { $bodies.Add((Set-Plant $t $sp $v)) } }
+    foreach ($b in (Get-BlobErrorPlants $v)) { $bodies.Add($b) }
+    $bodies.Count | Should -Be 75
+    $fellBack = 0
+    $leaks = @(foreach ($b in $bodies) {
+      foreach ($st in 400, 503) {
+        foreach ($d in $false, $true) {
+          $t = Get-StoreErrorText -StatusCode $st -Body $b -Detail:$d
+          if ($t -notmatch "^HTTP $st\b") { "not a status line: $t" }
+          if ($t -ceq "HTTP $st; diagnostics not shown (they could not be formatted)") { $fellBack++ }
+          $l = Get-PlantLeak $t
+          if ($l) { $l }
+        }
+      }
+    })
+    $leaks | Should -BeNullOrEmpty
+    $fellBack | Should -BeGreaterThan 0
+  }
+
   It 'checks of a submission (read, package, draft, price, compare, summary) show none of it (<Plant>)' -ForEach @(
     @{ Plant = 'Jwt' }, @{ Plant = 'Secret' }, @{ Plant = 'Sas' }, @{ Plant = 'All' }
   ) {
