@@ -4493,6 +4493,70 @@ Describe 'Store answers are read only as one strict JSON object, every signature
       $r.Hidden | Should -BeExactly ('id ' + ($NewId -creplace '5', '[redacted]'))
     }
   }
+
+  # Each strict-read gate on its own, apart from the reader that runs before
+  # it in a publish (r10 mutants ZB4, ZB5, ZB14, ZC2 and ZC6 survived the
+  # end-to-end cases, since an earlier read stops the same answers).
+  Context 'the strict-read gates on their own (PR #74 r11)' {
+    BeforeAll {
+      $script:GateSub = '{"id":"1152921505699999999","status":"PendingCommit","pricing":{"trialPeriod":"NoFreeTrial","priceId":"Free"},"applicationPackages":[{"fileName":"a.msixupload","fileStatus":"Uploaded","version":"0.4.1.0"}]}'
+    }
+
+    It 'Test-StoreJsonObject refuses <Case>' -ForEach @(
+      @{ Case = 'an array root'; Json = '[{"id":"1"}]' }
+      @{ Case = 'an empty array root'; Json = '[]' }
+      @{ Case = 'a string root'; Json = '"x"' }
+      @{ Case = 'a number root'; Json = '1' }
+      @{ Case = 'a null root'; Json = 'null' }
+      @{ Case = 'a true root'; Json = 'true' }
+      @{ Case = 'a key twice in another case'; Json = '{"id":"1","ID":"2"}' }
+      @{ Case = 'a nested key twice in another case'; Json = '{"a":{"b":1,"B":2}}' }
+      @{ Case = 'a key twice in another case in a list'; Json = '{"a":[{"b":1,"B":2}]}' }
+    ) {
+      & $Mod { param($j) Test-StoreJsonObject $j } $Json | Should -BeFalse
+    }
+
+    It 'Test-StoreJsonObject takes one object, nested objects and lists (the control)' {
+      & $Mod { param($j) Test-StoreJsonObject $j } $GateSub | Should -BeTrue
+      & $Mod { param($j) Test-StoreJsonObject $j } '{"a":{"b":1,"c":[{"b":1},{"b":2}]},"B":[]}' | Should -BeTrue
+    }
+
+    It 'Read-SubmissionSafe: applicationPackages holding <Case> is not read' -ForEach @(
+      @{ Case = 'a number'; Pkgs = '[1]' }
+      @{ Case = 'text'; Pkgs = '["x"]' }
+      @{ Case = 'null'; Pkgs = '[null]' }
+      @{ Case = 'true'; Pkgs = '[true]' }
+      @{ Case = 'a list'; Pkgs = '[[]]' }
+      @{ Case = 'a package and a number'; Pkgs = '[{"fileName":"a.msixupload","fileStatus":"Uploaded","version":"0.4.1.0"},1]' }
+    ) {
+      $j = $GateSub -replace '"applicationPackages":\[.*\]\}$', ('"applicationPackages":' + $Pkgs + '}')
+      $j | Should -Not -BeExactly $GateSub
+      & $Mod { param($j) Read-SubmissionSafe -SubmissionJson $j -ExpectedFileName 'a.msixupload' } $j | Should -BeNullOrEmpty
+    }
+
+    It 'Read-SubmissionSafe reads one package object in the list (the control)' {
+      $r = & $Mod { param($j) Read-SubmissionSafe -SubmissionJson $j -ExpectedFileName 'a.msixupload' } $GateSub
+      @($r.Packages).Count | Should -Be 1
+      $r.Packages[0].FileStatus | Should -BeExactly 'Uploaded'
+    }
+
+    It 'Set-SubmissionPackage: a key twice <Case> in a part it does not change is the fixed stop' -ForEach @(
+      @{ Case = 'as it is'; Dup = '"priceId":"Free",' }
+      @{ Case = 'in another case'; Dup = '"PriceId":"Free",' }
+    ) {
+      $j = $GateSub.Replace('"pricing":{', '"pricing":{' + $Dup)
+      $j | Should -Not -BeExactly $GateSub
+      { Set-SubmissionPackage -SubmissionJson $j -FileName 'b.msixupload' } |
+        Should -Throw -ExpectedMessage 'the submission JSON could not be read to set the packages (the parser''s message is not printed)'
+    }
+
+    It 'Set-SubmissionPackage sets the packages of a submission it reads (the control)' {
+      $n = [System.Text.Json.Nodes.JsonNode]::Parse((Set-SubmissionPackage -SubmissionJson $GateSub -FileName 'b.msixupload'))
+      $n['applicationPackages'].Count | Should -Be 2
+      [string]$n['applicationPackages'][0]['fileStatus'] | Should -BeExactly 'PendingDelete'
+      [string]$n['applicationPackages'][1]['fileName'] | Should -BeExactly 'b.msixupload'
+    }
+  }
 }
 
 # Pepper, PR #74 r9, point 2: the "src" steps of msstore-publish.yml and
