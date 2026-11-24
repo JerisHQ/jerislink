@@ -135,6 +135,13 @@ function ConvertTo-FakeNode([string]$Json) {
 # Commit, Upload, Delete, AppRead, SubmissionRead), after all the options
 # above; it may change the answer's StatusCode and Body (PR #74 r8: planted
 # credentials).
+# DropOn ('Token', 'Create', 'Update', 'Commit', 'Upload', 'Delete',
+# 'AppRead', 'SubmissionRead'; PR #74 r12): the first DropTimes such requests
+# (default 1) get no answer at all: the server reads the whole request, then
+# closes the connection cleanly (FIN) without sending a byte. The request is
+# carried out first, unless DropNotDone is set. Only the TCP server
+# (Start-FakeStoreServer -Tcp) closes a connection this way; the handler
+# returns status -3 for it. Dropped: how many requests were dropped.
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -181,6 +188,9 @@ function New-FakeStore {
     $FailReadBody = $null,
     [switch]$FailReadLost,
     [scriptblock]$EditAnswer = $null,
+    [ValidateSet('', 'Token', 'Create', 'Update', 'Commit', 'Upload', 'Delete', 'AppRead', 'SubmissionRead')][string]$DropOn = '',
+    [ValidateRange(1, 100)][int]$DropTimes = 1,
+    [switch]$DropNotDone,
     [string]$AnswerContentType = 'application/json',
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
@@ -188,7 +198,7 @@ function New-FakeStore {
   $f['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create($TargetPublishMode)
   if ($NoPricing) { [void]$f.Remove('pricing') } else { $f['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create($PriceId) }
   [hashtable]::Synchronized(@{
-    AppId = $AppId; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
+    AppId = $AppId; AppName = ''; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
     OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; PendingLag = [bool]$PendingLag; NoPendingAs = $NoPendingAs
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
     CreateErrorStatus = $CreateErrorStatus; CreateErrorBody = $CreateErrorBody; CreateQuery = $null
@@ -202,6 +212,7 @@ function New-FakeStore {
     AcceptOn = $AcceptOn; AcceptStatus = $AcceptStatus; AcceptNotDone = [bool]$AcceptNotDone; AcceptAt = $AcceptAt; AcceptSeen = 0; Accepted = $false
     FailReadOn = $FailReadOn; FailReadAt = $FailReadAt; FailReadStatus = $FailReadStatus; FailReadBody = $FailReadBody
     FailReadLost = [bool]$FailReadLost; FailReadSeen = 0; ReadFailed = $false; EditAnswer = $EditAnswer
+    DropOn = $DropOn; DropTimes = $DropTimes; DropNotDone = [bool]$DropNotDone; Dropped = 0
     Seen = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -270,6 +281,11 @@ function Invoke-FakeStoreRequest {
   param($Store, [string]$Method, [string]$Uri, [hashtable]$Headers = @{}, [byte[]]$BodyBytes = @())
   $path = ([uri]$Uri).AbsolutePath
   $kind = Get-FakeCallKind $Method $path
+  if ($Store.DropOn -and $kind -ceq $Store.DropOn -and $Store.Dropped -lt $Store.DropTimes) {
+    $Store.Dropped++
+    if (-not $Store.DropNotDone) { [void](Invoke-FakeStoreRoute -Store $Store -Method $Method -Uri $Uri -Headers $Headers -BodyBytes $BodyBytes) }
+    return New-FakeResponse -3 ''
+  }
   if ($Store.FailReadOn -and $kind -ceq $Store.FailReadOn -and -not $Store.ReadFailed) {
     $Store.FailReadSeen++
     if ($Store.FailReadSeen -eq $Store.FailReadAt) {
@@ -378,7 +394,8 @@ function Invoke-FakeStoreRoute {
 
 function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Text, [string]$App) {
   if ($Path -match "^/v1\.0/my/applications/$App$" -and $Method -eq 'GET') {
-    $o = [ordered]@{ id = $Store.AppId; primaryName = 'JerisLink'; lastPublishedApplicationSubmission = @{ id = '1152921505000000001'; resourceLocation = 'x' } }
+    # AppName: the app's name, when a test sets it (else JerisLink).
+    $o = [ordered]@{ id = $Store.AppId; primaryName = $(if ($Store.AppName) { $Store.AppName } else { 'JerisLink' }); lastPublishedApplicationSubmission = @{ id = '1152921505000000001'; resourceLocation = 'x' } }
     $shown = if ($Store.Sub -and $Store.PendingAfterCreate) { $Store.PendingAfterCreate } elseif ($Store.HidePending -and -not $Store.Sub) { '' } elseif ($Store.PendingLag -and $Store.Sub) { '' } else { $Store.PendingId }
     if ($shown) { $o.pendingApplicationSubmission = @{ id = $shown; resourceLocation = 'y' } }
     elseif ($Store.NoPendingAs -eq 'Null') { $o.pendingApplicationSubmission = $null }
@@ -452,12 +469,105 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
 
 # Serves Invoke-FakeStoreRequest on http://127.0.0.1:<free port> from a thread
 # job; the SAS upload URL points there too. Sets $Store.BaseUrl and returns it.
+# Tcp (PR #74 r12): HTTP/1.1 written by hand on a TcpListener instead of
+# HttpListener, one connection at a time, so the tests see exactly what goes
+# over the wire: each request in Seen also has Connection (1 for the first
+# connection the server accepted, 2 for the next, ...), and a request the
+# handler gives no answer (status 0 or -3, DropOn) is read whole, then its
+# connection is closed cleanly (FIN) without a byte of answer. Answers carry
+# Content-Length and keep the connection open for the next request
+# (keep-alive). Status -1 (HangOn) waits until the client hangs up; DripOn is
+# not served (the whole body is sent at once). Requests must have a
+# Content-Length body (no chunked request bodies).
 function Start-FakeStoreServer {
-  param([Parameter(Mandatory)]$Store)
+  param([Parameter(Mandatory)]$Store, [switch]$Tcp)
   $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
   $probe.Start(); $port = $probe.LocalEndpoint.Port; $probe.Stop()
   $Store.BaseUrl = "http://127.0.0.1:$port"
   $Store.Served = $true
+  if ($Tcp) {
+    $Store.Job = Start-ThreadJob -ArgumentList $Store, $PSCommandPath, $port -ScriptBlock {
+      param($Store, $ModulePath, $Port)
+      Import-Module $ModulePath
+      $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+      $l.Start()
+      $Store.Listener = $l
+      $latin = [System.Text.Encoding]::Latin1
+      $chunk = [byte[]]::new(65536)
+      $n = 0
+      while ($true) {
+        $c = $null
+        try { $c = $l.AcceptTcpClient() } catch { break }
+        $n++
+        $Store.Conn = $c
+        try {
+          $s = $c.GetStream()
+          $s.ReadTimeout = 30000
+          $buf = [System.IO.MemoryStream]::new()
+          while ($true) {
+            # One request: the head up to the empty line, then Content-Length bytes.
+            $head = -1
+            while (($head = $latin.GetString($buf.GetBuffer(), 0, [int]$buf.Length).IndexOf("`r`n`r`n")) -lt 0) {
+              $k = $s.Read($chunk, 0, $chunk.Length)
+              if ($k -le 0) { break }
+              $buf.Write($chunk, 0, $k)
+            }
+            if ($head -lt 0) { break }
+            $lines = @($latin.GetString($buf.GetBuffer(), 0, $head) -split "`r`n")
+            $first = @($lines[0] -split ' ')
+            $method = $first[0]; $target = $first[1]
+            $h = @{}
+            foreach ($x in @($lines | Select-Object -Skip 1)) {
+              $i = $x.IndexOf(':')
+              if ($i -le 0) { continue }
+              $name = $x.Substring(0, $i).Trim(); $v = $x.Substring($i + 1).Trim()
+              if ($h.ContainsKey($name)) { $h[$name] = $h[$name] + ', ' + $v } else { $h[$name] = $v }
+            }
+            if ($h.ContainsKey('Transfer-Encoding')) { [void]$Store.Log.Add('SERVER ERROR chunked request body'); break }
+            $len = if ($h.ContainsKey('Content-Length')) { [int]$h['Content-Length'] } else { 0 }
+            while ($buf.Length -lt $head + 4 + $len) {
+              $k = $s.Read($chunk, 0, $chunk.Length)
+              if ($k -le 0) { break }
+              $buf.Write($chunk, 0, $k)
+            }
+            if ($buf.Length -lt $head + 4 + $len) { break }
+            $body = [byte[]]::new($len)
+            [Array]::Copy($buf.GetBuffer(), $head + 4, $body, 0, $len)
+            $rest = [System.IO.MemoryStream]::new()
+            $rest.Write($buf.GetBuffer(), $head + 4 + $len, [int]$buf.Length - ($head + 4 + $len))
+            $buf = $rest
+            $uri = "http://127.0.0.1:$Port$target"
+            [void]$Store.Seen.Add(@{ Line = "$method $(([uri]$uri).AbsolutePath)"; Headers = $h; Connection = $n })
+            $r = Invoke-FakeStoreRequest -Store $Store -Method $method -Uri $uri -Headers $h -BodyBytes $body
+            if ($r.StatusCode -eq -1) {
+              # No answer: wait until the client hangs up.
+              $s.ReadTimeout = [System.Threading.Timeout]::Infinite
+              try { while ($s.Read($chunk, 0, $chunk.Length) -gt 0) { } } catch { }
+              break
+            }
+            if ($r.StatusCode -le 0) {
+              # No answer, and the connection ends cleanly: FIN, nothing sent.
+              $c.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+              [void]$c.Client.Poll(1000000, [System.Net.Sockets.SelectMode]::SelectRead)
+              break
+            }
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$r.Body)
+            $t = "HTTP/1.1 $($r.StatusCode) Fake`r`n"
+            if ($bytes.Length) { $t += "Content-Type: $($Store.AnswerContentType)`r`n" }
+            if ($r.Location) { $t += "Location: $($r.Location)`r`n" }
+            $t += "Content-Length: $($bytes.Length)`r`n`r`n"
+            $hb = $latin.GetBytes($t)
+            $s.Write($hb, 0, $hb.Length)
+            if ($bytes.Length) { $s.Write($bytes, 0, $bytes.Length) }
+            $s.Flush()
+          }
+        } catch {
+          [void]$Store.Log.Add("SERVER ERROR $_")
+        } finally { $c.Close(); $Store.Conn = $null }
+      }
+    }
+    return (Wait-FakeStoreServer $Store)
+  }
   $Store.Job = Start-ThreadJob -ArgumentList $Store, $PSCommandPath, "http://127.0.0.1:$port/" -ScriptBlock {
     param($Store, $ModulePath, $Prefix)
     Import-Module $ModulePath
@@ -515,6 +625,11 @@ function Start-FakeStoreServer {
       } finally { if (-not $hold) { $ctx.Response.Close() } }
     }
   }
+  Wait-FakeStoreServer $Store
+}
+
+# Waits until the server job listens; returns $Store.BaseUrl.
+function Wait-FakeStoreServer($Store) {
   $deadline = (Get-Date).AddSeconds(20)
   while (-not $Store.ContainsKey('Listener') -and (Get-Date) -lt $deadline) {
     if ($Store.Job.State -in 'Failed', 'Completed') { throw "fake Store server did not start: $($Store.Job | Receive-Job 2>&1 | Out-String)" }
@@ -528,7 +643,11 @@ function Stop-FakeStoreServer {
   param([Parameter(Mandatory)]$Store)
   foreach ($c in @($Store.Held)) { try { $c.Response.Abort() } catch { } }
   $Store.Held.Clear()
-  if ($Store.ContainsKey('Listener')) { $Store.Listener.Stop(); $Store.Listener.Close() }
+  if ($Store.ContainsKey('Listener')) {
+    $Store.Listener.Stop()
+    if ($Store.Listener -is [System.Net.Sockets.TcpListener]) { if ($Store.ContainsKey('Conn') -and $Store.Conn) { try { $Store.Conn.Close() } catch { } } }
+    else { $Store.Listener.Close() }
+  }
   if ($Store.ContainsKey('Job')) { $Store.Job | Wait-Job -Timeout 10 | Out-Null; $Store.Job | Remove-Job -Force }
 }
 

@@ -133,39 +133,38 @@ function Get-StorePackage {
 # dots) is still masked: this does not rely on the field checks. On top of
 # that, a value that holds a confirmed credential is never used as an id or a
 # version (Test-StoreId, Get-SafeValue), so it is never sent back or returned.
-# Confirmed (Pepper, PR #74 r11): the client secret, the access token and each
-# upload URL with what is read from it, in ConfirmedSecrets too. A sig value
-# found only by scanning an answer's text (Register-StoreTextSecret: it may be
-# a listing's description or a document link) is masked in output but never
-# makes an id or a version unusable.
+# Only confirmed credentials are registered (Pepper, PR #74 r11 and r12): the
+# client secret, the access token, and each upload URL with what is read from
+# it (Register-StoreUploadUrl): the URL a package is sent to, and every
+# fileUploadUrl of a Store answer (Register-StoreAnswerUploadUrl), the field
+# the API hands an upload URL in. A "sig=" anywhere else in an answer (a
+# listing's description, a document link, the app's name, another field, an
+# answer that is not JSON) is not a credential this run was given, and no
+# answer's text is printed (only ids, versions and listed values read from
+# it), so it is not registered: until r11 it was (found by scanning the text),
+# and masking its value, as short as one digit, cut the ids and the
+# GET /v1.0/my/... paths out of the lines that tell a person what to check.
 $script:KnownSecrets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:SecretPattern = $null
-$script:ConfirmedSecrets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-$script:ConfirmedPattern = $null
 $script:SecretText = '[redacted]'
-# The texts Register-StoreUploadUrl and Register-StoreTextSecret are done
+# The texts Register-StoreUploadUrl and Register-StoreTextUploadUrl are done
 # with: each registers the same secrets for the same text, and KnownSecrets
 # only grows, so a text seen again (each answer is read more than once) is not
 # read again. A text is added only after it is done. Tests clear it with
 # KnownSecrets.
 $script:SecretInputs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
-# Scanned: found by Register-StoreTextSecret only, so masked in output but not
-# confirmed (not in ConfirmedSecrets).
-function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value, [switch]$Scanned) {
+function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value) {
   if (-not $Value -or $Value -ceq $script:NotText) { return }
   $forms = @($Value, $Value.Replace('+', '%2B'), $Value.Replace('+', ' '))
   try { $forms += [uri]::UnescapeDataString($Value) } catch { }
   try { $forms += [uri]::EscapeDataString($Value) } catch { }
   $new = $false
-  $newConfirmed = $false
   foreach ($f in $forms) {
     if (-not $f) { continue }
     if ($script:KnownSecrets.Add($f)) { $new = $true }
-    if (-not $Scanned -and $script:ConfirmedSecrets.Add($f)) { $newConfirmed = $true }
   }
   if ($new) { $script:SecretPattern = New-StoreSecretPattern $script:KnownSecrets }
-  if ($newConfirmed) { $script:ConfirmedPattern = New-StoreSecretPattern $script:ConfirmedSecrets }
 }
 # Longest first, so a credential that holds another one is masked whole.
 function New-StoreSecretPattern($Set) {
@@ -243,29 +242,31 @@ function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Que
   }
 }
 
-# Every signature parameter anywhere in a text (an API answer, whatever its
-# shape), read as it is and with JSON string escapes undone (&, \/, ...):
-# so one in an answer that is not JSON that can be read, or in a field other
-# than fileUploadUrl, is masked as well, before anything is read from that
-# answer (Pepper, PR #74 r10). These are registered as scanned (PR #74 r11):
-# masked in output only, since any text field (a listing's description, a
-# document link) may hold "sig=" with a value that is not a credential. A pair is name=value; a name ends at "?", "&",
-# ";", "#", "=", a quote, a bracket or white space, a value at the same marks
-# but "=". A text already done (SecretInputs) is not read again. Never throws.
-$script:QueryPairPattern = [regex]::new('([^?&;#=\s"''<>{}\[\],]+)=([^?&;#\s"''<>{}\[\],]*)', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+# Each fileUploadUrl of an answer's text, whatever its shape (Pepper, PR #74
+# r10 and r12): every "key": "value" member, both JSON strings, whose key
+# with its escapes undone is fileUploadUrl in any case; its value, escapes
+# undone, is registered as an upload URL (Register-StoreUploadUrl). So an
+# upload URL in an answer the strict reader does not read (text before it,
+# two objects, a comment, a key twice) is a confirmed credential as well.
+# Read only in the text as it came, never with its escapes undone: inside a
+# JSON string every quote is escaped, so in a JSON text this matches real
+# members only, and text inside a field (a listing's description, a link
+# that holds "fileUploadUrl": "...") is never taken for one. A text already
+# done (SecretInputs) is not read again. Never throws.
+$script:JsonMemberPattern = [regex]::new('"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 $script:JsonEscapePattern = [regex]::new('\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
-function Register-StoreTextSecret([AllowNull()][AllowEmptyString()][string]$Text) {
+function ConvertFrom-StoreJsonEscape([AllowEmptyString()][string]$Text) {
+  $script:JsonEscapePattern.Replace($Text, [System.Text.RegularExpressions.MatchEvaluator]{
+    param($m)
+    if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
+    switch -CaseSensitive ($m.Groups[2].Value) { 'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $_ } }
+  })
+}
+function Register-StoreTextUploadUrl([AllowNull()][AllowEmptyString()][string]$Text) {
   if (-not $Text -or $script:SecretInputs.Contains("text:$Text")) { return }
   try {
-    $plain = $script:JsonEscapePattern.Replace($Text, [System.Text.RegularExpressions.MatchEvaluator]{
-      param($m)
-      if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
-      switch -CaseSensitive ($m.Groups[2].Value) { 'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $_ } }
-    })
-    foreach ($t in @($Text, $plain)) {
-      foreach ($m in $script:QueryPairPattern.Matches($t)) {
-        if ((ConvertFrom-StoreQueryName $m.Groups[1].Value) -ieq 'sig') { Register-StoreSecret $m.Groups[2].Value -Scanned; Register-StoreSecret $m.Groups[2].Value.Trim() -Scanned }
-      }
+    foreach ($m in $script:JsonMemberPattern.Matches($Text)) {
+      if ((ConvertFrom-StoreJsonEscape $m.Groups[1].Value) -ieq 'fileUploadUrl') { Register-StoreUploadUrl (ConvertFrom-StoreJsonEscape $m.Groups[2].Value) }
     }
     [void]$script:SecretInputs.Add("text:$Text")
   } catch { }
@@ -278,9 +279,10 @@ function Register-StoreTextSecret([AllowNull()][AllowEmptyString()][string]$Text
 # it, at any depth, with a key given twice, also not in another case
 # (ConvertFrom-Json keeps the last of two equal keys, and a lookup here does
 # not tell "status" from "Status"). Anything else is $null, which every
-# caller takes as "no answer that can be read" and stops on. Every signature
-# in the text (Register-StoreTextSecret) and each fileUploadUrl at any depth
-# (Register-StoreUploadUrl) is registered first, before any field of the
+# caller takes as "no answer that can be read" and stops on. Each
+# fileUploadUrl in the text, also in an answer that is not read
+# (Register-StoreTextUploadUrl), and at any depth of one that is
+# (Test-StoreJsonObject), is registered first, before any field of the
 # answer is returned to be read. Never throws.
 # What a stop says of an answer that is not read (fixed text).
 $script:UnreadAnswer = 'no JSON object that can be read (an answer is read only as one complete JSON object with each key once)'
@@ -288,7 +290,7 @@ $script:UnreadSubmission = ('no submission JSON that can be read (an answer is r
   'and applicationPackages, when given, as a list of objects)')
 function ConvertFrom-StoreJson([AllowNull()][AllowEmptyString()][string]$Text) {
   if (-not $Text) { return $null }
-  Register-StoreTextSecret $Text
+  Register-StoreTextUploadUrl $Text
   if (-not (Test-StoreJsonObject $Text)) { return $null }
   $o = $null
   try { $o = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop } catch { return $null }
@@ -327,14 +329,15 @@ function Test-StoreJsonObject([AllowNull()][AllowEmptyString()][string]$Text) {
   } catch { $false } finally { if ($null -ne $doc) { $doc.Dispose() } }
 }
 
-# Registers every signature of an API answer (JSON text or not) before
+# Registers each fileUploadUrl of an API answer (JSON text or not) before
 # anything else is done with it (ConvertFrom-StoreJson). Never throws.
 function Register-StoreAnswerUploadUrl([AllowNull()][AllowEmptyString()][string]$Body) {
   if (-not $Body) { return }
   try { [void](ConvertFrom-StoreJson $Body) } catch { }
 }
 
-# Text with every known credential replaced by $script:SecretText. Never throws.
+# Text with every registered credential (only confirmed ones are; see
+# KnownSecrets) replaced by $script:SecretText. Never throws.
 function Hide-StoreSecret([AllowNull()][AllowEmptyString()][string]$Text) {
   if (-not $Text) { return '' }
   $p = $script:SecretPattern
@@ -342,10 +345,10 @@ function Hide-StoreSecret([AllowNull()][AllowEmptyString()][string]$Text) {
   $p.Replace($Text, $script:SecretText)
 }
 
-# True when Value holds a confirmed credential (ConfirmedSecrets: never a sig
-# value found only by scanning a text; Pepper, PR #74 r11).
+# True when Value holds a registered credential, all of them confirmed
+# (KnownSecrets; Pepper, PR #74 r11 and r12).
 function Test-StoreSecretIn([AllowNull()][AllowEmptyString()][string]$Value) {
-  [bool]($Value -and $null -ne $script:ConfirmedPattern -and $script:ConfirmedPattern.IsMatch($Value))
+  [bool]($Value -and $null -ne $script:SecretPattern -and $script:SecretPattern.IsMatch($Value))
 }
 
 # The only Write-Host of this module: prints Text with every known credential masked.
@@ -522,6 +525,26 @@ function Test-StoreOutcomeUnknown($ErrorRecord) {
 # thrown (OutcomeUnknown). HttpClient writes nothing to PowerShell's streams
 # (Invoke-WebRequest in PowerShell 7.6 writes the URL, the headers and the
 # body of a request to the debug stream, PowerShell/PowerShell#27695).
+# A change (every method but GET: the token request, create, the PUT, the
+# upload, commit, DELETE) goes over the wire at most once (Pepper, PR #74
+# r12). SocketsHttpHandler sends a request again, up to 3 more times, when its
+# connection ends cleanly before the first byte of an answer and the request
+# has no content or waits for 100-continue (HttpConnection.SendAsync, .NET 8
+# and 10: "request.Content is null || allowExpect100ToContinue is not null";
+# HttpConnectionPool MaxConnectionFailureRetries = 3): a service that took a
+# create, commit or DELETE and then closed the connection got it four times
+# (since r4, 187611f, when the calls moved from Invoke-WebRequest, which sent
+# every change with content, to HttpClient). So no request but a GET is sent
+# without content (a change without a body gets empty content), none waits
+# for 100-continue, and only HTTP/1.1 is used (HTTP/2 and 3 have retry paths
+# of their own). Each call has its own handler, disposed with the call, so no
+# connection is ever reused from an earlier call: a request never goes out on
+# a pooled connection the service may already have closed. A GET may still be
+# sent again by the handler; a read changes nothing. A change whose
+# connection ended without an answer throws, and no caller sends it again:
+# Invoke-StoreApi marks it OutcomeUnknown, a create or a commit is then read
+# back (Resolve-UnconfirmedCreate, -Commit), and so is a DELETE
+# (Remove-StoreDraftSubmission).
 function Invoke-StoreHttp {
   param(
     [Parameter(Mandatory)][string]$Method,
@@ -564,6 +587,13 @@ function Invoke-StoreHttp {
     }
     if ($InFile) { $file = [System.IO.File]::OpenRead($InFile); $req.Content = [System.Net.Http.StreamContent]::new($file) }
     elseif ($PSBoundParameters.ContainsKey('Body')) { $req.Content = [System.Net.Http.ByteArrayContent]::new([System.Text.UTF8Encoding]::new($false).GetBytes($Body)) }
+    # A change without a body (create, commit, DELETE) is sent with empty
+    # content (Content-Length: 0, as Invoke-WebRequest sent it up to r3), so
+    # the handler never sends it twice (see above).
+    elseif ($Method -ne 'GET') { $req.Content = [System.Net.Http.ByteArrayContent]::new([byte[]]::new(0)) }
+    $req.Headers.ExpectContinue = $false
+    $req.Version = [System.Net.HttpVersion]::Version11
+    $req.VersionPolicy = [System.Net.Http.HttpVersionPolicy]::RequestVersionOrLower
     if ($req.Content -and $ContentType) { $req.Content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType) }
     $resp = Wait-StoreHttpTask ($client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)) $clock $TimeoutSec $cts
     # The status is in: from here on the call has an answer, and a body that
@@ -879,7 +909,7 @@ function Get-JsonField($Object, [string]$Name) {
 
 # Ids and versions from the API are printed (and compared) only when they are
 # ASCII digits (a version: up to four dot-separated numbers) and hold no
-# confirmed credential (Test-StoreSecretIn; Pepper, PR #74 r9 and r11); anything else becomes
+# confirmed credential (Test-StoreSecretIn; Pepper, PR #74 r9, r11 and r12); anything else becomes
 # [invalid]. Empty stays empty. A value that passes still goes through
 # Protect-WorkflowCommand, and every line still through Hide-StoreSecret.
 # Digits are [0-9] only: \d would also pass the digits of other scripts.
@@ -1595,7 +1625,9 @@ function Resolve-UnconfirmedCommit {
 # body is not used). HTTP 202 or another 2xx (Test-StoreAccepted) is never
 # reported as deleted: accepted, completion unconfirmed; it reads that id back
 # once (Get-AcceptedReadBack) and throws, sending nothing more (Pepper, PR #74
-# r7).
+# r7). No answer, HTTP 408 or 5xx (Test-StoreOutcomeUnknown): result
+# unconfirmed, the same read-back by id, and the DELETE is not sent again
+# (Pepper, PR #74 r12).
 function Remove-StoreDraftSubmission {
   param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
   $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId)
@@ -1609,6 +1641,11 @@ function Remove-StoreDraftSubmission {
       throw (Hide-StoreSecret ("$_. Accepted, completion unconfirmed: the Store accepted the delete of submission $SubmissionId but has not confirmed it is done, so it is not " +
         "reported as deleted; nothing more is sent. $(Get-AcceptedReadBack $ProductId $SubmissionId 30) A person needs to check " +
         "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId later: HTTP 404 there means it is gone."))
+    }
+    if (-not (Test-Store2xx $status) -and (Test-StoreOutcomeUnknown $_)) {
+      throw (Hide-StoreSecret ("$_. Result unconfirmed: the delete request for submission $SubmissionId got no answer that says what " +
+        "happened, so it may or may not have been deleted; it is not sent again. $(Get-AcceptedReadBack $ProductId $SubmissionId 30) " +
+        "A person needs to check GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId later: HTTP 404 there means it is gone."))
     }
     if (-not (Test-Store2xx $status)) { throw }
     $note = " (HTTP $status; the answer's body was not read)"
