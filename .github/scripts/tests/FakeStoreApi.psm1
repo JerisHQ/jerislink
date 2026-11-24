@@ -109,6 +109,17 @@ function ConvertTo-FakeNode([string]$Json) {
 # Commit, Upload or Delete with its status and its body lost, as the real
 # Invoke-StoreHttp does when the drip outlasts the call's time limit (or
 # breaks).
+# AcceptOn ('Token', 'Create', 'Update', 'Commit', 'Upload', 'Delete', or
+# 'AppRead' / 'SubmissionRead': a GET of the app / of a submission): the
+# AcceptAt-th such request (default the first) is answered with AcceptStatus
+# (default 202) instead of its usual 2xx (a 204 has no body); the others as
+# usual. The request is carried out as usual, unless
+# AcceptNotDone is set for a request that changes something (Create, Update,
+# Commit, Upload, Delete): then nothing is changed and the answer is
+# AcceptStatus with Create: id and status (no id with CreateWithoutId),
+# Update: the unchanged submission, Commit: status PendingCommit, Upload:
+# UploadBody, Delete: no body. Accepted: whether that answer was sent.
+# Combine with DripOn for an accepted answer whose body is lost.
 function New-FakeStore {
   param(
     [string]$AppId = '9NM3VWQ9MD7N',
@@ -145,6 +156,10 @@ function New-FakeStore {
     [ValidateRange(0, 600)][int]$DripSeconds = 0,
     [ValidateRange(0, 600)][int]$DripHeadSeconds = 0,
     [ValidateSet('Body', 'Break')][string]$DripEnd = 'Body',
+    [ValidateSet('', 'Token', 'Create', 'Update', 'Commit', 'Upload', 'Delete', 'AppRead', 'SubmissionRead')][string]$AcceptOn = '',
+    [ValidateRange(200, 299)][int]$AcceptStatus = 202,
+    [switch]$AcceptNotDone,
+    [ValidateRange(1, 100)][int]$AcceptAt = 1,
     [string]$AnswerContentType = 'application/json',
     [string]$BaseUrl = 'https://manage.devcenter.microsoft.com'
   )
@@ -163,6 +178,7 @@ function New-FakeStore {
     HangOn = $HangOn; CallSeconds = $CallSeconds; UploadSeconds = $UploadSeconds; CommitTried = $false
     DripOn = $DripOn; DripSeconds = $DripSeconds; DripHeadSeconds = $DripHeadSeconds; DripEnd = $DripEnd; Dripped = ''
     AnswerContentType = $AnswerContentType
+    AcceptOn = $AcceptOn; AcceptStatus = $AcceptStatus; AcceptNotDone = [bool]$AcceptNotDone; AcceptAt = $AcceptAt; AcceptSeen = 0; Accepted = $false
     Seen = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Calls = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
     Held = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -212,20 +228,49 @@ function Test-FakePackageList($Packages) {
   ''
 }
 
+# What a request is: 'Token', 'Create', 'Commit', 'Upload', 'Update',
+# 'Delete', 'AppRead', 'SubmissionRead' or ''.
+function Get-FakeCallKind([string]$Method, [string]$Path) {
+  if ($Method -eq 'POST' -and $Path -match '^/[^/]+/oauth2/v2\.0/token$') { return 'Token' }
+  if ($Method -eq 'POST' -and $Path -match '^/v1\.0/my/applications/[^/]+/submissions$') { return 'Create' }
+  if ($Method -eq 'POST' -and $Path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+/commit$') { return 'Commit' }
+  if ($Method -eq 'PUT' -and $Path -eq '/blob/upload.zip') { return 'Upload' }
+  if ($Method -eq 'PUT' -and $Path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$') { return 'Update' }
+  if ($Method -eq 'DELETE' -and $Path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$') { return 'Delete' }
+  if ($Method -eq 'GET' -and $Path -match '^/v1\.0/my/applications/[^/]+$') { return 'AppRead' }
+  if ($Method -eq 'GET' -and $Path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$') { return 'SubmissionRead' }
+  ''
+}
+
 # Handles one request. Headers: a hashtable (case-insensitive keys).
 function Invoke-FakeStoreRequest {
   param($Store, [string]$Method, [string]$Uri, [hashtable]$Headers = @{}, [byte[]]$BodyBytes = @())
-  $r = Invoke-FakeStoreRoute -Store $Store -Method $Method -Uri $Uri -Headers $Headers -BodyBytes $BodyBytes
   $path = ([uri]$Uri).AbsolutePath
-  $on = switch ($Store.DripOn) {
-    'Token' { $Method -eq 'POST' -and $path -match '^/[^/]+/oauth2/v2\.0/token$' }
-    'Create' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions$' }
-    'Commit' { $Method -eq 'POST' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+/commit$' }
-    'Upload' { $Method -eq 'PUT' -and $path -eq '/blob/upload.zip' }
-    'Update' { $Method -eq 'PUT' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$' }
-    'Delete' { $Method -eq 'DELETE' -and $path -match '^/v1\.0/my/applications/[^/]+/submissions/\d+$' }
-    default { $false }
+  $kind = Get-FakeCallKind $Method $path
+  $accept = $false
+  if ($Store.AcceptOn -and $kind -ceq $Store.AcceptOn -and -not $Store.Accepted) { $Store.AcceptSeen++; $accept = $Store.AcceptSeen -eq $Store.AcceptAt }
+  if ($accept -and $Store.AcceptNotDone -and $kind -in 'Create', 'Update', 'Commit', 'Upload', 'Delete') {
+    # Accepted but not carried out: nothing changes.
+    $Store.Accepted = $true
+    [void]$Store.Log.Add("$Method $path")
+    if ($kind -eq 'Create') { $Store.CreateQuery = ([uri]$Uri).Query }
+    $o = switch ($kind) {
+      'Create' { if ($Store.CreateWithoutId) { [ordered]@{ status = 'PendingCommit' } } else { [ordered]@{ id = $Store.NewId; status = 'PendingCommit' } } }
+      'Update' { if ($Store.Sub) { Get-FakeSubmission $Store } else { $null } }
+      'Commit' { @{ status = 'PendingCommit' } }
+      'Upload' { $Store.UploadBody }
+      default { $null }
+    }
+    $r = New-FakeResponse $Store.AcceptStatus $(if ($Store.AcceptStatus -eq 204) { $null } else { $o })
+  } else {
+    $r = Invoke-FakeStoreRoute -Store $Store -Method $Method -Uri $Uri -Headers $Headers -BodyBytes $BodyBytes
+    if ($accept -and $r.StatusCode -ge 200 -and $r.StatusCode -lt 300) {
+      $Store.Accepted = $true
+      $r.StatusCode = $Store.AcceptStatus
+      if ($Store.AcceptStatus -eq 204) { $r.Body = '' }
+    }
   }
+  $on = $Store.DripOn -and $kind -ceq $Store.DripOn -and $kind -notin 'AppRead', 'SubmissionRead'
   if ($on -and $r.StatusCode -gt 0) { $r.DripSeconds = $Store.DripSeconds }
   $r
 }

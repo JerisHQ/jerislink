@@ -166,6 +166,22 @@ function Get-StoreErrorStatus($ErrorRecord) {
   0
 }
 function Test-Store2xx([int]$Status) { $Status -ge 200 -and $Status -lt 300 }
+# A change (POST, PUT, DELETE, the upload) counts as done only on HTTP 200,
+# 201 or 204. HTTP 202 Accepted means the service took the request but has
+# not finished it (RFC 9110, 15.3.3), and the Store API uses no other 2xx
+# (203, 205-299) for a finished change, so those are "accepted, completion
+# unconfirmed" too (Test-StoreAccepted; Pepper, PR #74 r7).
+function Test-StoreDone([int]$Status) { $Status -in 200, 201, 204 }
+function Test-StoreAccepted([int]$Status) { (Test-Store2xx $Status) -and -not (Test-StoreDone $Status) }
+# The submission id an accepted change's answer named (Invoke-StoreApi keeps
+# only a plain number), or ''. Never throws.
+function Get-StoreAcceptedId($ErrorRecord) {
+  try {
+    $d = $ErrorRecord.Exception.Data
+    if ($d.Contains('StoreAcceptedId') -and [string]$d['StoreAcceptedId'] -cmatch $script:SafeId) { return [string]$d['StoreAcceptedId'] }
+  } catch { }
+  ''
+}
 
 # Fixed text printed instead of the diagnostics of a failed call when they
 # cannot be formatted (Get-StoreErrorText, Get-StoreFailureText). Formatting
@@ -617,6 +633,15 @@ function Connect-StoreApi {
 # service did it, but what it answered (a create's new id) is not known. The
 # status goes with the error (Get-StoreErrorStatus), so a caller can tell an
 # answered 2xx (done, answer unread) from no answer at all.
+# Which 2xx count (Pepper, PR #74 r7): a GET returns its body only on HTTP
+# 200; a 201, 202, 204 or other 2xx carries no resource to read, so it is a
+# failed read. A POST, PUT or DELETE returns its body only on 200, 201 or 204
+# (Test-StoreDone). HTTP 202 or another 2xx (Test-StoreAccepted) is thrown as
+# "accepted, completion unconfirmed", OutcomeUnknown with its status, whether
+# or not its body was read: an accepted answer does not say the change is
+# done. Only a plain-number "id" from a body that was read goes with that
+# error (Get-StoreAcceptedId), so the caller can check that id; nothing else
+# of the body is used or printed.
 # The access token is checked (Test-StoreBearerToken) before anything is sent.
 function Invoke-StoreApi {
   param(
@@ -642,12 +667,24 @@ function Invoke-StoreApi {
     throw (New-StoreError "Store API $what failed: $(Get-StoreFailureText $failure)" -OutcomeUnknown:$unknown)
   }
   $lost = Get-StoreBodyLost $r
-  $ok = $r.StatusCode -ge 200 -and $r.StatusCode -lt 300
-  if ($ok -and -not $lost) { return [string]$r.Body }
-  $unknown = $ok -or $r.StatusCode -eq 408 -or $r.StatusCode -ge 500
-  $t = if ($ok) { "HTTP $($r.StatusCode)" } else { Get-StoreErrorText $r.StatusCode $r.Body -Detail }
+  $s = $r.StatusCode
+  $used = if ($Method -eq 'GET') { $s -eq 200 } else { Test-StoreDone $s }
+  if ($used -and -not $lost) { return [string]$r.Body }
+  if ($Method -ne 'GET' -and (Test-StoreAccepted $s)) {
+    $e = New-StoreError "Store API $what answered HTTP ${s}: accepted, completion unconfirmed$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $s
+    if (-not $lost) {
+      $id = ''
+      try { $id = Get-JsonField ($r.Body | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
+      if ($id -cmatch $script:SafeId) { $e.Data['StoreAcceptedId'] = $id }
+    }
+    throw $e
+  }
+  $ok = Test-Store2xx $s
+  $unknown = $ok -or $s -eq 408 -or $s -ge 500
+  $t = if ($ok) { "HTTP $s" } else { Get-StoreErrorText $s $r.Body -Detail }
+  if ($ok -and -not $used) { $t += ' (a read is used only when answered HTTP 200)' }
   if ($lost) { $t += "; $lost" }
-  throw (New-StoreError "Store API $what failed: $t" -OutcomeUnknown:$unknown -Status $r.StatusCode)
+  throw (New-StoreError "Store API $what failed: $t" -OutcomeUnknown:$unknown -Status $s)
 }
 
 function Assert-ProductId([string]$ProductId) {
@@ -730,16 +767,22 @@ function Assert-NoPendingSubmission {
 # call, reports whether a submission is pending (Get-RefusedCreateReadBack),
 # and the error is thrown with that report. When no answer came back (or HTTP
 # 408/5xx), the result is unconfirmed: Resolve-UnconfirmedCreate reads the app
-# back and reports what it shows. An HTTP 2xx means the service created a
-# submission; when its id cannot be read (the body was lost, or it has no
-# usable id) that is "created, id unknown", never "not created":
-# Resolve-CreatedIdUnknown reads the app back and the run stops.
+# back and reports what it shows. HTTP 200, 201 or 204 means the service
+# created a submission; when its id cannot be read (the body was lost, or it
+# has no usable id) that is "created, id unknown", never "not created":
+# Resolve-CreatedIdUnknown reads the app back and the run stops. HTTP 202 (or
+# another 2xx, Test-StoreAccepted) means accepted, completion unconfirmed:
+# Resolve-AcceptedCreate checks once (by the answer's id, if it named one)
+# and the run stops, with or without that id.
 function New-StoreSubmission {
   param([Parameter(Mandatory)][string]$ProductId, [ValidateRange(1, 600)][int]$ReadBackTimeoutSec = 30)
   Assert-ProductId $ProductId
   try { $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions?isMinimalResponse=true" }
   catch {
     $status = Get-StoreErrorStatus $_
+    if (Test-StoreAccepted $status) {
+      throw (Resolve-AcceptedCreate -ProductId $ProductId -Answer "$_" -Status $status -Id (Get-StoreAcceptedId $_) -TimeoutSec $ReadBackTimeoutSec)
+    }
     if (Test-Store2xx $status) { throw (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "$_" -Status "HTTP $status" -TimeoutSec $ReadBackTimeoutSec) }
     if (Test-StoreOutcomeUnknown $_) { throw (Resolve-UnconfirmedCreate -ProductId $ProductId -Failure "$_") }
     $refused = "$_. No submission was created and none was deleted."
@@ -753,7 +796,7 @@ function New-StoreSubmission {
   try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
   $json = $null
   if ($id -cnotmatch $script:SafeId) {
-    throw (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "the create response (HTTP 2xx) has no usable submission id" -Status 'HTTP 2xx' -TimeoutSec $ReadBackTimeoutSec)
+    throw (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "the create response (HTTP 200, 201 or 204) has no usable submission id" -Status 'HTTP 200, 201 or 204' -TimeoutSec $ReadBackTimeoutSec)
   }
   Write-Host "created submission id=$id (from the create response)"
   $id
@@ -775,9 +818,9 @@ function Get-RefusedCreateReadBack([string]$ProductId, [int]$TimeoutSec) {
   "$h pendingApplicationSubmission id $pending. This run did not create it."
 }
 
-# The create was answered with HTTP 2xx, so the service created a submission,
-# but this run did not get its id: the answer's body was lost or has no usable
-# id (Pepper, PR #74 r5). Prints a warning first (so the facts are in the log
+# The create was answered with HTTP 200, 201 or 204 (Test-StoreDone), so the
+# service created a submission, but this run did not get its id: the answer's
+# body was lost or has no usable id (Pepper, PR #74 r5). Prints a warning first (so the facts are in the log
 # even if the step is killed during the read-back), then reads the app back
 # once (one GET, at most TimeoutSec) and returns the error text to throw, so
 # the run stops. A pending submission is reported by its id only; none yet,
@@ -803,6 +846,73 @@ function Resolve-CreatedIdUnknown([string]$ProductId, [string]$Answer, [string]$
   if ($pending -ceq '(no usable id)') { return "$head a pending submission without a usable id. $look. $script:ApiOnlyNote" }
   ("$head pending submission $pending. Reported by id only: not updated, not committed, not deleted. A person needs to " +
     "check submission $pending in Partner Center (look only, change nothing there) or with $app/submissions/$pending. $script:ApiOnlyNote")
+}
+
+# The create was answered with HTTP 202 Accepted or another 2xx that does not
+# confirm a change (Test-StoreAccepted): accepted, completion unconfirmed. The
+# service took the request but has not said the submission exists (RFC 9110,
+# 15.3.3; Pepper, PR #74 r7). Prints a warning first, then checks once: by
+# the id the answer named (Id, one GET of that submission,
+# Get-AcceptedReadBack), else by reading the app back (one GET; a pending
+# submission is reported by its id only). Returns the error text to throw, so
+# the run stops whatever the check shows: it never updates, uploads to,
+# commits or deletes a submission, and gives no re-run or delete advice (the
+# create may still be carried out). Never throws.
+function Resolve-AcceptedCreate([string]$ProductId, [string]$Answer, [int]$Status, [string]$Id, [int]$TimeoutSec) {
+  $app = "GET /v1.0/my/applications/$ProductId"
+  $what = "the Store answered the create with HTTP ${Status}: it accepted the request but has not confirmed that a submission was created"
+  if ($Id) {
+    $look = "A person needs to check submission $Id later in Partner Center (look only, change nothing there) or with $app/submissions/$Id"
+    $how = "Checking submission $Id (the id in the answer) once by id"
+  } else {
+    $look = "A person needs to check the app's pending submission later in Partner Center (look only, change nothing there) or with $app (pendingApplicationSubmission.id)"
+    $how = 'The answer named no usable id; reading the app back once'
+  }
+  Write-Host ("::warning title=Store create::Accepted, completion unconfirmed: $what ($Answer). The run stops; it updates, " +
+    "uploads to, commits and deletes nothing. $how. If this step ends before a result is printed below: $look.")
+  $head = "$Answer. Accepted, completion unconfirmed: $what. This run stops: it does not update, upload to, commit or delete any submission."
+  if ($Id) { return "$head $(Get-AcceptedReadBack $ProductId $Id $TimeoutSec) $look. $script:ApiOnlyNote" }
+  $rb = 'Read-back of the app (one GET; nothing changed):'
+  try { $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId -TimeoutSec $TimeoutSec) -ProductId $ProductId }
+  catch { return "$head $rb failed ($_). $look once the API answers. $script:ApiOnlyNote" }
+  if (-not $pending) {
+    return "$head $rb no pending submission yet. That does not mean none will be created: the Store may still be processing the request. $look. $script:ApiOnlyNote"
+  }
+  if ($pending -ceq '(no usable id)') { return "$head $rb a pending submission without a usable id. $look. $script:ApiOnlyNote" }
+  ("$head $rb pending submission $pending. Reported by id only: not updated, not committed, not deleted. A person needs to " +
+    "check submission $pending later in Partner Center (look only, change nothing there) or with $app/submissions/$pending. $script:ApiOnlyNote")
+}
+
+# One read-only GET of submission SubmissionId (at most TimeoutSec, and no
+# longer than the call deadline) after a change to it was accepted without
+# being confirmed (Test-StoreAccepted). Returns one sentence for the log: the
+# status and packages that id shows (safe fields only), that it returned
+# another submission, or that the GET failed (an HTTP 404 among them). Draws
+# no conclusion: the change may still be processing. Never throws.
+function Get-AcceptedReadBack([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec) {
+  $h = "Read-back of submission $SubmissionId by id (one GET; nothing changed):"
+  try { $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec) }
+  catch { return "$h failed ($_)." }
+  if (-not $sub -or $sub.Id -cne $SubmissionId) { return "$h it did not return that submission." }
+  $p = @(foreach ($k in $sub.Packages) { "$($k.FileName) $($k.FileStatus)" })
+  "$h status $($sub.Status); packages: $(if ($p.Count) { $p -join ', ' } else { 'none' })."
+}
+
+# A change to this run's own draft (the PUT of the submission, What 'update',
+# or the package upload, What 'package upload') was answered with HTTP 202
+# Accepted or another 2xx that does not confirm it (Test-StoreAccepted):
+# accepted, completion unconfirmed (Pepper, PR #74 r7). The run stops before
+# its next call, so the draft stays uncommitted and nothing more is sent to
+# it. Prints a warning first, then reads the draft back once by id
+# (Get-AcceptedReadBack) and returns the error text to throw. No delete or
+# re-run advice: the change may still be carried out. Never throws.
+function Resolve-AcceptedChange([string]$ProductId, [string]$SubmissionId, [string]$Answer, [string]$What, [int]$TimeoutSec) {
+  $look = "A person needs to check submission $SubmissionId later (look only, change nothing in Partner Center) with GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
+  Write-Host ("::warning title=Store ${What}::Accepted, completion unconfirmed: $Answer. The run stops; draft $SubmissionId " +
+    "stays uncommitted and nothing more is sent to it. Reading it back once by id. If this step ends before a result is printed below: $look.")
+  ("$Answer. Accepted, completion unconfirmed: the Store accepted the $What of submission $SubmissionId but has not confirmed it is done. Not committed: this " +
+    "run stops, draft $SubmissionId stays uncommitted and nothing more is sent to it. " +
+    "$(Get-AcceptedReadBack $ProductId $SubmissionId $TimeoutSec) $look. $script:ApiOnlyNote")
 }
 
 # The create request got no answer. This run has no submission id of its own
@@ -955,10 +1065,16 @@ function Send-StorePackage {
       $wait = Get-CallTimeout 600
       $r = Invoke-StoreHttp -Method PUT -Uri $UploadUrl.Replace('+', '%2B') -Kind Upload -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/zip' -InFile $zip -TimeoutSec $wait
     } catch { throw "package upload failed: $(Get-StoreFailureText $_)" }
-    # Put Blob answers 201 with an empty body once the blob is stored, so a
-    # 2xx is success even when the body was lost (BodyLost); an error status
-    # is reported with the fixed BodyLost text when its body was lost.
+    # Put Blob answers 201 with an empty body once the blob is stored, so 200,
+    # 201 or 204 is success even when the body was lost (BodyLost); an error
+    # status is reported with the fixed BodyLost text when its body was lost.
+    # HTTP 202 or another 2xx (Test-StoreAccepted) does not say the blob is
+    # stored: thrown as accepted, completion unconfirmed, with its status
+    # (Pepper, PR #74 r7).
     $lost = Get-StoreBodyLost $r
+    if (Test-StoreAccepted $r.StatusCode) {
+      throw (New-StoreError "package upload answered HTTP $($r.StatusCode): accepted, completion unconfirmed (not confirmed stored)$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $r.StatusCode)
+    }
     if ($r.StatusCode -lt 200 -or $r.StatusCode -ge 300) { throw "package upload failed: $(Get-StoreErrorText $r.StatusCode $r.Body)$(if ($lost) { "; $lost" })" }
     Write-Host "package uploaded: $name in Upload.zip ($len bytes), HTTP $($r.StatusCode)$(if ($lost) { " (the answer's body was not read: $lost)" })"
   } finally {
@@ -967,7 +1083,10 @@ function Send-StorePackage {
 }
 
 # POST /applications/{productId}/submissions/{submissionId}/commit: commits
-# exactly this submission, whatever else the app has.
+# exactly this submission, whatever else the app has. Only HTTP 200, 201 or
+# 204 with its body read returns here; a 202 or another 2xx is thrown by
+# Invoke-StoreApi as accepted, completion unconfirmed (OutcomeUnknown), and
+# Publish-StoreSubmission reads it back by id (Resolve-UnconfirmedCommit).
 function Invoke-SubmissionCommit {
   param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId, [ValidateRange(1, 600)][int]$TimeoutSec = 600)
   Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
@@ -977,9 +1096,11 @@ function Invoke-SubmissionCommit {
   Write-Host "submission $SubmissionId commit requested through the API: status=$(Get-SafeValue $st $script:SafeWord)"
 }
 
-# The commit request got no answer, or an HTTP 2xx whose body was lost (Status:
-# the commit was accepted, but whether it has started is not read; the text
-# says which). The commit API is asynchronous
+# The commit request got no answer, an HTTP 200, 201 or 204 whose body was
+# lost (Status: the commit was accepted, but whether it has started is not
+# read), or an HTTP 202 or other 2xx (Test-StoreAccepted: accepted, completion
+# unconfirmed, body read or not; Pepper, PR #74 r7). The text says which. The
+# commit API is asynchronous
 # (https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission),
 # so a PendingCommit read-back does not show the commit did not happen: the
 # request may still be on its way or being processed. First prints (an
@@ -1007,11 +1128,13 @@ function Resolve-UnconfirmedCommit {
     [datetime]$DeadlineUtc = [datetime]::MaxValue
   )
   $accepted = Test-Store2xx $Status
-  $got = if ($accepted) { "was accepted (HTTP $Status) but its answer's body was not read" } else { 'got no answer' }
+  $got = if (Test-StoreAccepted $Status) { "was accepted (HTTP $Status) but the Store has not confirmed it is done" }
+         elseif ($accepted) { "was accepted (HTTP $Status) but its answer's body was not read" } else { 'got no answer' }
   $may = if ($accepted) { 'so whether the commit has started is not confirmed' } else { 'so it may or may not have been committed' }
-  $head = "$Failure. Result unconfirmed: the commit request for submission $SubmissionId $got, $may."
+  $label = if (Test-StoreAccepted $Status) { 'Accepted, completion unconfirmed' } else { 'Result unconfirmed' }
+  $head = "$Failure. ${label}: the commit request for submission $SubmissionId $got, $may."
   $get = "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId"
-  Write-Host ("::warning title=Store commit::Result unconfirmed: the commit request for submission $SubmissionId $got " +
+  Write-Host ("::warning title=Store commit::${label}: the commit request for submission $SubmissionId $got " +
     "($Failure). Reading it back by id for up to $BudgetSeconds s. If this step ends before a result is printed below, check " +
     "$get by hand: CommitStarted or a later status means it was committed. Do not delete, edit, commit or re-submit it, " +
     "and do not re-run this workflow for it.")
@@ -1053,7 +1176,11 @@ function Resolve-UnconfirmedCommit {
 
 # Deletes one submission by id, only while it is an uncommitted draft
 # (PendingCommit). For recovery by hand; the publish workflow never deletes.
-# An HTTP 2xx whose body was lost counts as deleted (the body is not used).
+# HTTP 200, 201 or 204 counts as deleted, also when its body was lost (the
+# body is not used). HTTP 202 or another 2xx (Test-StoreAccepted) is never
+# reported as deleted: accepted, completion unconfirmed; it reads that id back
+# once (Get-AcceptedReadBack) and throws, sending nothing more (Pepper, PR #74
+# r7).
 function Remove-StoreDraftSubmission {
   param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
   $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId)
@@ -1063,6 +1190,11 @@ function Remove-StoreDraftSubmission {
   try { Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" | Out-Null }
   catch {
     $status = Get-StoreErrorStatus $_
+    if (Test-StoreAccepted $status) {
+      throw ("$_. Accepted, completion unconfirmed: the Store accepted the delete of submission $SubmissionId but has not confirmed it is done, so it is not " +
+        "reported as deleted; nothing more is sent. $(Get-AcceptedReadBack $ProductId $SubmissionId 30) A person needs to check " +
+        "GET /v1.0/my/applications/$ProductId/submissions/$SubmissionId later: HTTP 404 there means it is gone.")
+    }
     if (-not (Test-Store2xx $status)) { throw }
     $note = " (HTTP $status; the answer's body was not read)"
   }
@@ -1193,7 +1325,10 @@ function Write-SubmissionSummary {
 # commit was accepted (or, when the commit got no answer, once a read-back by
 # id shows it committed within CommitReadBackAttempts read-backs,
 # CommitReadBackIntervalSeconds apart). Before the commit, any failure leaves this run's
-# draft uncommitted and says how to delete exactly that draft.
+# draft uncommitted and says how to delete exactly that draft, except an
+# accepted, unconfirmed PUT or upload (HTTP 202 or another 2xx,
+# Test-StoreAccepted): that stops with a read-back by id and no delete or
+# re-run advice (Resolve-AcceptedChange; Pepper, PR #74 r7).
 # Time budget: DeadlineUtc is the last moment a call may still wait for an
 # answer; msstore-publish.yml sets it some minutes before the step's timeout so
 # the error text still prints. The last CommitTimeoutSeconds +
@@ -1232,6 +1367,9 @@ function Publish-StoreSubmission {
 
   Assert-NoPendingSubmission -ProductId $ProductId
   $id = New-StoreSubmission -ProductId $ProductId
+  # Set when the PUT or the upload was accepted without being confirmed: the
+  # stop text, thrown as is (no delete or re-run advice).
+  $accepted = ''
   try {
     $pending = Read-AppPendingSubmissionId -AppJson (Get-StoreApp $ProductId) -ProductId $ProductId
     if ($pending -cne $id) { throw "after create, the app's pending submission is '$pending', not $id" }
@@ -1247,14 +1385,22 @@ function Publish-StoreSubmission {
 
     $put = Set-SubmissionPackage -SubmissionJson $sub -FileName $ExpectedFileName
     $sub = $null
-    $updated = Invoke-StoreApi -Method PUT -Path "applications/$ProductId/submissions/$id" -Body $put
+    try { $updated = Invoke-StoreApi -Method PUT -Path "applications/$ProductId/submissions/$id" -Body $put }
+    catch {
+      if (Test-StoreAccepted (Get-StoreErrorStatus $_)) { $accepted = Resolve-AcceptedChange $ProductId $id "$_" 'update' 30; throw $accepted }
+      throw
+    }
     $put = $null
     $safe = Read-SubmissionSafe -SubmissionJson $updated
     if (-not $safe -or $safe.Id -cne $id) { throw "PUT submission $id returned another submission" }
     $url = Get-SubmissionUploadUrl $updated
     $updated = $null
     Write-Host "submission $id updated: old packages PendingDelete, $ExpectedFileName PendingUpload"
-    Send-StorePackage -UploadUrl $url -PackagePath $PackagePath
+    try { Send-StorePackage -UploadUrl $url -PackagePath $PackagePath }
+    catch {
+      if (Test-StoreAccepted (Get-StoreErrorStatus $_)) { $accepted = Resolve-AcceptedChange $ProductId $id "$_" 'package upload' 30; throw $accepted }
+      throw
+    }
     $url = $null
 
     $now = Get-StoreSubmissionJson $ProductId $id
@@ -1276,6 +1422,7 @@ function Publish-StoreSubmission {
         "$($DeadlineUtc.ToString('u')), and that time has started")
     }
   } catch {
+    if ($accepted) { throw $accepted }
     throw "$_. Not committed: draft $id stays uncommitted. $script:ApiOnlyNote $(Get-DeleteByIdText $ProductId $id)"
   }
   $script:CallDeadline = $commitBy.AddSeconds($CommitTimeoutSeconds)
