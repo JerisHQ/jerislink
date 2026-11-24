@@ -98,7 +98,13 @@ BeforeAll {
   # session, so without this they would pile up across tests).
   # The memo of registered texts (SecretInputs) is cleared too, where the
   # module has one (the r9 module has none, and the r10 tests run on it too).
-  function script:Reset-StoreSecrets { & (Get-Module MsStoreRunner) { $script:KnownSecrets.Clear(); $script:SecretPattern = $null; if (Get-Variable -Name SecretInputs -Scope Script -ErrorAction Ignore) { $script:SecretInputs.Clear() } } }
+  function script:Reset-StoreSecrets {
+    & (Get-Module MsStoreRunner) {
+      $script:KnownSecrets.Clear(); $script:SecretPattern = $null
+      if (Get-Variable -Name SecretInputs -Scope Script -ErrorAction Ignore) { $script:SecretInputs.Clear() }
+      if (Get-Variable -Name ConfirmedSecrets -Scope Script -ErrorAction Ignore) { $script:ConfirmedSecrets.Clear(); $script:ConfirmedPattern = $null }
+    }
+  }
 
   function script:New-TestPackage {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkg-' + [guid]::NewGuid().ToString('N'))
@@ -4264,8 +4270,10 @@ Describe 'Store answers are read only as one strict JSON object, every signature
 
   # Point 1: Pepper's repro. The pending check's answer holds an upload URL
   # whose signature the pending id repeats.
-  It 'the pending check''s answer holds a signature, <Case>, in <Where>, and the pending id is that signature: no usable id, never printed, no delete advice' -ForEach @(
-    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field') { foreach ($c in $urlCases) { $c + @{ Where = $w } } }
+  # r11: a sig in another field is found only by scanning the text: masked in
+  # output, but the pending id stays usable (the usual stop, by id, masked).
+  It 'the pending check''s answer holds a signature, <Case>, in <Where>, and the pending id is that signature: <Then>, never printed' -ForEach @(
+    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field') { foreach ($c in $urlCases) { $c + @{ Where = $w; Then = $(if ($w -ceq 'another field') { 'the id is usable (r11), the usual stop by id' } else { 'no usable id, no delete advice' }) } } }
   ) {
     # Locals only: a closure does not see this script's variables.
     $url = $R10Url + $Query + $R10Sig + $After; $sig = $R10Sig
@@ -4278,14 +4286,26 @@ Describe 'Store answers are read only as one strict JSON object, every signature
       }
       $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}')
     }.GetNewClosure()) })
-    $x.R.Err | Should -BeExactly ("Partner Center already has a pending submission (no usable id) for $App. This run did not create it, " +
-      "so it stops and touches nothing. Check GET /v1.0/my/applications/$App before doing anything. $ApiNote")
     $x.Log | Should -Be @("GET $Base") -Because '[sent]'
-    Assert-R10Safe $x
+    if ($Where -ceq 'another field') {
+      $want = ("Partner Center already has a pending submission $R10Sig for $App. This run did not create it, " +
+        "so it stops and touches nothing (it never deletes a submission it did not create). $ApiNote " +
+        "If it is in certification, let certification finish. If it is an uncommitted draft: " + (& $Mod { param($a, $b) Get-DeleteByIdText $a $b } $App $R10Sig))
+      $x.R.Err | Should -BeExactly $want.Replace($R10Sig, '[redacted]')
+      $x.R.All | Should -Not -Match $R10Leak -Because '[printed]'
+      $x.R.Out | Should -Not -Match 'verified submission' -Because '[verified]'
+    } else {
+      $x.R.Err | Should -BeExactly ("Partner Center already has a pending submission (no usable id) for $App. This run did not create it, " +
+        "so it stops and touches nothing. Check GET /v1.0/my/applications/$App before doing anything. $ApiNote")
+      Assert-R10Safe $x
+    }
   }
 
-  It 'the create answer holds a signature, <Case>, in <Where>, and the app read after it shows that signature as pending: never printed, no delete advice' -ForEach @(
-    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field', 'an answer with text before it') { foreach ($c in $urlCases) { $c + @{ Where = $w } } }
+  # r11: in another field the pending id is usable, so the run gives the usual
+  # stop for another pending id (delete advice for this run's own draft only,
+  # then a re-run, as for any other pending id).
+  It 'the create answer holds a signature, <Case>, in <Where>, and the app read after it shows that signature as pending: never printed, <Then>' -ForEach @(
+    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field', 'an answer with text before it') { foreach ($c in $urlCases) { $c + @{ Where = $w; Then = $(if ($w -ceq 'another field') { 'the usual stop, delete advice for this run''s own draft only (r11)' } else { 'no delete advice' }) } } }
   ) {
     # Locals only: a closure does not see this script's variables.
     $url = $R10Url + $Query + $R10Sig + $After; $sig = $R10Sig
@@ -4303,9 +4323,20 @@ Describe 'Store answers are read only as one strict JSON object, every signature
     }.GetNewClosure()
     $pending = New-R10JsonMap { param($o) $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}') }.GetNewClosure()
     $x = Invoke-R10Run @(@{ Kind = 'Create'; At = 1; Map = $create }, @{ Kind = 'AppRead'; At = 2; Map = $pending })
+    # r11: a sig outside a fileUploadUrl the strict reader read (another field,
+    # an answer that is not read) is found only by scanning: masked in output,
+    # but the pending id stays usable, so the stop names it (masked).
     if ($Where -ceq 'an answer with text before it') {
       $x.R.Err | Should -Match 'Created, id unknown'
-      $x.R.Err | Should -Match ([regex]::Escape('Read-back of the app (one GET): a pending submission without a usable id.'))
+      $x.R.Err | Should -Match ([regex]::Escape('Read-back of the app (one GET): pending submission [redacted]. Reported by id only: not updated, not committed, not deleted.'))
+    } elseif ($Where -ceq 'another field') {
+      $apiOnly = & $Mod { $script:ApiOnlyNote }
+      $x.R.Err | Should -Match ('^' + [regex]::Escape("after create, the app's pending submission is '[redacted]', not $NewId. Not committed: draft $NewId stays uncommitted. $apiOnly Delete exactly this submission through the API: DELETE $Base/submissions/$NewId "))
+      $x.R.Err | Should -Not -Match 'Could not verify'
+      $x.Sent | Should -BeExactly "POST $Base/submissions" -Because '[sent]'
+      $x.R.All | Should -Not -Match $R10Leak -Because '[printed]'
+      $x.R.Out | Should -Not -Match 'verified submission' -Because '[verified]'
+      return
     } else {
       $x.R.Err | Should -BeExactly (Get-R10Unverified "after create, the app's pending submission has no usable id" $R10ReadApp)
     }
@@ -4341,6 +4372,126 @@ Describe 'Store answers are read only as one strict JSON object, every signature
     $t = & $Mod { param($a, $v) Register-StoreUploadUrl $a; Hide-StoreSecret "pending submission $v" } $u $R10Sig
     $t | Should -Not -Match $R10Sig -Because '[printed]'
     Reset-StoreSecrets
+  }
+
+  It 'Register-StoreUploadUrl, a URL with a fragment: the URL without the fragment masked whole' {
+    $u = $R10Url + '&sig=' + $R10Sig + '#r10'
+    Reset-StoreSecrets
+    $t = & $Mod { param($a) Register-StoreUploadUrl $a; Hide-StoreSecret "<$($a.Substring(0, $a.IndexOf('#')))>" } $u
+    Reset-StoreSecrets
+    $t | Should -BeExactly '<[redacted]>'
+  }
+
+  # Pepper, PR #74 r11: a plain "sig=" in a public listing of the submission
+  # (a description, a document link), its value a digit of the draft id or of
+  # the version. Found only by scanning the answer's text, it is masked in
+  # output but is not a confirmed credential (the token, the client secret,
+  # the signature read from a fileUploadUrl), so the id and the version stay
+  # usable: the run goes as without it. The 954a12f module stops before the
+  # PUT, the check after the commit is not verified, a delete by hand deletes
+  # nothing.
+  Context 'a sig in a public listing (PR #74 r11)' {
+    BeforeAll {
+      # Adds Text to the listing field (a list: one more item) in the fake's
+      # submission fields.
+      function script:Set-R11Listing($Store, [string]$Lang, [string]$Field, [string]$Text) {
+        $n = [System.Text.Json.Nodes.JsonNode]::Parse($Store.Fields)
+        $l = $n['listings'][$Lang]['baseListing']
+        if ($l[$Field] -is [System.Text.Json.Nodes.JsonArray]) { $l[$Field].Add([System.Text.Json.Nodes.JsonValue]::Create($Text)) }
+        else { $l[$Field] = [System.Text.Json.Nodes.JsonValue]::Create($l[$Field].GetValue[string]() + $Text) }
+        $Store.Fields = $n.ToJsonString()
+      }
+      $script:R11Sent = "POST $Base/submissions | PUT $Base/submissions/$NewId | PUT /blob/upload.zip | POST $Base/submissions/$NewId/commit"
+    }
+
+    $listingCases = @(
+      @{ Case = 'the en-us description holds "sig=5" (a digit of the draft id)'; Lang = 'en-us'; Field = 'description'; Text = ' Help: sig=5' }
+      @{ Case = 'the en-us privacy policy link holds "?sig=9" (a document link)'; Lang = 'en-us'; Field = 'privacyPolicy'; Text = 'https://example.com/privacy?sig=9' }
+      @{ Case = 'the en-us website link holds "&sig=0" (a digit of the id and of the version)'; Lang = 'en-us'; Field = 'websiteUrl'; Text = 'https://example.com/docs?lang=en&sig=0' }
+      @{ Case = 'the zh-hk description holds "sig=4" (a digit of the version only)'; Lang = 'zh-hk'; Field = 'description'; Text = ' sig=4' }
+      @{ Case = 'an en-us feature holds "%73ig=1" (an encoded name)'; Lang = 'en-us'; Field = 'features'; Text = 'Docs: https://example.com/help?%73ig=1' }
+    )
+
+    It 'publish, <Case>: committed as without it, the listing sent as it is' -ForEach $listingCases {
+      $x = Invoke-R10Run @() @{} $null { param($s) Set-R11Listing $s $Lang $Field $Text }
+      $x.R.Err | Should -BeNullOrEmpty
+      $x.Sent | Should -BeExactly $R11Sent -Because '[sent]'
+      $x.Committed | Should -BeTrue -Because '[commit sent]'
+      $x.R.Value | Should -Be @($NewId) -Because '[result]'
+      $x.R.Out | Should -Match 'draft verified: '
+      $x.R.Out | Should -Match 'commit requested through the API: status=CommitStarted'
+      # The PUT sends the listing as the Store gave it: a request is not masked.
+      $v = [System.Text.Json.Nodes.JsonNode]::Parse($x.Store.LastPut)['listings'][$Lang]['baseListing'][$Field]
+      if ($v -is [System.Text.Json.Nodes.JsonArray]) { $v = $v[$v.Count - 1] }
+      $v.GetValue[string]().EndsWith($Text, [StringComparison]::Ordinal) | Should -BeTrue -Because '[PUT body]'
+      $x.R.All | Should -Not -Match $Leak -Because '[printed]'
+    }
+
+    It 'the check after the commit, <Case>: verified' -ForEach $listingCases {
+      $x = Invoke-R10Run @() @{} {
+        Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -ExpectedFileName $File -TimeoutMinutes 0 -IntervalSeconds 0 } {
+        param($s) $s.Sub = @{ id = $SubId; status = 'Certification'; applicationPackages = @(
+          [ordered]@{ id = 'p3'; fileName = $File; fileStatus = 'Uploaded'; version = '0.4.1.0' }) }
+        Set-R11Listing $s $Lang $Field $Text }
+      $x.R.Err | Should -BeNullOrEmpty
+      $x.R.Out | Should -Match 'verified submission \S+: submission holds exactly one Uploaded package, version '
+      $x.Sent | Should -BeExactly '' -Because '[sent]'
+    }
+
+    It 'a delete by hand, <Case>: deleted' -ForEach $listingCases {
+      $x = Invoke-R10Run @() @{} { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $NewId } {
+        param($s) $s.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @(
+          [ordered]@{ id = 'p1'; fileName = $File; fileStatus = 'PendingUpload'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }; $s.PendingId = $NewId
+        Set-R11Listing $s $Lang $Field $Text }
+      $x.R.Err | Should -BeNullOrEmpty
+      $x.Sent | Should -BeExactly "DELETE $Base/submissions/$NewId" -Because '[sent]'
+      $x.R.Out | Should -Match 'deleted draft submission '
+    }
+
+    It 'a sig found by scanning a text: masked in output, the id and the version still usable' {
+      Reset-StoreSecrets
+      $r = & $Mod { param($id)
+        Register-StoreTextSecret '{"description":"Help: sig=5","privacyPolicy":"https://example.com/privacy?sig=0"}'
+        [pscustomobject]@{ Id = (Test-StoreId $id); SafeId = (Get-SafeValue $id $script:SafeId); Version = (Get-SafeValue '0.4.1.0' $script:SafeVersion); Hidden = (Hide-StoreSecret "id $id") } } $NewId
+      Reset-StoreSecrets
+      $r.Id | Should -BeTrue
+      $r.SafeId | Should -BeExactly $NewId
+      $r.Version | Should -BeExactly '0.4.1.0'
+      $r.Hidden | Should -BeExactly ('id ' + ($NewId -creplace '[05]', '[redacted]'))
+    }
+
+    # r9 kept: a confirmed credential still makes an id that holds it unusable,
+    # also when the same value was (or is later) found by scanning.
+    It 'a confirmed credential, <Case>: an id that holds it is not usable' -ForEach @(
+      @{ Case = 'the signature of an upload URL'; Code = 'param($v) Register-StoreUploadUrl "https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sr=b&sp=w&sig=$v"' }
+      # Decoded as a server reads it (%35 is 5); in the fragment, so only this
+      # value's own forms give it.
+      @{ Case = 'the signature of an upload URL, percent-encoded in the fragment'; Code = 'param($v) Register-StoreUploadUrl ("https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w#sig=%3" + $v)' }
+      # Its value trimmed too (%20 is a space).
+      @{ Case = 'the signature of an upload URL, a space before it'; Code = 'param($v) Register-StoreUploadUrl ("https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w&sig=%20" + $v)' }
+      @{ Case = 'the signature of a fileUploadUrl in an answer, the name in another case'; Code = 'param($v) Register-StoreAnswerUploadUrl (''{"id":"1","FileUploadURL":"https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w&sig='' + $v + ''"}'')' }
+      @{ Case = 'the signature of a nested fileUploadUrl in an answer'; Code = 'param($v) Register-StoreAnswerUploadUrl (''{"id":"1","r11":{"fileUploadUrl":"https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w&sig='' + $v + ''"}}'')' }
+      @{ Case = 'scanned first, then the same value from an upload URL'; Code = 'param($v) Register-StoreTextSecret "Help: sig=$v"; Register-StoreUploadUrl "https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w&sig=$v"' }
+      @{ Case = 'from an upload URL first, then the same value scanned'; Code = 'param($v) Register-StoreUploadUrl "https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sp=w&sig=$v"; Register-StoreTextSecret "Help: sig=$v"' }
+      @{ Case = 'the client secret, signing in'; Code = ''; SignIn = @{ Secret = '5' } }
+      @{ Case = 'the access token, signing in'; Code = ''; SignIn = @{ Token = '5' } }
+    ) {
+      Reset-StoreSecrets
+      if ($Code) { & $Mod.NewBoundScriptBlock([scriptblock]::Create($Code)) '5' }
+      else {
+        $s = New-FakeStore; Use-FakeStore $s
+        if ($SignIn.Token) { $s.Token = $SignIn.Token }
+        $sec = if ($SignIn.Secret) { $SignIn.Secret } else { $Secret }
+        # Signed in or refused: the credential is registered either way.
+        $null = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $sec }
+      }
+      $r = & $Mod { param($id) [pscustomobject]@{ Id = (Test-StoreId $id); SafeId = (Get-SafeValue $id $script:SafeId); Version = (Get-SafeValue '0.5.1.0' $script:SafeVersion); Hidden = (Hide-StoreSecret "id $id") } } $NewId
+      Reset-StoreSecrets
+      $r.Id | Should -BeFalse
+      $r.SafeId | Should -BeExactly '[invalid]'
+      $r.Version | Should -BeExactly '[invalid]'
+      $r.Hidden | Should -BeExactly ('id ' + ($NewId -creplace '5', '[redacted]'))
+    }
   }
 }
 

@@ -131,10 +131,17 @@ function Get-StorePackage {
 # and fails on any other throw or output). So a credential that an answer puts
 # in a field whose format it fits (an id of digits, a version of digits and
 # dots) is still masked: this does not rely on the field checks. On top of
-# that, a value that holds a credential is never used as an id or a version
-# (Test-StoreId, Get-SafeValue), so it is never sent back or returned.
+# that, a value that holds a confirmed credential is never used as an id or a
+# version (Test-StoreId, Get-SafeValue), so it is never sent back or returned.
+# Confirmed (Pepper, PR #74 r11): the client secret, the access token and each
+# upload URL with what is read from it, in ConfirmedSecrets too. A sig value
+# found only by scanning an answer's text (Register-StoreTextSecret: it may be
+# a listing's description or a document link) is masked in output but never
+# makes an id or a version unusable.
 $script:KnownSecrets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:SecretPattern = $null
+$script:ConfirmedSecrets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$script:ConfirmedPattern = $null
 $script:SecretText = '[redacted]'
 # The texts Register-StoreUploadUrl and Register-StoreTextSecret are done
 # with: each registers the same secrets for the same text, and KnownSecrets
@@ -143,17 +150,27 @@ $script:SecretText = '[redacted]'
 # KnownSecrets.
 $script:SecretInputs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
-function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value) {
+# Scanned: found by Register-StoreTextSecret only, so masked in output but not
+# confirmed (not in ConfirmedSecrets).
+function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value, [switch]$Scanned) {
   if (-not $Value -or $Value -ceq $script:NotText) { return }
   $forms = @($Value, $Value.Replace('+', '%2B'), $Value.Replace('+', ' '))
   try { $forms += [uri]::UnescapeDataString($Value) } catch { }
   try { $forms += [uri]::EscapeDataString($Value) } catch { }
   $new = $false
-  foreach ($f in $forms) { if ($f -and $script:KnownSecrets.Add($f)) { $new = $true } }
-  if (-not $new) { return }
-  # Longest first, so a credential that holds another one is masked whole.
-  $all = @($script:KnownSecrets | Sort-Object -Property Length -Descending | ForEach-Object { [regex]::Escape($_) })
-  $script:SecretPattern = [regex]::new(($all -join '|'), [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+  $newConfirmed = $false
+  foreach ($f in $forms) {
+    if (-not $f) { continue }
+    if ($script:KnownSecrets.Add($f)) { $new = $true }
+    if (-not $Scanned -and $script:ConfirmedSecrets.Add($f)) { $newConfirmed = $true }
+  }
+  if ($new) { $script:SecretPattern = New-StoreSecretPattern $script:KnownSecrets }
+  if ($newConfirmed) { $script:ConfirmedPattern = New-StoreSecretPattern $script:ConfirmedSecrets }
+}
+# Longest first, so a credential that holds another one is masked whole.
+function New-StoreSecretPattern($Set) {
+  $all = @($Set | Sort-Object -Property Length -Descending | ForEach-Object { [regex]::Escape($_) })
+  [regex]::new(($all -join '|'), [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 }
 
 # A SAS upload URL (it carries a write signature): the URL with and without
@@ -230,7 +247,9 @@ function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Que
 # shape), read as it is and with JSON string escapes undone (&, \/, ...):
 # so one in an answer that is not JSON that can be read, or in a field other
 # than fileUploadUrl, is masked as well, before anything is read from that
-# answer (Pepper, PR #74 r10). A pair is name=value; a name ends at "?", "&",
+# answer (Pepper, PR #74 r10). These are registered as scanned (PR #74 r11):
+# masked in output only, since any text field (a listing's description, a
+# document link) may hold "sig=" with a value that is not a credential. A pair is name=value; a name ends at "?", "&",
 # ";", "#", "=", a quote, a bracket or white space, a value at the same marks
 # but "=". A text already done (SecretInputs) is not read again. Never throws.
 $script:QueryPairPattern = [regex]::new('([^?&;#=\s"''<>{}\[\],]+)=([^?&;#\s"''<>{}\[\],]*)', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
@@ -245,7 +264,7 @@ function Register-StoreTextSecret([AllowNull()][AllowEmptyString()][string]$Text
     })
     foreach ($t in @($Text, $plain)) {
       foreach ($m in $script:QueryPairPattern.Matches($t)) {
-        if ((ConvertFrom-StoreQueryName $m.Groups[1].Value) -ieq 'sig') { Register-StoreSecret $m.Groups[2].Value; Register-StoreSecret $m.Groups[2].Value.Trim() }
+        if ((ConvertFrom-StoreQueryName $m.Groups[1].Value) -ieq 'sig') { Register-StoreSecret $m.Groups[2].Value -Scanned; Register-StoreSecret $m.Groups[2].Value.Trim() -Scanned }
       }
     }
     [void]$script:SecretInputs.Add("text:$Text")
@@ -323,9 +342,10 @@ function Hide-StoreSecret([AllowNull()][AllowEmptyString()][string]$Text) {
   $p.Replace($Text, $script:SecretText)
 }
 
-# True when Value holds a known credential.
+# True when Value holds a confirmed credential (ConfirmedSecrets: never a sig
+# value found only by scanning a text; Pepper, PR #74 r11).
 function Test-StoreSecretIn([AllowNull()][AllowEmptyString()][string]$Value) {
-  [bool]($Value -and $null -ne $script:SecretPattern -and $script:SecretPattern.IsMatch($Value))
+  [bool]($Value -and $null -ne $script:ConfirmedPattern -and $script:ConfirmedPattern.IsMatch($Value))
 }
 
 # The only Write-Host of this module: prints Text with every known credential masked.
@@ -858,8 +878,8 @@ function Get-JsonField($Object, [string]$Name) {
 }
 
 # Ids and versions from the API are printed (and compared) only when they are
-# ASCII digits (a version: up to four dot-separated numbers) and hold no known
-# credential (Test-StoreSecretIn; Pepper, PR #74 r9); anything else becomes
+# ASCII digits (a version: up to four dot-separated numbers) and hold no
+# confirmed credential (Test-StoreSecretIn; Pepper, PR #74 r9 and r11); anything else becomes
 # [invalid]. Empty stays empty. A value that passes still goes through
 # Protect-WorkflowCommand, and every line still through Hide-StoreSecret.
 # Digits are [0-9] only: \d would also pass the digits of other scripts.
@@ -870,7 +890,7 @@ function Get-SafeValue([AllowNull()][AllowEmptyString()][string]$Value, [string]
   if ($Value -cmatch $Pattern -and -not (Test-StoreSecretIn $Value)) { Protect-WorkflowCommand $Value } else { '[invalid]' }
 }
 # A submission id this module may use (send in a path, return, print): ASCII
-# digits that hold no known credential.
+# digits that hold no confirmed credential.
 function Test-StoreId([AllowNull()][AllowEmptyString()][string]$Value) {
   [bool]($Value -cmatch $script:SafeId -and -not (Test-StoreSecretIn $Value))
 }
