@@ -88,9 +88,15 @@ BeforeAll {
       }
       [pscustomobject]@{ StatusCode = $r.StatusCode; Body = $r.Body }
     }
+    Reset-StoreSecrets
     Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret 6>$null
     $Store.Log.Clear(); $Store.Calls.Clear()
   }
+
+  # Each fake Store run is one workflow step, a new PowerShell session: it
+  # starts with no known credentials (the module keeps them for the whole
+  # session, so without this they would pile up across tests).
+  function script:Reset-StoreSecrets { & (Get-Module MsStoreRunner) { $script:KnownSecrets.Clear(); $script:SecretPattern = $null } }
 
   function script:New-TestPackage {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkg-' + [guid]::NewGuid().ToString('N'))
@@ -1963,8 +1969,8 @@ Describe 'Credentials planted at every spot of every API answer are never printe
       $root.ToJsonString()
     }
     # The first planted text in Text, with some context, or ''.
-    function script:Get-PlantLeak([AllowEmptyString()][string]$Text) {
-      $m = [regex]::Match($Text, "(?is).{0,60}(?:$PlantedAny).{0,30}")
+    function script:Get-PlantLeak([AllowEmptyString()][string]$Text, [string]$Pattern = $PlantedAny) {
+      $m = [regex]::Match($Text, "(?is).{0,60}(?:$Pattern).{0,30}")
       if ($m.Success) { $m.Value -replace '\s+', ' ' } else { '' }
     }
     # Fills the lists the fake leaves empty (statusDetails) and adds app
@@ -1976,8 +1982,9 @@ Describe 'Credentials planted at every spot of every API answer are never printe
       if ($Kind -ceq 'AppRead' -and $Body.StartsWith('{')) { $Body = '{"packageFamilyName":"JerisHQ.JerisLink_0abc","firstPublishedDate":"2026-01-01T00:00:00Z",' + $Body.Substring(1) }
       $Body
     }
-    # The fake's EditAnswer: fills the answer (Add-PlantFill), then for an
-    # answer of the kind $global:PlantState.Kind makes it the planted error
+    # The fake's EditAnswer: fills the answer (Add-PlantFill), makes Sig (when
+    # set) the signature of every SAS upload URL the fake hands out, then for
+    # an answer of the kind $global:PlantState.Kind makes it the planted error
     # body (when Status is set) and plants Value at spot K.
     $script:PlantSpotCache = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $script:PlantHook = {
@@ -1986,6 +1993,7 @@ Describe 'Credentials planted at every spot of every API answer are never printe
       if ($null -eq $p) { return }
       if ($Kind -ceq $p.Kind -and $p.Status) { $R.StatusCode = $p.Status; $R.Body = $p.ErrorBody }
       $R.Body = Add-PlantFill $Kind ([string]$R.Body)
+      if ($p.Sig) { $R.Body = $R.Body.Replace('FAKE\u002BSAS%2FSIGNATURE-0123456789', $p.Sig).Replace('FAKE+SAS%2FSIGNATURE-0123456789', $p.Sig) }
       if ($Kind -cne $p.Kind) { return }
       $spots = $null
       if (-not $PlantSpotCache.TryGetValue($R.Body, [ref]$spots)) { $spots = Get-PlantSpots $R.Body; $PlantSpotCache[$R.Body] = $spots }
@@ -1996,22 +2004,29 @@ Describe 'Credentials planted at every spot of every API answer are never printe
     # once for each spot K = 0, 1, ... with Value planted at spot K of every
     # answer of kind Kind (made the error body ErrorBody with HTTP Status
     # first, when Status is set), until K has passed every spot any such
-    # answer had. Returns the leaks (run and planted text shown), the number
-    # of runs and how many answers were planted.
+    # answer had. Token, ClientSecret and Sig (when set) are this session's
+    # access token, client secret and SAS signature; a leak is any text
+    # matching LeakPattern (default: the planted texts). Returns the leaks
+    # (run and planted text shown), the number of runs and how many answers
+    # were planted.
     function script:Invoke-PlantRuns {
-      param([string]$Kind, [string]$Value, [hashtable]$Options = @{}, [scriptblock]$Action, [int]$Status = 0, [string]$ErrorBody = '')
+      param([string]$Kind, [string]$Value, [hashtable]$Options = @{}, [scriptblock]$Action, [int]$Status = 0, [string]$ErrorBody = '',
+            [string]$Token = '', [string]$ClientSecret = $Secret, [string]$Sig = '', [string]$LeakPattern = $PlantedAny)
       Use-FakeStore (New-FakeStore)
       $leaks = [System.Collections.Generic.List[string]]::new()
-      $global:PlantState = @{ Kind = $Kind; K = 0; Max = 0; Value = $Value; Planted = 0; Status = $Status; ErrorBody = $ErrorBody }
+      $global:PlantState = @{ Kind = $Kind; K = 0; Max = 0; Value = $Value; Planted = 0; Status = $Status; ErrorBody = $ErrorBody; Sig = $Sig }
       $k = 0; $planted = 0
       try {
         do {
           $global:PlantState.K = $k; $global:PlantState.Planted = 0
           $s = New-FakeStore @Options -EditAnswer $PlantHook
+          if ($Token) { $s.Token = $Token }
           $global:FakeStore = $s
-          $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret; & $Action $s }
+          Reset-StoreSecrets
+          $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $ClientSecret; & $Action $s }
           $planted += $global:PlantState.Planted
-          $leak = Get-PlantLeak $r.All
+          $leak = Get-PlantLeak (($r.Value | ForEach-Object { "$_" }) -join "`n") $LeakPattern
+          if (-not $leak) { $leak = Get-PlantLeak $r.All $LeakPattern }
           if ($leak) { $leaks.Add("$Kind spot ${k}: $leak") }
           $k++
         } while ($k -lt $global:PlantState.Max)
@@ -2296,6 +2311,49 @@ Describe 'Credentials planted at every spot of every API answer are never printe
     $act = switch ($Name) { 'publish' { $PlantPublish } 'manual delete' { $PlantDelete } default { $PlantVerify } }
     $res = Invoke-PlantRuns -Kind $Kind -Value $Plants[$Plant] -Status $Status -ErrorBody $body -Action $act
     $res.Planted | Should -BeGreaterThan 0
+    $res.Leaks | Should -BeNullOrEmpty
+  }
+
+  # Pepper, PR #74 r9, point 1: masking must not rest on a field's format
+  # check. The access token, client secret and SAS signature are made values
+  # that fit the fields an answer has (a submission id or a number: digits;
+  # a package version: dotted numbers), and each is planted in turn at every
+  # spot of every answer of a kind; none may come out. The token and secret
+  # are known from the sign-in on; the SAS signature from the first answer
+  # that holds the upload URL (the GET before the PUT: the create asks for
+  # the minimal answer, id and status only), so it is planted in the answers
+  # from then on (an answer before that cannot hold a signature not yet
+  # issued to this run, and a value seen before it is not a known credential).
+  It 'end to end, credentials that fit a field''s format (<Form>): <Name>, the <Cred> planted in every <Kind> answer' -ForEach @(
+    foreach ($fm in 'digits', 'dotted') {
+      foreach ($cr in 'access token', 'client secret', 'SAS signature') {
+        $kinds = if ($cr -eq 'SAS signature') { 'Upload', 'Commit' } else { 'Token', 'AppRead', 'Create', 'Upload', 'Commit' }
+        foreach ($kd in $kinds) { @{ Form = $fm; Cred = $cr; Name = 'publish'; Kind = $kd } }
+        @{ Form = $fm; Cred = $cr; Name = 'verify after commit'; Kind = 'SubmissionRead' }
+        foreach ($kd in 'SubmissionRead', 'Delete') { @{ Form = $fm; Cred = $cr; Name = 'manual delete'; Kind = $kd } }
+        if ($cr -ne 'SAS signature') { @{ Form = $fm; Cred = $cr; Name = 'publish, create accepted (HTTP 202)'; Kind = 'Create' } }
+        @{ Form = $fm; Cred = $cr; Name = 'publish, commit accepted (HTTP 202)'; Kind = 'Commit' }
+      }
+    }
+    # The submission reads and the PUT answer have the most spots: the SAS
+    # signature (registered from the URL) and one sign-in credential each.
+    @{ Form = 'digits'; Cred = 'access token'; Name = 'publish'; Kind = 'SubmissionRead' }
+    @{ Form = 'dotted'; Cred = 'SAS signature'; Name = 'publish'; Kind = 'SubmissionRead' }
+    @{ Form = 'digits'; Cred = 'SAS signature'; Name = 'publish'; Kind = 'Update' }
+    @{ Form = 'dotted'; Cred = 'client secret'; Name = 'publish'; Kind = 'Update' }
+  ) {
+    $c = if ($Form -eq 'digits') { @{ Token = '1152921505000000123'; Secret = '1152921505000000456'; Sig = '1152921505000000789' } }
+         else { @{ Token = '7.7.7.7'; Secret = '8.8.8.8'; Sig = '9.9.9.9' } }
+    $v = switch ($Cred) { 'access token' { $c.Token } 'client secret' { $c.Secret } default { $c.Sig } }
+    $opt = switch ($Name) {
+      'publish, create accepted (HTTP 202)' { @{ AcceptOn = 'Create' } }
+      'publish, commit accepted (HTTP 202)' { @{ AcceptOn = 'Commit' } }
+      default { @{} }
+    }
+    $act = switch -Wildcard ($Name) { 'publish*' { $PlantPublish } 'verify after commit' { $PlantVerify } 'manual delete' { $PlantDelete } }
+    $pattern = (@($c.Token, $c.Secret, $c.Sig) | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $res = Invoke-PlantRuns -Kind $Kind -Value $v -Options $opt -Action $act -Token $c.Token -ClientSecret $c.Secret -Sig $c.Sig -LeakPattern $pattern
+    $res.Planted | Should -BeGreaterThan 0 -Because "the scenario reaches a $Kind answer"
     $res.Leaks | Should -BeNullOrEmpty
   }
 }
@@ -3437,5 +3495,797 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (PR
     $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Pkg -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
     $r.Err | Should -BeExactly "Store API GET $Base failed: HTTP 202 (a read is used only when answered HTTP 200); cannot check for a pending submission; not publishing"
     @($Srv.Log) | Should -Be @($Token1, "GET $Base")
+  }
+}
+
+# Pepper, PR #74 r9, point 1: every credential this session has seen (the
+# client secret, the access token, every SAS upload URL, its query and its
+# signature) is masked in every line printed and every error thrown, also
+# when it fits the format of the field it is in (an id of digits, a version
+# of digits and dots), so the mask does not rely on the field checks.
+Describe 'Every known credential is masked in every line printed and every error thrown (PR #74 r9)' {
+  BeforeAll {
+    $script:Mod = Get-Module MsStoreRunner
+    $script:ModulePath = Join-Path $PSScriptRoot '..' 'MsStoreRunner.psm1'
+  }
+  BeforeEach { Reset-StoreSecrets }
+  AfterAll { Reset-StoreSecrets }
+
+  It 'masks a registered value in each form a URL escapes or unescapes it to, and not a part of it' {
+    & $Mod { Register-StoreSecret 'Ab+c/d=e%3F' }
+    foreach ($f in 'Ab+c/d=e%3F', 'Ab%2Bc/d=e%3F', 'Ab c/d=e%3F', 'Ab+c/d=e?', 'Ab%2Bc%2Fd%3De%253F') {
+      & $Mod { param($f) Hide-StoreSecret "x $f y" } $f | Should -BeExactly 'x [redacted] y'
+    }
+    & $Mod { Hide-StoreSecret 'x Ab+c y' } | Should -BeExactly 'x Ab+c y'
+  }
+
+  It 'masks the longer of two credentials whole when it holds the other' {
+    & $Mod { Register-StoreSecret '1152921505000000123'; Register-StoreSecret '1152921505000000123456' }
+    & $Mod { Hide-StoreSecret 'a 1152921505000000123456 b 1152921505000000123 c' } | Should -BeExactly 'a [redacted] b [redacted] c'
+  }
+
+  It 'registers nothing for an empty value, $null or the not-text mark' {
+    & $Mod { Register-StoreSecret ''; Register-StoreSecret $null; Register-StoreSecret $script:NotText; $script:KnownSecrets.Count } | Should -Be 0
+    & $Mod { Hide-StoreSecret '[not text] x' } | Should -BeExactly '[not text] x'
+  }
+
+  It 'masks a SAS upload URL, its query with and without "?", and its signature alone, in each form' {
+    $u = 'https://acct.blob.core.windows.net/c/u.zip?sv=2020-08-04&sr=b&SIG=Ab+Cd%2F9&sp=w'
+    & $Mod { param($u) Register-StoreUploadUrl $u } $u
+    foreach ($t in $u, '?sv=2020-08-04&sr=b&SIG=Ab+Cd%2F9&sp=w', 'sv=2020-08-04&sr=b&SIG=Ab+Cd%2F9&sp=w', 'Ab+Cd%2F9', 'Ab%2BCd%2F9', 'Ab+Cd/9', 'Ab Cd%2F9') {
+      & $Mod { param($t) Hide-StoreSecret "<$t>" } $t | Should -BeExactly '<[redacted]>'
+    }
+  }
+
+  It 'New-StoreError, Write-StoreHost and Protect-StoreText mask a credential of digits and one of digits and dots' {
+    & $Mod { Register-StoreSecret '1152921505000000456'; Register-StoreSecret '8.8.8.8' }
+    $e = & $Mod { New-StoreError 'submission 1152921505000000456 version 8.8.8.8' -OutcomeUnknown -Status 503 }
+    $e.Message | Should -BeExactly 'submission [redacted] version [redacted]'
+    $e.Data['StoreText'] | Should -BeExactly 'submission [redacted] version [redacted]'
+    $r = Invoke-Captured { & (Get-Module MsStoreRunner) { Write-StoreHost 'id 1152921505000000456 v 8.8.8.8' } }
+    $r.Out | Should -BeExactly 'id [redacted] v [redacted]'
+    Protect-StoreText 'id 1152921505000000456 v 8.8.8.8' | Should -BeExactly 'id [redacted] v [redacted]'
+  }
+
+  It 'never uses a value that fits the id or version format but holds a credential as an id or a version' {
+    & $Mod { Register-StoreSecret '1152921505000000456'; Register-StoreSecret '8.8.8.8' }
+    & $Mod { Test-StoreId '1152921505000000456' } | Should -BeFalse
+    & $Mod { Test-StoreId '11529215050000004561' } | Should -BeFalse
+    & $Mod { Test-StoreId '1152921505000000004' } | Should -BeTrue
+    & $Mod { Get-SafeValue '1152921505000000456' $script:SafeId } | Should -BeExactly '[invalid]'
+    & $Mod { Get-SafeValue '8.8.8.8' $script:SafeVersion } | Should -BeExactly '[invalid]'
+    & $Mod { Get-SafeValue '0.4.1.0' $script:SafeVersion } | Should -BeExactly '0.4.1.0'
+    $ex = [System.InvalidOperationException]::new('x'); $ex.Data['StoreAcceptedId'] = '1152921505000000456'
+    $rec = [System.Management.Automation.ErrorRecord]::new($ex, 'x', 'NotSpecified', $null)
+    & $Mod { param($r) Get-StoreAcceptedId $r } $rec | Should -BeExactly ''
+    $ex.Data['StoreAcceptedId'] = '1152921505000000004'
+    & $Mod { param($r) Get-StoreAcceptedId $r } $rec | Should -BeExactly '1152921505000000004'
+    foreach ($c in { Invoke-SubmissionCommit -ProductId $App -SubmissionId '1152921505000000456' },
+                   { Remove-StoreDraftSubmission -ProductId $App -SubmissionId '1152921505000000456' },
+                   { Assert-SubmissionHasPackage -ProductId $App -SubmissionId '1152921505000000456' -ExpectedVersion '0.4.1.0' -TimeoutMinutes 0 }) {
+      $r = Invoke-Captured $c
+      $r.Err | Should -BeExactly "submission id '[invalid]' is not a number"
+      $r.All | Should -Not -Match '1152921505000000456'
+    }
+  }
+
+  It 'Connect-StoreApi masks the client secret before its first check, and an access token it refuses' {
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'bad tenant' -ClientId 'client-1' -ClientSecret '1152921505000000456' }
+    $r.Err | Should -BeExactly 'tenant id has unexpected characters'
+    & $Mod { Hide-StoreSecret 'x 1152921505000000456' } | Should -BeExactly 'x [redacted]'
+    Use-FakeStore (New-FakeStore)
+    $FakeStore.Token = '7.7.7.7 x'
+    Reset-StoreSecrets
+    $r = Invoke-Captured { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret }
+    $r.Err | Should -BeExactly "the token response's access_token is not a valid bearer token (it is not printed); not signed in"
+    & $Mod { Hide-StoreSecret 'x 7.7.7.7 x' } | Should -BeExactly 'x [redacted]'
+  }
+
+  It 'Invoke-StoreApi masks the fileUploadUrl of an answer from the moment it arrives (<Method> HTTP <Status>)' -ForEach @(
+    @{ Method = 'GET'; Status = 200 }, @{ Method = 'GET'; Status = 202 }, @{ Method = 'GET'; Status = 404 }, @{ Method = 'POST'; Status = 201 },
+    @{ Method = 'POST'; Status = 202 }, @{ Method = 'POST'; Status = 503 }, @{ Method = 'PUT'; Status = 200 }, @{ Method = 'PUT'; Status = 400 }
+  ) {
+    Use-FakeStore (New-FakeStore)
+    $u = 'https://plantedacct.blob.core.windows.net/c/p.zip?sv=2022-11-02&sig=1152921505000000789'
+    $global:R9Answer = [pscustomobject]@{ StatusCode = $Status; Body = (@{ id = $SubId; fileUploadUrl = $u } | ConvertTo-Json -Compress) }
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { $global:R9Answer }
+    $r = Invoke-Captured { & (Get-Module MsStoreRunner) { param($m) Invoke-StoreApi -Method $m -Path 'applications/9NM3VWQ9MD7N' } $Method }
+    $r.All | Should -Not -Match 'plantedacct|1152921505000000789'
+    & $Mod { Hide-StoreSecret 'a 1152921505000000789 b' } | Should -BeExactly 'a [redacted] b'
+    & $Mod { param($u) Hide-StoreSecret "a $u b" } $u | Should -BeExactly 'a [redacted] b'
+  }
+
+  # Each function that reads an upload URL masks it on its own, so a URL that
+  # did not come through Invoke-StoreApi is masked too.
+  It '<Fn> masks the upload URL it is given on its own, before it uses it' -ForEach @(
+    @{ Fn = 'Get-SubmissionUploadUrl' }, @{ Fn = 'Read-SubmissionSafe' }, @{ Fn = 'Send-StorePackage' }
+  ) {
+    $sig = '1152921505000000456'
+    $u = "https://jlr9layer.blob.core.windows.net/c/u.zip?sv=2022-11-02&sig=$sig"
+    $json = '{"id":"1152921505000000099","status":"PendingCommit","fileUploadUrl":"' + $u + '"}'
+    & $Mod {
+      param($Fn, $Json, $U)
+      switch ($Fn) {
+        'Get-SubmissionUploadUrl' { [void](Get-SubmissionUploadUrl $Json) }
+        'Read-SubmissionSafe' { [void](Read-SubmissionSafe -SubmissionJson $Json) }
+        # No such file: it throws before zipping or sending anything.
+        'Send-StorePackage' { try { Send-StorePackage -UploadUrl $U -PackagePath (Join-Path ([IO.Path]::GetTempPath()) 'jl-r9-none/none.msix') } catch { } }
+      }
+    } $Fn $json $u
+    & $Mod { param($s) Hide-StoreSecret "a $s b" } $sig | Should -BeExactly 'a [redacted] b'
+    & $Mod { param($u) Hide-StoreSecret "a $u b" } $u | Should -BeExactly 'a [redacted] b'
+  }
+
+  It 'Invoke-StoreApi registers nothing from an answer without a text fileUploadUrl (<Case>)' -ForEach @(
+    @{ Case = 'a number'; Body = '{"fileUploadUrl":1152921505000000789}'; Lost = $false }
+    @{ Case = 'not JSON'; Body = 'sig=1152921505000000789'; Lost = $false }
+    @{ Case = 'body lost'; Body = ''; Lost = $true }
+  ) {
+    Use-FakeStore (New-FakeStore)
+    $before = & $Mod { $script:KnownSecrets.Count }
+    $global:R9Answer = [pscustomobject]@{ StatusCode = 200; Body = $Body }
+    if ($Lost) { $global:R9Answer | Add-Member BodyLost 'the answer body was not read (the connection broke)' }
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { $global:R9Answer }
+    $null = Invoke-Captured { & (Get-Module MsStoreRunner) { Invoke-StoreApi -Method GET -Path 'applications/9NM3VWQ9MD7N' } }
+    & $Mod { $script:KnownSecrets.Count } | Should -Be $before
+  }
+
+  # The rule the masking rests on, checked on the module's source: every
+  # throw is fixed text through Hide-StoreSecret or New-StoreError, a rethrow
+  # (bare throw) of one of those, Invoke-StoreApi's own New-StoreError ($e),
+  # or Wait-StoreHttpTask's network exception (its callers print only its
+  # type names, Get-StoreFailureText); the only Write-Host is Write-StoreHost;
+  # nothing else writes to a stream that reaches the log.
+  It 'every throw of the module is masked, and Write-StoreHost is its only output' {
+    $tokens = $null; $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ModulePath).Path, [ref]$tokens, [ref]$errs)
+    $errs | Should -BeNullOrEmpty
+    $fnOf = { param($a) $f = $a.Parent; while ($f -and $f -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $f = $f.Parent }; if ($f) { $f.Name } else { '' } }
+    $throws = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+    $bad = @(foreach ($t in $throws) {
+      $fn = & $fnOf $t
+      $p = if ($t.Pipeline) { $t.Pipeline.Extent.Text } else { '' }
+      $ok = (-not $t.Pipeline) -or $p -cmatch '^\((Hide-StoreSecret|New-StoreError) ' -or
+        ($fn -ceq 'Wait-StoreHttpTask' -and $p -ceq '$Task.Exception.InnerException') -or ($fn -ceq 'Invoke-StoreApi' -and $p -ceq '$e')
+      if (-not $ok) { "line $($t.Extent.StartLineNumber) in ${fn}: $($t.Extent.Text)" }
+    })
+    $bad | Should -BeNullOrEmpty
+    $throws.Count | Should -BeGreaterThan 50
+    $inv = $ast.Find({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -ceq 'Invoke-StoreApi' }, $true)
+    $sets = @($inv.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -ceq '$e' }, $true))
+    $sets.Count | Should -Be 1
+    $sets[0].Right.Extent.Text | Should -Match '^New-StoreError '
+    $out = @(foreach ($c in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+      $n = $c.GetCommandName()
+      if ($n -in 'Write-Warning', 'Write-Verbose', 'Write-Debug', 'Write-Information', 'Write-Error', 'Write-Progress', 'Write-Output', 'Out-Host', 'Out-Default', 'echo') { "line $($c.Extent.StartLineNumber): $n" }
+      if ($n -eq 'Write-Host' -and (& $fnOf $c) -cne 'Write-StoreHost') { "line $($c.Extent.StartLineNumber): Write-Host outside Write-StoreHost" }
+    })
+    $out | Should -BeNullOrEmpty
+    @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'Write-Host' }, $true)).Count | Should -Be 1
+    @($ast.FindAll({ ($args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -and $args[0].TypeName.FullName -match '^(System\.)?Console\z') -or
+      ($args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $args[0].VariablePath.UserPath -ieq 'Host') }, $true)) | Should -BeNullOrEmpty
+  }
+}
+
+# Pepper, PR #74 r9, point 3: nothing is sent to the draft (the PUT, the
+# upload, the commit) unless the read before it shows the draft with status
+# PendingCommit: the GET before the PUT, the PUT's own answer (before the
+# upload) and the draft check's GET after the upload (before the commit). A
+# status that is missing, empty, null, not text, not listed or another listed
+# one stops with "Could not verify": look by id only, no delete or re-run
+# advice. So does a PUT answer that does not parse, names another
+# submission or has no upload URL as text.
+Describe 'Nothing is sent to the draft unless the read before it shows it PendingCommit (PR #74 r9, fake Store)' {
+  BeforeAll {
+    $script:Mod = Get-Module MsStoreRunner
+    # The fake's EditAnswer: the At-th answer of kind Kind becomes what Map
+    # makes of its body.
+    $script:R9Edit = {
+      param([string]$Kind, $R)
+      $e = $global:R9EditState
+      if ($null -eq $e -or $Kind -cne $e.Kind) { return }
+      $e.Seen++
+      if ($e.Seen -eq $e.At) { $R.Body = & $e.Map ([string]$R.Body); $e.Done = $true }
+    }
+    # A Map that runs Edit on the body's top-level JSON object.
+    function script:New-R9JsonMap([scriptblock]$Edit) {
+      { param($b) $n = [System.Text.Json.Nodes.JsonNode]::Parse($b); & $Edit $n.AsObject(); $n.ToJsonString() }.GetNewClosure()
+    }
+    # Status values a read can show, what this module makes of each, and
+    # how to set it.
+    $script:R9Statuses = [ordered]@{
+      'missing' = @{ Shown = '[none]'; Edit = { param($o) [void]$o.Remove('status') } }
+      'empty' = @{ Shown = '[none]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonValue]::Create('') } }
+      'null' = @{ Shown = '[none]'; Edit = { param($o) $o['status'] = $null } }
+      'Published' = @{ Shown = 'Published'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonValue]::Create('Published') } }
+      'CommitStarted' = @{ Shown = 'CommitStarted'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonValue]::Create('CommitStarted') } }
+      'pendingcommit (other case)' = @{ Shown = '[unlisted]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonValue]::Create('pendingcommit') } }
+      'an array' = @{ Shown = '[unlisted]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonNode]::Parse('["PendingCommit"]') } }
+      'an object' = @{ Shown = '[unlisted]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"value":"PendingCommit"}') } }
+      'a number' = @{ Shown = '[unlisted]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonNode]::Parse('1') } }
+      'true' = @{ Shown = '[unlisted]'; Edit = { param($o) $o['status'] = [System.Text.Json.Nodes.JsonNode]::Parse('true') } }
+    }
+    $script:R9Reads = @{
+      'GET before the PUT' = @{ Kind = 'SubmissionRead'; At = 1; Call = 'GET'; Read = "the read of submission $NewId before the update (GET submission)"; Sent = @() }
+      'PUT answer' = @{ Kind = 'Update'; At = 1; Call = 'PUT'; Read = "the answer to the update of submission $NewId (PUT submission)"; Sent = @("PUT $Base/submissions/$NewId") }
+      'GET after the upload' = @{ Kind = 'SubmissionRead'; At = 2; Call = 'GET'; Read = "the draft check's read of submission $NewId after the upload (GET submission)"; Sent = @("PUT $Base/submissions/$NewId", 'PUT /blob/upload.zip') }
+    }
+    # Runs the publish with Map on the At-th answer of kind Kind.
+    function script:Invoke-R9Publish([string]$Kind, [int]$At, [scriptblock]$Map) {
+      $s = New-FakeStore -EditAnswer $R9Edit
+      Use-FakeStore $s
+      $global:R9EditState = @{ Kind = $Kind; At = $At; Seen = 0; Done = $false; Map = $Map }
+      try { $r = Invoke-Publish $Pkg } finally { $done = $global:R9EditState.Done; $global:R9EditState = $null }
+      $done | Should -BeTrue -Because "the run reaches answer $At of kind $Kind"
+      [pscustomobject]@{ R = $r; Log = @($s.Log); Store = $s }
+    }
+    function script:Get-R9Unverified([string]$Failure, [string]$Read) {
+      & $Mod { param($a, $b, $c, $d) Get-UnverifiedDraftText $a $b $c $d } $App $NewId $Failure $Read
+    }
+  }
+  AfterAll { $global:R9EditState = $null }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It '<Step> with status <Case>: Could not verify, nothing more sent, no delete or re-run advice' -ForEach @(
+    foreach ($st in 'GET before the PUT', 'PUT answer', 'GET after the upload') { foreach ($c in 'missing', 'empty', 'null', 'Published', 'CommitStarted', 'pendingcommit (other case)', 'an array', 'an object', 'a number', 'true') { @{ Step = $st; Case = $c } } }
+  ) {
+    $rd = $R9Reads[$Step]; $v = $R9Statuses[$Case]
+    $x = Invoke-R9Publish $rd.Kind $rd.At (New-R9JsonMap $v.Edit)
+    $x.R.Err | Should -BeExactly (Get-R9Unverified "$($rd.Call) submission $NewId showed status $($v.Shown), not PendingCommit" $rd.Read)
+    $x.R.Value | Should -BeNullOrEmpty
+    # Sent to the draft: only what came before this read.
+    (@($x.Log | Where-Object { $_ -cmatch '^(PUT|POST|DELETE) ' -and $_ -cne "POST $Base/submissions" }) -join ' | ') | Should -BeExactly ($rd.Sent -join ' | ')
+    $x.R.All | Should -Not -Match $DeleteAdvice
+    $x.R.All | Should -Not -Match $RetryAdvice
+    $x.R.All | Should -Not -Match $Leak
+  }
+
+  It '<Step> with status PendingCommit (the control): the run goes on and commits' -ForEach @(
+    @{ Step = 'GET before the PUT' }, @{ Step = 'PUT answer' }, @{ Step = 'GET after the upload' }
+  ) {
+    $rd = $R9Reads[$Step]
+    $x = Invoke-R9Publish $rd.Kind $rd.At (New-R9JsonMap { param($o) $o['status'] = [System.Text.Json.Nodes.JsonValue]::Create('PendingCommit') })
+    $x.R.Err | Should -BeNullOrEmpty
+    $x.R.Value | Should -Be @($NewId)
+    $x.Log | Should -Contain "POST $Base/submissions/$NewId/commit"
+  }
+
+  It 'PUT answer <Case>: Could not verify, no upload, no commit, no delete or re-run advice' -ForEach @(
+    @{ Case = 'that is not JSON'; Map = { param($b) 'not json' }; Fail = 'PUT submission <id> answered JSON that does not parse' }
+    @{ Case = 'that is a JSON array'; Map = { param($b) "[$b]" }; Fail = 'PUT submission <id> answered JSON that does not parse' }
+    @{ Case = 'naming another submission'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000007') }; Fail = 'PUT submission <id> returned another submission' }
+    @{ Case = 'without an id'; Edit = { param($o) [void]$o.Remove('id') }; Fail = 'PUT submission <id> returned another submission' }
+    @{ Case = 'with the id as a number'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonNode]::Parse('1152921505000000099') }; Fail = 'PUT submission <id> returned another submission' }
+    @{ Case = 'without a fileUploadUrl'; Edit = { param($o) [void]$o.Remove('fileUploadUrl') }; Fail = 'the submission has no fileUploadUrl' }
+    @{ Case = 'with a null fileUploadUrl'; Edit = { param($o) $o['fileUploadUrl'] = $null }; Fail = 'the submission has no fileUploadUrl' }
+    @{ Case = 'with an empty fileUploadUrl'; Edit = { param($o) $o['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create('') }; Fail = 'the submission has no fileUploadUrl' }
+    @{ Case = 'with a fileUploadUrl that is a number'; Edit = { param($o) $o['fileUploadUrl'] = [System.Text.Json.Nodes.JsonNode]::Parse('7') }; Fail = "the submission's fileUploadUrl is not text" }
+    @{ Case = 'with a fileUploadUrl that is an array'; Edit = { param($o) $o['fileUploadUrl'] = [System.Text.Json.Nodes.JsonNode]::Parse('["https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sig=FAKE"]') }; Fail = "the submission's fileUploadUrl is not text" }
+  ) {
+    $map = if ($Map) { $Map } else { New-R9JsonMap $Edit }
+    $x = Invoke-R9Publish 'Update' 1 $map
+    $x.R.Err | Should -BeExactly (Get-R9Unverified $Fail.Replace('<id>', $NewId) $R9Reads['PUT answer'].Read)
+    $x.Log | Should -Not -Contain 'PUT /blob/upload.zip'
+    $x.Log | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
+    $x.R.All | Should -Not -Match $DeleteAdvice
+    $x.R.All | Should -Not -Match $RetryAdvice
+    $x.R.All | Should -Not -Match $Leak
+  }
+
+  # HTTP 204 is "done" for a PUT, but it carries no body, so nothing shows
+  # the draft PendingCommit with its upload URL: Could not verify, not a
+  # pre-commit stop with delete advice.
+  It 'PUT answered HTTP 204 with no body: Could not verify, no upload, no commit, no delete or re-run advice' {
+    $s = New-FakeStore -AcceptOn Update -AcceptStatus 204; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeExactly (Get-R9Unverified "PUT submission $NewId answered JSON that does not parse" $R9Reads['PUT answer'].Read)
+    $r.Value | Should -BeNullOrEmpty
+    @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base", "GET $Base/submissions/$NewId", "PUT $Base/submissions/$NewId")
+    $r.All | Should -Not -Match 'accepted, completion unconfirmed'
+    $r.All | Should -Not -Match $DeleteAdvice
+    $r.All | Should -Not -Match $RetryAdvice
+    $r.All | Should -Not -Match $Leak
+  }
+
+  # Success-condition matrix (Pepper, PR #74 r9): each field a decision to go
+  # on rests on, read back missing and with another value. Status and the
+  # PUT answer are above; these are the ids of the reads before the commit.
+  It '<Step> with the id <Case>: Could not verify, nothing more sent' -ForEach @(
+    foreach ($st in 'GET before the PUT', 'GET after the upload') {
+      @{ Step = $st; Case = 'missing'; Edit = { param($o) [void]$o.Remove('id') } }
+      @{ Step = $st; Case = 'another number'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000007') } }
+      @{ Step = $st; Case = 'a JSON number'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonNode]::Parse('1152921505000000099') } }
+    }
+  ) {
+    $rd = $R9Reads[$Step]
+    $x = Invoke-R9Publish $rd.Kind $rd.At (New-R9JsonMap $Edit)
+    $x.R.Err | Should -BeExactly (Get-R9Unverified "GET submission $NewId returned another submission" $rd.Read)
+    (@($x.Log | Where-Object { $_ -cmatch '^(PUT|POST|DELETE) ' -and $_ -cne "POST $Base/submissions" }) -join ' | ') | Should -BeExactly ($rd.Sent -join ' | ')
+    $x.R.All | Should -Not -Match $DeleteAdvice
+    $x.R.All | Should -Not -Match $RetryAdvice
+  }
+}
+
+# Pepper, PR #74 r9, point 4: after the commit, a package whose fileStatus is
+# missing, not text or not a documented value could be an Uploaded package
+# the check cannot see, so the submission cannot be verified; it is verified
+# only with exactly one Uploaded package, of the expected version.
+Describe 'After the commit, verified only when every fileStatus is documented and exactly one package is Uploaded (PR #74 r9)' {
+  BeforeAll {
+    $script:Mod = Get-Module MsStoreRunner
+    $script:UpJson = '{"fileName":"' + $File + '","fileStatus":"Uploaded","version":"0.4.1.0"}'
+    function script:New-R9Sub([string[]]$Packages, [string]$Id = ('"' + $SubId + '"')) {
+      '{"id":' + $Id + ',"status":"Certification","targetPublishMode":"Manual","applicationPackages":[' + ($Packages -join ',') + ']}'
+    }
+    $script:CannotTell = 'not one of None, PendingUpload, Uploaded, PendingDelete, so this check cannot tell which packages are Uploaded'
+  }
+  BeforeEach { Reset-StoreSecrets }
+  AfterAll { Reset-StoreSecrets }
+
+  It 'another package with fileStatus <Case>: Fail, could not verify' -ForEach @(
+    @{ Case = 'missing'; Status = $null; Shown = '[none]' }
+    @{ Case = 'empty'; Status = '""'; Shown = '[none]' }
+    @{ Case = 'null'; Status = 'null'; Shown = '[none]' }
+    @{ Case = 'uploaded (other case)'; Status = '"uploaded"'; Shown = '[unlisted]' }
+    @{ Case = 'an unknown value'; Status = '"Processing"'; Shown = '[unlisted]' }
+    @{ Case = 'an array'; Status = '["Uploaded"]'; Shown = '[unlisted]' }
+    @{ Case = 'an object'; Status = '{"value":"Uploaded"}'; Shown = '[unlisted]' }
+    @{ Case = 'a number'; Status = '1'; Shown = '[unlisted]' }
+    @{ Case = 'true'; Status = 'true'; Shown = '[unlisted]' }
+  ) {
+    $other = if ($null -eq $Status) { '{"fileName":"Jerislink-0.4.1.0-x64.msix","version":"0.4.1.0"}' } else { '{"fileName":"Jerislink-0.4.1.0-x64.msix","fileStatus":' + $Status + ',"version":"0.4.1.0"}' }
+    foreach ($pk in @(@($UpJson, $other), @($other, $UpJson), @($other))) {
+      $r = Test-SubmissionHasPackage -SubmissionJson (New-R9Sub $pk) -ExpectedVersion '0.4.1.0' -ExpectedFileName $File
+      $r.Result | Should -Be 'Fail'
+      $r.Reason | Should -BeExactly "could not verify: 1 package(s) have fileStatus $Shown, $CannotTell"
+    }
+  }
+
+  It 'the submission id <Case>: Fail' -ForEach @(
+    @{ Case = 'letters'; Id = '"abc"' }
+    @{ Case = 'a JSON number'; Id = '1152921505000000004' }
+    @{ Case = 'a known credential of digits'; Id = '"1152921505000000456"'; Secret = '1152921505000000456' }
+  ) {
+    if ($Secret) { & $Mod { param($v) Register-StoreSecret $v } $Secret }
+    $r = Test-SubmissionHasPackage -SubmissionJson (New-R9Sub @($UpJson) $Id) -ExpectedVersion '0.4.1.0' -ExpectedFileName $File
+    $r.Result | Should -Be 'Fail'
+    $r.Reason | Should -BeExactly 'the submission GET returned submission id [invalid]'
+  }
+
+  It 'counts Uploaded packages: <Case>' -ForEach @(
+    @{ Case = 'exactly one, of the expected version'; Pk = @('U'); Result = 'Pass'; Reason = 'submission holds exactly one Uploaded package, version 0.4.1.0' }
+    @{ Case = 'one, and an old one PendingDelete'; Pk = @('U', '{"fileName":"a.msix","fileStatus":"PendingDelete","version":"0.3.0.0"}'); Result = 'Pass'; Reason = 'submission holds exactly one Uploaded package, version 0.4.1.0' }
+    @{ Case = 'two of the expected version'; Pk = @('U', 'U'); Result = 'Fail'; Reason = 'submission has 2 Uploaded packages with version 0.4.1.0; expected exactly one' }
+    @{ Case = 'one, and one whose version is not filled in'; Pk = @('U', '{"fileName":"a.msix","fileStatus":"Uploaded"}'); Result = 'Pending'; Reason = 'package version not filled in yet' }
+    @{ Case = 'one, and one of another version'; Pk = @('U', '{"fileName":"a.msix","fileStatus":"Uploaded","version":"0.3.0.0"}'); Result = 'Fail'; Reason = 'submission still has Uploaded package(s) with version 0.3.0.0; expected only 0.4.1.0' }
+    @{ Case = 'one whose version holds a known credential'; Pk = @('{"fileName":"a.msix","fileStatus":"Uploaded","version":"8.8.8.8"}'); Secret = '8.8.8.8'; Result = 'Fail'; Reason = 'submission still has Uploaded package(s) with version [invalid]; expected only 0.4.1.0' }
+    @{ Case = 'one, and one still PendingUpload'; Pk = @('U', '{"fileName":"a.msix","fileStatus":"PendingUpload"}'); Result = 'Pending'; Reason = 'package still PendingUpload' }
+    @{ Case = 'none, and one still PendingUpload'; Pk = @('{"fileName":"a.msix","fileStatus":"PendingUpload"}'); Result = 'Pending'; Reason = 'package still PendingUpload' }
+    @{ Case = 'none'; Pk = @('{"fileName":"a.msix","fileStatus":"PendingDelete","version":"0.3.0.0"}'); Result = 'Fail'; Reason = 'submission has no Uploaded package with version 0.4.1.0' }
+  ) {
+    if ($Secret) { & $Mod { param($v) Register-StoreSecret $v } $Secret }
+    $pk = @($Pk | ForEach-Object { if ($_ -ceq 'U') { $UpJson } else { $_ } })
+    $r = Test-SubmissionHasPackage -SubmissionJson (New-R9Sub $pk) -ExpectedVersion '0.4.1.0' -ExpectedFileName $File
+    $r.Result | Should -Be $Result
+    $r.Reason | Should -BeExactly $Reason
+  }
+
+  It 'Assert-SubmissionHasPackage (fake Store): <Case>, never "verified"' -ForEach @(
+    @{ Case = 'a package without fileStatus'; Extra = [ordered]@{ id = 'p4'; fileName = 'Jerislink-0.4.1.0-x64.msix'; version = '0.4.1.0' }
+       Err = "submission check failed: could not verify: 1 package(s) have fileStatus [none], not one of None, PendingUpload, Uploaded, PendingDelete, so this check cannot tell which packages are Uploaded" }
+    @{ Case = 'a package with fileStatus uploaded'; Extra = [ordered]@{ id = 'p4'; fileName = 'Jerislink-0.4.1.0-x64.msix'; fileStatus = 'uploaded'; version = '0.4.1.0' }
+       Err = "submission check failed: could not verify: 1 package(s) have fileStatus [unlisted], not one of None, PendingUpload, Uploaded, PendingDelete, so this check cannot tell which packages are Uploaded" }
+    @{ Case = 'two Uploaded packages'; Extra = [ordered]@{ id = 'p4'; fileName = 'Jerislink-0.4.1.0-x64.msixupload'; fileStatus = 'Uploaded'; version = '0.4.1.0' }
+       Err = 'submission check failed: submission has 2 Uploaded packages with version 0.4.1.0; expected exactly one' }
+    @{ Case = 'an Uploaded package whose version is not filled in'; Extra = [ordered]@{ id = 'p4'; fileName = 'a.msix'; fileStatus = 'Uploaded' }
+       Err = 'submission not verified after 0 min: package version not filled in yet' }
+  ) {
+    $s = New-FakeStore; Use-FakeStore $s
+    $s.Sub = @{ id = $SubId; status = 'Certification'; applicationPackages = @(
+      [ordered]@{ id = 'p3'; fileName = $File; fileStatus = 'Uploaded'; version = '0.4.1.0' }, $Extra) }
+    $r = Invoke-Captured { Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -ExpectedFileName $File -TimeoutMinutes 0 -IntervalSeconds 0 }
+    $r.Err | Should -BeExactly $Err
+    $r.Out | Should -Not -Match 'verified submission'
+  }
+}
+
+# K17 (Pepper, PR #74 r8 and r9): JSON that parses but holds a lone UTF-16
+# surrogate ("\ud800") cannot be written back (JsonNode.ToJsonString throws,
+# and its message is .NET's, not this module's). Each function that writes a
+# submission back throws its own fixed text instead, and the publish stops
+# with "Could not verify".
+Describe 'A submission JSON that parses but cannot be written back: fixed text only (K17, PR #74 r9)' {
+  BeforeAll {
+    $s0 = New-FakeStore
+    $s0.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @(
+      [ordered]@{ fileName = $File; fileStatus = 'PendingUpload'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }
+    $script:K17Good = Get-FakeSubmission $s0
+    $script:K17Bad = $K17Good.Replace('"title":"JerisLink"', '"title":"\ud800"')
+    $script:K17Map = { param($b) $b.Replace('"title":"JerisLink"', '"title":"\ud800"') }
+    $script:Mod = Get-Module MsStoreRunner
+    function script:Get-K17Err([scriptblock]$Command) { try { & $Command | Out-Null; '' } catch { "$_" } }
+  }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  It 'the surrogate JSON parses, and writing it back throws .NET''s own message' {
+    $K17Bad | Should -Not -BeExactly $K17Good
+    ($K17Bad | ConvertFrom-Json).listings.'en-us'.baseListing.title.Length | Should -Be 1
+    $n = [System.Text.Json.Nodes.JsonNode]::Parse($K17Bad)
+    { $n.ToJsonString() } | Should -Throw
+  }
+
+  It 'Get-SubmissionComparedFields, Set-SubmissionPackage and Compare-SubmissionFields throw their own fixed text' {
+    $kept = Get-SubmissionComparedFields -SubmissionJson $K17Good
+    Get-K17Err { Get-SubmissionComparedFields -SubmissionJson $K17Bad } | Should -BeExactly "the submission JSON could not be read to keep its fields (the parser's message is not printed)"
+    Get-K17Err { Set-SubmissionPackage -SubmissionJson $K17Bad -FileName $File } | Should -BeExactly "the submission JSON could not be read to set the packages (the parser's message is not printed)"
+    Get-K17Err { Compare-SubmissionFields -ExpectedJson $kept -SubmissionJson $K17Bad } | Should -BeExactly "the submission fields could not be compared (the parser's message is not printed)"
+    Get-K17Err { Compare-SubmissionFields -ExpectedJson $K17Bad -SubmissionJson $K17Bad } | Should -BeExactly "the submission fields could not be compared (the parser's message is not printed)"
+    # Either side holding it gives the same fixed text on every runtime
+    # (.NET 9 and 10 can compare it without throwing; .NET 8 throws).
+    Get-K17Err { Compare-SubmissionFields -ExpectedJson $K17Bad -SubmissionJson $K17Good } | Should -BeExactly "the submission fields could not be compared (the parser's message is not printed)"
+    (Compare-SubmissionFields -ExpectedJson $kept -SubmissionJson $K17Good).Changed | Should -BeNullOrEmpty
+  }
+
+  It 'publish, the <Step> holds it: Could not verify with the fixed text, nothing more sent' -ForEach @(
+    @{ Step = 'GET before the PUT'; At = 1; Fail = "the submission JSON could not be read to keep its fields (the parser's message is not printed)"
+       Read = 'the read of submission <id> before the update (GET submission)'; Sent = @() }
+    @{ Step = 'GET after the upload'; At = 2; Fail = "the submission fields could not be compared (the parser's message is not printed)"
+       Read = "the draft check's read of submission <id> after the upload (GET submission)"; Sent = @('PUT <base>/submissions/<id>', 'PUT /blob/upload.zip') }
+  ) {
+    $global:K17State = @{ At = $At; Seen = 0; Map = $K17Map }
+    $s = New-FakeStore -EditAnswer { param($Kind, $R) if ($Kind -ceq 'SubmissionRead' -and ++$global:K17State.Seen -eq $global:K17State.At) { $R.Body = & $global:K17State.Map ([string]$R.Body) } }
+    Use-FakeStore $s
+    try { $r = Invoke-Publish $Pkg } finally { $global:K17State = $null }
+    $want = & $Mod { param($a, $b, $c, $d) Get-UnverifiedDraftText $a $b $c $d } $App $NewId $Fail $Read.Replace('<id>', $NewId)
+    $Sent = @($Sent | ForEach-Object { $_.Replace('<base>', $Base).Replace('<id>', $NewId) })
+    $r.Err | Should -BeExactly $want
+    (@($s.Log | Where-Object { $_ -cmatch '^(PUT|POST|DELETE) ' -and $_ -cne "POST $Base/submissions" }) -join ' | ') | Should -BeExactly ($Sent -join ' | ')
+    $r.All | Should -Not -Match 'ToJsonString|surrogate|UTF-16'
+  }
+}
+
+# K22 (Pepper, PR #74 r8 and r9): an accepted commit (HTTP 202) keeps the id
+# its answer names (Exception.Data StoreAcceptedId) only when it is a plain
+# number that holds no known credential; anything else is never kept, so it
+# is never checked, returned or printed.
+Describe 'An accepted commit keeps the id its answer names only when it is a usable id (K22, PR #74 r9, fake Store)' {
+  BeforeAll {
+    function script:Invoke-K22Commit([string]$IdJson) {
+      $global:K22Body = '{"id":' + $IdJson + ',"status":"CommitStarted"}'
+      $s = New-FakeStore -AcceptOn Commit -EditAnswer { param($Kind, $R) if ($Kind -ceq 'Commit') { $R.Body = $global:K22Body } }
+      $s.Token = '1152921505000000123'
+      Use-FakeStore $s
+      Reset-StoreSecrets
+      Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret '1152921505000000456' 6>$null
+      $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
+      $rec = $null
+      try { Invoke-SubmissionCommit -ProductId $App -SubmissionId $SubId 6>$null } catch { $rec = $_ }
+      $global:K22Body = $null
+      $rec
+    }
+  }
+
+  It 'an id that is <Case>: not kept' -ForEach @(
+    @{ Case = 'letters'; Id = '"abc"'; Raw = 'abc' }
+    @{ Case = 'the access token (digits)'; Id = '"1152921505000000123"'; Raw = '1152921505000000123' }
+    @{ Case = 'the client secret (digits)'; Id = '"1152921505000000456"'; Raw = '1152921505000000456' }
+    @{ Case = 'a JSON number'; Id = '1152921505000000004'; Raw = '[not text]' }
+    @{ Case = 'an array'; Id = '["1152921505000000004"]'; Raw = '[not text]' }
+    @{ Case = 'digits of another script'; Id = '"١١٥٢٩٢١٥٠٥٠٠٠٠٠٠٠٠٤"'; Raw = '١١٥٢٩٢١٥٠٥٠٠٠٠٠٠٠٠٤' }
+    @{ Case = 'empty'; Id = '""'; Raw = '' }
+  ) {
+    $rec = Invoke-K22Commit $Id
+    $rec | Should -Not -BeNullOrEmpty
+    "$rec" | Should -BeExactly "Store API POST /v1.0/my/applications/$App/submissions/$SubId/commit answered HTTP 202: accepted, completion unconfirmed"
+    $rec.Exception.Data['StoreStatus'] | Should -Be 202
+    $rec.Exception.Data.Contains('StoreAcceptedId') | Should -BeFalse
+    if ($Raw) { @($rec.Exception.Data.Values | ForEach-Object { "$_" }) | Should -Not -Contain $Raw }
+    & (Get-Module MsStoreRunner) { param($r) Get-StoreAcceptedId $r } $rec | Should -BeExactly ''
+  }
+
+  It 'a plain id that holds no credential (the control): kept' {
+    $rec = Invoke-K22Commit ('"' + $SubId + '"')
+    $rec.Exception.Data['StoreAcceptedId'] | Should -BeExactly $SubId
+    & (Get-Module MsStoreRunner) { param($r) Get-StoreAcceptedId $r } $rec | Should -BeExactly $SubId
+  }
+}
+
+# Pepper, PR #74 r9, point 2: the "src" steps of msstore-publish.yml and
+# msstore-publish-check.yml (the msix run lookups) run here as GitHub's pwsh
+# shell runs them, with `gh api` answered by a stand-in. Each field of each
+# GitHub API answer the step gets is made missing, empty, null, not valid,
+# another valid value, a number, an array, an object, true, a credential of
+# the shape GitHub's own token has, and a key given twice in another case;
+# each whole answer is made a gh failure (the credential in gh's error
+# output), not JSON, an array, empty, null and a JSON string. Only fixed text
+# and checked values (run id: digits; sha: 40 hex; ref: main, the release tag
+# or [not shown]; compare status: listed) may come out, and the step goes on
+# only where the table below says so (success-condition matrix).
+Describe 'Workflow lookups print only fixed text and checked values of each GitHub API answer (PR #74 r9)' {
+  BeforeAll {
+    $script:WfDir = Join-Path $PSScriptRoot '..' '..' 'workflows'
+    # The `run: |` script of the step with this id in a workflow, dedented.
+    function script:Get-StepScript([string]$Workflow, [string]$Id) {
+      $lines = @(Get-Content -LiteralPath $Workflow)
+      $at = -1
+      for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -ceq "        id: $Id") { $at = $i; break } }
+      if ($at -lt 0) { throw "no step with id $Id in $Workflow" }
+      while ($lines[$at] -cne '        run: |') { $at++ }
+      $body = [System.Collections.Generic.List[string]]::new()
+      for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+        $l = $lines[$i]
+        if ($l.Trim() -and -not $l.StartsWith('          ')) { break }
+        $body.Add($(if ($l.Length -ge 10) { $l.Substring(10) } else { '' }))
+      }
+      $body -join "`n"
+    }
+    # Runs a step script as GitHub's pwsh shell does ($ErrorActionPreference
+    # Stop), with `gh api <path>` answered from Answers (path -> @{ Exit; Out;
+    # Err }; a path not listed exits 1) and these environment variables.
+    # Returns what it printed, the error it stopped with, its outputs and the
+    # gh calls.
+    function script:Invoke-WorkflowStep([scriptblock]$Script, [hashtable]$Answers, [hashtable]$Vars) {
+      $global:GhAnswers = $Answers
+      $global:GhCalls = [System.Collections.Generic.List[string]]::new()
+      $out = New-TemporaryFile
+      $names = @('GITHUB_REPOSITORY', 'GITHUB_SHA', 'GITHUB_OUTPUT', 'EVENT', 'TAG', 'RUN_ID')
+      $saved = @{}; foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+      try {
+        foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $null) }
+        [Environment]::SetEnvironmentVariable('GITHUB_OUTPUT', $out.FullName)
+        foreach ($k in $Vars.Keys) { [Environment]::SetEnvironmentVariable($k, $Vars[$k]) }
+        $printed = [System.Collections.Generic.List[string]]::new(); $err = ''
+        try {
+          & {
+            $ErrorActionPreference = 'Stop'
+            function gh {
+              if ($args.Count -ne 2 -or $args[0] -cne 'api') { throw "unexpected gh call: $($args -join ' ')" }
+              $global:GhCalls.Add([string]$args[1])
+              $a = $global:GhAnswers[[string]$args[1]]
+              if (-not $a) { $a = @{ Exit = 1; Err = 'gh: Not Found (HTTP 404)' } }
+              if ($a.Throw) { throw $a.Throw }
+              if ($a.Err) { Write-Error -Message $a.Err -ErrorAction Continue }
+              if ($null -ne $a.Out) { ([string]$a.Out).Split("`n") }
+              $global:LASTEXITCODE = [int]$a.Exit
+            }
+            . $Script
+          } *>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.InformationRecord]) { $printed.Add([string]$_.MessageData) } else { $printed.Add([string]$_) }
+          }
+        } catch { $err = "$_" }
+        [pscustomobject]@{
+          Out = @($printed); Err = $err; All = (($printed -join "`n") + "`n" + $err)
+          Outputs = @(Get-Content -LiteralPath $out.FullName); Calls = @($global:GhCalls)
+        }
+      } finally {
+        foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+        Remove-Item -LiteralPath $out.FullName -Force
+        $global:LASTEXITCODE = 0
+      }
+    }
+
+    $script:Repo = 'JerisHQ/jerislink'
+    # The shape of the token GitHub gives a job (GH_TOKEN): the one GitHub
+    # credential these steps hold.
+    $script:GhCred = 'ghs_R9plantedGitHubTokenAbCdEf0123456789Z'
+    $script:Sha1 = '0123456789abcdef0123456789abcdef01234567'
+    $script:Sha2 = 'fedcba9876543210fedcba9876543210fedcba98'
+    # Planted text that must never come out: the credential, and the
+    # made-up values below (r9-...).
+    $script:WfNever = 'ghs_|R9planted|r9-'
+    function script:New-RunJson([string]$Branch) {
+      '{"id":123456789,"name":"msix","event":"push","conclusion":"success","head_sha":"' + $Sha1 + '","head_branch":"' + $Branch +
+        '","head_repository":{"full_name":"JerisHQ/jerislink"},"created_at":"2026-11-20T10:00:00Z"}'
+    }
+    $b64 = { param($t) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t)) }
+    # GitHub sends base64 content in lines of 60 characters.
+    $content = '{"encoding":"base64","content":"' + (& $b64 "0.4.1`n").Insert(4, '\n') + '"}'
+    $pub = [scriptblock]::Create((Get-StepScript (Join-Path $WfDir 'msstore-publish.yml') 'src'))
+    $chk = [scriptblock]::Create((Get-StepScript (Join-Path $WfDir 'msstore-publish-check.yml') 'src'))
+    $runs = "repos/$Repo/actions/workflows/msix.yml/runs?head_sha=$Sha1&event=push&status=success&per_page=20"
+    $newest = "repos/$Repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1"
+    $byId = "repos/$Repo/actions/runs/123456789"
+    $cmp1 = "repos/$Repo/compare/$Sha1...main"; $cmp2 = "repos/$Repo/compare/$Sha2...main"
+    $ver1 = "repos/$Repo/contents/VERSION?ref=$Sha1"; $ver2 = "repos/$Repo/contents/VERSION?ref=$Sha2"
+    $ahead = '{"status":"ahead"}'
+    # Each step as the workflow runs it. Answers: path -> JSON. Out and
+    # Outputs: what a run that goes on prints and outputs, from its run id,
+    # sha and ref.
+    $script:WfScenarios = @{
+      'publish, release' = @{ Script = $pub; Env = @{ GITHUB_REPOSITORY = $Repo; GITHUB_SHA = $Sha1; EVENT = 'release'; TAG = 'v0.4.1' }
+        Answers = [ordered]@{ "repos/$Repo/commits/v0.4.1" = '{"sha":"' + $Sha1 + '"}'; $runs = '{"total_count":1,"workflow_runs":[' + (New-RunJson 'v0.4.1') + ']}'; $cmp1 = $ahead }
+        Ref = 'v0.4.1'
+        Out = { param($Id, $Sha, $Ref) "msix run ${Id}: event=push ref=$Ref sha=$Sha conclusion=success", "main vs $Sha : ahead" }
+        Outputs = { param($Id, $Sha) "run_id=$Id", "sha=$Sha", 'version=0.4.1.0' } }
+      'publish, dispatch' = @{ Script = $pub; Env = @{ GITHUB_REPOSITORY = $Repo; GITHUB_SHA = $Sha2; EVENT = 'workflow_dispatch'; RUN_ID = '123456789' }
+        Answers = [ordered]@{ $byId = (New-RunJson 'main'); $cmp1 = $ahead; $cmp2 = $ahead }
+        Ref = 'main'
+        Out = { param($Id, $Sha, $Ref) "msix run ${Id}: event=push ref=$Ref sha=$Sha conclusion=success", "main vs $Sha : ahead" }
+        Outputs = { param($Id, $Sha) "run_id=$Id", "sha=$Sha", 'version=' } }
+      'check, by run id' = @{ Script = $chk; Env = @{ GITHUB_REPOSITORY = $Repo; RUN_ID = '123456789' }
+        Answers = [ordered]@{ $byId = (New-RunJson 'main'); $ver1 = $content; $ver2 = $content }
+        Ref = 'main'
+        Out = { param($Id, $Sha, $Ref) "msix run ${Id}: event=push ref=$Ref sha=$Sha -> expected package version 0.4.1.0" }
+        Outputs = { param($Id, $Sha) "run_id=$Id", 'version=0.4.1.0' } }
+      'check, newest on main' = @{ Script = $chk; Env = @{ GITHUB_REPOSITORY = $Repo }
+        Answers = [ordered]@{ $newest = '{"total_count":1,"workflow_runs":[' + (New-RunJson 'main') + ']}'; $ver1 = $content; $ver2 = $content }
+        Ref = 'main'
+        Out = { param($Id, $Sha, $Ref) "msix run ${Id}: event=push ref=$Ref sha=$Sha -> expected package version 0.4.1.0" }
+        Outputs = { param($Id, $Sha) "run_id=$Id", 'version=0.4.1.0' } }
+    }
+    # Every text a lookup may stop with (fixed text and checked values only).
+    $p = 'repos/JerisHQ/jerislink/[A-Za-z0-9/._?&=-]+'
+    $script:WfStops = '^(' + (@(
+      "GitHub API GET $p failed \(gh exit code 1; its answer is not printed\)"
+      "the GitHub API answer to GET $p is not one JSON object that parses \(not printed\)"
+      'the GitHub API answered no commit sha for tag v0\.4\.1 \(its answer is not printed\)'
+      'tag v0\.4\.1 points at [0-9a-f]{40}, but the event is for [0-9a-f]{40}'
+      'the GitHub API answer has no list of workflow runs \(not printed\)'
+      'a run in the GitHub API answer has no created_at date \(not printed\)'
+      'no successful msix push run for [0-9a-f]{40} yet; re-run this job once it has finished'
+      'the GitHub API did not answer with run 123456789'
+      'run is not the msix workflow', 'run was not triggered by a push', 'run did not succeed', 'run is from another repository'
+      'the GitHub API answered a run id or commit sha of an unexpected shape \(not printed\)'
+      'commit [0-9a-f]{40} is not in main''s history \((behind|diverged|\[unlisted\])\)'
+      'no successful msix push run on main', 'the newest run the GitHub API answered is not on main'
+      'not a successful msix push run of this repository'
+      'the GitHub API answered VERSION at [0-9a-f]{40} without base64 content \(not printed\)'
+      'VERSION at [0-9a-f]{40} is not MAJOR\.MINOR\.PATCH \(its text is not printed\)'
+      'the msix run lookup failed; its error message is not printed \(it can quote the GitHub API answer\)'
+    ) -join '|') + ')\z'
+    # The value each variant puts at a field (JSON), or $null for missing.
+    $script:WfValues = [ordered]@{
+      'missing' = $null; 'empty' = '""'; 'null' = 'null'; 'not valid' = '"r9-not valid"'; 'other' = ''
+      'a number' = '7'; 'an array' = '["r9-in-an-array"]'; 'an object' = '{"r9key":"r9-in-an-object"}'; 'true' = 'true'
+      'a credential' = '"' + $GhCred + '"'; 'a key given twice in another case' = ''; 'the key only in another case' = ''; 'the value sent, in an array' = ''
+    }
+    # The answer at Path with the field Key of the object at At made Variant.
+    function script:Set-WfField([string]$Json, [object[]]$At, [string]$Key, [string]$Variant, [string]$Other) {
+      $root = [System.Text.Json.Nodes.JsonNode]::Parse($Json)
+      $o = $root; foreach ($k in $At) { $o = $o[$k] }
+      $o = $o.AsObject()
+      switch ($Variant) {
+        'missing' { [void]$o.Remove($Key) }
+        'other' { $o[$Key] = [System.Text.Json.Nodes.JsonNode]::Parse($Other) }
+        'a key given twice in another case' { $o[$Key.ToUpperInvariant()] = [System.Text.Json.Nodes.JsonValue]::Create($GhCred) }
+        # The field is missing; the same key in capitals holds the value sent.
+        'the key only in another case' { $v = $o[$Key]; [void]$o.Remove($Key); $o[$Key.ToUpperInvariant()] = $v }
+        # The value sent, as the one item of a JSON array.
+        'the value sent, in an array' { $v = $o[$Key]; [void]$o.Remove($Key); $l = [System.Text.Json.Nodes.JsonArray]::new(); $l.Add($v); $o[$Key] = $l }
+        'extra' { $o[$Key] = [System.Text.Json.Nodes.JsonNode]::Parse($Other) }
+        # Assigned directly: a JSON array or object written to the pipeline
+        # would be enumerated.
+        default { if ($WfValues[$Variant] -ceq 'null') { $o[$Key] = $null } else { $o[$Key] = [System.Text.Json.Nodes.JsonNode]::Parse($WfValues[$Variant]) } }
+      }
+      $root.ToJsonString()
+    }
+    # Runs scenario Name with Answers; returns '' when it did what Ok (and,
+    # when it goes on, Id, Sha, Ref) says, else what went wrong.
+    function script:Test-WfRun([string]$Name, [string]$Case, $Answers, [bool]$Ok, [string]$Id = '123456789', [string]$Sha = $Sha1, [string]$Ref = '', [string]$Stop = '') {
+      $sc = $WfScenarios[$Name]
+      if (-not $Ref) { $Ref = $sc.Ref }
+      $r = Invoke-WorkflowStep $sc.Script $Answers $sc.Env
+      $bad = [System.Collections.Generic.List[string]]::new()
+      if ($r.All -match $WfNever -or ($r.Outputs -join "`n") -match $WfNever) { $bad.Add('planted text came out') }
+      if (($r.Calls -join "`n") -match $WfNever) { $bad.Add('planted text in a GitHub API path') }
+      if ($Ok) {
+        if ($r.Err) { $bad.Add("stopped: $($r.Err)") }
+        if (($r.Out -join "`n") -cne ((& $sc.Out $Id $Sha $Ref) -join "`n")) { $bad.Add("printed: $($r.Out -join ' / ')") }
+        if (($r.Outputs -join "`n") -cne ((& $sc.Outputs $Id $Sha) -join "`n")) { $bad.Add("outputs: $($r.Outputs -join ' / ')") }
+      } else {
+        if ($r.Err -cnotmatch $WfStops) { $bad.Add("stop text not fixed: $($r.Err)") }
+        if ($Stop -and $r.Err -cne $Stop) { $bad.Add("stopped with: $($r.Err)") }
+        if ($r.Outputs.Count) { $bad.Add("outputs: $($r.Outputs -join ' / ')") }
+        foreach ($l in $r.Out) {
+          if ($l -cnotmatch '^(msix run 123456789: event=push ref=(main|v0\.4\.1|\[not shown\]) sha=[0-9a-f]{40} conclusion=success|main vs [0-9a-f]{40} : (ahead|identical|behind|diverged|\[unlisted\]))\z') { $bad.Add("printed: $l") }
+        }
+      }
+      if ($bad.Count) { "${Name}, ${Case}: $($bad -join '; ')" } else { '' }
+    }
+  }
+  AfterAll { $global:GhAnswers = $null; $global:GhCalls = $null }
+
+  It '<Name>: the answers as GitHub sends them go on' -ForEach @(
+    @{ Name = 'publish, release' }, @{ Name = 'publish, dispatch' }, @{ Name = 'check, by run id' }, @{ Name = 'check, newest on main' }
+  ) {
+    $a = @{}; foreach ($kv in $WfScenarios[$Name].Answers.GetEnumerator()) { $a[$kv.Key] = @{ Exit = 0; Out = $kv.Value } }
+    Test-WfRun $Name 'as sent' $a $true | Should -BeNullOrEmpty
+  }
+
+  # Name, the answer (Path: 'runs', 'run', 'commit', 'compare', 'content'),
+  # the object in it (At), the field (Key), its other valid value (Other) and
+  # the variants with which the step goes on (Ok; with Id, Sha or Ref when
+  # those change).
+  It '<Name>: field <Field> missing, empty, null, not valid, other, of another JSON type, a credential, or given twice' -ForEach @(
+    $runAt = @{ 'publish, release' = @('runs', @('workflow_runs', 0)); 'check, newest on main' = @('runs', @('workflow_runs', 0)); 'publish, dispatch' = @('run', @()); 'check, by run id' = @('run', @()) }
+    $notCaseDup = @('missing', 'the key only in another case', 'empty', 'null', 'not valid', 'other', 'a number', 'an array', 'the value sent, in an array', 'an object', 'true', 'a credential')
+    foreach ($n in 'publish, release', 'publish, dispatch', 'check, by run id', 'check, newest on main') {
+      $pa = $runAt[$n][0]; $at = $runAt[$n][1]
+      $release = $n -eq 'publish, release'; $newestRun = $n -eq 'check, newest on main'
+      if ($release) { @{ Name = $n; Field = 'sha (commit of the tag)'; Path = 'commit'; At = @(); Key = 'sha'; Other = '"' + 'fedcba9876543210fedcba9876543210fedcba98' + '"'; Ok = @() } }
+      if ($release -or $newestRun) { @{ Name = $n; Field = 'workflow_runs'; Path = 'runs'; At = @(); Key = 'workflow_runs'; Other = '[]'; Ok = @() } }
+      # A run id is any JSON whole number above 0: the release and newest-run
+      # lookups go on with it; a lookup by id needs the id it asked for.
+      @{ Name = $n; Field = 'id'; Path = $pa; At = $at; Key = 'id'; Other = '987654321'; Ok = $(if ($release -or $newestRun) { @('other', 'a number') } else { @() }); IdOf = @{ 'other' = '987654321'; 'a number' = '7' }
+         Extra = @{ 'the run id as JSON text' = '"123456789"' } }
+      # The release lookup lists the runs of msix.yml only, so it does not read name.
+      @{ Name = $n; Field = 'name'; Path = $pa; At = $at; Key = 'name'; Other = '"windows"'; Ok = $(if ($release) { $notCaseDup } else { @() }) }
+      @{ Name = $n; Field = 'event'; Path = $pa; At = $at; Key = 'event'; Other = '"workflow_dispatch"'; Ok = @() }
+      @{ Name = $n; Field = 'conclusion'; Path = $pa; At = $at; Key = 'conclusion'; Other = '"failure"'; Ok = @() }
+      @{ Name = $n; Field = 'head_sha'; Path = $pa; At = $at; Key = 'head_sha'; Other = '"fedcba9876543210fedcba9876543210fedcba98"'; Ok = $(if ($release) { @() } else { @('other') }); Sha = 'fedcba9876543210fedcba9876543210fedcba98' }
+      # The branch is never printed: main or the release tag shows as such,
+      # anything else as [not shown]; the newest run must be on main.
+      @{ Name = $n; Field = 'head_branch'; Path = $pa; At = $at; Key = 'head_branch'; Other = '"r9-other-branch"'; Ok = $(if ($newestRun) { @() } else { $notCaseDup }); Ref = '[not shown]' }
+      # Only the release lookup reads created_at (to pick the newest run).
+      @{ Name = $n; Field = 'created_at'; Path = $pa; At = $at; Key = 'created_at'; Other = '"2026-11-21T09:00:00Z"'; Ok = $(if ($release) { @('other') } else { $notCaseDup }) }
+      @{ Name = $n; Field = 'head_repository'; Path = $pa; At = $at; Key = 'head_repository'; Other = '{"full_name":"someone/else"}'; Ok = @() }
+      @{ Name = $n; Field = 'head_repository.full_name'; Path = $pa; At = @($at + 'head_repository'); Key = 'full_name'; Other = '"someone/else"'; Ok = @() }
+      if ($n -like 'publish*') { @{ Name = $n; Field = 'status (compare with main)'; Path = 'compare'; At = @(); Key = 'status'; Other = '"behind"'; Ok = @() } }
+      else {
+        @{ Name = $n; Field = 'encoding (VERSION)'; Path = 'content'; At = @(); Key = 'encoding'; Other = '"utf-8"'; Ok = @() }
+        @{ Name = $n; Field = 'content (VERSION)'; Path = 'content'; At = @(); Key = 'content'; Other = '"MS4yCg=="'; Ok = @() }
+      }
+    }
+  ) {
+    $sc = $WfScenarios[$Name]
+    $like = switch ($Path) { 'commit' { '*/commits/*' } 'runs' { '*/workflows/msix.yml/runs?*' } 'run' { '*/actions/runs/*' }
+                             'compare' { "*/compare/$Sha1...main" } 'content' { "*VERSION?ref=$Sha1" } }
+    $path = @($sc.Answers.Keys | Where-Object { $_ -like $like })
+    $path.Count | Should -Be 1
+    $variants = @($WfValues.Keys)
+    # VERSION content: also the credential, base64 encoded.
+    if ($Key -ceq 'content') { $variants += 'the credential, base64 encoded' }
+    if ($Extra) { $variants += @($Extra.Keys) }
+    $fails = @(foreach ($v in $variants) {
+      $a = @{}; foreach ($kv in $sc.Answers.GetEnumerator()) { $a[$kv.Key] = @{ Exit = 0; Out = $kv.Value } }
+      foreach ($q in $(if ($Path -eq 'content') { @($sc.Answers.Keys | Where-Object { $_ -like '*VERSION?ref=*' }) } elseif ($Path -eq 'compare') { @($sc.Answers.Keys | Where-Object { $_ -like '*/compare/*' }) } else { $path })) {
+        $json = if ($v -ceq 'the credential, base64 encoded') { Set-WfField $sc.Answers[$q] $At $Key 'extra' ('"' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($GhCred)) + '"') }
+          elseif ($Extra -and $Extra.Contains($v)) { Set-WfField $sc.Answers[$q] $At $Key 'extra' $Extra[$v] }
+          else { Set-WfField $sc.Answers[$q] $At $Key $v $Other }
+        $a[$q] = @{ Exit = 0; Out = $json }
+      }
+      # (Not $ok: PowerShell names are not case-sensitive, so it would be $Ok.)
+      $goesOn = $v -cin $Ok
+      $ar = @{ Ok = $goesOn }
+      if ($goesOn -and $IdOf) { $ar.Id = $IdOf[$v] }
+      if ($goesOn -and $v -ceq 'other' -and $Sha) { $ar.Sha = $Sha }
+      if ($goesOn -and $Ref) { $ar.Ref = $Ref }
+      Test-WfRun $Name "$Field $v" $a @ar
+    }) | Where-Object { $_ }
+    $fails | Should -BeNullOrEmpty
+  }
+
+  It '<Name>: each whole answer a gh failure, not JSON, an array, empty, null or a JSON string; an unexpected error' -ForEach @(
+    @{ Name = 'publish, release' }, @{ Name = 'publish, dispatch' }, @{ Name = 'check, by run id' }, @{ Name = 'check, newest on main' }
+  ) {
+    $sc = $WfScenarios[$Name]
+    $n = 0
+    $fails = @(foreach ($q in @($sc.Answers.Keys)) {
+      $failed = "GitHub API GET $q failed (gh exit code 1; its answer is not printed)"
+      $notJson = "the GitHub API answer to GET $q is not one JSON object that parses (not printed)"
+      foreach ($w in @(
+          @{ Case = 'gh failed'; Answer = @{ Exit = 1; Out = $null; Err = "HTTP 401: Bad credentials $GhCred" }; Stop = $failed }
+          @{ Case = 'gh failed with output'; Answer = @{ Exit = 1; Out = $sc.Answers[$q]; Err = "gh: $GhCred" }; Stop = $failed }
+          @{ Case = 'not JSON'; Answer = @{ Exit = 0; Out = "r9-not json $GhCred" }; Stop = $notJson }
+          @{ Case = 'an array'; Answer = @{ Exit = 0; Out = '[' + $sc.Answers[$q] + ']' }; Stop = $notJson }
+          @{ Case = 'empty'; Answer = @{ Exit = 0; Out = '' }; Stop = $notJson }
+          @{ Case = 'null'; Answer = @{ Exit = 0; Out = 'null' }; Stop = $notJson }
+          @{ Case = 'a JSON string'; Answer = @{ Exit = 0; Out = '"' + $GhCred + '"' }; Stop = $notJson }
+          @{ Case = 'two JSON objects'; Answer = @{ Exit = 0; Out = $sc.Answers[$q] + "`n" + '{"r9":"' + $GhCred + '"}' }; Stop = $notJson }
+          # An error the step does not expect (here gh itself throws, its
+          # message holding the credential) is replaced by fixed text.
+          @{ Case = 'gh threw'; Answer = @{ Throw = "r9-gh threw $GhCred" }; Stop = 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)' })) {
+        $a = @{}; foreach ($kv in $sc.Answers.GetEnumerator()) { $a[$kv.Key] = @{ Exit = 0; Out = $kv.Value } }
+        $a[$q] = $w.Answer
+        # The answer for the other sha is never asked for.
+        $asked = -not ($q -like "*$Sha2*")
+        $n++
+        Test-WfRun $Name "$q $($w.Case)" $a (-not $asked) -Stop $(if ($asked) { $w.Stop } else { '' })
+      }
+    }) | Where-Object { $_ }
+    $fails | Should -BeNullOrEmpty
+    $n | Should -BeGreaterThan 15
   }
 }

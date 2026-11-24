@@ -184,50 +184,97 @@ jobs:
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
-          # gh writes the API's error message to stderr. It is kept out of the
-          # log, and a failed call stops the job with fixed text (Pepper, PR #74
-          # r8). Each path below holds only values checked before it is built.
+          # Only fixed text and values of a fixed shape from the GitHub API
+          # reach the log or the outputs (Pepper, PR #74 r8 and r9). gh's error
+          # output (the API's message) is kept out of the log. An answer that
+          # is not one JSON object (a key given twice in another case, a bad
+          # literal, an array) or a field that is missing, not text or of
+          # another shape stops the job with fixed text: a parser's or a cast's
+          # own message can quote the answer, so every error but this step's
+          # own (Stop-Lookup) is replaced by fixed text. The branch of the run
+          # is never printed, only whether it is main or this release's tag.
+          # Each path below holds only values checked before it is built.
+          function Stop-Lookup([string]$Text) { $e = [System.InvalidOperationException]::new($Text); $e.Data['Lookup'] = $true; throw $e }
           function Invoke-GitHubApi([string]$Path) {
             $out = gh api $Path 2>$null
-            if ($LASTEXITCODE -ne 0) { throw "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
-            $out
+            if ($LASTEXITCODE -ne 0) { Stop-Lookup "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
+            $o = $null
+            try { $o = ConvertFrom-Json -InputObject ($out -join "`n") -NoEnumerate -ErrorAction Stop } catch { }
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { Stop-Lookup "the GitHub API answer to GET $Path is not one JSON object that parses (not printed)" }
+            $o
           }
-          if ($env:EVENT -eq 'release') {
-            if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "release tag '$env:TAG' is not vMAJOR.MINOR.PATCH" }
-            $sha = [string](Invoke-GitHubApi "repos/$repo/commits/$env:TAG" | ConvertFrom-Json).sha
-            if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "the GitHub API answered no commit sha for tag $env:TAG (its answer is not printed)" }
-            if ($sha -ne $env:GITHUB_SHA) { throw "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
-            $runs = (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20" | ConvertFrom-Json).workflow_runs |
-              Where-Object { $_.head_sha -eq $sha -and $_.head_repository.full_name -eq $repo -and $_.event -ceq 'push' -and $_.conclusion -ceq 'success' } |
-              Sort-Object { [datetime]$_.created_at } -Descending
-            if (-not $runs) { throw "no successful msix push run for $sha yet; re-run this job once it has finished" }
-            $run = @($runs)[0]
-            $version = $env:TAG.Substring(1) + '.0'
-          } else {
-            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-            $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-            if ($run.name -ne 'msix')          { throw "run is not the msix workflow" }
-            if ($run.event -cne 'push')         { throw "run was not triggered by a push" }
-            if ($run.conclusion -cne 'success') { throw "run did not succeed" }
-            if ($run.head_repository.full_name -ne $repo) { throw "run is from another repository" }
-            $sha = $run.head_sha
-            $version = ''
+          # A field by its exact name: its value, or $null when it is missing.
+          function Get-Field($Object, [string]$Name) {
+            if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $p = $Object.PSObject.Properties[$Name]
+            if ($p -and $p.Name -ceq $Name) { , $p.Value }
           }
-          # Only values of a fixed shape from the GitHub API reach the log or
-          # the outputs (Pepper, PR #74 r8): anything else stops the job or is
-          # shown as [not shown].
-          if ([string]$run.id -cnotmatch '^[0-9]{1,20}$' -or [string]$sha -cnotmatch '^[0-9a-f]{40}$') {
-            throw 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+          # A field as text: '' when it is missing, null or not a JSON string.
+          function Get-Text($Object, [string]$Name) {
+            $v = Get-Field $Object $Name
+            if ($v -is [string]) { $v } else { '' }
           }
-          $ref = if ([string]$run.head_branch -cmatch '^[A-Za-z0-9._/-]{1,100}$') { $run.head_branch } else { '[not shown]' }
-          Write-Host "msix run $($run.id): event=push ref=$ref sha=$sha conclusion=success"
-          $cmp = Invoke-GitHubApi "repos/$repo/compare/$sha...main" | ConvertFrom-Json
-          $ahead = if ([string]$cmp.status -cin @('ahead', 'identical', 'behind', 'diverged')) { $cmp.status } else { '[unlisted]' }
-          Write-Host "main vs $sha : $ahead"
-          if ($ahead -cnotin @('ahead', 'identical')) { throw "commit $sha is not in main's history ($ahead)" }
-          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
-          "sha=$sha" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          # The run id (GitHub sends a JSON number), as digits, or ''.
+          function Get-RunId($Run) {
+            $v = Get-Field $Run 'id'
+            if (($v -is [long] -or $v -is [int]) -and $v -gt 0) { [string]$v } else { '' }
+          }
+          # created_at as a UTC date: ConvertFrom-Json makes GitHub's ISO 8601
+          # text a [datetime]; anything else stops with fixed text.
+          function Get-RunDate($Run) {
+            $v = Get-Field $Run 'created_at'
+            $d = [datetime]::MinValue
+            if ($v -is [datetime]) { return $v.ToUniversalTime() }
+            if ($v -is [string] -and [datetime]::TryParseExact($v, 'yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]'AssumeUniversal, AdjustToUniversal', [ref]$d)) { return $d }
+            Stop-Lookup 'a run in the GitHub API answer has no created_at date (not printed)'
+          }
+          try {
+            if ($env:EVENT -eq 'release') {
+              if ($env:TAG -cnotmatch '^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\z') { Stop-Lookup 'the release tag is not vMAJOR.MINOR.PATCH (not printed)' }
+              $sha = Get-Text (Invoke-GitHubApi "repos/$repo/commits/$env:TAG") 'sha'
+              if ($sha -cnotmatch '^[0-9a-f]{40}\z') { Stop-Lookup "the GitHub API answered no commit sha for tag $env:TAG (its answer is not printed)" }
+              if ($sha -cne $env:GITHUB_SHA) { Stop-Lookup "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
+              $list = Get-Field (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20") 'workflow_runs'
+              if ($list -isnot [array]) { Stop-Lookup 'the GitHub API answer has no list of workflow runs (not printed)' }
+              $runs = @(@(foreach ($r in $list) {
+                if ((Get-Text $r 'head_sha') -ceq $sha -and (Get-Text (Get-Field $r 'head_repository') 'full_name') -eq $repo -and
+                    (Get-Text $r 'event') -ceq 'push' -and (Get-Text $r 'conclusion') -ceq 'success') {
+                  [pscustomobject]@{ Run = $r; Date = Get-RunDate $r }
+                }
+              }) | Sort-Object Date -Descending)
+              if ($runs.Count -eq 0) { Stop-Lookup "no successful msix push run for $sha yet; re-run this job once it has finished" }
+              $run = $runs[0].Run
+              $version = $env:TAG.Substring(1) + '.0'
+            } else {
+              if ($env:RUN_ID -cnotmatch '^[0-9]{1,20}\z') { Stop-Lookup 'msix_run_id must be a number' }
+              $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID"
+              if ((Get-RunId $run) -cne $env:RUN_ID)            { Stop-Lookup "the GitHub API did not answer with run $env:RUN_ID" }
+              if ((Get-Text $run 'name') -cne 'msix')           { Stop-Lookup 'run is not the msix workflow' }
+              if ((Get-Text $run 'event') -cne 'push')          { Stop-Lookup 'run was not triggered by a push' }
+              if ((Get-Text $run 'conclusion') -cne 'success')  { Stop-Lookup 'run did not succeed' }
+              if ((Get-Text (Get-Field $run 'head_repository') 'full_name') -ne $repo) { Stop-Lookup 'run is from another repository' }
+              $sha = Get-Text $run 'head_sha'
+              $version = ''
+            }
+            $runId = Get-RunId $run
+            if ($runId -cnotmatch '^[0-9]{1,20}\z' -or $sha -cnotmatch '^[0-9a-f]{40}\z') {
+              Stop-Lookup 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+            }
+            $branch = Get-Text $run 'head_branch'
+            $ref = if ($branch -ceq 'main') { 'main' } elseif ($env:TAG -and $branch -ceq $env:TAG) { $env:TAG } else { '[not shown]' }
+            Write-Host "msix run ${runId}: event=push ref=$ref sha=$sha conclusion=success"
+            $status = Get-Text (Invoke-GitHubApi "repos/$repo/compare/$sha...main") 'status'
+            $ahead = if ($status -cin @('ahead', 'identical', 'behind', 'diverged')) { $status } else { '[unlisted]' }
+            Write-Host "main vs $sha : $ahead"
+            if ($ahead -cnotin @('ahead', 'identical')) { Stop-Lookup "commit $sha is not in main's history ($ahead)" }
+            "run_id=$runId" >> $env:GITHUB_OUTPUT
+            "sha=$sha" >> $env:GITHUB_OUTPUT
+            "version=$version" >> $env:GITHUB_OUTPUT
+          } catch {
+            if ($_.Exception.Data['Lookup']) { throw }
+            throw 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)'
+          }
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
@@ -324,7 +371,7 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
           $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
-          if ($id -notmatch '^\d+$') { throw "submission id is not a number" }
+          if ($id -isnot [string] -or $id -cnotmatch '^[0-9]{1,20}\z') { throw "submission id is not a number" }
           "submission_id=$id" >> $env:GITHUB_OUTPUT
 
       - name: Read the submission back by its id and fail unless it holds the new package

@@ -33,8 +33,9 @@ name: msstore-publish-check
 # shapes, status changes and upload are not verified here.
 # The `pester` job runs .github/scripts/tests (the same flow with a mocked HTTP
 # layer, the draft check, the field comparison, the read-back, unconfirmed
-# create and commit, URL rules, redirects, fixed error text, pricing and
-# delete-by-id).
+# create and commit, URL rules, redirects, fixed error text, pricing,
+# delete-by-id, and the msix run lookup steps of both Store workflows against
+# stand-in GitHub API answers).
 
 on:
   pull_request:
@@ -68,7 +69,8 @@ env:
 
 jobs:
   pester:
-    # Unit tests: .github/scripts/tests.
+    # Unit tests: .github/scripts/tests. They also run the msix run lookup
+    # steps of the two Store workflows, so .github/workflows is checked out.
     runs-on: windows-latest
     timeout-minutes: 10
     defaults:
@@ -78,7 +80,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
 
       - name: Run Pester
         run: |
@@ -169,38 +173,72 @@ jobs:
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
-          # gh writes the API's error message to stderr. It is kept out of the
-          # log, and a failed call stops the job with fixed text (Pepper, PR #74
-          # r8). Each path below holds only values checked before it is built.
-          function Invoke-GitHubApi([string]$Path, [string]$Jq) {
-            if ($Jq) { $out = gh api $Path --jq $Jq 2>$null }
-            else { $out = gh api $Path 2>$null }
-            if ($LASTEXITCODE -ne 0) { throw "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
-            $out
+          # Only fixed text and values of a fixed shape from the GitHub API
+          # reach the log or the outputs (Pepper, PR #74 r8 and r9). gh's error
+          # output (the API's message) is kept out of the log. An answer that
+          # is not one JSON object (a key given twice in another case, a bad
+          # literal, an array) or a field that is missing, not text or of
+          # another shape stops the job with fixed text: a parser's or a cast's
+          # own message can quote the answer, so every error but this step's
+          # own (Stop-Lookup) is replaced by fixed text. The branch of the run
+          # is never printed, only whether it is main.
+          # Each path below holds only values checked before it is built.
+          function Stop-Lookup([string]$Text) { $e = [System.InvalidOperationException]::new($Text); $e.Data['Lookup'] = $true; throw $e }
+          function Invoke-GitHubApi([string]$Path) {
+            $out = gh api $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { Stop-Lookup "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
+            $o = $null
+            try { $o = ConvertFrom-Json -InputObject ($out -join "`n") -NoEnumerate -ErrorAction Stop } catch { }
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { Stop-Lookup "the GitHub API answer to GET $Path is not one JSON object that parses (not printed)" }
+            $o
           }
-          if ($env:RUN_ID) {
-            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-            $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-            if ($run.name -ne 'msix' -or $run.event -ne 'push' -or $run.conclusion -ne 'success') { throw "not a successful msix push run" }
-          } else {
-            $run = @((Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1" | ConvertFrom-Json).workflow_runs)[0]
-            if (-not $run) { throw "no successful msix push run on main" }
+          # A field by its exact name: its value, or $null when it is missing.
+          function Get-Field($Object, [string]$Name) {
+            if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $p = $Object.PSObject.Properties[$Name]
+            if ($p -and $p.Name -ceq $Name) { , $p.Value }
           }
-          $sha = [string]$run.head_sha
-          # Only values of a fixed shape from the GitHub API reach the log or
-          # the outputs (Pepper, PR #74 r8): anything else stops the job or is
-          # shown as [not shown].
-          if ([string]$run.id -cnotmatch '^[0-9]{1,20}$' -or $sha -cnotmatch '^[0-9a-f]{40}$') {
-            throw 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+          # A field as text: '' when it is missing, null or not a JSON string.
+          function Get-Text($Object, [string]$Name) {
+            $v = Get-Field $Object $Name
+            if ($v -is [string]) { $v } else { '' }
           }
-          $v = Invoke-GitHubApi "repos/$repo/contents/VERSION?ref=$sha" .content
-          $version = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v -join '')).Split("`n")[0].Trim()) + '.0'
-          if ($version -cnotmatch '^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\.0$') { throw "VERSION at $sha is not MAJOR.MINOR.PATCH (its text is not printed)" }
-          $ev = if ([string]$run.event -ceq 'push') { 'push' } else { '[not shown]' }
-          $ref = if ([string]$run.head_branch -cmatch '^[A-Za-z0-9._/-]{1,100}$') { $run.head_branch } else { '[not shown]' }
-          Write-Host "msix run $($run.id): event=$ev ref=$ref sha=$sha -> expected package version $version"
-          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          # The run id (GitHub sends a JSON number), as digits, or ''.
+          function Get-RunId($Run) {
+            $v = Get-Field $Run 'id'
+            if (($v -is [long] -or $v -is [int]) -and $v -gt 0) { [string]$v } else { '' }
+          }
+          try {
+            if ($env:RUN_ID) {
+              if ($env:RUN_ID -cnotmatch '^[0-9]{1,20}\z') { Stop-Lookup 'msix_run_id must be a number' }
+              $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID"
+              if ((Get-RunId $run) -cne $env:RUN_ID) { Stop-Lookup "the GitHub API did not answer with run $env:RUN_ID" }
+            } else {
+              $list = Get-Field (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1") 'workflow_runs'
+              if ($list -isnot [array]) { Stop-Lookup 'the GitHub API answer has no list of workflow runs (not printed)' }
+              if ($list.Count -eq 0) { Stop-Lookup 'no successful msix push run on main' }
+              $run = $list[0]
+              if ((Get-Text $run 'head_branch') -cne 'main') { Stop-Lookup 'the newest run the GitHub API answered is not on main' }
+            }
+            if ((Get-Text $run 'name') -cne 'msix' -or (Get-Text $run 'event') -cne 'push' -or (Get-Text $run 'conclusion') -cne 'success' -or
+                (Get-Text (Get-Field $run 'head_repository') 'full_name') -ne $repo) { Stop-Lookup 'not a successful msix push run of this repository' }
+            $runId = Get-RunId $run
+            $sha = Get-Text $run 'head_sha'
+            if ($runId -cnotmatch '^[0-9]{1,20}\z' -or $sha -cnotmatch '^[0-9a-f]{40}\z') {
+              Stop-Lookup 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+            }
+            $file = Invoke-GitHubApi "repos/$repo/contents/VERSION?ref=$sha"
+            if ((Get-Text $file 'encoding') -cne 'base64') { Stop-Lookup "the GitHub API answered VERSION at $sha without base64 content (not printed)" }
+            $version = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Text $file 'content'))).Split("`n")[0].Trim() + '.0'
+            if ($version -cnotmatch '^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\.0\z') { Stop-Lookup "VERSION at $sha is not MAJOR.MINOR.PATCH (its text is not printed)" }
+            $ref = if ((Get-Text $run 'head_branch') -ceq 'main') { 'main' } else { '[not shown]' }
+            Write-Host "msix run ${runId}: event=push ref=$ref sha=$sha -> expected package version $version"
+            "run_id=$runId" >> $env:GITHUB_OUTPUT
+            "version=$version" >> $env:GITHUB_OUTPUT
+          } catch {
+            if ($_.Exception.Data['Lookup']) { throw }
+            throw 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)'
+          }
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
