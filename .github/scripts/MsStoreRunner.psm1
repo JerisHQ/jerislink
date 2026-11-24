@@ -255,18 +255,28 @@ function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Que
 # done (SecretInputs) is not read again. Never throws.
 $script:JsonMemberPattern = [regex]::new('"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 $script:JsonEscapePattern = [regex]::new('\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+# Made once: a script block made a MatchEvaluator on every call cost more
+# than the rest of the scan (PR #74 r12, pester job timed out).
+$script:JsonEscapeEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+  param($m)
+  if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
+  switch -CaseSensitive ($m.Groups[2].Value) { 'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $_ } }
+}
+# Text with its JSON string escapes undone; a text without a backslash has
+# none and comes back as it is.
 function ConvertFrom-StoreJsonEscape([AllowEmptyString()][string]$Text) {
-  $script:JsonEscapePattern.Replace($Text, [System.Text.RegularExpressions.MatchEvaluator]{
-    param($m)
-    if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
-    switch -CaseSensitive ($m.Groups[2].Value) { 'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $_ } }
-  })
+  if ($Text.IndexOf([char]'\') -lt 0) { return $Text }
+  $script:JsonEscapePattern.Replace($Text, $script:JsonEscapeEvaluator)
 }
 function Register-StoreTextUploadUrl([AllowNull()][AllowEmptyString()][string]$Text) {
   if (-not $Text -or $script:SecretInputs.Contains("text:$Text")) { return }
   try {
     foreach ($m in $script:JsonMemberPattern.Matches($Text)) {
-      if ((ConvertFrom-StoreJsonEscape $m.Groups[1].Value) -ieq 'fileUploadUrl') { Register-StoreUploadUrl (ConvertFrom-StoreJsonEscape $m.Groups[2].Value) }
+      # A key without a backslash has no escape to undo: compared as it is,
+      # with no call per member (an answer has dozens).
+      $k = $m.Groups[1].Value
+      if ($k.IndexOf([char]'\') -ge 0) { $k = ConvertFrom-StoreJsonEscape $k }
+      if ($k -ieq 'fileUploadUrl') { Register-StoreUploadUrl (ConvertFrom-StoreJsonEscape $m.Groups[2].Value) }
     }
     [void]$script:SecretInputs.Add("text:$Text")
   } catch { }
