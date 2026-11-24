@@ -187,19 +187,47 @@ jobs:
           # Only fixed text and values of a fixed shape from the GitHub API
           # reach the log or the outputs (Pepper, PR #74 r8 and r9). gh's error
           # output (the API's message) is kept out of the log. An answer that
-          # is not one JSON object (a key given twice in another case, a bad
-          # literal, an array) or a field that is missing, not text or of
-          # another shape stops the job with fixed text: a parser's or a cast's
-          # own message can quote the answer, so every error but this step's
-          # own (Stop-Lookup) is replaced by fixed text. The branch of the run
-          # is never printed, only whether it is main or this release's tag.
+          # is not exactly one complete JSON object (Test-JsonObject: a key
+          # given twice at any depth, also in another case, text before or after
+          # it, a comment, a bad literal, an array) or a field that is missing,
+          # not text or of another shape stops the job with fixed text: a
+          # parser's or a cast's own message can quote the answer, so every error
+          # but this step's own (Stop-Lookup) is replaced by fixed text. The
+          # branch of the run is never printed, only whether it is main or this
+          # release's tag.
           # Each path below holds only values checked before it is built.
           function Stop-Lookup([string]$Text) { $e = [System.InvalidOperationException]::new($Text); $e.Data['Lookup'] = $true; throw $e }
+          # True when Text is exactly one complete JSON object as System.Text.Json
+          # reads it by default (nothing before or after it, no comments, trailing
+          # commas or single quotes, all of which ConvertFrom-Json takes) in which
+          # no object, at any depth, has a key twice, also not in another case
+          # (ConvertFrom-Json keeps the last of two equal keys; a lookup here does
+          # not tell them apart). Pepper, PR #74 r10. Never throws.
+          function Test-JsonObject([string]$Text) {
+            $doc = $null
+            try {
+              $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+              if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+              $todo = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+              $todo.Push($doc.RootElement)
+              while ($todo.Count -gt 0) {
+                $e = $todo.Pop()
+                if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                  $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                  foreach ($p in $e.EnumerateObject()) { if (-not $seen.Add($p.Name)) { return $false }; $todo.Push($p.Value) }
+                } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                  foreach ($i in $e.EnumerateArray()) { $todo.Push($i) }
+                }
+              }
+              $true
+            } catch { $false } finally { if ($null -ne $doc) { $doc.Dispose() } }
+          }
           function Invoke-GitHubApi([string]$Path) {
             $out = gh api $Path 2>$null
             if ($LASTEXITCODE -ne 0) { Stop-Lookup "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
             $o = $null
-            try { $o = ConvertFrom-Json -InputObject ($out -join "`n") -NoEnumerate -ErrorAction Stop } catch { }
+            $text = $out -join "`n"
+            if (Test-JsonObject $text) { try { $o = ConvertFrom-Json -InputObject $text -NoEnumerate -ErrorAction Stop } catch { } }
             if ($o -isnot [System.Management.Automation.PSCustomObject]) { Stop-Lookup "the GitHub API answer to GET $Path is not one JSON object that parses (not printed)" }
             $o
           }

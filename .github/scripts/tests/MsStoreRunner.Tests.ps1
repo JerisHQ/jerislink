@@ -96,7 +96,9 @@ BeforeAll {
   # Each fake Store run is one workflow step, a new PowerShell session: it
   # starts with no known credentials (the module keeps them for the whole
   # session, so without this they would pile up across tests).
-  function script:Reset-StoreSecrets { & (Get-Module MsStoreRunner) { $script:KnownSecrets.Clear(); $script:SecretPattern = $null } }
+  # The memo of registered texts (SecretInputs) is cleared too, where the
+  # module has one (the r9 module has none, and the r10 tests run on it too).
+  function script:Reset-StoreSecrets { & (Get-Module MsStoreRunner) { $script:KnownSecrets.Clear(); $script:SecretPattern = $null; if (Get-Variable -Name SecretInputs -Scope Script -ErrorAction Ignore) { $script:SecretInputs.Clear() } } }
 
   function script:New-TestPackage {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('pkg-' + [guid]::NewGuid().ToString('N'))
@@ -117,6 +119,11 @@ BeforeAll {
   # not advice to re-run.
   $script:DeleteAdvice = 'DELETE /v1|Remove-StoreDraftSubmission|Delete exactly'
   $script:RetryAdvice = '(?<!do not )re-run this workflow|\bretry\b|commit (it )?again'
+  # What a stop says of a Store answer that is not read (Pepper, PR #74 r10:
+  # an answer is read only as one complete JSON object with each key once).
+  $script:UnreadAnswer = 'no JSON object that can be read (an answer is read only as one complete JSON object with each key once)'
+  $script:UnreadSubmission = ('no submission JSON that can be read (an answer is read only as one complete JSON object with each key once, ' +
+    'and applicationPackages, when given, as a list of objects)')
   # A Store API error body whose message carries every kind of secret and
   # text the output must never show (a SAS URL, scheme-less query strings,
   # sig=, a bearer token, the current access token, the client secret in
@@ -425,10 +432,24 @@ Describe 'Get-StoreErrorText (fixed diagnostics for HTTP errors)' {
     @{ Case = 'a nested error object'; Code = 400; Want = 'HTTP 400 (BadRequest)'; Body = '{"error":{"code":"BadRequest","message":"see https://evil.invalid"}}' }
     @{ Case = 'a token endpoint error'; Code = 401; Want = 'HTTP 401 (invalid_client, AADSTS7000215)'
        Body = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret dummy-client-secret-Zx9","error_codes":[7000215]}' }
-    @{ Case = 'a code with a line break and a workflow command'; Code = 500; Want = 'HTTP 500 ([unlisted code])'; Body = "{`"code`":`"Bad`n::error::pwned`"}" }
+    @{ Case = 'a code with a line break and a workflow command'; Code = 500; Want = 'HTTP 500 ([unlisted code])'; Body = '{"code":"Bad\n::error::pwned"}' }
+    @{ Case = 'a code with an unescaped line break (not JSON that can be read)'; Code = 500; Want = 'HTTP 500'; Body = "{`"code`":`"Bad`n::error::pwned`"}" }
     @{ Case = 'a code that is a URL'; Code = 400; Want = 'HTTP 400 ([unlisted code])'; Body = '{"code":"https://evil.invalid/x?sig=FAKE+SAS"}' }
     @{ Case = 'an HTML page'; Code = 502; Want = 'HTTP 502'; Body = '<html><body>Bad gateway https://evil.invalid ::error::pwned</body></html>' }
     @{ Case = 'an empty body'; Code = 404; Want = 'HTTP 404'; Body = '' }
+    # Pepper, PR #74 r10: each field only in its own JSON type (the 127f676
+    # module read a code in a list as its text, and error_codes as text or in
+    # a nested list as numbers).
+    @{ Case = 'error.code in a list'; Code = 400; Want = 'HTTP 400 ([unlisted code])'; Body = '{"error":{"code":["InvalidParameterValue"]}}' }
+    @{ Case = 'error.code an object'; Code = 400; Want = 'HTTP 400 ([unlisted code])'; Body = '{"error":{"code":{"code":"InvalidParameterValue"}}}' }
+    @{ Case = 'code in a list'; Code = 400; Want = 'HTTP 400'; Body = '{"code":["InvalidParameterValue"]}' }
+    @{ Case = 'error_codes as text, not a list'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":"7000215"}' }
+    @{ Case = 'error_codes a number, not a list'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":7000215}' }
+    @{ Case = 'error_codes, a number as text'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":["7000215"]}' }
+    @{ Case = 'error_codes, a number in a nested list'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":[[7000215]]}' }
+    @{ Case = 'error_codes, an object'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":{"c":7000215}}' }
+    @{ Case = 'error_codes, a number with a fraction'; Code = 401; Want = 'HTTP 401 (invalid_client)'; Body = '{"error":"invalid_client","error_codes":[7000215.0]}' }
+    @{ Case = 'error_codes given twice'; Code = 401; Want = 'HTTP 401'; Body = '{"error":"invalid_client","error_codes":[],"error_codes":[7000215]}' }
   ) {
     $t = Get-StoreErrorText -StatusCode $Code -Body $Body
     $t | Should -BeExactly $Want
@@ -671,16 +692,16 @@ Describe 'Strings from the API are printed only when they are plain values' {
   }
   It 'prints no injected commit status' {
     $s = New-FakeStore; Use-FakeStore $s
-    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = 200; Body = "{`"status`":`"CommitStarted`n::error::pwned`"}" } }
+    Mock -ModuleName MsStoreRunner Invoke-StoreHttp { [pscustomobject]@{ StatusCode = 200; Body = '{"status":"CommitStarted\n::error::pwned"}' } }
     $r = Invoke-Captured { Invoke-SubmissionCommit -ProductId $App -SubmissionId $SubId }
     $r.Out | Should -BeExactly "submission $SubId commit requested through the API: status=[unlisted]"
   }
   It 'prints no injected priceId' {
-    $r = Test-SubmissionPricing -SubmissionJson "{`"pricing`":{`"priceId`":`"Free`n::error::pwned`"}}"
+    $r = Test-SubmissionPricing -SubmissionJson '{"pricing":{"priceId":"Free\n::error::pwned"}}'
     $r.Reason | Should -BeExactly 'pricing.priceId=[unlisted] is kept as is'
   }
   It 'prints no injected pending submission id' {
-    $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1`n::error::pwned`"}}"
+    $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1\n::error::pwned`"}}"
     $r = Invoke-Captured { Test-NoPendingSubmission -AppJson $appJson -ProductId $App }
     $r.Err | Should -Match 'pending submission \(no usable id\)'
     $r.All | Should -Not -Match $Injected
@@ -1860,22 +1881,24 @@ Describe 'A read before the commit that gives no usable answer: could not verify
       @{ Step = $step; Case = 'no answer'; Status = 0; Fail = 'no response (HttpRequestException Unknown <- IOException <- SocketException ConnectionReset)' }
       @{ Step = $step; Case = 'no answer before the time limit'; Status = -1; Fail = 'no response (time limit of 600 s for the whole request reached)' }
       @{ Step = $step; Case = 'not sent'; Status = -2; Fail = "not sent: no time left in this step's time budget" }
-      @{ Step = $step; Case = 'HTTP 200, not JSON'; Status = 200; Body = 'NotJson'; Fail = $(if ($step -eq 'App') { '=GET application returned JSON that does not parse' } else { '=GET submission {Id} returned JSON that does not parse' }) }
+      @{ Step = $step; Case = 'HTTP 200, not JSON'; Status = 200; Body = 'NotJson'; Fail = $(if ($step -eq 'App') { "=GET application returned {UA}" } else { "=GET submission {Id} returned {US}" }) }
     }
     @{ Step = 'App'; Case = 'HTTP 200, another app'; Status = 200; Body = 'OtherApp'; Fail = '=GET application returned a different or empty application id' }
     @{ Step = 'App'; Case = 'HTTP 200, a pending submission without a usable id'; Status = 200; Body = 'PendingNoId'; Fail = "=after create, the app's pending submission has no usable id" }
     foreach ($step in 'Sub', 'Draft') {
-      @{ Step = $step; Case = 'HTTP 200, an invalid literal'; Status = 200; Body = 'BadLiteral'; Fail = '=GET submission {Id} returned JSON that does not parse' }
-      @{ Step = $step; Case = 'HTTP 200, keys that differ only in case'; Status = 200; Body = 'CaseKeys'; Fail = '=GET submission {Id} returned JSON that does not parse' }
+      @{ Step = $step; Case = 'HTTP 200, an invalid literal'; Status = 200; Body = 'BadLiteral'; Fail = "=GET submission {Id} returned {US}" }
+      @{ Step = $step; Case = 'HTTP 200, keys that differ only in case'; Status = 200; Body = 'CaseKeys'; Fail = "=GET submission {Id} returned {US}" }
       @{ Step = $step; Case = 'HTTP 200, another submission (a planted id)'; Status = 200; Body = 'OtherSub'; Fail = '=GET submission {Id} returned another submission' }
       @{ Step = $step; Case = 'HTTP 200, another submission (another number)'; Status = 200; Body = 'OtherSubNumber'; Fail = '=GET submission {Id} returned another submission' }
     }
-    @{ Step = 'Sub'; Case = 'HTTP 200, a top-level key twice'; Status = 200; Body = 'TopDup'; Fail = "=submission JSON is not an object that can be read (the parser's message is not printed)" }
-    @{ Step = 'Draft'; Case = 'HTTP 200, a top-level key twice'; Status = 200; Body = 'TopDup'; Fail = "=submission JSON is not an object that can be read (the parser's message is not printed)" }
-    @{ Step = 'Draft'; Case = 'HTTP 200, a key twice in a compared field'; Status = 200; Body = 'NestedDup'; Fail = "=the submission fields could not be compared (the parser's message is not printed)" }
-    # ConvertFrom-Json takes a key given twice in the same case, System.Text.Json
-    # refuses it when the PUT body is built, with a message that quotes the key.
-    @{ Step = 'Sub'; Case = 'HTTP 200, a key twice in a package object'; Status = 200; Body = 'PackageDup'; Fail = "=the submission JSON could not be read to set the packages (the parser's message is not printed)" }
+    # ConvertFrom-Json takes a key given twice in the same case; the strict
+    # read (Pepper, PR #74 r10) refuses it at any depth, before anything is
+    # read from the answer.
+    foreach ($step in 'Sub', 'Draft') {
+      @{ Step = $step; Case = 'HTTP 200, a top-level key twice'; Status = 200; Body = 'TopDup'; Fail = "=GET submission {Id} returned {US}" }
+      @{ Step = $step; Case = 'HTTP 200, a key twice in a compared field'; Status = 200; Body = 'NestedDup'; Fail = "=GET submission {Id} returned {US}" }
+      @{ Step = $step; Case = 'HTTP 200, a key twice in a package object'; Status = 200; Body = 'PackageDup'; Fail = "=GET submission {Id} returned {US}" }
+    }
   ) {
     $d = $Reads[$Step]
     $o = @{ FailReadOn = $d.On; FailReadAt = $d.At; FailReadStatus = $Status }
@@ -1883,7 +1906,7 @@ Describe 'A read before the commit that gives no usable answer: could not verify
     if ($Lost) { $o.FailReadLost = $true; $o.DripEnd = $Lost }
     $s = New-FakeStore @o; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $f = $Fail.Replace('{R}', $ReadOnly200).Replace('{Id}', $NewId)
+    $f = $Fail.Replace('{R}', $ReadOnly200).Replace('{Id}', $NewId).Replace('{UA}', $UnreadAnswer).Replace('{US}', $UnreadSubmission)
     if ($Lost) { $f = $f.Replace('{L}', $LostText[$Lost]) }
     $f = if ($f.StartsWith('=')) { $f.Substring(1) } else { "Store API GET $($d.Path) failed: $f" }
     $r.Err | Should -BeExactly ("$f. Could not verify: $($d.Read) gave no usable answer, so this run does not know what draft $NewId holds now. " +
@@ -2230,7 +2253,7 @@ Describe 'Credentials planted at every spot of every API answer are never printe
     $leaks | Should -BeNullOrEmpty
     # The parser refused each where expected, and only fixed text came out.
     $thrown['Package Same 4'] | Should -BeExactly "the submission JSON could not be read to set the packages (the parser's message is not printed)"
-    $thrown['Pricing Same 1'] | Should -BeExactly "the submission fields could not be compared (the parser's message is not printed)"
+    $thrown['Pricing Same 1'] | Should -BeExactly "submission JSON is not an object that can be read (the parser's message is not printed)"
     $thrown['Top Same 3'] | Should -BeExactly "submission JSON is not an object that can be read (the parser's message is not printed)"
     $thrown['Top Case 4'] | Should -BeExactly "the submission JSON could not be read to set the packages (the parser's message is not printed)"
   }
@@ -3618,7 +3641,7 @@ Describe 'Every known credential is masked in every line printed and every error
 
   It 'Invoke-StoreApi registers nothing from an answer without a text fileUploadUrl (<Case>)' -ForEach @(
     @{ Case = 'a number'; Body = '{"fileUploadUrl":1152921505000000789}'; Lost = $false }
-    @{ Case = 'not JSON'; Body = 'sig=1152921505000000789'; Lost = $false }
+    @{ Case = 'not JSON, no signature'; Body = 'id=1152921505000000789'; Lost = $false }
     @{ Case = 'body lost'; Body = ''; Lost = $true }
   ) {
     Use-FakeStore (New-FakeStore)
@@ -3673,8 +3696,8 @@ Describe 'Every known credential is masked in every line printed and every error
 # upload) and the draft check's GET after the upload (before the commit). A
 # status that is missing, empty, null, not text, not listed or another listed
 # one stops with "Could not verify": look by id only, no delete or re-run
-# advice. So does a PUT answer that does not parse, names another
-# submission or has no upload URL as text.
+# advice. So does a PUT answer that is not one strict JSON object (r10),
+# names another submission or has no upload URL as text.
 Describe 'Nothing is sent to the draft unless the read before it shows it PendingCommit (PR #74 r9, fake Store)' {
   BeforeAll {
     $script:Mod = Get-Module MsStoreRunner
@@ -3752,8 +3775,8 @@ Describe 'Nothing is sent to the draft unless the read before it shows it Pendin
   }
 
   It 'PUT answer <Case>: Could not verify, no upload, no commit, no delete or re-run advice' -ForEach @(
-    @{ Case = 'that is not JSON'; Map = { param($b) 'not json' }; Fail = 'PUT submission <id> answered JSON that does not parse' }
-    @{ Case = 'that is a JSON array'; Map = { param($b) "[$b]" }; Fail = 'PUT submission <id> answered JSON that does not parse' }
+    @{ Case = 'that is not JSON'; Map = { param($b) 'not json' }; Fail = "PUT submission <id> answered {US}" }
+    @{ Case = 'that is a JSON array'; Map = { param($b) "[$b]" }; Fail = "PUT submission <id> answered {US}" }
     @{ Case = 'naming another submission'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000007') }; Fail = 'PUT submission <id> returned another submission' }
     @{ Case = 'without an id'; Edit = { param($o) [void]$o.Remove('id') }; Fail = 'PUT submission <id> returned another submission' }
     @{ Case = 'with the id as a number'; Edit = { param($o) $o['id'] = [System.Text.Json.Nodes.JsonNode]::Parse('1152921505000000099') }; Fail = 'PUT submission <id> returned another submission' }
@@ -3765,7 +3788,7 @@ Describe 'Nothing is sent to the draft unless the read before it shows it Pendin
   ) {
     $map = if ($Map) { $Map } else { New-R9JsonMap $Edit }
     $x = Invoke-R9Publish 'Update' 1 $map
-    $x.R.Err | Should -BeExactly (Get-R9Unverified $Fail.Replace('<id>', $NewId) $R9Reads['PUT answer'].Read)
+    $x.R.Err | Should -BeExactly (Get-R9Unverified $Fail.Replace('<id>', $NewId).Replace('{US}', $UnreadSubmission) $R9Reads['PUT answer'].Read)
     $x.Log | Should -Not -Contain 'PUT /blob/upload.zip'
     $x.Log | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
     $x.R.All | Should -Not -Match $DeleteAdvice
@@ -3779,7 +3802,7 @@ Describe 'Nothing is sent to the draft unless the read before it shows it Pendin
   It 'PUT answered HTTP 204 with no body: Could not verify, no upload, no commit, no delete or re-run advice' {
     $s = New-FakeStore -AcceptOn Update -AcceptStatus 204; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -BeExactly (Get-R9Unverified "PUT submission $NewId answered JSON that does not parse" $R9Reads['PUT answer'].Read)
+    $r.Err | Should -BeExactly (Get-R9Unverified "PUT submission $NewId answered $UnreadSubmission" $R9Reads['PUT answer'].Read)
     $r.Value | Should -BeNullOrEmpty
     @($s.Log) | Should -Be @("GET $Base", "POST $Base/submissions", "GET $Base", "GET $Base/submissions/$NewId", "PUT $Base/submissions/$NewId")
     $r.All | Should -Not -Match 'accepted, completion unconfirmed'
@@ -3989,6 +4012,335 @@ Describe 'An accepted commit keeps the id its answer names only when it is a usa
     $rec = Invoke-K22Commit ('"' + $SubId + '"')
     $rec.Exception.Data['StoreAcceptedId'] | Should -BeExactly $SubId
     & (Get-Module MsStoreRunner) { param($r) Get-StoreAcceptedId $r } $rec | Should -BeExactly $SubId
+  }
+}
+
+# Pepper, PR #74 r10. Every Store answer is read only as exactly one complete
+# JSON object with each key once, at any depth and in any case
+# (ConvertFrom-StoreJson), and every signature in it is masked before any
+# field of it is read: a sig parameter whose name is percent-encoded (once or
+# twice), one before or in a fragment, after a ";", in a nested fileUploadUrl,
+# in another field, or in an answer that is not JSON that can be read.
+# Point 1: masking. Point 2: each read of the publish (and of every read-back
+# and check) given each answer shape (an array in place of the object, an
+# object in place of a list, a key twice, text before or after it, two
+# objects, a comment, single quotes, a trailing comma, NaN) stops safely:
+# nothing more is sent, no delete or re-run advice, nothing of it printed.
+# Point 3: the check after the commit is never "verified" on such an answer.
+# The 127f676 module fails these tests (the controls aside).
+Describe 'Store answers are read only as one strict JSON object, every signature masked first (PR #74 r10, fake Store)' {
+  BeforeAll {
+    $script:Mod = Get-Module MsStoreRunner
+    # A synthetic signature that is also a usable submission id: the pending
+    # id the app read shows in Pepper's repro.
+    $script:R10Sig = '1152921505000000123'
+    $script:R10Url = 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sr=b&sp=w'
+    $script:R10Leak = "$Leak|$R10Sig|r10-planted"
+    $script:ApiNote = & $Mod { $script:ApiOnlyNote }
+    # Text as the Store sends it (no & for "&").
+    $script:R10Out = [System.Text.Json.JsonSerializerOptions]::new()
+    $R10Out.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    # A Map that runs Edit on the body's top-level JSON object.
+    function script:New-R10JsonMap([scriptblock]$Edit) {
+      $opt = $R10Out
+      { param($b) $n = [System.Text.Json.Nodes.JsonNode]::Parse($b); & $Edit $n.AsObject(); $n.ToJsonString($opt) }.GetNewClosure()
+    }
+    # The fake's EditAnswer: for each edit @{ Kind; At; Map }, the At-th
+    # answer of kind Kind becomes what Map makes of its body.
+    $script:R10Edit = {
+      param([string]$Kind, $R)
+      foreach ($e in @($global:R10EditState)) {
+        if ($null -eq $e -or $Kind -cne $e.Kind) { continue }
+        $e.Seen++
+        if ($e.Seen -eq $e.At) { $R.Body = [string](& $e.Map ([string]$R.Body)); $e.Done = $true }
+      }
+    }
+    # Runs Command (default: the publish) against a fake Store made with
+    # Options, with Edits on its answers.
+    function script:Invoke-R10Run([hashtable[]]$Edits, [hashtable]$Options = @{}, [scriptblock]$Command = $null, [scriptblock]$Setup = $null) {
+      $s = New-FakeStore -EditAnswer $R10Edit @Options
+      Use-FakeStore $s
+      if ($Setup) { & $Setup $s }
+      $global:R10EditState = @(foreach ($e in $Edits) { @{ Kind = $e.Kind; At = $e.At; Map = $e.Map; Seen = 0; Done = $false } })
+      try { $r = if ($Command) { Invoke-Captured $Command } else { Invoke-Publish $Pkg } } finally { $st = @($global:R10EditState); $global:R10EditState = $null }
+      foreach ($e in $st) { $e.Done | Should -BeTrue -Because "the run reaches answer $($e.At) of kind $($e.Kind)" }
+      [pscustomobject]@{ R = $r; Log = @($s.Log); Sent = (@($s.Log | Where-Object { $_ -cmatch '^(PUT|POST|DELETE) ' }) -join ' | '); Store = $s
+        Committed = [bool]@($s.Log | Where-Object { $_ -cmatch '^POST .*/commit$' }) }
+    }
+    function script:Get-R10Unverified([string]$Failure, [string]$Read) {
+      & $Mod { param($a, $b, $c, $d) Get-UnverifiedDraftText $a $b $c $d } $App $NewId $Failure $Read
+    }
+    function script:Assert-R10Safe($X) {
+      $X.R.All | Should -Not -Match $DeleteAdvice -Because '[delete advice]'
+      $X.R.All | Should -Not -Match $RetryAdvice -Because '[re-run advice]'
+      $X.R.All | Should -Not -Match $R10Leak -Because '[printed]'
+      $X.R.Out | Should -Not -Match 'verified submission' -Because '[verified]'
+    }
+
+    # The shapes of an answer (Body: one JSON object, as the fake sends it).
+    $script:R10Shapes = [ordered]@{
+      'an array holding it' = { param($b) "[$b]" }
+      'text before it' = { param($b) "Answer: $b" }
+      'text after it' = { param($b) "$b (r10)" }
+      'two JSON objects' = { param($b) "$b`n$b" }
+      'a comment in it' = { param($b) '{/* r10 */' + $b.Substring(1) }
+      'a key in single quotes' = { param($b) $b -creplace '^\{"([^"]+)"', '{''$1''' }
+      'a trailing comma' = { param($b) $b.Substring(0, $b.Length - 1) + ',}' }
+      'NaN in it' = { param($b) '{"r10":NaN,' + $b.Substring(1) }
+      'its first key twice, a planted value first' = { param($b) $b -creplace '^\{"([^"]+)":', '{"$1":"r10-planted","$1":' }
+      'its first key twice, in another case' = { param($b) '{"' + [regex]::Match($b, '^\{"([^"]+)"').Groups[1].Value.ToUpperInvariant() + '":"r10-planted",' + $b.Substring(1) }
+      'a nested key twice' = { param($b) if ($b -cmatch '":\{"') { $b -creplace '":\{"([^"]+)":', '":{"$1":"r10-planted","$1":' } else { '{"r10":{"k":"r10-planted","k":1},' + $b.Substring(1) } }
+      # Submission answers only.
+      'applicationPackages one object, not a list' = New-R10JsonMap { param($o) $p = $o['applicationPackages'].AsArray(); $last = $p[$p.Count - 1]; $p.RemoveAt($p.Count - 1); $o['applicationPackages'] = $last }
+      'status twice, a planted value first' = { param($b) $b.Replace('"status":"', '"status":"Published","status":"') }
+      'status twice, PendingCommit first' = { param($b) $b.Replace('"status":"', '"status":"PendingCommit","status":"') }
+      'status twice, in another case' = { param($b) $b.Replace('"status":"', '"Status":"Published","status":"') }
+      'applicationPackages twice, an empty list first' = { param($b) $b.Replace('"applicationPackages":', '"applicationPackages":[],"applicationPackages":') }
+      'a package''s fileStatus twice' = { param($b) $b.Replace('"fileStatus":"', '"fileStatus":"Uploaded","fileStatus":"') }
+    }
+
+    $s0 = New-FakeStore
+    $script:R10Read1 = "the read of submission $NewId before the update (GET submission)"
+    $script:R10ReadPut = "the answer to the update of submission $NewId (PUT submission)"
+    $script:R10Read2 = "the draft check's read of submission $NewId after the upload (GET submission)"
+    $script:R10ReadApp = 'the read of the app after create (GET application)'
+    $create = "POST $Base/submissions"
+    $put = "PUT $Base/submissions/$NewId"
+    $commit = "POST $Base/submissions/$NewId/commit"
+    # Where each read is, what its stop says (Err exactly, or ErrLike each
+    # matched), and every PUT, POST and DELETE sent in the run.
+    $script:R10Points = @{
+      'GET application, the pending check' = @{ Edits = @(@{ Kind = 'AppRead'; At = 1 }); Err = "GET application returned $UnreadAnswer"; Sent = '' }
+      'POST create' = @{ Edits = @(@{ Kind = 'Create'; At = 1 }); Sent = $create
+        ErrLike = @('Created, id unknown', [regex]::Escape("Read-back of the app (one GET): pending submission $NewId. Reported by id only")) }
+      'GET application after the create' = @{ Edits = @(@{ Kind = 'AppRead'; At = 2 }); Err = (Get-R10Unverified "GET application returned $UnreadAnswer" $R10ReadApp); Sent = $create }
+      'GET submission before the PUT' = @{ Edits = @(@{ Kind = 'SubmissionRead'; At = 1 }); Err = (Get-R10Unverified "GET submission $NewId returned $UnreadSubmission" $R10Read1); Sent = $create }
+      'PUT submission' = @{ Edits = @(@{ Kind = 'Update'; At = 1 }); Err = (Get-R10Unverified "PUT submission $NewId answered $UnreadSubmission" $R10ReadPut); Sent = "$create | $put" }
+      'GET submission after the upload' = @{ Edits = @(@{ Kind = 'SubmissionRead'; At = 2 }); Err = (Get-R10Unverified "GET submission $NewId returned $UnreadSubmission" $R10Read2); Sent = "$create | $put | PUT /blob/upload.zip" }
+      # The commit answer is shown, not used: the next step checks the
+      # submission by id (below).
+      'POST commit' = @{ Edits = @(@{ Kind = 'Commit'; At = 1 }); Value = $NewId; Sent = "$create | $put | PUT /blob/upload.zip | $commit"
+        OutLike = [regex]::Escape("submission $NewId commit requested through the API: status=[answer not read]") }
+      'GET submission, read-backs of a commit with no answer' = @{ Options = @{ LoseResponse = 'Commit' }; Sent = "$create | $put | PUT /blob/upload.zip | $commit"
+        Edits = @(@{ Kind = 'SubmissionRead'; At = 3 }, @{ Kind = 'SubmissionRead'; At = 4 }, @{ Kind = 'SubmissionRead'; At = 5 })
+        ErrLike = @('Result unconfirmed', [regex]::Escape('last: read-back 3 of 3 did not return that submission')); NotLike = 'by id shows status' }
+      'GET submission, read-back of an accepted PUT' = @{ Options = @{ AcceptOn = 'Update' }; Edits = @(@{ Kind = 'SubmissionRead'; At = 2 }); Sent = "$create | $put"
+        ErrLike = @([regex]::Escape("Read-back of submission $NewId by id (one GET; nothing changed): it did not return that submission.")) }
+      'GET application, read-back of a refused create' = @{ Options = @{ CreateErrorStatus = 400; CreateErrorBody = '{"code":"InvalidParameterValue"}' }; Edits = @(@{ Kind = 'AppRead'; At = 2 }); Sent = $create
+        ErrLike = @([regex]::Escape("Read-back of the app after the refused create (one GET; nothing changed or deleted): failed (GET application returned $UnreadAnswer).")) }
+      'GET application, read-back of a create without an id' = @{ Options = @{ CreateWithoutId = $true }; Edits = @(@{ Kind = 'AppRead'; At = 2 }); Sent = $create
+        ErrLike = @('Created, id unknown', [regex]::Escape("Read-back of the app (one GET): failed (GET application returned $UnreadAnswer).")) }
+      'GET application, read-back of a create with no answer' = @{ Options = @{ LoseResponse = 'Create' }; Edits = @(@{ Kind = 'AppRead'; At = 2 }); Sent = $create
+        ErrLike = @([regex]::Escape("Read-back of the app: failed too (GET application returned $UnreadAnswer).")) }
+      'POST create answered HTTP 202' = @{ Options = @{ AcceptOn = 'Create' }; Edits = @(@{ Kind = 'Create'; At = 1 }); Sent = $create
+        ErrLike = @('Accepted, completion unconfirmed', [regex]::Escape("Read-back of the app (one GET; nothing changed): pending submission $NewId. Reported by id only")) }
+    }
+  }
+  AfterAll { $global:R10EditState = $null; Reset-StoreSecrets }
+  BeforeEach { $script:Pkg = New-TestPackage }
+  AfterEach { Remove-Item -LiteralPath (Split-Path $Pkg) -Recurse -Force }
+
+  # Discovery-time lists (-ForEach is built before BeforeAll runs).
+  $shapes = @('an array holding it', 'text before it', 'text after it', 'two JSON objects', 'a comment in it', 'a key in single quotes',
+    'a trailing comma', 'NaN in it', 'its first key twice, a planted value first', 'its first key twice, in another case', 'a nested key twice')
+  $subShapes = @('applicationPackages one object, not a list', 'status twice, a planted value first', 'status twice, PendingCommit first', 'status twice, in another case',
+    'applicationPackages twice, an empty list first', 'a package''s fileStatus twice')
+  $urlCases = @(
+    @{ Case = 'a percent-encoded name (%73ig)'; Query = '&%73ig=' }
+    @{ Case = 'a percent-encoded name (s%69g)'; Query = '&s%69g=' }
+    @{ Case = 'a name encoded twice (%2573ig)'; Query = '&%2573ig=' }
+    @{ Case = 'a name with a space before it (%20sig)'; Query = '&%20sig=' }
+    @{ Case = 'a name with + after it (sig+, a space once decoded)'; Query = '&sig+=' }
+    @{ Case = 'a fragment after the signature'; Query = '&sig='; After = '#r10' }
+    @{ Case = 'the signature in the fragment'; Query = '#sig=' }
+    @{ Case = 'a ; before the signature'; Query = ';sig=' }
+    @{ Case = 'SIG in capitals (the control)'; Query = '&SIG=' }
+  )
+
+  # Point 2 (and the self-check): every read, every shape.
+  It '<Point>, the answer <Shape>: stops safely, nothing more sent, no delete or re-run advice, nothing of it printed' -ForEach @(
+    foreach ($p in 'GET application, the pending check', 'POST create', 'GET application after the create', 'POST commit',
+      'GET application, read-back of a refused create', 'GET application, read-back of a create without an id',
+      'GET application, read-back of a create with no answer', 'POST create answered HTTP 202') { foreach ($sh in $shapes) { @{ Point = $p; Shape = $sh } } }
+    foreach ($p in 'GET submission before the PUT', 'PUT submission', 'GET submission after the upload',
+      'GET submission, read-backs of a commit with no answer', 'GET submission, read-back of an accepted PUT') { foreach ($sh in $shapes + $subShapes) { @{ Point = $p; Shape = $sh } } }
+  ) {
+    $pt = $R10Points[$Point]
+    $o = if ($pt.Options) { $pt.Options } else { @{} }
+    $x = Invoke-R10Run @(foreach ($e in $pt.Edits) { @{ Kind = $e.Kind; At = $e.At; Map = $R10Shapes[$Shape] } }) $o
+    if ($pt.Err) { $x.R.Err | Should -BeExactly $pt.Err }
+    foreach ($l in @($pt.ErrLike)) { if ($l) { $x.R.Err | Should -Match $l } }
+    if ($pt.OutLike) { $x.R.Err | Should -BeNullOrEmpty; $x.R.Out | Should -Match $pt.OutLike }
+    if ($pt.NotLike) { $x.R.All | Should -Not -Match $pt.NotLike }
+    if ($pt.Value) { $x.R.Value | Should -Be @($pt.Value) -Because '[result]' } else { $x.R.Value | Should -BeNullOrEmpty -Because '[result]' }
+    if ($pt.Sent -notmatch '/commit') { $x.Committed | Should -BeFalse -Because '[commit sent]' }
+    $x.Sent | Should -BeExactly $pt.Sent -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  It 'the token answer <Shape>: not signed in, nothing of it printed' -ForEach @(foreach ($sh in $shapes) { @{ Shape = $sh } }) {
+    $x = Invoke-R10Run @(@{ Kind = 'Token'; At = 1; Map = $R10Shapes[$Shape] }) @{} { Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret }
+    $x.R.Err | Should -BeExactly "the token request returned $UnreadAnswer; not signed in"
+    $x.R.Out | Should -Not -Match 'signed in to the Store'
+    Assert-R10Safe $x
+  }
+
+  It 'a delete by hand, its GET answer <Shape>: nothing deleted' -ForEach @(foreach ($sh in $shapes + $subShapes) { @{ Shape = $sh } }) {
+    $x = Invoke-R10Run @(@{ Kind = 'SubmissionRead'; At = 1; Map = $R10Shapes[$Shape] }) @{} { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $NewId } {
+      param($s) $s.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @(
+        [ordered]@{ id = 'p1'; fileName = $File; fileStatus = 'PendingUpload'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }; $s.PendingId = $NewId }
+    $x.R.Err | Should -BeExactly "GET submission $NewId did not return that submission; not deleting"
+    $x.Sent | Should -BeExactly '' -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  # Point 3: the check after the commit (the next workflow step).
+  It 'the check after the commit, the answer <Shape>: failed, never "verified"' -ForEach @(foreach ($sh in $shapes + $subShapes) { @{ Shape = $sh } }) {
+    $x = Invoke-R10Run @(@{ Kind = 'SubmissionRead'; At = 1; Map = $R10Shapes[$Shape] }) @{} {
+      Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -ExpectedFileName $File -TimeoutMinutes 0 -IntervalSeconds 0 } {
+      param($s) $s.Sub = @{ id = $SubId; status = 'Certification'; applicationPackages = @(
+        [ordered]@{ id = 'p3'; fileName = $File; fileStatus = 'Uploaded'; version = '0.4.1.0' }) } }
+    $x.R.Err | Should -BeExactly "submission check failed: the submission GET returned $UnreadSubmission"
+    $x.Sent | Should -BeExactly '' -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  It 'the check after the commit, the same answer as one JSON object (the control): verified' {
+    $x = Invoke-R10Run @() @{} {
+      Assert-SubmissionHasPackage -ProductId $App -SubmissionId $SubId -ExpectedVersion '0.4.1.0' -ExpectedFileName $File -TimeoutMinutes 0 -IntervalSeconds 0 } {
+      param($s) $s.Sub = @{ id = $SubId; status = 'Certification'; applicationPackages = @(
+        [ordered]@{ id = 'p3'; fileName = $File; fileStatus = 'Uploaded'; version = '0.4.1.0' }) } }
+    $x.R.Err | Should -BeNullOrEmpty
+    $x.R.Out | Should -Match "verified submission ${SubId}: submission holds exactly one Uploaded package, version 0\.4\.1\.0"
+  }
+
+  # Pepper's repros of point 3, as pure checks: a package object in place of
+  # the list, and status twice (PendingCommit, then Published) were verified.
+  It 'Test-SubmissionHasPackage and Test-DraftReadyToCommit, <Case>: Fail, the answer is not read' -ForEach @(
+    @{ Case = 'applicationPackages one object'; Pk = '{"fileName":"<f>","fileStatus":"Uploaded","version":"0.4.1.0"}'; Status = '"status":"<s>"' }
+    @{ Case = 'status twice, PendingCommit then the status checked'; Pk = '[{"fileName":"<f>","fileStatus":"Uploaded","version":"0.4.1.0"}]'; Status = '"status":"PendingCommit","status":"<s>"' }
+    @{ Case = 'status twice, the status checked then Published'; Pk = '[{"fileName":"<f>","fileStatus":"Uploaded","version":"0.4.1.0"}]'; Status = '"status":"<s>","status":"Published"' }
+    @{ Case = 'status twice, in another case'; Pk = '[{"fileName":"<f>","fileStatus":"Uploaded","version":"0.4.1.0"}]'; Status = '"Status":"PendingCommit","status":"<s>"' }
+    @{ Case = 'a package''s fileStatus twice'; Pk = '[{"fileName":"<f>","fileStatus":"PendingDelete","fileStatus":"Uploaded","version":"0.4.1.0"}]'; Status = '"status":"<s>"' }
+    @{ Case = 'applicationPackages twice'; Pk = '[],"applicationPackages":[{"fileName":"<f>","fileStatus":"Uploaded","version":"0.4.1.0"}]'; Status = '"status":"<s>"' }
+  ) {
+    foreach ($w in @(@{ S = 'Published'; Fn = 'Has' }, @{ S = 'PendingCommit'; Fn = 'Ready' })) {
+      $json = '{"id":"' + $SubId + '",' + $Status.Replace('<s>', $w.S) + ',"targetPublishMode":"Manual","applicationPackages":' + $Pk.Replace('<f>', $File) + '}'
+      $r = if ($w.Fn -eq 'Has') { Test-SubmissionHasPackage -SubmissionJson $json -ExpectedVersion '0.4.1.0' -ExpectedSubmissionId $SubId -ExpectedFileName $File }
+           else { Test-DraftReadyToCommit -SubmissionJson $json -SubmissionId $SubId -ExpectedFileName $File -ExpectedVersion '0.4.1.0' }
+      $r.Result | Should -Be 'Fail' -Because "[result] $($w.Fn)"
+      $r.Reason | Should -BeExactly "the submission GET returned $UnreadSubmission" -Because $w.Fn
+    }
+    # The control: the same answer with the list and one status.
+    $ok = '{"id":"' + $SubId + '","status":"Published","targetPublishMode":"Manual","applicationPackages":[{"fileName":"' + $File + '","fileStatus":"Uploaded","version":"0.4.1.0"}]}'
+    (Test-SubmissionHasPackage -SubmissionJson $ok -ExpectedVersion '0.4.1.0' -ExpectedSubmissionId $SubId -ExpectedFileName $File).Result | Should -Be 'Pass'
+  }
+
+  # Point 3: one strict rule for every read, the price check among them.
+  It 'Test-SubmissionPricing, <Case>: <Result>' -ForEach @(
+    @{ Case = 'pricing as a list'; Json = '{"pricing":[{"priceId":"Tier1"}]}'; Result = 'Unread'; Reason = 'pricing is not a JSON object; this run does not send a price it cannot read' }
+    @{ Case = 'priceId as a list'; Json = '{"pricing":{"priceId":["Tier1"]}}'; Result = 'Unread'; Reason = 'pricing.priceId is not text; this run does not send a price it cannot read' }
+    @{ Case = 'pricing twice'; Json = '{"pricing":{"priceId":"Base"},"pricing":{"priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
+    @{ Case = 'priceId twice'; Json = '{"pricing":{"priceId":"Base","priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
+    @{ Case = 'priceId twice, in another case'; Json = '{"pricing":{"PriceId":"Base","priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
+    @{ Case = 'the answer in a list'; Json = '[{"pricing":{"priceId":"Tier1"}}]'; Result = 'Unread'; Reason = '<unread>' }
+    @{ Case = 'text before it'; Json = 'Answer: {"pricing":{"priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
+    @{ Case = 'one JSON object (the control)'; Json = '{"pricing":{"priceId":"Tier1"}}'; Result = 'Pass'; Reason = 'pricing.priceId=Tier1 is kept as is' }
+  ) {
+    $r = Test-SubmissionPricing -SubmissionJson $Json
+    $r.Result | Should -Be $Result -Because '[result]'
+    $r.Reason | Should -BeExactly $Reason.Replace('<unread>', "the submission GET returned $UnreadAnswer")
+  }
+
+  It 'publish, the read before the PUT shows <Case>: could not verify, no PUT, no delete or re-run advice' -ForEach @(
+    @{ Case = 'pricing as a list'; Edit = { param($o) $o['pricing'] = [System.Text.Json.Nodes.JsonNode]::Parse('[{"priceId":"Free"}]') }; Fail = 'price check: pricing is not a JSON object; this run does not send a price it cannot read' }
+    @{ Case = 'priceId as a list'; Edit = { param($o) $o['pricing']['priceId'] = [System.Text.Json.Nodes.JsonNode]::Parse('["Free"]') }; Fail = 'price check: pricing.priceId is not text; this run does not send a price it cannot read' }
+  ) {
+    $x = Invoke-R10Run @(@{ Kind = 'SubmissionRead'; At = 1; Map = (New-R10JsonMap $Edit) })
+    $x.R.Err | Should -BeExactly (Get-R10Unverified $Fail $R10Read1)
+    $x.Sent | Should -BeExactly "POST $Base/submissions" -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  # Point 1: Pepper's repro. The pending check's answer holds an upload URL
+  # whose signature the pending id repeats.
+  It 'the pending check''s answer holds a signature, <Case>, in <Where>, and the pending id is that signature: no usable id, never printed, no delete advice' -ForEach @(
+    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field') { foreach ($c in $urlCases) { $c + @{ Where = $w } } }
+  ) {
+    # Locals only: a closure does not see this script's variables.
+    $url = $R10Url + $Query + $R10Sig + $After; $sig = $R10Sig
+    $x = Invoke-R10Run @(@{ Kind = 'AppRead'; At = 1; Map = (New-R10JsonMap {
+      param($o)
+      switch ($Where) {
+        'fileUploadUrl' { $o['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+        'a nested fileUploadUrl' { $o['r10'] = [System.Text.Json.Nodes.JsonObject]::new(); $o['r10']['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+        'another field' { $o['r10note'] = [System.Text.Json.Nodes.JsonValue]::Create("upload to $url") }
+      }
+      $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}')
+    }.GetNewClosure()) })
+    $x.R.Err | Should -BeExactly ("Partner Center already has a pending submission (no usable id) for $App. This run did not create it, " +
+      "so it stops and touches nothing. Check GET /v1.0/my/applications/$App before doing anything. $ApiNote")
+    $x.Log | Should -Be @("GET $Base") -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  It 'the create answer holds a signature, <Case>, in <Where>, and the app read after it shows that signature as pending: never printed, no delete advice' -ForEach @(
+    foreach ($w in 'fileUploadUrl', 'a nested fileUploadUrl', 'another field', 'an answer with text before it') { foreach ($c in $urlCases) { $c + @{ Where = $w } } }
+  ) {
+    # Locals only: a closure does not see this script's variables.
+    $url = $R10Url + $Query + $R10Sig + $After; $sig = $R10Sig
+    $opt = $R10Out
+    $create = {
+      param($b)
+      $n = [System.Text.Json.Nodes.JsonNode]::Parse($b)
+      switch ($Where) {
+        'a nested fileUploadUrl' { $n['r10'] = [System.Text.Json.Nodes.JsonObject]::new(); $n['r10']['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+        'another field' { $n['r10note'] = [System.Text.Json.Nodes.JsonValue]::Create("upload to $url") }
+        default { $n['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+      }
+      $t = $n.ToJsonString($opt)
+      if ($Where -ceq 'an answer with text before it') { "Answer: $t" } else { $t }
+    }.GetNewClosure()
+    $pending = New-R10JsonMap { param($o) $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}') }.GetNewClosure()
+    $x = Invoke-R10Run @(@{ Kind = 'Create'; At = 1; Map = $create }, @{ Kind = 'AppRead'; At = 2; Map = $pending })
+    if ($Where -ceq 'an answer with text before it') {
+      $x.R.Err | Should -Match 'Created, id unknown'
+      $x.R.Err | Should -Match ([regex]::Escape('Read-back of the app (one GET): a pending submission without a usable id.'))
+    } else {
+      $x.R.Err | Should -BeExactly (Get-R10Unverified "after create, the app's pending submission has no usable id" $R10ReadApp)
+    }
+    $x.Sent | Should -BeExactly "POST $Base/submissions" -Because '[sent]'
+    Assert-R10Safe $x
+  }
+
+  It 'an answer holding a signature, <Case>: masked before anything of it is read' -ForEach @(
+    @{ Case = 'fileUploadUrl, %73ig'; Body = '{"fileUploadUrl":"<u>&%73ig=<v>"}' }
+    @{ Case = 'fileUploadUrl, a fragment after the signature'; Body = '{"fileUploadUrl":"<u>&sig=<v>#r10"}' }
+    @{ Case = 'fileUploadUrl, the signature in the fragment'; Body = '{"fileUploadUrl":"<u>#sig=<v>"}' }
+    @{ Case = 'fileUploadUrl, a ; before the signature'; Body = '{"fileUploadUrl":"<u>;sig=<v>"}' }
+    @{ Case = 'fileUploadUrl twice, the URL with the signature first'; Body = '{"fileUploadUrl":"<u>&sig=<v>","fileUploadUrl":"https://jlfakeupload.blob.core.windows.net/blob/x.zip"}' }
+    @{ Case = 'a nested fileUploadUrl'; Body = '{"id":"1","r10":{"fileUploadUrl":"<u>&sig=<v>"}}' }
+    @{ Case = 'a fileUploadUrl in a list'; Body = '{"id":"1","r10":[{"fileUploadUrl":"<u>&sig=<v>"}]}' }
+    @{ Case = 'another field'; Body = '{"id":"1","note":"upload to <u>&sig=<v>"}' }
+    @{ Case = 'another field, "&" and the name JSON-escaped'; Body = '{"id":"1","note":"upload to <u>\u0026\u0073ig=<v>"}' }
+    @{ Case = 'an answer in a list'; Body = '[{"fileUploadUrl":"<u>&sig=<v>"}]' }
+    @{ Case = 'an answer with text before it'; Body = 'Answer: {"fileUploadUrl":"<u>&%73ig=<v>"}' }
+    @{ Case = 'an answer that is not JSON'; Body = 'upload to <u>&sig=<v> failed' }
+    @{ Case = 'fileUploadUrl, sig (the control)'; Body = '{"fileUploadUrl":"<u>&sig=<v>"}' }
+  ) {
+    $b = $Body.Replace('<u>', $R10Url).Replace('<v>', $R10Sig)
+    Reset-StoreSecrets
+    $t = & $Mod { param($a, $v) Register-StoreAnswerUploadUrl $a; Hide-StoreSecret "pending submission $v" } $b $R10Sig
+    $t | Should -Not -Match $R10Sig -Because '[printed]'
+    Reset-StoreSecrets
+  }
+
+  It 'Register-StoreUploadUrl, a URL with <Case>: its signature masked' -ForEach @($urlCases) {
+    $u = $R10Url + $Query + $R10Sig + $After
+    Reset-StoreSecrets
+    $t = & $Mod { param($a, $v) Register-StoreUploadUrl $a; Hide-StoreSecret "pending submission $v" } $u $R10Sig
+    $t | Should -Not -Match $R10Sig -Because '[printed]'
+    Reset-StoreSecrets
   }
 }
 
@@ -4257,7 +4609,11 @@ Describe 'Workflow lookups print only fixed text and checked values of each GitH
     $fails | Should -BeNullOrEmpty
   }
 
-  It '<Name>: each whole answer a gh failure, not JSON, an array, empty, null or a JSON string; an unexpected error' -ForEach @(
+  # Pepper, PR #74 r10: an answer is read only as exactly one complete JSON
+  # object with each key once. ConvertFrom-Json takes a comment, single
+  # quotes, a trailing comma and NaN, and keeps the last of two equal keys
+  # (here the value sent comes last, so a reader that took it would go on).
+  It '<Name>: each whole answer a gh failure, not JSON, an array, empty, null or a JSON string, or not one strict JSON object; an unexpected error' -ForEach @(
     @{ Name = 'publish, release' }, @{ Name = 'publish, dispatch' }, @{ Name = 'check, by run id' }, @{ Name = 'check, newest on main' }
   ) {
     $sc = $WfScenarios[$Name]
@@ -4274,6 +4630,15 @@ Describe 'Workflow lookups print only fixed text and checked values of each GitH
           @{ Case = 'null'; Answer = @{ Exit = 0; Out = 'null' }; Stop = $notJson }
           @{ Case = 'a JSON string'; Answer = @{ Exit = 0; Out = '"' + $GhCred + '"' }; Stop = $notJson }
           @{ Case = 'two JSON objects'; Answer = @{ Exit = 0; Out = $sc.Answers[$q] + "`n" + '{"r9":"' + $GhCred + '"}' }; Stop = $notJson }
+          @{ Case = 'text before it'; Answer = @{ Exit = 0; Out = "r9-before $GhCred " + $sc.Answers[$q] }; Stop = $notJson }
+          @{ Case = 'text after it'; Answer = @{ Exit = 0; Out = $sc.Answers[$q] + " r9-after $GhCred" }; Stop = $notJson }
+          @{ Case = 'a comment in it'; Answer = @{ Exit = 0; Out = '{/* r9-comment */' + $sc.Answers[$q].Substring(1) }; Stop = $notJson }
+          @{ Case = 'a key in single quotes'; Answer = @{ Exit = 0; Out = ($sc.Answers[$q] -creplace '^\{"([^"]+)"', "{''`$1''") }; Stop = $notJson }
+          @{ Case = 'a trailing comma'; Answer = @{ Exit = 0; Out = $sc.Answers[$q].Substring(0, $sc.Answers[$q].Length - 1) + ',}' }; Stop = $notJson }
+          @{ Case = 'NaN'; Answer = @{ Exit = 0; Out = '{"r9nan":NaN,' + $sc.Answers[$q].Substring(1) }; Stop = $notJson }
+          @{ Case = 'its first key twice'; Answer = @{ Exit = 0; Out = ($sc.Answers[$q] -creplace '^\{"([^"]+)":', '{"$1":"r9-planted","$1":') }; Stop = $notJson }
+          @{ Case = 'its first key twice, in another case'; Answer = @{ Exit = 0; Out = ('{"' + ([regex]::Match($sc.Answers[$q], '^\{"([^"]+)"').Groups[1].Value.ToUpperInvariant()) + '":"r9-planted",' + $sc.Answers[$q].Substring(1)) }; Stop = $notJson }
+          @{ Case = 'a nested key twice'; Answer = @{ Exit = 0; Out = $(if ($sc.Answers[$q] -cmatch '":\{"') { $sc.Answers[$q] -creplace '":\{"([^"]+)":', '":{"$1":"r9-planted","$1":' } else { '{"r9n":{"k":"r9-planted","k":1},' + $sc.Answers[$q].Substring(1) }) }; Stop = $notJson }
           # An error the step does not expect (here gh itself throws, its
           # message holding the credential) is replaced by fixed text.
           @{ Case = 'gh threw'; Answer = @{ Throw = "r9-gh threw $GhCred" }; Stop = 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)' })) {
@@ -4286,6 +4651,6 @@ Describe 'Workflow lookups print only fixed text and checked values of each GitH
       }
     }) | Where-Object { $_ }
     $fails | Should -BeNullOrEmpty
-    $n | Should -BeGreaterThan 15
+    $n | Should -BeGreaterThan 40
   }
 }

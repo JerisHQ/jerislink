@@ -136,6 +136,12 @@ function Get-StorePackage {
 $script:KnownSecrets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:SecretPattern = $null
 $script:SecretText = '[redacted]'
+# The texts Register-StoreUploadUrl and Register-StoreTextSecret are done
+# with: each registers the same secrets for the same text, and KnownSecrets
+# only grows, so a text seen again (each answer is read more than once) is not
+# read again. A text is added only after it is done. Tests clear it with
+# KnownSecrets.
+$script:SecretInputs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
 function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value) {
   if (-not $Value -or $Value -ceq $script:NotText) { return }
@@ -150,26 +156,163 @@ function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value) {
   $script:SecretPattern = [regex]::new(($all -join '|'), [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 }
 
-# A SAS upload URL (it carries a write signature): the URL, its query with and
-# without "?", and the value of each sig parameter.
+# A SAS upload URL (it carries a write signature): the URL with and without
+# its fragment, its query with and without "?", and the value of each
+# signature parameter (Register-StoreQuerySecret). The query is read twice
+# (Pepper, PR #74 r10): as the URI parser reads it ([uri] Query: after "?",
+# up to "#", in its escaped and unescaped forms), and as the text between the
+# first "?" and the first "#"; the fragment is read for signatures too.
+# A URL already done (SecretInputs) is not read again.
 function Register-StoreUploadUrl([AllowNull()][AllowEmptyString()][string]$Url) {
-  if (-not $Url) { return }
+  if (-not $Url -or $Url -ceq $script:NotText -or $script:SecretInputs.Contains("url:$Url")) { return }
+  Register-StoreUrlSecret $Url
+  [void]$script:SecretInputs.Add("url:$Url")
+}
+function Register-StoreUrlSecret([string]$Url) {
   Register-StoreSecret $Url
-  $q = $Url.IndexOf('?')
-  if ($q -lt 0) { return }
-  Register-StoreSecret $Url.Substring($q)
-  Register-StoreSecret $Url.Substring($q + 1)
-  foreach ($kv in $Url.Substring($q + 1).Split('&')) {
+  $hash = $Url.IndexOf('#')
+  if ($hash -ge 0) {
+    Register-StoreSecret $Url.Substring(0, $hash)
+    Register-StoreQuerySecret $Url.Substring($hash + 1)
+  }
+  $u = $null
+  if ([uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$u)) {
+    foreach ($f in [UriFormat]::UriEscaped, [UriFormat]::Unescaped) {
+      $q = ''
+      try { $q = $u.GetComponents([UriComponents]::Query, $f) } catch { }
+      if (-not $q) { continue }
+      Register-StoreSecret $q
+      Register-StoreSecret "?$q"
+      Register-StoreQuerySecret $q
+    }
+  }
+  $at = $Url.IndexOf('?')
+  if ($at -lt 0) { return }
+  # As before: from "?" to the end, and to the fragment.
+  Register-StoreSecret $Url.Substring($at)
+  Register-StoreSecret $Url.Substring($at + 1)
+  $q = $Url.Substring($at + 1)
+  $hash = $q.IndexOf('#')
+  if ($hash -ge 0) { $q = $q.Substring(0, $hash); Register-StoreSecret $q; Register-StoreSecret "?$q" }
+  Register-StoreQuerySecret $q
+}
+
+# The name of a query parameter as a server reads it: percent escapes and
+# "+" decoded, again until nothing changes (at most four times, so %2573ig is
+# sig as well), and trimmed (Pepper, PR #74 r10: a percent-encoded sig).
+function ConvertFrom-StoreQueryName([AllowEmptyString()][string]$Name) {
+  $n = $Name
+  for ($i = 0; $i -lt 4; $i++) {
+    $d = $n.Replace('+', ' ')
+    try { $d = [uri]::UnescapeDataString($d) } catch { }
+    if ($d -ceq $n) { break }
+    $n = $d
+  }
+  $n.Trim()
+}
+
+# Registers the value of each signature parameter of a query (or fragment)
+# text: a name=value pair between "&" or ";" whose decoded name
+# (ConvertFrom-StoreQueryName) is sig in any case, also trimmed.
+function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Query) {
+  if (-not $Query) { return }
+  foreach ($kv in $Query.TrimStart('?').Split([char[]]@('&', ';'))) {
     $eq = $kv.IndexOf('=')
-    if ($eq -gt 0 -and $kv.Substring(0, $eq) -ieq 'sig') { Register-StoreSecret $kv.Substring($eq + 1) }
+    if ($eq -le 0) { continue }
+    if ((ConvertFrom-StoreQueryName $kv.Substring(0, $eq)) -ine 'sig') { continue }
+    $v = $kv.Substring($eq + 1)
+    Register-StoreSecret $v
+    Register-StoreSecret $v.Trim()
   }
 }
 
-# The top-level fileUploadUrl of an API answer (JSON text), if it has one as
-# text. Never throws.
+# Every signature parameter anywhere in a text (an API answer, whatever its
+# shape), read as it is and with JSON string escapes undone (&, \/, ...):
+# so one in an answer that is not JSON that can be read, or in a field other
+# than fileUploadUrl, is masked as well, before anything is read from that
+# answer (Pepper, PR #74 r10). A pair is name=value; a name ends at "?", "&",
+# ";", "#", "=", a quote, a bracket or white space, a value at the same marks
+# but "=". A text already done (SecretInputs) is not read again. Never throws.
+$script:QueryPairPattern = [regex]::new('([^?&;#=\s"''<>{}\[\],]+)=([^?&;#\s"''<>{}\[\],]*)', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+$script:JsonEscapePattern = [regex]::new('\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+function Register-StoreTextSecret([AllowNull()][AllowEmptyString()][string]$Text) {
+  if (-not $Text -or $script:SecretInputs.Contains("text:$Text")) { return }
+  try {
+    $plain = $script:JsonEscapePattern.Replace($Text, [System.Text.RegularExpressions.MatchEvaluator]{
+      param($m)
+      if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
+      switch -CaseSensitive ($m.Groups[2].Value) { 'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $_ } }
+    })
+    foreach ($t in @($Text, $plain)) {
+      foreach ($m in $script:QueryPairPattern.Matches($t)) {
+        if ((ConvertFrom-StoreQueryName $m.Groups[1].Value) -ieq 'sig') { Register-StoreSecret $m.Groups[2].Value; Register-StoreSecret $m.Groups[2].Value.Trim() }
+      }
+    }
+    [void]$script:SecretInputs.Add("text:$Text")
+  } catch { }
+}
+
+# Store API answers are read strictly (Pepper, PR #74 r10). An answer is read
+# only when it is exactly one complete JSON object: no text before or after
+# it, no second value, nothing JSON does not allow (comments, trailing commas,
+# single quotes, NaN: ConvertFrom-Json takes all of these), and no object in
+# it, at any depth, with a key given twice, also not in another case
+# (ConvertFrom-Json keeps the last of two equal keys, and a lookup here does
+# not tell "status" from "Status"). Anything else is $null, which every
+# caller takes as "no answer that can be read" and stops on. Every signature
+# in the text (Register-StoreTextSecret) and each fileUploadUrl at any depth
+# (Register-StoreUploadUrl) is registered first, before any field of the
+# answer is returned to be read. Never throws.
+# What a stop says of an answer that is not read (fixed text).
+$script:UnreadAnswer = 'no JSON object that can be read (an answer is read only as one complete JSON object with each key once)'
+$script:UnreadSubmission = ('no submission JSON that can be read (an answer is read only as one complete JSON object with each key once, ' +
+  'and applicationPackages, when given, as a list of objects)')
+function ConvertFrom-StoreJson([AllowNull()][AllowEmptyString()][string]$Text) {
+  if (-not $Text) { return $null }
+  Register-StoreTextSecret $Text
+  if (-not (Test-StoreJsonObject $Text)) { return $null }
+  $o = $null
+  try { $o = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop } catch { return $null }
+  if ($o -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+  $o
+}
+
+# True when Text is exactly one complete JSON object (RFC 8259, as
+# System.Text.Json reads it by default: one value, nothing after it, no
+# comments or trailing commas, at most 64 levels) in which no object has a
+# key twice, compared as PowerShell's property lookup compares them
+# (OrdinalIgnoreCase). Registers each fileUploadUrl text it meets, at any
+# depth, as an upload URL. Never throws.
+function Test-StoreJsonObject([AllowNull()][AllowEmptyString()][string]$Text) {
+  if (-not $Text) { return $false }
+  $doc = $null
+  try {
+    $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+    if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+    $todo = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+    $todo.Push($doc.RootElement)
+    while ($todo.Count -gt 0) {
+      $e = $todo.Pop()
+      if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $e.EnumerateObject()) {
+          if (-not $seen.Add($p.Name)) { return $false }
+          if ($p.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and $p.Name -ieq 'fileUploadUrl') { Register-StoreUploadUrl $p.Value.GetString() }
+          $todo.Push($p.Value)
+        }
+      } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+        foreach ($i in $e.EnumerateArray()) { $todo.Push($i) }
+      }
+    }
+    $true
+  } catch { $false } finally { if ($null -ne $doc) { $doc.Dispose() } }
+}
+
+# Registers every signature of an API answer (JSON text or not) before
+# anything else is done with it (ConvertFrom-StoreJson). Never throws.
 function Register-StoreAnswerUploadUrl([AllowNull()][AllowEmptyString()][string]$Body) {
   if (-not $Body) { return }
-  try { Register-StoreUploadUrl (Get-JsonField ($Body | ConvertFrom-Json -ErrorAction Stop) 'fileUploadUrl') } catch { }
+  try { [void](ConvertFrom-StoreJson $Body) } catch { }
 }
 
 # Text with every known credential replaced by $script:SecretText. Never throws.
@@ -658,17 +801,23 @@ function Format-StoreErrorText {
   $codes = [System.Collections.Generic.List[string]]::new()
   $target = $null
   if ($Body) {
-    $j = $null
-    try { $j = $Body | ConvertFrom-Json -ErrorAction Stop } catch { }
+    # Read as every Store answer is (ConvertFrom-StoreJson); an answer that
+    # is not one JSON object that can be read gives only an XML <Code>. Each
+    # field is read only in its own JSON type (Pepper, PR #74 r10): a code
+    # only as text (error.code that is not text is [unlisted code]),
+    # error_codes only as a list of JSON whole numbers of 1 to 9 digits.
+    $j = ConvertFrom-StoreJson $Body
     if ($j -is [System.Management.Automation.PSCustomObject]) {
       foreach ($n in 'code', 'error') {
         $p = $j.PSObject.Properties[$n]
         if (-not $p -or $null -eq $p.Value) { continue }
         if ($p.Value -is [string]) { $codes.Add($p.Value) }
-        elseif ($p.Value -is [System.Management.Automation.PSCustomObject] -and $p.Value.PSObject.Properties['code']) { $codes.Add([string]$p.Value.code) }
+        elseif ($p.Value -is [System.Management.Automation.PSCustomObject] -and $p.Value.PSObject.Properties['code']) { $codes.Add((Get-JsonField $p.Value 'code')) }
       }
       $ec = $j.PSObject.Properties['error_codes']
-      if ($ec -and $null -ne $ec.Value) { foreach ($c in @($ec.Value)) { if ("$c" -cmatch '^\d{1,9}\z') { $codes.Add("AADSTS$c") } } }
+      if ($ec -and $ec.Value -is [array]) {
+        foreach ($c in $ec.Value) { if (($c -is [long] -or $c -is [int]) -and "$c" -cmatch '^[0-9]{1,9}\z') { $codes.Add("AADSTS$c") } }
+      }
       if ($Detail) {
         $e = $j.PSObject.Properties['error']
         foreach ($o in @($j, $(if ($e -and $e.Value -is [System.Management.Automation.PSCustomObject]) { $e.Value }))) {
@@ -798,8 +947,11 @@ function Connect-StoreApi {
     if ($lost) { $t += "; $lost" }
     throw (Hide-StoreSecret "could not get a Partner Center access token: $t")
   }
-  $tok = ''
-  try { $tok = Get-JsonField ($r.Body | ConvertFrom-Json -ErrorAction Stop) 'access_token' } catch { }
+  $tok = ''; $answer = $null
+  try { $answer = ConvertFrom-StoreJson $r.Body } catch { }
+  if ($null -eq $answer) { throw (Hide-StoreSecret "the token request returned $script:UnreadAnswer; not signed in") }
+  $tok = Get-JsonField $answer 'access_token'
+  $answer = $null
   # Masked from here on, also when it is refused below.
   Register-StoreSecret $tok
   if (-not $tok) { throw (Hide-StoreSecret "the token response has no access_token") }
@@ -872,7 +1024,7 @@ function Invoke-StoreApi {
     $e = New-StoreError "Store API $what answered HTTP ${s}: accepted, completion unconfirmed$(if ($lost) { "; $lost" })" -OutcomeUnknown -Status $s
     if (-not $lost) {
       $id = ''
-      try { $id = Get-JsonField ($r.Body | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
+      try { $id = Get-JsonField (ConvertFrom-StoreJson $r.Body) 'id' } catch { }
       if (Test-StoreId $id) { $e.Data['StoreAcceptedId'] = $id }
     }
     throw $e
@@ -909,11 +1061,13 @@ function Get-DeleteByIdText([string]$ProductId, [string]$SubmissionId) {
 # field or null, so both count as none; the create call (HTTP 409 while a
 # submission is pending) and the post-create pending check back this up.
 # A pending submission without a numeric id is '(no usable id)'.
-# Throws on JSON that does not parse or is another app.
+# Throws on an answer that is not one strict JSON object (ConvertFrom-StoreJson)
+# or is another app.
 function Read-AppPendingSubmissionId {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
-  try { $app = $AppJson | ConvertFrom-Json -ErrorAction Stop } catch { throw (Hide-StoreSecret "GET application returned JSON that does not parse") }
-  if ($null -eq $app -or (Get-JsonField $app 'id') -cne $ProductId) { throw (Hide-StoreSecret "GET application returned a different or empty application id") }
+  $app = ConvertFrom-StoreJson $AppJson
+  if ($null -eq $app) { throw (Hide-StoreSecret "GET application returned $script:UnreadAnswer") }
+  if ( (Get-JsonField $app 'id') -cne $ProductId) { throw (Hide-StoreSecret "GET application returned a different or empty application id") }
   $p = $app.PSObject.Properties['pendingApplicationSubmission']
   if (-not $p -or $null -eq $p.Value) { return '' }
   $id = Get-JsonField $p.Value 'id'
@@ -991,7 +1145,7 @@ function New-StoreSubmission {
       "another submission is pending; see the pending-submission check above. $readBack"))
   }
   $id = ''
-  try { $id = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'id' } catch { }
+  $id = Get-JsonField (ConvertFrom-StoreJson $json) 'id'
   $json = $null
   if (-not (Test-StoreId $id)) {
     throw (Hide-StoreSecret (Resolve-CreatedIdUnknown -ProductId $ProductId -Answer "the create response (HTTP 200, 201 or 204) has no usable submission id" -Status 'HTTP 200, 201 or 204' -TimeoutSec $ReadBackTimeoutSec))
@@ -1148,14 +1302,19 @@ function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
 
 # The service rejects or mishandles some pricing on PUT; the CLI refuses the
 # same cases before its PUT (PriceIds.IsRoundTrippable): no pricing, an empty
-# priceId (a PUT with it makes the product free) or 'Base'. Pure.
+# priceId (a PUT with it makes the product free) or 'Base': Result Fail.
+# An answer it cannot read (ConvertFrom-StoreJson), pricing that is not a JSON
+# object or a priceId that is not text: Result Unread, which the publish flow
+# stops on as "Could not verify" (Pepper, PR #74 r10). Pure.
 function Test-SubmissionPricing {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
-  try { $s = $SubmissionJson | ConvertFrom-Json -ErrorAction Stop } catch { return [pscustomobject]@{ Result = 'Fail'; Reason = 'submission JSON does not parse' } }
-  $p = if ($null -ne $s) { $s.PSObject.Properties['pricing'] } else { $null }
+  $s = ConvertFrom-StoreJson $SubmissionJson
+  if ($null -eq $s) { return [pscustomobject]@{ Result = 'Unread'; Reason = "the submission GET returned $script:UnreadAnswer" } }
+  $p = $s.PSObject.Properties['pricing']
   if (-not $p -or $null -eq $p.Value) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'submission has no pricing; a PUT without it could change the price' } }
+  if ($p.Value -isnot [System.Management.Automation.PSCustomObject]) { return [pscustomobject]@{ Result = 'Unread'; Reason = 'pricing is not a JSON object; this run does not send a price it cannot read' } }
   $price = Get-JsonField $p.Value 'priceId'
-  if ($price -ceq $script:NotText) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is not text; this run does not send a price it cannot read' } }
+  if ($price -ceq $script:NotText) { return [pscustomobject]@{ Result = 'Unread'; Reason = 'pricing.priceId is not text; this run does not send a price it cannot read' } }
   if (-not $price) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is empty; a PUT with it would make the product free' } }
   if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = "pricing.priceId is 'Base', which the service rejects on PUT" } }
   [pscustomobject]@{ Result = 'Pass'; Reason = "pricing.priceId=$(Get-ListedPriceId $price) is kept as is" }
@@ -1182,6 +1341,9 @@ function Set-SubmissionPackage {
     $n = $null
     try { $n = [System.Text.Json.Nodes.JsonNode]::Parse($SubmissionJson, $o) } catch { }
     if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { $why = 'submission JSON is not an object'; throw (Hide-StoreSecret $why) }
+    # Only an answer ConvertFrom-StoreJson would read (Pepper, PR #74 r10): a
+    # key twice at any depth, also in another case, is the fixed text below.
+    if (-not (Test-StoreJsonObject $SubmissionJson)) { throw (Hide-StoreSecret 'not read') }
     $pk = $n['applicationPackages']
     if ($null -eq $pk) { $pk = [System.Text.Json.Nodes.JsonArray]::new(); $n['applicationPackages'] = $pk }
     if ($pk -isnot [System.Text.Json.Nodes.JsonArray]) { $why = 'applicationPackages is not a list'; throw (Hide-StoreSecret $why) }
@@ -1219,7 +1381,8 @@ function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json) {
   $o.PropertyNameCaseInsensitive = $true
   $n = $null
   try {
-    $n = [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o)
+    # Only an answer ConvertFrom-StoreJson would read (Pepper, PR #74 r10).
+    if (Test-StoreJsonObject $Json) { $n = [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o) }
     if ($n -is [System.Text.Json.Nodes.JsonObject]) { foreach ($f in $script:UncomparedFields) { [void]$n.Remove($f) } }
   } catch { $n = $null }
   if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { throw (Hide-StoreSecret 'submission JSON is not an object that can be read (the parser''s message is not printed)') }
@@ -1266,7 +1429,7 @@ function Compare-SubmissionFields {
 # fileUploadUrl from submission JSON. Never print the result.
 function Get-SubmissionUploadUrl([string]$SubmissionJson) {
   $u = ''
-  try { $u = Get-JsonField ($SubmissionJson | ConvertFrom-Json -ErrorAction Stop) 'fileUploadUrl' } catch { }
+  $u = Get-JsonField (ConvertFrom-StoreJson $SubmissionJson) 'fileUploadUrl'
   Register-StoreUploadUrl $u
   if (-not $u) { throw (Hide-StoreSecret "the submission has no fileUploadUrl") }
   if ($u -ceq $script:NotText) { throw (Hide-StoreSecret "the submission's fileUploadUrl is not text") }
@@ -1321,9 +1484,11 @@ function Invoke-SubmissionCommit {
   param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId, [ValidateRange(1, 600)][int]$TimeoutSec = 600)
   Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
   $json = Invoke-StoreApi -Method POST -Path "applications/$ProductId/submissions/$SubmissionId/commit" -TimeoutSec $TimeoutSec
-  $st = ''
-  try { $st = Get-JsonField ($json | ConvertFrom-Json -ErrorAction Stop) 'status' } catch { }
-  Write-StoreHost "submission $SubmissionId commit requested through the API: status=$(Get-ListedValue $st $script:SubmissionStatuses)"
+  # The commit answer is shown, not used: the read-back step checks the
+  # submission by id. One that cannot be read shows as [answer not read].
+  $o = ConvertFrom-StoreJson $json
+  $st = if ($null -eq $o) { '[answer not read]' } else { Get-ListedValue (Get-JsonField $o 'status') $script:SubmissionStatuses }
+  Write-StoreHost "submission $SubmissionId commit requested through the API: status=$st"
 }
 
 # The commit request got no answer, an HTTP 200, 201 or 204 whose body was
@@ -1436,22 +1601,25 @@ function Remove-StoreDraftSubmission {
 # ExpectedFileName, else [file name not shown]), Version (digits and dots,
 # else [invalid]) and FileStatus (a documented value, else [unlisted]).
 # Nothing else of the JSON is kept; FileUploadUrl (a SAS URL with write
-# access) is never copied. Returns $null when there is no JSON object, or when
-# reading it fails (the error is not passed on: a parser message can quote the
-# JSON). Never throws.
+# access) is never copied. Returns $null when the answer is not one JSON
+# object that can be read (ConvertFrom-StoreJson: strict, each key once at
+# any depth), when applicationPackages is given but is not a JSON list or an
+# item of it is not an object (Pepper, PR #74 r10: one package object in
+# place of the list is not a list of one), or when reading it fails (the
+# error is not passed on: a parser message can quote the JSON). Never throws.
 function Read-SubmissionSafe {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson, [AllowEmptyString()][string]$ExpectedFileName = '')
   try {
-    $start = $SubmissionJson.IndexOf('{')
-    if ($start -lt 0) { return $null }
-    $raw = $SubmissionJson.Substring($start) | ConvertFrom-Json -ErrorAction Stop
+    # Every SAS URL and signature in it is masked from now on, before any
+    # field is read (ConvertFrom-StoreJson).
+    $raw = ConvertFrom-StoreJson $SubmissionJson
     if ($raw -isnot [System.Management.Automation.PSCustomObject]) { return $null }
-    # A SAS URL here is masked from now on, before any field is read.
-    Register-StoreUploadUrl (Get-JsonField $raw 'FileUploadUrl')
     $pkgs = @()
     $pkgProp = $raw.PSObject.Properties['ApplicationPackages']
     if ($pkgProp -and $null -ne $pkgProp.Value) {
-      $pkgs = @(foreach ($p in @($pkgProp.Value)) {
+      if ($pkgProp.Value -isnot [array]) { return $null }
+      foreach ($p in $pkgProp.Value) { if ($p -isnot [System.Management.Automation.PSCustomObject]) { return $null } }
+      $pkgs = @(foreach ($p in $pkgProp.Value) {
         [pscustomobject]@{ FileName = Get-ListedFileName (Get-JsonField $p 'FileName') $ExpectedFileName
                            Version = Get-SafeValue (Get-JsonField $p 'Version') $script:SafeVersion
                            FileStatus = Get-ListedValue (Get-JsonField $p 'FileStatus') $script:FileStatuses }
@@ -1485,7 +1653,7 @@ function Test-DraftReadyToCommit {
     [Parameter(Mandatory)][string]$ExpectedVersion
   )
   $sub = Read-SubmissionSafe -SubmissionJson $SubmissionJson -ExpectedFileName $ExpectedFileName
-  if (-not $sub) { return New-CheckResult $null 'Fail' 'the submission GET returned no submission JSON that parses' }
+  if (-not $sub) { return New-CheckResult $null 'Fail' "the submission GET returned $script:UnreadSubmission" }
   if ($sub.Id -cne $SubmissionId) { return New-CheckResult $sub 'Fail' "the submission GET returned submission '$($sub.Id)', not draft $SubmissionId that this run created" }
   if ($sub.Status -cne 'PendingCommit') { return New-CheckResult $sub 'Fail' "draft status is '$($sub.Status)', not PendingCommit" }
   $remain = @($sub.Packages | Where-Object { $_.FileStatus -cne 'PendingDelete' })
@@ -1527,7 +1695,7 @@ function Test-SubmissionHasPackage {
     [string]$ExpectedFileName = ''
   )
   $sub = Read-SubmissionSafe -SubmissionJson $SubmissionJson -ExpectedFileName $ExpectedFileName
-  if (-not $sub) { return New-CheckResult $null 'Fail' 'the submission GET returned no submission JSON that parses' }
+  if (-not $sub) { return New-CheckResult $null 'Fail' "the submission GET returned $script:UnreadSubmission" }
   if (-not $sub.Id) { return New-CheckResult $sub 'Fail' 'submission JSON has no Id' }
   if ($sub.Id -cnotmatch $script:SafeId) { return New-CheckResult $sub 'Fail' "the submission GET returned submission id $($sub.Id)" }
   if ($ExpectedSubmissionId -and $sub.Id -cne $ExpectedSubmissionId) {
@@ -1575,8 +1743,8 @@ function Write-SubmissionSummary {
 # A read before the commit (the app after create, the new submission before
 # the PUT, the draft after the upload) gave no usable answer: no answer, not
 # sent, any status but HTTP 200 (a 202 or another 2xx among them, its body
-# read or not), HTTP 200 with its body lost, JSON that does not parse or
-# cannot be read, another app or submission, a pending submission without
+# read or not), HTTP 200 with its body lost, an answer that is not one
+# strict JSON object (ConvertFrom-StoreJson) or cannot be read, another app or submission, a pending submission without
 # a usable id, or a submission whose status is not PendingCommit (none, an
 # unlisted one or another one; Pepper, PR #74 r9), also in the PUT's answer.
 # This run cannot verify what draft SubmissionId holds, so it
@@ -1672,13 +1840,14 @@ function Publish-StoreSubmission {
     try { $sub = Get-StoreSubmissionJson $ProductId $id }
     catch { $stop = Get-UnverifiedDraftText $ProductId $id "$_" $read; throw (Hide-StoreSecret $stop) }
     $safe = Read-SubmissionSafe -SubmissionJson $sub -ExpectedFileName $ExpectedFileName
-    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned JSON that does not parse" $read; throw (Hide-StoreSecret $stop) }
+    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned $script:UnreadSubmission" $read; throw (Hide-StoreSecret $stop) }
     if ($safe.Id -cne $id) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned another submission" $read; throw (Hide-StoreSecret $stop) }
     # Nothing is sent to the draft unless this read shows it as an uncommitted
     # PendingCommit draft (Pepper, PR #74 r9): no status, an unlisted one or
     # any other one is "Could not verify".
     if ($safe.Status -cne 'PendingCommit') { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id $(Get-NotPendingCommitText $safe.Status)" $read; throw (Hide-StoreSecret $stop) }
     $price = Test-SubmissionPricing -SubmissionJson $sub
+    if ($price.Result -eq 'Unread') { $stop = Get-UnverifiedDraftText $ProductId $id "price check: $($price.Reason)" $read; throw (Hide-StoreSecret $stop) }
     if ($price.Result -ne 'Pass') { throw (Hide-StoreSecret "price check failed: $($price.Reason)") }
     Write-StoreHost "price check: $($price.Reason)"
     # Every field but the packages, as this run read it before its PUT, and
@@ -1699,7 +1868,7 @@ function Publish-StoreSubmission {
     # PR #74 r9).
     $read = "the answer to the update of submission $id (PUT submission)"
     $safe = Read-SubmissionSafe -SubmissionJson $updated
-    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "PUT submission $id answered JSON that does not parse" $read; throw (Hide-StoreSecret $stop) }
+    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "PUT submission $id answered $script:UnreadSubmission" $read; throw (Hide-StoreSecret $stop) }
     if ($safe.Id -cne $id) { $stop = Get-UnverifiedDraftText $ProductId $id "PUT submission $id returned another submission" $read; throw (Hide-StoreSecret $stop) }
     if ($safe.Status -cne 'PendingCommit') { $stop = Get-UnverifiedDraftText $ProductId $id "PUT submission $id $(Get-NotPendingCommitText $safe.Status)" $read; throw (Hide-StoreSecret $stop) }
     $url = ''
@@ -1719,7 +1888,7 @@ function Publish-StoreSubmission {
     try { $now = Get-StoreSubmissionJson $ProductId $id }
     catch { $stop = Get-UnverifiedDraftText $ProductId $id "$_" $read; throw (Hide-StoreSecret $stop) }
     $safe = Read-SubmissionSafe -SubmissionJson $now -ExpectedFileName $ExpectedFileName
-    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned JSON that does not parse" $read; throw (Hide-StoreSecret $stop) }
+    if (-not $safe) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned $script:UnreadSubmission" $read; throw (Hide-StoreSecret $stop) }
     if ($safe.Id -cne $id) { $stop = Get-UnverifiedDraftText $ProductId $id "GET submission $id returned another submission" $read; throw (Hide-StoreSecret $stop) }
     $check = Test-DraftReadyToCommit -SubmissionJson $now -SubmissionId $id `
       -ExpectedFileName $ExpectedFileName -ExpectedVersion $ExpectedVersion
