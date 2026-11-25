@@ -28,7 +28,7 @@ On the Mac:
 
 1. Download `JerisLink-<version>-macos-arm64.zip` from the [latest release](https://github.com/JerisHQ/jerislink/releases/latest), unpack it, and move `JerisLink.app` into the `Applications` folder in your home folder (`~/Applications`; create it if it is missing).
 2. Open `JerisLink.app`. It starts its background services. Allow what macOS asks for in System Settings > Privacy & Security: **Screen Recording** for JerisLink and **Accessibility** for JerisLink Input Helper. If it asks, also turn on JerisLink under General > Login Items & Extensions. Open the app again: all three services should show `enabled`.
-3. Allow your PC. The host app has no field for the first address yet, so run this once in Terminal, with the **Windows PC's** Tailscale IPv4 in place of `100.x.y.z`:
+3. Allow your PC. The host app's **連線設定…** window has an allowed-address list (白名單), but it can only save to `listen.plist`, and the app does not create that file yet. So create it once in Terminal, with the **Windows PC's** Tailscale IPv4 in place of `100.x.y.z`:
 
    ```sh
    mkdir -p ~/Library/Application\ Support/JerisLink
@@ -37,7 +37,7 @@ On the Mac:
      -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' listen.plist
    ```
 
-4. Set a connection password: open `JerisLink.app`, click **連線設定…** (connection settings) and set it there. Without a password, the allowed PC connects on its address alone.
+4. Set a connection password: open `JerisLink.app`, click **連線設定…** (connection settings) and set it there. Without a password, the allowed PC connects on its address alone. More PCs and blocked addresses are added in the same window from now on.
 
 On the PC:
 
@@ -54,7 +54,7 @@ This PC's own address is chosen automatically. More detail: [Mac host install gu
 - Keyboard and mouse, with Mac or Windows keyboard layout presets. The overlay can open the Mac's Force Quit window.
 - Text clipboard in both directions.
 - Files in both directions: copy in Explorer and paste in Finder or the other way round, drag files onto the viewer, or right-click and use Send to JerisLink in Explorer or the Finder. Files that arrive on Windows carry the internet zone mark.
-- Connection password. The password itself is never sent; the Mac keeps only a key derived from it, in the Keychain. Repeated wrong passwords lock that address out for a while, then block it. With a password set, every video, audio and mouse packet is tied to the logged-in session, and other packets are dropped. Allowed and blocked addresses are edited in the host app.
+- Connection password. The password itself is never sent; the Mac keeps only a key derived from it, in the Keychain. Repeated wrong passwords lock that address out for a while, then block it. With a password set, every video, audio and mouse packet is tied to the logged-in session, and other packets are dropped. Allowed and blocked addresses are edited in the host app's 連線設定 window; the first allowed address is set once in Terminal (quick start, step 3).
 - Launch screen with a green or blue theme, and an overlay during the session instead of a menu bar.
 - No analytics, crash reporting or update check. See [PRIVACY.md](PRIVACY.md).
 
@@ -130,7 +130,7 @@ JerisLink does not ship with any built-in addresses. Normal setup is the [quick 
 | Windows viewer | `--source-ip <ipv4>` (optional) | The Mac's address for this start; skips the launch screen. |
 | Windows viewer | `JERISLINK_SOURCE_IP` env var (optional, older setups) | Used only when no address is saved and none is given with `--source-ip`. |
 | Windows viewer | `--bind-ip` (optional) | This PC's Tailscale IPv4; chosen automatically from the Mac address if not set |
-| macOS host | `~/Library/Application Support/JerisLink/listen.plist` | Listen mode, allowed viewer addresses (`clientIP`, `allowedIPs`), blocked addresses. Edit it with the host app's 連線設定 or through `lockf` as in the quick start; see the [Mac host install guide](personal/mac-host/Deploy/README.md#listen-endpoint) |
+| macOS host | `~/Library/Application Support/JerisLink/listen.plist` | Listen mode, allowed viewer addresses (`clientIP`, `allowedIPs`), blocked addresses. Create it, or change `mode`, through `lockf` as in the quick start; once it exists, the host app's 連線設定 sets the password and edits the allowed and blocked addresses; see the [Mac host install guide](personal/mac-host/Deploy/README.md#listen-endpoint) |
 | macOS host (without `listen.plist`) / A/B tool | `JERISLINK_BIND_IP`, `JERISLINK_CLIENT_IP` in `~/Library/Application Support/JerisLink/network.conf` (or env) | This Mac's and the Windows viewer's Tailscale IPv4 |
 | Support macOS build | `JERISLINK_CORE_ROOT` (optional) | Path to `personal/mac-host`; defaults to the copy in this repo |
 | Support Windows helper | `JERISLINK_SUPPORT_HOME` (optional) | Install folder; defaults to `%LOCALAPPDATA%\JerisLink Support` |
