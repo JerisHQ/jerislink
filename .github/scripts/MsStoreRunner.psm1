@@ -15,17 +15,28 @@
 #   (IStorePackagedAPIExtensions.cs#L521-L522).
 #
 # Flow (Publish-StoreSubmission), each step on this run's submission id:
-#   GET app: stop if a submission is pending (never delete one this run did not
-#   create) -> POST create, id taken from the response -> GET app: the pending
-#   submission must be that id -> GET submission -> price check -> PUT with every
-#   old package PendingDelete and the new file PendingUpload -> PUT the zip to
-#   the SAS upload URL -> GET submission: every field except the packages is
+#   GET app: stop if a submission is pending (never delete, change or commit one
+#   this run did not create; one GET of it by id says whether it is an
+#   uncommitted PendingCommit draft, and the stop says a person decides what
+#   happens to it) -> POST create, id taken from the response -> GET app: the
+#   pending submission must be that id -> GET submission -> price check -> PUT
+#   with every old package PendingDelete and the new file PendingUpload -> PUT
+#   the zip to the SAS upload URL -> GET submission: every field except the
+#   packages, friendlyName, the pricing fields the service rewrites and the
+#   package rollout status and fallback submission id Partner Center sets is
 #   unchanged (Compare-SubmissionFields) and Test-DraftReadyToCommit passes ->
 #   POST .../submissions/{id}/commit. Assert-SubmissionHasPackage then reads
 #   that id back until it is committed with the new package. When create or
 #   commit gets no answer, the run reads the app or the submission back and
 #   reports what it shows (Resolve-UnconfirmedCreate/-Commit); while the result
 #   is unconfirmed it gives no delete or retry advice.
+# Diagnose (Show-StoreSubmissionDiagnosis; msstore-publish.yml mode=diagnose):
+# GET calls only. Reads the app, one given submission and the app's last
+# published submission, and prints which friendlyName, pricing and other
+# fields differ between the two submissions, as field paths, never values.
+# While it runs, any request but a GET to the Store API is refused before it
+# is sent ($script:ReadOnlyCalls, checked in Invoke-StoreApi and again in
+# Invoke-StoreHttp).
 # Time budget: the publish step has one timeout, and nothing prints once the
 # runner kills it. Publish-StoreSubmission works to a deadline set before that
 # timeout: the commit and its read-backs keep their own time at the end, every
@@ -76,6 +87,10 @@ $script:Token = ''
 # Set only by Connect-StoreApi -LoopbackTestServer (msstore-publish-check.yml
 # and the HTTP tests): then a stand-in on 127.0.0.1/localhost is also allowed.
 $script:LoopbackTestServer = $false
+# Set only while Show-StoreSubmissionDiagnosis runs: then Invoke-StoreApi and
+# Invoke-StoreHttp refuse every request but a GET to the Store API, before
+# anything is sent.
+$script:ReadOnlyCalls = $false
 
 # Finds the one Store package in $Dir and checks its identity and version.
 # Returns Path (the full path of the .msixupload that is uploaded), FileName, Version (the manifest Identity Version) and Sha256.
@@ -602,6 +617,9 @@ function Invoke-StoreHttp {
   if (-not (Test-StoreUri -Uri $Uri -Kind $Kind)) {
     throw (New-StoreError "refused: $Kind requests go only to $($script:UriRule[$Kind]); nothing was sent" -NotSent)
   }
+  if ($script:ReadOnlyCalls -and -not ($Kind -ceq 'Api' -and $Method -ceq 'GET')) {
+    throw (New-StoreError "refused: this is a read-only run (GET calls to the Store API only); nothing was sent" -NotSent)
+  }
   $clock = [System.Diagnostics.Stopwatch]::StartNew()
   $handler = [System.Net.Http.SocketsHttpHandler]::new()
   $handler.AllowAutoRedirect = $false
@@ -974,22 +992,18 @@ function Test-StoreId([AllowNull()][AllowEmptyString()][string]$Value) {
 # anything else is [unlisted]. Values from "Manage app submissions"
 # (learn.microsoft.com, Windows Store submission API): the submission status
 # (also the commit response's status), the publish mode, a package's file
-# status, and the price ids Base, NotAvailable, Free and Tier<number>
-# (Get-ListedPriceId).
+# status and a package's file status. A price (priceId, a market price) is
+# never printed, listed or not (Pepper, PR #75 r1): the price check says
+# only whether it passed (Test-SubmissionPricing).
 $script:SubmissionStatuses = @('None', 'Canceled', 'PendingCommit', 'CommitStarted', 'CommitFailed', 'PendingPublication',
   'Publishing', 'Published', 'PublishFailed', 'PreProcessing', 'PreProcessingFailed', 'Certification', 'CertificationFailed',
   'Release', 'ReleaseFailed')
 $script:PublishModes = @('Immediate', 'Manual', 'SpecificDate')
 $script:FileStatuses = @('None', 'PendingUpload', 'Uploaded', 'PendingDelete')
-$script:PriceIds = @('Base', 'NotAvailable', 'Free')
 function Get-ListedValue([AllowNull()][AllowEmptyString()][string]$Value, [string[]]$List) {
   if (-not $Value) { return '' }
   foreach ($v in $List) { if ($v -ceq $Value) { return $v } }
   '[unlisted]'
-}
-function Get-ListedPriceId([AllowNull()][AllowEmptyString()][string]$Value) {
-  if ($Value -cmatch '^Tier[0-9]{1,5}\z') { return "Tier$($Value.Substring(4))" }
-  Get-ListedValue $Value $script:PriceIds
 }
 
 # A package file name from the API is printed only when it is exactly
@@ -1091,6 +1105,10 @@ function Invoke-StoreApi {
   )
   if (-not $script:Token) { throw (Hide-StoreSecret "not signed in to the Store submission API (Connect-StoreApi)") }
   $what = "$Method /v1.0/my/$Path"
+  # A read-only run (Show-StoreSubmissionDiagnosis) sends GET calls only.
+  if ($script:ReadOnlyCalls -and $Method -cne 'GET') {
+    throw (New-StoreError "Store API $what refused: this is a read-only run (GET calls only); nothing was sent" -NotSent)
+  }
   $a = @{ Method = $Method; Uri = "$script:ApiBase/v1.0/my/$Path"; Kind = 'Api'; Headers = @{ Authorization = "Bearer $script:Token" } }
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
   try {
@@ -1168,18 +1186,51 @@ function Read-AppPendingSubmissionId {
   $id
 }
 
+# How to look at a submission without changing anything: the read-only
+# diagnose mode of msstore-publish.yml (Show-StoreSubmissionDiagnosis).
+function Get-DiagnoseText([string]$SubmissionId) {
+  "To look at it without changing anything, run this workflow with mode=diagnose and submission_id=$SubmissionId (GET calls only)."
+}
+
 # Throws if the app (GET /applications/{productId} JSON) has a pending
-# submission. Pure. Deletes nothing.
+# submission. Pure. Deletes nothing. PendingStatus: the status of that
+# submission as Read-SubmissionSafe read it by its id (a listed status, or
+# [unlisted]), or '' when it was not read. Whatever it is, the run stops and
+# touches nothing; a person decides what happens to that submission:
+# - PendingCommit: an uncommitted draft. The run does not delete, change or
+#   commit it; the text gives its id and how to delete exactly that draft
+#   should the person decide to discard it.
+# - any other status: not an uncommitted draft (in certification, failed,
+#   ...): no delete advice (Remove-StoreDraftSubmission deletes only a
+#   PendingCommit draft).
+# - not read: as before this status was read, with both cases.
 function Test-NoPendingSubmission {
-  param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
+  param(
+    [Parameter(Mandatory)][AllowEmptyString()][string]$AppJson,
+    [Parameter(Mandatory)][string]$ProductId,
+    [AllowEmptyString()][string]$PendingStatus = ''
+  )
   $pendingId = Read-AppPendingSubmissionId -AppJson $AppJson -ProductId $ProductId
   if ($pendingId -ceq '(no usable id)') {
     throw (Hide-StoreSecret ("Partner Center already has a pending submission (no usable id) for $ProductId. This run did not create it, " +
       "so it stops and touches nothing. Check GET /v1.0/my/applications/$ProductId before doing anything. $script:ApiOnlyNote"))
   }
+  if ($pendingId -and $PendingStatus -ceq 'PendingCommit') {
+    throw (Hide-StoreSecret ("Partner Center already has a pending submission $pendingId for ${ProductId}: an uncommitted draft " +
+      "(status PendingCommit). This run did not create it, so it stops and touches nothing: it does not delete, change or commit " +
+      "draft $pendingId. A person decides what happens to draft $pendingId. $(Get-DiagnoseText $pendingId) $script:ApiOnlyNote " +
+      "If the person decides to discard it: " + (Get-DeleteByIdText $ProductId $pendingId)))
+  }
+  if ($pendingId -and $PendingStatus) {
+    throw (Hide-StoreSecret ("Partner Center already has a pending submission $pendingId for $ProductId (status $PendingStatus, not an " +
+      "uncommitted PendingCommit draft). This run did not create it, so it stops and touches nothing (it never deletes, changes or " +
+      "commits a submission it did not create). A person decides what happens to submission $pendingId; if it is in certification, " +
+      "let certification finish. $(Get-DiagnoseText $pendingId) $script:ApiOnlyNote"))
+  }
   if ($pendingId) {
-    throw (Hide-StoreSecret ("Partner Center already has a pending submission $pendingId for $ProductId. This run did not create it, " +
-      "so it stops and touches nothing (it never deletes a submission it did not create). $script:ApiOnlyNote " +
+    throw (Hide-StoreSecret ("Partner Center already has a pending submission $pendingId for $ProductId (its status was not read). " +
+      "This run did not create it, so it stops and touches nothing (it never deletes, changes or commits a submission it did not " +
+      "create). A person decides what happens to submission $pendingId. $(Get-DiagnoseText $pendingId) $script:ApiOnlyNote " +
       "If it is in certification, let certification finish. If it is an uncommitted draft: " + (Get-DeleteByIdText $ProductId $pendingId)))
   }
   Write-StoreHost "No pending submission for $ProductId; safe to create a new one."
@@ -1195,12 +1246,35 @@ function Get-StoreSubmissionJson([string]$ProductId, [string]$SubmissionId, [int
   Invoke-StoreApi -Method GET -Path "applications/$ProductId/submissions/$SubmissionId" -TimeoutSec $TimeoutSec
 }
 
+# The status of submission SubmissionId from one read-only GET by its id
+# (Read-SubmissionSafe: a listed status or [unlisted]), or '' when that read
+# failed, gave no answer it can read or showed another submission. Prints
+# one line when it is ''. Never throws.
+function Get-PendingSubmissionStatus([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec = 60) {
+  $why = ''
+  try {
+    $safe = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec)
+    if (-not $safe) { $why = "GET submission $SubmissionId returned $script:UnreadSubmission" }
+    elseif ($safe.Id -cne $SubmissionId) { $why = "GET submission $SubmissionId returned another submission" }
+    elseif (-not $safe.Status) { $why = "GET submission $SubmissionId showed no status" }
+    else { return $safe.Status }
+  } catch { $why = "$_" }
+  try { Write-StoreHost "the status of pending submission $SubmissionId was not read: $why" } catch { }
+  ''
+}
+
 # Asks Partner Center whether the app has a pending submission; throws unless
-# the call succeeded and reported none. Fails closed.
+# the call succeeded and reported none. Fails closed. When one is pending
+# with a usable id, one more GET (of that submission, by its id) reads its
+# status for the stop text (Test-NoPendingSubmission); nothing is sent to it.
 function Assert-NoPendingSubmission {
   param([Parameter(Mandatory)][string]$ProductId)
   try { $json = Get-StoreApp $ProductId } catch { throw (Hide-StoreSecret "$_; cannot check for a pending submission; not publishing") }
-  Test-NoPendingSubmission -AppJson $json -ProductId $ProductId
+  $pendingId = ''
+  try { $pendingId = Read-AppPendingSubmissionId -AppJson $json -ProductId $ProductId } catch { }
+  $status = ''
+  if ($pendingId -and $pendingId -cne '(no usable id)') { $status = Get-PendingSubmissionStatus $ProductId $pendingId }
+  Test-NoPendingSubmission -AppJson $json -ProductId $ProductId -PendingStatus $status
 }
 
 # POST /applications/{productId}/submissions?isMinimalResponse=true (the query
@@ -1398,7 +1472,9 @@ function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
 # priceId (a PUT with it makes the product free) or 'Base': Result Fail.
 # An answer it cannot read (ConvertFrom-StoreJson), pricing that is not a JSON
 # object or a priceId that is not text: Result Unread, which the publish flow
-# stops on as "Could not verify" (Pepper, PR #74 r10). Pure.
+# stops on as "Could not verify" (Pepper, PR #74 r10). Each Reason is fixed
+# text: the price is never in it (Pepper, PR #75 r1: run 45524510567 printed
+# the priceId). Pure.
 function Test-SubmissionPricing {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
   $s = ConvertFrom-StoreJson $SubmissionJson
@@ -1409,8 +1485,8 @@ function Test-SubmissionPricing {
   $price = Get-JsonField $p.Value 'priceId'
   if ($price -ceq $script:NotText) { return [pscustomobject]@{ Result = 'Unread'; Reason = 'pricing.priceId is not text; this run does not send a price it cannot read' } }
   if (-not $price) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is empty; a PUT with it would make the product free' } }
-  if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = "pricing.priceId is 'Base', which the service rejects on PUT" } }
-  [pscustomobject]@{ Result = 'Pass'; Reason = "pricing.priceId=$(Get-ListedPriceId $price) is kept as is" }
+  if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is one the service rejects on PUT (the price is not printed)' } }
+  [pscustomobject]@{ Result = 'Pass'; Reason = 'pricing.priceId is set and is kept as is (the price is not printed)' }
 }
 
 # Returns the submission JSON for the PUT: every existing package is marked
@@ -1459,24 +1535,51 @@ function Set-SubmissionPackage {
 }
 
 # Top-level submission fields left out of the before/after comparison:
-# Partner Center owns them (id, status, statusDetails, fileUploadUrl) or this
-# run changes them on purpose (applicationPackages). Every other field, known
-# or not (pricing, listings, visibility, targetPublishMode, targetPublishDate,
-# allowTargetFutureDeviceFamilies, ...), must come back from the PUT unchanged.
-$script:UncomparedFields = @('id', 'status', 'statusDetails', 'fileUploadUrl', 'applicationPackages')
+# Partner Center owns them (id, status, statusDetails, fileUploadUrl,
+# friendlyName) or this run changes them on purpose (applicationPackages).
+# friendlyName is generated by the service, which rewrote it after the PUT
+# (run 45524510567). Every other field, known or not (pricing, listings,
+# visibility, targetPublishMode, targetPublishDate,
+# allowTargetFutureDeviceFamilies, ...), must come back from the PUT
+# unchanged; pricing is compared by its price fields only
+# (Compare-SubmissionPricing), and packageDeliveryOptions without the two
+# package rollout fields Partner Center sets (UncomparedRolloutFields).
+$script:UncomparedFields = @('id', 'status', 'statusDetails', 'fileUploadUrl', 'applicationPackages', 'friendlyName')
+# packageDeliveryOptions.packageRollout fields Partner Center sets itself, so
+# a change of them after the PUT is the Store's, like friendlyName, and is not
+# compared. "Manage app submissions", Package rollout resource
+# (https://learn.microsoft.com/en-us/windows/uwp/monetize/manage-app-submissions):
+# "The packageRolloutStatus and fallbackSubmissionId values are assigned by
+# Partner Center, and are not intended to be set by the developer. If you
+# include these values in a request body, these values will be ignored."
+# The rest of packageDeliveryOptions (isPackageRollout,
+# packageRolloutPercentage, isMandatoryUpdate, mandatoryUpdateEffectiveDate)
+# is what the PUT sends and stays compared.
+$script:UncomparedRolloutFields = @('packageRolloutStatus', 'fallbackSubmissionId')
 
 # Parses Json into a JsonObject without the uncompared fields. Throws fixed
 # text only (a System.Text.Json message quotes the JSON; Pepper, PR #74 r8).
 # A JsonObject reads its properties only on first use, and a duplicate key
 # throws then, so the Remove calls stay inside the try.
-function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json) {
+# KeepStoreSetFields (Get-SubmissionDiagnosis): friendlyName and the package
+# rollout fields Partner Center sets (UncomparedRolloutFields) are kept.
+function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json, [switch]$KeepStoreSetFields) {
   $o = [System.Text.Json.Nodes.JsonNodeOptions]::new()
   $o.PropertyNameCaseInsensitive = $true
   $n = $null
   try {
     # Only an answer ConvertFrom-StoreJson would read (Pepper, PR #74 r10).
     if (Test-StoreJsonObject $Json) { $n = [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o) }
-    if ($n -is [System.Text.Json.Nodes.JsonObject]) { foreach ($f in $script:UncomparedFields) { [void]$n.Remove($f) } }
+    if ($n -is [System.Text.Json.Nodes.JsonObject]) {
+      foreach ($f in $script:UncomparedFields) { if (-not ($KeepStoreSetFields -and $f -ceq 'friendlyName')) { [void]$n.Remove($f) } }
+      # Only where the docs put them: packageDeliveryOptions.packageRollout,
+      # both objects. Anything else there is compared as it is.
+      $r = $n['packageDeliveryOptions']
+      if (-not $KeepStoreSetFields -and $r -is [System.Text.Json.Nodes.JsonObject]) {
+        $r = $r['packageRollout']
+        if ($r -is [System.Text.Json.Nodes.JsonObject]) { foreach ($f in $script:UncomparedRolloutFields) { [void]$r.Remove($f) } }
+      }
+    }
   } catch { $n = $null }
   if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { throw (Hide-StoreSecret 'submission JSON is not an object that can be read (the parser''s message is not printed)') }
   , $n
@@ -1490,18 +1593,107 @@ function Get-SubmissionComparedFields {
   try { $n.ToJsonString() } catch { throw (Hide-StoreSecret 'the submission JSON could not be read to keep its fields (the parser''s message is not printed)') }
 }
 
+# Field paths: where two submissions differ, never what the values are. A
+# path is segments joined by ".": a documented field name as this module
+# spells it ($script:StoreTargetNames), a market code (two ASCII letters)
+# under marketSpecificPricings, a language code under listings, each with an
+# optional [index] in a list; any other key is [unlisted field name], and
+# the path ends there. At most MaxDiffPaths paths are kept, then
+# [more paths not shown].
+$script:UnlistedFieldName = '[unlisted field name]'
+$script:MorePaths = '[more paths not shown]'
+$script:MaxDiffPaths = 40
+$script:MaxDiffDepth = 6
+
+function Get-ListedPathSegment([AllowEmptyString()][string]$Key, [AllowEmptyString()][string]$Parent) {
+  if ($Parent -ceq 'marketSpecificPricings' -and $Key -cmatch '^[A-Za-z]{2}\z') { return $Key }
+  if ($Parent -ceq 'listings' -and $Key -cmatch '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,2}\z' -and -not (Test-StoreSecretIn $Key)) { return $Key }
+  $c = ''
+  if ($script:StoreTargetNames.TryGetValue($Key, [ref]$c)) { return $c }
+  $script:UnlistedFieldName
+}
+
+function Add-DiffPath([System.Collections.Generic.List[string]]$Paths, [string]$Path) {
+  if ($Paths.Contains($Path)) { return }
+  if ($Paths.Count -lt $script:MaxDiffPaths) { $Paths.Add($Path) }
+  elseif (-not $Paths.Contains($script:MorePaths)) { $Paths.Add($script:MorePaths) }
+}
+
+# Adds to Paths where Want and Got (System.Text.Json nodes) differ: a key on
+# one side only, a list of another length, or a value that is not
+# DeepEquals. Objects are compared key by key (key case and order do not
+# count), lists of the same length item by item; at MaxDiffDepth segments,
+# or under an unlisted name, the whole value's path is added. Path: the path
+# of Want and Got; Name: its last segment without an index. Pure. May throw
+# (a duplicate key in a nested object; the message quotes it), so callers
+# catch and throw fixed text.
+function Add-JsonDiffPath($Want, $Got, [string]$Path, [string]$Name, [System.Collections.Generic.List[string]]$Paths, [int]$Depth = 1) {
+  if ([System.Text.Json.Nodes.JsonNode]::DeepEquals($Want, $Got)) { return }
+  if ($Name -cne $script:UnlistedFieldName -and $Depth -lt $script:MaxDiffDepth) {
+    if ($Want -is [System.Text.Json.Nodes.JsonObject] -and $Got -is [System.Text.Json.Nodes.JsonObject]) {
+      foreach ($kv in $Want) {
+        $seg = Get-ListedPathSegment $kv.Key $Name
+        if (-not $Got.ContainsKey($kv.Key)) { Add-DiffPath $Paths "$Path.$seg" }
+        else { Add-JsonDiffPath $kv.Value $Got[$kv.Key] "$Path.$seg" $seg $Paths ($Depth + 1) }
+      }
+      foreach ($kv in $Got) { if (-not $Want.ContainsKey($kv.Key)) { Add-DiffPath $Paths "$Path.$(Get-ListedPathSegment $kv.Key $Name)" } }
+      return
+    }
+    if ($Want -is [System.Text.Json.Nodes.JsonArray] -and $Got -is [System.Text.Json.Nodes.JsonArray] -and $Want.Count -eq $Got.Count -and $Want.Count -le 9999) {
+      for ($i = 0; $i -lt $Want.Count; $i++) { Add-JsonDiffPath $Want[$i] $Got[$i] ($Path + '[' + $i + ']') $Name $Paths ($Depth + 1) }
+      return
+    }
+  }
+  Add-DiffPath $Paths $Path
+}
+
+# The pricing a PUT must keep: priceId, trialPeriod and the price of each
+# market in marketSpecificPricings (a market added or dropped counts too).
+# The service rewrites the rest of pricing after a PUT (run 45524510567:
+# sales emptied, isAdvancedPricingModel changed; the docs call sales
+# deprecated and isAdvancedPricingModel read-only), and the order of keys or
+# markets never counts. Pricing that is not a JSON object on either side is
+# compared whole. Adds the path of each difference to Paths. Pure. May throw
+# (callers catch).
+$script:ComparedPricingFields = @('priceId', 'trialPeriod')
+function Compare-SubmissionPricing($Want, $Got, [System.Collections.Generic.List[string]]$Paths) {
+  if ($Want -isnot [System.Text.Json.Nodes.JsonObject] -or $Got -isnot [System.Text.Json.Nodes.JsonObject]) {
+    if (-not [System.Text.Json.Nodes.JsonNode]::DeepEquals($Want, $Got)) { Add-DiffPath $Paths 'pricing' }
+    return
+  }
+  foreach ($f in $script:ComparedPricingFields) {
+    if (-not [System.Text.Json.Nodes.JsonNode]::DeepEquals($Want[$f], $Got[$f])) { Add-DiffPath $Paths "pricing.$f" }
+  }
+  $wm = $Want['marketSpecificPricings']; $gm = $Got['marketSpecificPricings']
+  if ($wm -is [System.Text.Json.Nodes.JsonObject] -and $gm -is [System.Text.Json.Nodes.JsonObject]) {
+    foreach ($kv in $wm) {
+      if (-not $gm.ContainsKey($kv.Key) -or -not [System.Text.Json.Nodes.JsonNode]::DeepEquals($kv.Value, $gm[$kv.Key])) {
+        Add-DiffPath $Paths "pricing.marketSpecificPricings.$(Get-ListedPathSegment $kv.Key 'marketSpecificPricings')"
+      }
+    }
+    foreach ($kv in $gm) {
+      if (-not $wm.ContainsKey($kv.Key)) { Add-DiffPath $Paths "pricing.marketSpecificPricings.$(Get-ListedPathSegment $kv.Key 'marketSpecificPricings')" }
+    }
+  } elseif (-not [System.Text.Json.Nodes.JsonNode]::DeepEquals($wm, $gm)) { Add-DiffPath $Paths 'pricing.marketSpecificPricings' }
+}
+
 # Compares the fields kept by Get-SubmissionComparedFields with a submission
-# read later. Returns Compared (how many fields) and Changed: the names of
-# fields that differ, were dropped or were added, each as this module spells
-# it when it is a documented submission field name ($script:StoreTargetNames),
-# else [unlisted field name] (Pepper, PR #74 r8). Pure. Throws fixed text
-# only: a nested object with a duplicate key throws while it is compared, and
-# that message quotes the key; so does JSON that cannot be written back (K17).
+# read later: every top-level field but the uncompared ones exactly, pricing
+# by its price fields only (Compare-SubmissionPricing). Returns Compared (how
+# many fields), Changed: the names of fields that differ, were dropped or
+# were added, each as this module spells it when it is a documented
+# submission field name ($script:StoreTargetNames), else [unlisted field
+# name] (Pepper, PR #74 r8), and Paths: where they differ, as field paths
+# (pricing.priceId, pricing.marketSpecificPricings.HK, listings.zh-hk, ...),
+# never values. Pure. Throws fixed text only: a nested object with a
+# duplicate key throws while it is compared, and that message quotes the
+# key; so does JSON that cannot be written back (K17).
 function Compare-SubmissionFields {
   param([Parameter(Mandatory)][string]$ExpectedJson, [Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
   $want = ConvertTo-SubmissionNode $ExpectedJson
   $got = ConvertTo-SubmissionNode $SubmissionJson
   $names = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $paths = [System.Collections.Generic.List[string]]::new()
   try {
     # Both sides must be JSON that can be written back (K17: a lone UTF-16
     # surrogate). DeepEquals throws on one in .NET 8 (pwsh 7.4) but not
@@ -1509,14 +1701,62 @@ function Compare-SubmissionFields {
     # on the same fixed text.
     [void]$want.ToJsonString(); [void]$got.ToJsonString()
     foreach ($kv in $want) {
-      if (-not $got.ContainsKey($kv.Key) -or -not [System.Text.Json.Nodes.JsonNode]::DeepEquals($kv.Value, $got[$kv.Key])) { [void]$names.Add($kv.Key) }
+      $seg = Get-ListedPathSegment $kv.Key ''
+      if (-not $got.ContainsKey($kv.Key)) { [void]$names.Add($kv.Key); Add-DiffPath $paths $seg; continue }
+      if ($kv.Key -eq 'pricing') {
+        $p = [System.Collections.Generic.List[string]]::new()
+        Compare-SubmissionPricing $kv.Value $got[$kv.Key] $p
+        if ($p.Count -gt 0) { [void]$names.Add($kv.Key); foreach ($x in $p) { Add-DiffPath $paths $x } }
+      }
+      elseif (-not [System.Text.Json.Nodes.JsonNode]::DeepEquals($kv.Value, $got[$kv.Key])) {
+        [void]$names.Add($kv.Key)
+        Add-JsonDiffPath $kv.Value $got[$kv.Key] $seg $seg $paths
+      }
     }
-    foreach ($kv in $got) { if (-not $want.ContainsKey($kv.Key)) { [void]$names.Add($kv.Key) } }
+    foreach ($kv in $got) { if (-not $want.ContainsKey($kv.Key)) { [void]$names.Add($kv.Key); Add-DiffPath $paths (Get-ListedPathSegment $kv.Key '') } }
   } catch { throw (Hide-StoreSecret 'the submission fields could not be compared (the parser''s message is not printed)') }
   [pscustomobject]@{
     Compared = $want.Count
-    Changed = @($names | ForEach-Object { $c = ''; if ($script:StoreTargetNames.TryGetValue($_, [ref]$c)) { $c } else { '[unlisted field name]' } } | Select-Object -Unique)
+    Changed = @($names | ForEach-Object { $c = ''; if ($script:StoreTargetNames.TryGetValue($_, [ref]$c)) { $c } else { $script:UnlistedFieldName } } | Select-Object -Unique)
+    Paths = @($paths)
   }
+}
+
+# What differs between submission SubmissionJson and the last published
+# submission PublishedJson, as field paths (see Add-JsonDiffPath), never
+# values. Pure. Returns FriendlyName ('same' or 'differs'), Pricing: every
+# pricing sub-field path that differs (sales, isAdvancedPricingModel, a
+# market, ...), Other: the paths of every other field that differs (id,
+# status, statusDetails, fileUploadUrl and applicationPackages are left
+# out), and Check: the paths Compare-SubmissionFields stops a publish run on
+# with PublishedJson as before and SubmissionJson as after (none: it would
+# pass). Throws fixed text only.
+function Get-SubmissionDiagnosis {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson, [Parameter(Mandatory)][AllowEmptyString()][string]$PublishedJson)
+  $a = ConvertTo-SubmissionNode $PublishedJson -KeepStoreSetFields
+  $b = ConvertTo-SubmissionNode $SubmissionJson -KeepStoreSetFields
+  $pricing = [System.Collections.Generic.List[string]]::new()
+  $other = [System.Collections.Generic.List[string]]::new()
+  $friendly = ''
+  try {
+    [void]$a.ToJsonString(); [void]$b.ToJsonString()
+    $friendly = if ([System.Text.Json.Nodes.JsonNode]::DeepEquals($a['friendlyName'], $b['friendlyName'])) { 'same' } else { 'differs' }
+    foreach ($kv in $a) {
+      if ($kv.Key -eq 'friendlyName') { continue }
+      $seg = Get-ListedPathSegment $kv.Key ''
+      # Not $to = if (...): an if returns a list unrolled, and an empty one as $null.
+      $to = $other; if ($kv.Key -eq 'pricing') { $to = $pricing }
+      if (-not $b.ContainsKey($kv.Key)) { Add-DiffPath $to $seg }
+      else { Add-JsonDiffPath $kv.Value $b[$kv.Key] $seg $seg $to }
+    }
+    foreach ($kv in $b) {
+      if ($kv.Key -eq 'friendlyName' -or $a.ContainsKey($kv.Key)) { continue }
+      $to = $other; if ($kv.Key -eq 'pricing') { $to = $pricing }
+      Add-DiffPath $to (Get-ListedPathSegment $kv.Key '')
+    }
+  } catch { throw (Hide-StoreSecret 'the submission fields could not be compared (the parser''s message is not printed)') }
+  $check = Compare-SubmissionFields -ExpectedJson $PublishedJson -SubmissionJson $SubmissionJson
+  [pscustomobject]@{ FriendlyName = $friendly; Pricing = @($pricing); Other = @($other); Check = @($check.Paths) }
 }
 
 # fileUploadUrl from submission JSON. Never print the result.
@@ -2003,11 +2243,15 @@ function Publish-StoreSubmission {
     catch { $stop = Get-UnverifiedDraftText $ProductId $id "$_" $read; throw (Hide-StoreSecret $stop) }
     $now = $null
     if ($diff.Changed.Count -gt 0) {
-      throw (Hide-StoreSecret ("submission fields changed after this run's update: $($diff.Changed -join ', '). Only applicationPackages " +
-        "may change; every other field (pricing, listings, visibility, publish mode and date, device families, ...) " +
-        "must read back as it was before the update"))
+      throw (Hide-StoreSecret ("submission fields changed after this run's update: $($diff.Changed -join ', '). Paths that differ " +
+        "(values not printed): $($diff.Paths -join ', '). Only applicationPackages, friendlyName, the pricing fields other " +
+        "than priceId, trialPeriod and the market prices, and the package rollout status and fallback submission id Partner " +
+        "Center sets may change; every other field (the price, the market prices, listings, visibility, publish mode and " +
+        "date, device families, package delivery options, ...) must read back as it was before the update"))
     }
-    Write-StoreHost "fields unchanged: $($diff.Compared) submission fields other than applicationPackages read back as before the update"
+    Write-StoreHost ("fields unchanged: $($diff.Compared) submission fields other than applicationPackages and friendlyName read " +
+      "back as before the update (pricing: priceId, trialPeriod and the market prices; packageDeliveryOptions: all but the " +
+      "package rollout status and fallback submission id Partner Center sets)")
     Write-StoreHost "draft verified: $($check.Reason)"
     if ((Get-StoreUtcNow) -ge $commitBy) {
       throw (Hide-StoreSecret ("no time left for the commit: it and its read-backs need the last $reserve s before the deadline " +
@@ -2081,4 +2325,85 @@ function Assert-SubmissionHasPackage {
   }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage
+# Parses GET /applications/{productId}: the last published submission's id
+# (lastPublishedApplicationSubmission.id), '' when there is none, or
+# '(no usable id)'. Throws on an answer it cannot read or another app (as
+# Read-AppPendingSubmissionId).
+function Read-AppLastPublishedSubmissionId {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$AppJson, [Parameter(Mandatory)][string]$ProductId)
+  $app = ConvertFrom-StoreJson $AppJson
+  if ($null -eq $app) { throw (Hide-StoreSecret "GET application returned $script:UnreadAnswer") }
+  if ( (Get-JsonField $app 'id') -cne $ProductId) { throw (Hide-StoreSecret "GET application returned a different or empty application id") }
+  $p = $app.PSObject.Properties['lastPublishedApplicationSubmission']
+  if (-not $p -or $null -eq $p.Value) { return '' }
+  $id = Get-JsonField $p.Value 'id'
+  if (-not (Test-StoreId $id)) { return '(no usable id)' }
+  $id
+}
+
+# One submission read by id for Show-StoreSubmissionDiagnosis: its JSON (never
+# printed) and its listed status. Throws fixed text when the read fails, its
+# answer cannot be read or it shows another submission.
+function Get-DiagnosedSubmission([string]$ProductId, [string]$SubmissionId, [int]$TimeoutSec, [string]$What) {
+  $json = Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec
+  $safe = Read-SubmissionSafe -SubmissionJson $json
+  if (-not $safe) { throw (Hide-StoreSecret "GET $What $SubmissionId returned $script:UnreadSubmission") }
+  if ($safe.Id -cne $SubmissionId) { throw (Hide-StoreSecret "GET $What $SubmissionId returned another submission") }
+  Write-StoreHost "$What ${SubmissionId}: status $(if ($safe.Status) { $safe.Status } else { '[none]' })"
+  $json
+}
+
+function Format-DiffPaths([string[]]$Paths) {
+  if (@($Paths).Count -eq 0) { return 'none' }
+  @($Paths) -join ', '
+}
+
+# The read-only diagnose mode (msstore-publish.yml mode=diagnose). GET calls
+# only: while it runs, $script:ReadOnlyCalls makes Invoke-StoreApi and
+# Invoke-StoreHttp refuse any other request before it is sent. Reads the app
+# (its pending and last published submission ids), submission SubmissionId
+# and the last published submission, each by id, and prints their listed ids
+# and statuses, then Get-SubmissionDiagnosis: whether friendlyName differs,
+# which pricing sub-fields and other fields differ, as field paths, never
+# values, and whether the publish run's field check would pass. Creates,
+# changes, commits and deletes nothing; a read that fails stops it.
+function Show-StoreSubmissionDiagnosis {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [ValidateRange(1, 600)][int]$TimeoutSec = 60
+  )
+  Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
+  $was = $script:ReadOnlyCalls
+  $script:ReadOnlyCalls = $true
+  try {
+    Write-StoreHost "diagnose (read-only): GET calls only; nothing is created, changed, committed or deleted"
+    $app = ''
+    try { $app = Get-StoreApp $ProductId -TimeoutSec $TimeoutSec } catch { throw (Hide-StoreSecret "$_; cannot read the app; diagnose stops") }
+    $pending = Read-AppPendingSubmissionId -AppJson $app -ProductId $ProductId
+    $published = Read-AppLastPublishedSubmissionId -AppJson $app -ProductId $ProductId
+    $app = $null
+    Write-StoreHost ("app ${ProductId}: pending submission $(if ($pending) { $pending } else { '[none]' }), " +
+      "last published submission $(if ($published) { $published } else { '[none]' })")
+    if ($pending -cne $SubmissionId) { Write-StoreHost "note: submission $SubmissionId is not the app's pending submission" }
+    $sub = Get-DiagnosedSubmission $ProductId $SubmissionId $TimeoutSec 'submission'
+    if (-not $published -or $published -ceq '(no usable id)') {
+      Write-StoreHost 'no last published submission with a usable id: nothing to compare submission fields with'
+    }
+    else {
+      $pub = Get-DiagnosedSubmission $ProductId $published $TimeoutSec 'last published submission'
+      $d = Get-SubmissionDiagnosis -SubmissionJson $sub -PublishedJson $pub
+      $sub = $null; $pub = $null
+      Write-StoreHost "compared last published submission $published with submission $SubmissionId (field paths only, values not printed)"
+      Write-StoreHost "friendlyName: $($d.FriendlyName)"
+      Write-StoreHost "pricing sub-fields that differ: $(Format-DiffPaths $d.Pricing)"
+      Write-StoreHost "other fields that differ (applicationPackages not compared): $(Format-DiffPaths $d.Other)"
+      Write-StoreHost ("the publish run's field check (Compare-SubmissionFields; last published as before, submission $SubmissionId " +
+        "as after): $(if (@($d.Check).Count -gt 0) { 'would stop on ' + (@($d.Check) -join ', ') } else { 'would pass' })")
+    }
+    Write-StoreHost "diagnose done: GET calls only; nothing was created, changed, committed or deleted"
+  }
+  finally { $script:ReadOnlyCalls = $was }
+}
+
+Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis

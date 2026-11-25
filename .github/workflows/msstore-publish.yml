@@ -9,7 +9,10 @@ name: msstore-publish
 #   prerelease is promoted to one). Draft releases and prereleases do not fire
 #   it. release.yml creates the release as a draft on a v* tag push; publishing
 #   that draft by hand is the release decision, and that is what starts this.
-# - workflow_dispatch (fallback): give the run id of a successful `msix` run.
+# - workflow_dispatch, mode=publish (fallback): give the run id of a
+#   successful `msix` run.
+# - workflow_dispatch, mode=diagnose: give a submission id. Read-only; see
+#   "Diagnose" below. Neither the inspect nor the publish job runs.
 #
 # Package selection: the jobs never build. They find the successful `msix` push
 # run for exactly the released commit and download its jerislink-msix-store
@@ -36,8 +39,14 @@ name: msstore-publish
 #   id where there is one, and never given re-run or delete advice. On the
 #   create, PUT or upload the run stops there, uncommitted (steps 2 and 4); on
 #   the commit it is read back by id like any unconfirmed commit (step 6).
-#   1. GET the app: stop if any submission is pending. This run never deletes
-#      a submission it did not create;
+#   1. GET the app: stop if any submission is pending, and GET that pending
+#      submission by id to name its status. This run never deletes, changes
+#      or commits a submission it did not create: for an uncommitted draft
+#      (PendingCommit) the error gives its id and says a person decides what
+#      happens to it (how to look at it with mode=diagnose, and the DELETE
+#      for that id only as what to run if that person decides to discard
+#      it); for any other status (certification, ...) it gives no delete
+#      advice; when the status could not be read it covers both cases;
 #   2. POST a new submission; its id comes from that response. If the service
 #      refuses (any status but 2xx, 408 and 5xx, e.g. HTTP 409 when a
 #      submission appeared after step 1), stop. If the POST gets no answer,
@@ -54,7 +63,8 @@ name: msstore-publish
 #      the answer named, else the app) and stop, whatever that shows. None of
 #      these gives re-run or delete advice;
 #   3. GET the app again: its pending submission must be that id;
-#   4. GET the submission, check its price can be sent back unchanged, PUT it
+#   4. GET the submission, check its price can be sent back unchanged (the
+#      log says only whether it can, never the price), PUT it
 #      with every old package PendingDelete and the new .msixupload
 #      PendingUpload (minimumDirectXVersion and minimumSystemRam None), then
 #      PUT the zipped package to its SAS upload URL. If the PUT or the upload
@@ -62,10 +72,20 @@ name: msstore-publish
 #      accepted, completion unconfirmed: read that id back once and stop,
 #      uncommitted, with no delete or re-run advice;
 #   5. GET it again and stop, uncommitted, unless every field other than
-#      applicationPackages (pricing, listings, visibility, publish mode and
-#      date, device families, ...) reads back as in step 4's GET
+#      applicationPackages and friendlyName (listings, visibility, publish
+#      mode and date, device families, ...) reads back as in step 4's GET
 #      (Compare-SubmissionFields) and only the new package would remain
-#      (Test-DraftReadyToCommit);
+#      (Test-DraftReadyToCommit). The Store renames the draft (friendlyName)
+#      and rewrites pricing on a PUT (run 45524510567: sales emptied,
+#      isAdvancedPricingModel changed), so pricing is compared only on
+#      priceId, trialPeriod and marketSpecificPricings, each market on its
+#      own and in any order: a changed price, or a market added, removed or
+#      priced differently, still stops the run. Partner Center sets
+#      packageDeliveryOptions.packageRollout.packageRolloutStatus and
+#      fallbackSubmissionId itself (the docs: "assigned by Partner Center"),
+#      so those two are not compared either; the rest of
+#      packageDeliveryOptions is. The error names the paths that differ
+#      (such as pricing.priceId), never their values;
 #   6. print the submission id and how to check it by hand, then POST
 #      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
 #      gets no answer, HTTP 408 or 5xx, an HTTP 200, 201 or 204 whose body is
@@ -122,19 +142,42 @@ name: msstore-publish
 #   manage.devcenter.microsoft.com and <account>.blob.core.windows.net, follow
 #   no redirects, and run with verbose and debug output off (PowerShell 7.6
 #   writes request URLs, headers and bodies to the debug stream).
-# - Secrets reach the API only through step env vars of the two steps that
-#   sign in; the token stays in that step's PowerShell session. Nothing is
-#   written to disk or put in the repo. msstore-publish-check.yml runs the same
-#   flow against a local stand-in for the API on every change to these files.
+# - Secrets reach the API only through step env vars of the steps that sign
+#   in (two in publish, one in diagnose); the token stays in that step's
+#   PowerShell session. Nothing is written to disk or put in the repo.
+#   msstore-publish-check.yml runs the same flow against a local stand-in for
+#   the API on every change to these files.
+#
+# Diagnose (workflow_dispatch, mode=diagnose, submission_id=<id>): the
+# `diagnose` job runs in the `store` environment, so it also waits for that
+# approval. It signs in, then sends GET calls only: the app, that submission
+# and the app's last published submission (Show-StoreSubmissionDiagnosis). It
+# prints the submission's status and which friendlyName, pricing and other
+# fields differ from the last published submission, by path, never a value,
+# and whether the publish run's field check would pass. The module refuses any
+# call but a GET while it runs, before anything is sent, so it creates,
+# changes, commits and deletes nothing.
 
 on:
   release:
     types: [released]
   workflow_dispatch:
     inputs:
-      msix_run_id:
-        description: 'Run id of a successful "msix" push run whose commit is in main (its jerislink-msix-store artifact is uploaded)'
+      mode:
+        description: 'publish: upload and commit the package of msix_run_id. diagnose: read submission_id and the last published submission (GET calls only)'
         required: true
+        default: publish
+        type: choice
+        options:
+          - publish
+          - diagnose
+      msix_run_id:
+        description: 'mode=publish: run id of a successful "msix" push run whose commit is in main (its jerislink-msix-store artifact is uploaded)'
+        required: false
+        type: string
+      submission_id:
+        description: 'mode=diagnose: the submission id to read (digits only)'
+        required: false
         type: string
 
 permissions:
@@ -157,7 +200,8 @@ jobs:
     if: >-
       (github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
         && !github.event.release.draft && !github.event.release.prerelease)
-      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        && inputs.mode == 'publish')
     runs-on: windows-latest
     timeout-minutes: 15
     defaults:
@@ -416,3 +460,39 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
           Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes 30 -IntervalSeconds 60
+
+  # mode=diagnose (see "Diagnose" above): GET calls only. It is in the store
+  # environment because it signs in with its secrets, so it waits for the same
+  # approval as a publish. It never runs on a release.
+  diagnose:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.mode == 'diagnose'
+    runs-on: windows-latest
+    environment: store
+    # checkout 5 + diagnose 5 min (sign-in and three GET calls of up to 60 s).
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Read the submission and the last published submission (GET calls only) and print which fields differ, by path, never values
+        id: diagnose
+        timeout-minutes: 5
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
+          PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
+          PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
+        run: |
+          # The id is checked before the sign-in. While it runs,
+          # Show-StoreSubmissionDiagnosis refuses any call but a GET to the
+          # Store API, before it is sent.
+          if ($env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission_id must be a number' }
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+          Show-StoreSubmissionDiagnosis -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID

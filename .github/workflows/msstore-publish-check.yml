@@ -10,15 +10,22 @@ name: msstore-publish-check
 #   environment (and without secrets), so the approver sees it before approving;
 #   that the publish step sets its deadline first, at least 2 min before its
 #   timeout, and passes it on; and that every step of the publish job has a
-#   timeout and they add up to at most the job's.
+#   timeout and they add up to at most the job's; that the diagnose job runs
+#   only on a manual run from main with mode=diagnose, in the store
+#   environment, checks submission_id before the sign-in and then runs only
+#   Show-StoreSubmissionDiagnosis; and that inspect (so publish) does not run
+#   for mode=diagnose.
 # - runs that flow with the real package over real HTTP against a stand-in for
 #   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1,
 #   allowed only through Connect-StoreApi -LoopbackTestServer): the calls and
 #   their order, every call after create on the created id, the uploaded zip
 #   (only the package, same SHA-256), no DELETE, the read-back, and no token,
 #   secret or SAS URL in any output stream with verbose and debug output on.
-#   Also: a pending submission stops the run before create; a PUT that changes
-#   the pricing stops it uncommitted; a commit that gets a 504 while still
+#   The stand-in renames the draft and rearranges its pricing on the PUT as
+#   the real Store does (run 45524510567), and the flow still commits.
+#   Also: a pending PendingCommit draft stops the run before create, names
+#   the draft, says a person decides and sends it nothing; a PUT that changes
+#   the price stops it uncommitted and names the path; no output shows a price; a commit that gets a 504 while still
 #   processing is read back by id until it shows CommitStarted; a draft someone
 #   else creates after the pending check, with a create that gets a 504, is
 #   reported as of unconfirmed origin with no delete advice; a commit that
@@ -27,7 +34,9 @@ name: msstore-publish-check
 #   submission before its update answered HTTP 202, with a token, a secret
 #   and a SAS URL in its body, stops it uncommitted with "Could not verify",
 #   look-by-id only, no delete or re-run advice and none of that body
-#   printed; without -LoopbackTestServer nothing is sent to the stand-in.
+#   printed; without -LoopbackTestServer nothing is sent to the stand-in;
+#   mode=diagnose (Show-StoreSubmissionDiagnosis) sends only GET requests
+#   after the sign-in, changes nothing and prints field paths, not values.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
@@ -164,7 +173,33 @@ jobs:
           if ($inspect -notmatch 'Package to publish after approval') { throw "inspect job does not print the package before approval" }
           if ($inspect -match '(?m)^\s+environment:' -or $inspect -match 'secrets\.') { throw "inspect job must not use an environment or secrets" }
           if ($wf -notmatch '(?ms)^  publish:\s*\n(?:(?!^  \S).)*?^\s+needs: inspect\s*$(?:(?!^  \S).)*?^\s+environment: store\s*$') { throw "publish job must need inspect and run in the store environment" }
-          Write-Host "msstore-publish.yml: publish job order, package gate and time budget OK"
+          # mode=diagnose skips inspect, so publish (it needs inspect) too.
+          if ($inspect -notmatch "(?m)^\s+&& inputs\.mode == 'publish'\)\s*$") { throw "inspect (and so publish) must run on a manual run only with mode=publish" }
+          # The diagnose job: only on a manual run from main with
+          # mode=diagnose, in the store environment, a checkout and one step
+          # whose code is exactly: check the id, sign in, diagnose (GET calls
+          # only; the module refuses anything else before it is sent).
+          $diag = [regex]::Match($code, '(?ms)^  diagnose:\s*\n(?:(?!^  \S).)*').Value
+          if (-not $diag) { throw "msstore-publish.yml has no diagnose job" }
+          if ($diag -notmatch "(?m)^    if: github\.event_name == 'workflow_dispatch' && github\.ref == 'refs/heads/main' && inputs\.mode == 'diagnose'\s*$") { throw "the diagnose job must run only on a manual run from main with mode=diagnose" }
+          if ($diag -notmatch '(?m)^    environment: store\s*$') { throw "the diagnose job must run in the store environment" }
+          if ($diag -notmatch '(?m)^          SUBMISSION_ID: \$\{\{ inputs\.submission_id \}\}\s*$') { throw "the diagnose job must take the id from inputs.submission_id through env" }
+          if ($diag -match '\$\{\{\s*inputs\.' -and ([regex]::Matches($diag, '\$\{\{\s*inputs\.')).Count -ne 1) { throw "the diagnose job may use an input only as SUBMISSION_ID" }
+          $uses = @([regex]::Matches($diag, '(?m)^\s+(?:- )?uses: (\S+)\s*$') | ForEach-Object { $_.Groups[1].Value })
+          if (($uses -join ',') -cne 'actions/checkout@v4' -or ([regex]::Matches($diag, '(?m)^      - ')).Count -ne 2) { throw "the diagnose job must be a checkout and one step" }
+          $run = [regex]::Match($diag, '(?ms)^        run: \|\s*\n(.*)').Groups[1].Value
+          $lines = @($run -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          $want = @(
+            "if (`$env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission_id must be a number' }",
+            'Import-Module ./.github/scripts/MsStoreRunner.psm1',
+            $connect,
+            'Show-StoreSubmissionDiagnosis -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID'
+          )
+          if (($lines -join "`n") -cne ($want -join "`n")) { throw "the diagnose step must check the id, sign in and run Show-StoreSubmissionDiagnosis, and nothing else" }
+          $jobMin = [regex]::Match($diag, '(?m)^    timeout-minutes: (\d+)\s*$')
+          $mins = @([regex]::Matches($diag, '(?m)^        timeout-minutes: (\d+)\s*$') | ForEach-Object { [int]$_.Groups[1].Value })
+          if (-not $jobMin.Success -or $mins.Count -ne 2 -or ($mins | Measure-Object -Sum).Sum -gt [int]$jobMin.Groups[1].Value) { throw "the diagnose job and its steps need timeouts that add up to at most the job's" }
+          Write-Host "msstore-publish.yml: publish job order, package gate and time budget OK; diagnose job gated, in the store environment, GET-only call OK"
 
       - name: Find the msix run
         id: src
@@ -325,6 +360,8 @@ jobs:
             foreach ($bad in @($secret, $store.Token, 'FAKE+SAS', 'FAKE%2BSAS', 'SIGNATURE-0123456789', '/blob/')) {
               if ($text.Contains($bad)) { throw "output contains a secret, token or SAS URL part" }
             }
+            # No price either: the stand-in's priceId, trialPeriod, market and sale prices.
+            if ($text -cmatch '\bFree\b|Tier[0-9]|NoFreeTrial|Launch sale') { throw "output contains a price" }
           }
           $app = $env:STORE_PRODUCT_ID
           $base = "/v1.0/my/applications/$app"
@@ -339,6 +376,7 @@ jobs:
             if ($r.Err) { throw "publish flow failed against the stand-in" }
             Assert-NoLeak $r.Text $s
             if ($r.Text -notmatch 'fields unchanged: \d+ submission fields') { throw "the fields were not compared before commit" }
+            if ($r.Text -cnotmatch 'price check: pricing\.priceId is set and is kept as is \(the price is not printed\)') { throw "the price check line is not the fixed text" }
             $id = $s.NewId
             if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
             if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
@@ -359,15 +397,21 @@ jobs:
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
 
-          # 2. A pending submission the run did not create: stop before create, delete nothing.
+          # 2. An uncommitted draft (PendingCommit) the run did not create: stop
+          # before create, name the draft, a person decides; it is only read.
           $s = New-FakeStore -AppId $app -PendingId '1152921505000000007'
           $url = Start-FakeStoreServer -Store $s
           try {
             Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
             $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
-            if ($r.Err -notmatch "already has a pending submission 1152921505000000007" -or $r.Err -notmatch "DELETE $([regex]::Escape($base))/submissions/1152921505000000007 ") { throw "pending submission did not stop the run with delete-by-id guidance" }
-            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base") { throw "calls after the pending check: $(@($s.Log) -join ', ')" }
+            if ($r.Err -notmatch "already has a pending submission 1152921505000000007 for $app\: an uncommitted draft \(status PendingCommit\)" -or
+                $r.Err -notmatch "it does not delete, change or commit draft 1152921505000000007\. A person decides what happens to draft 1152921505000000007\. " -or
+                $r.Err -notmatch "mode=diagnose and submission_id=1152921505000000007 " -or
+                $r.Err -notmatch "If the person decides to discard it: .*DELETE $([regex]::Escape($base))/submissions/1152921505000000007 ") { throw "a pending draft did not stop the run with its id and 'a person decides'" }
+            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nGET $base/submissions/1152921505000000007") { throw "calls after the pending check: $(@($s.Log) -join ', ')" }
+            if ($s.PendingId -cne '1152921505000000007') { throw "the pending draft changed" }
             Assert-NoLeak $r.Text $s
+            Write-Host "pending PendingCommit draft: stopped before create, read only, a person decides"
           } finally { Stop-FakeStoreServer -Store $s }
 
           # 3. Dead port: sign-in and the pending check fail closed, with fixed text.
@@ -510,5 +554,26 @@ jobs:
             if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base`nGET $base/submissions/$id") { throw "calls after the failed read: $(@($s.Log) -join ', ')" }
             Assert-NoLeak $r.Text $s
             Write-Host "read answered HTTP 202: could not verify, no delete or re-run advice"
+          } finally { Stop-FakeStoreServer -Store $s }
+
+          # 11. mode=diagnose on the pending draft whose market price changed:
+          # after the sign-in only GET requests reach the stand-in, nothing
+          # changes, and the differing paths are printed, never the values.
+          $s = New-FakeStore -AppId $app -PendingId '1152921505000000007' -DriftOnPut MarketPrice
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $fields = $s.PendingFields
+            $r = Invoke-Shown { Show-StoreSubmissionDiagnosis -ProductId $app -SubmissionId '1152921505000000007' }
+            if ($r.Err) { throw "diagnose failed against the stand-in" }
+            $got = @($s.Log)
+            Write-Host "calls:`n  $($got -join "`n  ")"
+            if (($got -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nGET $base/submissions/1152921505000000007`nGET $base/submissions/1152921505000000001") { throw "diagnose sent more than the sign-in and three GET requests" }
+            if (@($s.Seen | Where-Object { $_.Line -cnotmatch '^(GET /v1\.0/|POST /tenant-dry-run/oauth2/v2\.0/token$)' }).Count) { throw "a request other than a GET reached the stand-in" }
+            if ($s.PendingId -cne '1152921505000000007' -or $s.PendingFields -cne $fields -or $s.Sub -or $s.Blob) { throw "diagnose changed the stand-in" }
+            if ($r.Text -notmatch '(?m)^pricing sub-fields that differ: pricing\.marketSpecificPricings\.HK, ' -or $r.Text -notmatch '(?m)would stop on pricing\.marketSpecificPricings\.HK$') { throw "diagnose did not name the changed market price" }
+            if ($r.Text -cmatch 'Tier\d|Launch sale|Submission [12]|NoFreeTrial') { throw "diagnose printed a field value" }
+            Assert-NoLeak $r.Text $s
+            Write-Host "diagnose: GET requests only after the sign-in, paths only"
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"

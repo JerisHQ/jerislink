@@ -114,8 +114,18 @@ BeforeAll {
     $p
   }
 
+  # Prices: the fake's priceId, trialPeriod, market and sale prices, and the
+  # ones tests set. None may be printed, by any publish run (Pepper, PR #75
+  # r1: run 45524510567 printed "pricing.priceId=Free is kept as is").
+  # Matched in this case only, so fixed text such as "make the product free"
+  # does not count.
+  $script:PriceValues = '\bFree\b|\bBase\b|\bNotAvailable\b|Tier[0-9]|NoFreeTrial|OneWeek|Launch sale'
+  # Every publish run through this helper, whatever it ends with, is checked
+  # for prices.
   function script:Invoke-Publish([string]$Package) {
-    Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r.All | Should -Not -MatchExactly $PriceValues -Because 'a publish run never prints a price (Pepper, PR #75 r1)'
+    $r
   }
 
   $script:Base = "/v1.0/my/applications/$App"
@@ -704,7 +714,7 @@ Describe 'Strings from the API are printed only when they are plain values' {
   }
   It 'prints no injected priceId' {
     $r = Test-SubmissionPricing -SubmissionJson '{"pricing":{"priceId":"Free\n::error::pwned"}}'
-    $r.Reason | Should -BeExactly 'pricing.priceId=[unlisted] is kept as is'
+    $r.Reason | Should -BeExactly 'pricing.priceId is set and is kept as is (the price is not printed)'
   }
   It 'prints no injected pending submission id' {
     $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1\n::error::pwned`"}}"
@@ -735,7 +745,72 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $s.Sub.status | Should -Be 'Certification'
     $r.Out | Should -Match "created submission id=$NewId \(from the create response\)"
     $r.Out | Should -Match 'package uploaded: Jerislink-0\.4\.1\.0-x64\.msixupload in Upload\.zip \(\d+ bytes\), HTTP 201'
-    $r.Out | Should -Match 'fields unchanged: 20 submission fields other than applicationPackages read back as before the update'
+    $r.Out | Should -Match ([regex]::Escape('fields unchanged: 19 submission fields other than applicationPackages and friendlyName read back as before the update (pricing: priceId, trialPeriod and the market prices; packageDeliveryOptions: all but the package rollout status and fallback submission id Partner Center sets)'))
+    $r.All | Should -Not -Match $Leak
+  }
+
+  # Run 45524510567: after the PUT the real Store gave the draft a new
+  # friendlyName and rearranged pricing (sales emptied, isAdvancedPricingModel
+  # changed, the markets in another order), with the price itself unchanged.
+  # The fake does the same on every PUT; the run must still commit.
+  It 'commits when the Store only renamed the draft and rearranged its pricing after the update (run 45524510567)' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $before = ConvertFrom-Json $s.Fields -AsHashtable
+    @($before.pricing.sales).Count | Should -Be 1
+    $before.pricing.isAdvancedPricingModel | Should -BeFalse
+    @($before.pricing.marketSpecificPricings.Keys) | Should -Be @('HK', 'US', 'GB')
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$NewId/commit"
+    $s.Sub.status | Should -Be 'Certification'
+    # What the fake did to the fields on the PUT.
+    $after = ConvertFrom-Json $s.Fields -AsHashtable
+    $after.friendlyName | Should -BeExactly 'Submission 2 (updated)'
+    @($after.pricing.sales).Count | Should -Be 0
+    $after.pricing.isAdvancedPricingModel | Should -BeTrue
+    @($after.pricing.marketSpecificPricings.Keys) | Should -Be @('GB', 'US', 'HK')
+    $after.pricing.priceId | Should -BeExactly 'Free'
+    $after.pricing.trialPeriod | Should -BeExactly 'NoFreeTrial'
+    $after.pricing.marketSpecificPricings.HK | Should -BeExactly 'Tier2'
+    $r.All | Should -Not -Match $Leak
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2'
+  }
+
+  # Pepper, PR #75 r1: the price check printed the priceId. It prints fixed
+  # text now, and no price (priceId, trialPeriod, a market or sale price) is
+  # printed anywhere in the run (Invoke-Publish checks that for every run).
+  It 'prints no price anywhere in a publish run; the price check line is fixed text (priceId <PriceId>)' -ForEach @(
+    @{ PriceId = 'Free' }, @{ PriceId = 'Tier7' }, @{ PriceId = 'NotAvailable' }
+  ) {
+    $s = New-FakeStore -PriceId $PriceId; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$NewId/commit"
+    $r.Out | Should -Match '(?m)^price check: pricing\.priceId is set and is kept as is \(the price is not printed\)$'
+    $r.All | Should -Not -MatchExactly ([regex]::Escape($PriceId))
+    $r.All | Should -Not -MatchExactly $PriceValues
+  }
+
+  # Partner Center sets packageDeliveryOptions.packageRollout.packageRolloutStatus
+  # and fallbackSubmissionId itself ("Manage app submissions", Package rollout
+  # resource: "assigned by Partner Center, and are not intended to be set by
+  # the developer"). A change of them after the PUT does not stop the run.
+  It 'commits when Partner Center only set its own package rollout fields after the update (packageRolloutStatus, fallbackSubmissionId)' {
+    $s = New-FakeStore -DriftOnPut StoreSetRollout; Use-FakeStore $s
+    $before = ConvertFrom-Json $s.Fields -AsHashtable
+    $before.packageDeliveryOptions.packageRollout.packageRolloutStatus | Should -BeExactly 'PackageRolloutNotStarted'
+    $before.packageDeliveryOptions.packageRollout.fallbackSubmissionId | Should -BeExactly '0'
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$NewId/commit"
+    $s.Sub.status | Should -Be 'Certification'
+    $after = ConvertFrom-Json $s.Fields -AsHashtable
+    $after.packageDeliveryOptions.packageRollout.packageRolloutStatus | Should -BeExactly 'PackageRolloutInProgress'
+    $after.packageDeliveryOptions.packageRollout.fallbackSubmissionId | Should -BeExactly '1152921505000000042'
+    $after.packageDeliveryOptions.packageRollout.packageRolloutPercentage | Should -Be 0
+    $after.packageDeliveryOptions.isMandatoryUpdate | Should -BeFalse
+    $r.Out | Should -Match 'fields unchanged: 19 submission fields'
+    $r.All | Should -Not -MatchExactly 'PackageRollout(NotStarted|InProgress)|1152921505000000042'
     $r.All | Should -Not -Match $Leak
   }
 
@@ -751,13 +826,26 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $new[0].minimumSystemRam | Should -BeExactly 'None'
   }
 
-  # Item r3-2: everything but the packages must read back as it was.
-  It 'stops uncommitted when the update changed <Case>' -ForEach @(
-    @{ Case = 'the pricing'; Drift = 'Pricing'; Field = 'pricing' }, @{ Case = 'the listings (one dropped)'; Drift = 'DropListing'; Field = 'listings' }
+  # Item r3-2: everything but the packages, friendlyName and the pricing
+  # fields the Store rewrites must read back as it was. Each drift comes on
+  # top of the rename and the rearranged pricing (which alone pass).
+  It 'stops uncommitted when the update changed <Case>, and names the path, not the values' -ForEach @(
+    @{ Case = 'the price (priceId)'; Drift = 'Pricing'; Field = 'pricing'; Path = 'pricing.priceId' }
+    @{ Case = 'a market price'; Drift = 'MarketPrice'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.HK' }
+    @{ Case = 'the markets (one added)'; Drift = 'AddMarket'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.JP' }
+    @{ Case = 'the markets (one removed)'; Drift = 'RemoveMarket'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.US' }
+    @{ Case = 'the listings (one dropped)'; Drift = 'DropListing'; Field = 'listings'; Path = 'listings.zh-hk' }
+    # Partner Center also set its own rollout fields; only the field this run
+    # controls is named.
+    @{ Case = 'the package rollout percentage, with the rollout fields Partner Center sets'; Drift = 'RolloutPercentage'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage' }
+    @{ Case = 'the mandatory update setting, with the rollout fields Partner Center sets'; Drift = 'MandatoryUpdate'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.isMandatoryUpdate' }
   ) {
     $s = New-FakeStore -DriftOnPut $Drift; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "submission fields changed after this run's update: $Field\. Only applicationPackages may change"
+    $r.Err | Should -Match ("submission fields changed after this run's update: $Field\. Paths that differ \(values not printed\): " +
+      [regex]::Escape($Path) + '\. Only applicationPackages, friendlyName, the pricing fields other than priceId, trialPeriod and the market ' +
+      'prices, and the package rollout status and fallback submission id Partner Center sets may change')
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2|NoFreeTrial|PackageRollout(NotStarted|InProgress)|1152921505000000042'
     $r.Err | Should -Match "Not committed: draft $NewId stays uncommitted"
     $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
@@ -801,13 +889,49 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $s.Sub.applicationPackages[0].version | Should -Be '0.4.1.0'
   }
 
-  It 'stops before create, and deletes nothing, when a submission is already pending' {
+  # Run 45524510567 left draft 1152921505702498903 PendingCommit. Step 1 still
+  # stops on such a draft and sends nothing to it; it reads its status by id
+  # (one GET) and says a person decides, with the draft id.
+  It 'stops before create on an existing PendingCommit draft: names the draft, says a person decides, sends nothing to it' {
     $s = New-FakeStore -PendingId '1152921505000000007'; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match 'already has a pending submission 1152921505000000007'
-    $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/1152921505000000007 "
+    $r.Err | Should -Match ([regex]::Escape("Partner Center already has a pending submission 1152921505000000007 for ${App}: an uncommitted draft (status PendingCommit). " +
+      'This run did not create it, so it stops and touches nothing: it does not delete, change or commit draft 1152921505000000007. ' +
+      'A person decides what happens to draft 1152921505000000007. To look at it without changing anything, run this workflow with mode=diagnose ' +
+      'and submission_id=1152921505000000007 (GET calls only).'))
+    $r.Err | Should -Match "If the person decides to discard it: .*DELETE /v1\.0/my/applications/$App/submissions/1152921505000000007 "
     $r.Err | Should -Match "Remove-StoreDraftSubmission -ProductId $App -SubmissionId 1152921505000000007"
-    @($s.Log) | Should -Be @("GET $Base")
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/1152921505000000007")
+    $s.PendingId | Should -BeExactly '1152921505000000007'
+    $r.All | Should -Not -Match $Leak
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2'
+  }
+
+  It 'stops before create on a pending submission <Case>: no delete advice, a person decides, sends nothing to it' -ForEach @(
+    @{ Case = 'in certification'; Status = 'Certification'; Shown = 'Certification' }
+    @{ Case = 'in a status not listed'; Status = "Odd`n::error::pwned"; Shown = '[unlisted]' }
+  ) {
+    $s = New-FakeStore -PendingId '1152921505000000007' -PendingStatus $Status; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -Match ([regex]::Escape("Partner Center already has a pending submission 1152921505000000007 for $App (status $Shown, not an uncommitted PendingCommit draft). " +
+      'This run did not create it, so it stops and touches nothing (it never deletes, changes or commits a submission it did not create). ' +
+      'A person decides what happens to submission 1152921505000000007; if it is in certification, let certification finish. ' +
+      'To look at it without changing anything, run this workflow with mode=diagnose and submission_id=1152921505000000007 (GET calls only).'))
+    $r.Err | Should -Not -Match $DeleteAdvice
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/1152921505000000007")
+    $r.All | Should -Not -Match "$Leak|$Injected"
+  }
+
+  It 'stops before create on a pending submission whose status cannot be read: both cases, a person decides, sends nothing to it' {
+    $s = New-FakeStore -PendingId '1152921505000000007'; $s.PresetPendingId = ''; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Out | Should -Match 'the status of pending submission 1152921505000000007 was not read: .*HTTP 404'
+    $r.Err | Should -Match ([regex]::Escape("Partner Center already has a pending submission 1152921505000000007 for $App (its status was not read). " +
+      'This run did not create it, so it stops and touches nothing (it never deletes, changes or commits a submission it did not create). ' +
+      'A person decides what happens to submission 1152921505000000007. To look at it without changing anything'))
+    $r.Err | Should -Match 'If it is in certification, let certification finish\. If it is an uncommitted draft: '
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/1152921505000000007")
+    $r.All | Should -Not -Match $Leak
   }
 
   It 'stops, and deletes nothing, when create is refused because a submission appeared after the check' {
@@ -926,11 +1050,14 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   }
 
   It 'stops uncommitted, before the PUT, when pricing is <Case>' -ForEach @(
-    @{ Case = 'Base'; Opt = @{ PriceId = 'Base' }; Want = "'Base'" }, @{ Case = 'empty'; Opt = @{ PriceId = '' }; Want = 'empty' }, @{ Case = 'missing'; Opt = @{ NoPricing = $true }; Want = 'no pricing' }
+    @{ Case = 'Base'; Opt = @{ PriceId = 'Base' }; Want = 'pricing\.priceId is one the service rejects on PUT \(the price is not printed\)' }
+    @{ Case = 'base'; Opt = @{ PriceId = 'base' }; Want = 'pricing\.priceId is one the service rejects on PUT \(the price is not printed\)' }
+    @{ Case = 'empty'; Opt = @{ PriceId = '' }; Want = 'pricing\.priceId is empty' }, @{ Case = 'missing'; Opt = @{ NoPricing = $true }; Want = 'submission has no pricing' }
   ) {
     $s = New-FakeStore @Opt; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "price check failed: .*$Want"
+    $r.Err | Should -Match "price check failed: $Want"
+    $r.All | Should -Not -Match "'base'|\bbase\b"
     $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
     @($s.Log) | Should -Not -Contain "PUT $Base/submissions/$NewId"
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
@@ -2841,35 +2968,311 @@ Describe 'Compare-SubmissionFields' {
     }
     $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
     $d.Changed | Should -BeNullOrEmpty
-    $d.Compared | Should -Be 20
+    $d.Paths | Should -BeNullOrEmpty
+    $d.Compared | Should -Be 19
+  }
+
+  # Run 45524510567: what the real Store did to the draft after the PUT. None
+  # of it is a change this run must stop on.
+  It 'reports nothing when the Store only <Case>' -ForEach @(
+    @{ Case = 'renamed the draft (friendlyName)'; Change = { param($n) $n['friendlyName'] = [System.Text.Json.Nodes.JsonValue]::Create('Submission 2 (updated)') } }
+    @{ Case = 'dropped friendlyName'; Change = { param($n) [void]$n.Remove('friendlyName') } }
+    @{ Case = 'emptied pricing.sales'; Change = { param($n) $n['pricing']['sales'] = [System.Text.Json.Nodes.JsonArray]::new() } }
+    @{ Case = 'dropped pricing.sales'; Change = { param($n) [void]$n['pricing'].AsObject().Remove('sales') } }
+    @{ Case = 'changed pricing.isAdvancedPricingModel'; Change = { param($n) $n['pricing']['isAdvancedPricingModel'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'dropped pricing.isAdvancedPricingModel'; Change = { param($n) [void]$n['pricing'].AsObject().Remove('isAdvancedPricingModel') } }
+    @{ Case = 'put the markets in another order'; Change = {
+        param($n)
+        $m = [System.Text.Json.Nodes.JsonObject]::new()
+        foreach ($c in 'US', 'GB', 'HK') { $m[$c] = [System.Text.Json.Nodes.JsonValue]::Create([string]$n['pricing']['marketSpecificPricings'][$c]) }
+        $n['pricing']['marketSpecificPricings'] = $m
+      } }
+    @{ Case = 'put the pricing fields in another order'; Change = {
+        param($n)
+        $old = $n['pricing'].ToJsonString() | ConvertFrom-Json -AsHashtable
+        $p = [System.Text.Json.Nodes.JsonObject]::new()
+        foreach ($k in @($old.Keys | Sort-Object -Descending)) { $p[$k] = [System.Text.Json.Nodes.JsonNode]::Parse((ConvertTo-Json -Compress -Depth 9 -InputObject $old[$k])) }
+        $n['pricing'] = $p
+      } }
+    # Partner Center sets these two itself ("Manage app submissions", Package
+    # rollout resource).
+    @{ Case = 'set packageDeliveryOptions.packageRollout.packageRolloutStatus'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress') } }
+    @{ Case = 'set packageDeliveryOptions.packageRollout.fallbackSubmissionId'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000042') } }
+    @{ Case = 'dropped both package rollout fields Partner Center sets'; Change = { param($n) foreach ($k in 'packageRolloutStatus', 'fallbackSubmissionId') { [void]$n['packageDeliveryOptions']['packageRollout'].AsObject().Remove($k) } } }
+    @{ Case = 'set both package rollout fields, as the fake Store does with StoreSetRollout'; Change = {
+        param($n)
+        $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+        $f = [System.Text.Json.Nodes.JsonNode]::Parse((Edit-FakeFieldsOnPut ([System.Text.Json.Nodes.JsonNode]::Parse($n.ToJsonString(), $o)) 'Submission 2' 'StoreSetRollout'), $o)
+        $n['packageDeliveryOptions'] = [System.Text.Json.Nodes.JsonNode]::Parse($f['packageDeliveryOptions'].ToJsonString())
+      } }
+    @{ Case = 'renamed the draft and rearranged pricing, as the fake Store does on every PUT'; Change = {
+        param($n)
+        $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+        $f = [System.Text.Json.Nodes.JsonNode]::Parse((Edit-FakeFieldsOnPut ([System.Text.Json.Nodes.JsonNode]::Parse($n.ToJsonString(), $o)) 'Submission 2' ''), $o)
+        foreach ($k in 'friendlyName', 'pricing') { $n[$k] = [System.Text.Json.Nodes.JsonNode]::Parse($f[$k].ToJsonString()) }
+      } }
+  ) {
+    $after = Edit-Submission $Change
+    $after | Should -Not -BeExactly $Before
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
+    $d.Changed | Should -BeNullOrEmpty
+    $d.Paths | Should -BeNullOrEmpty
+  }
+
+  # A real change of the price still stops the run, by path, never by value;
+  # each also with the Store's rename and rearranged pricing on top.
+  It 'reports pricing at <Path> when <Case> (<Rearranged>)' -ForEach @(
+    foreach ($re in 'as sent', 'renamed and rearranged too') {
+      @{ Case = 'priceId changed'; Path = 'pricing.priceId'; Rearranged = $re; Change = { param($n) $n['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') } }
+      @{ Case = 'priceId is gone'; Path = 'pricing.priceId'; Rearranged = $re; Change = { param($n) [void]$n['pricing'].AsObject().Remove('priceId') } }
+      @{ Case = 'trialPeriod changed'; Path = 'pricing.trialPeriod'; Rearranged = $re; Change = { param($n) $n['pricing']['trialPeriod'] = [System.Text.Json.Nodes.JsonValue]::Create('OneWeek') } }
+      @{ Case = 'a market price changed'; Path = 'pricing.marketSpecificPricings.HK'; Rearranged = $re; Change = { param($n) $n['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Free') } }
+      @{ Case = 'a market was added'; Path = 'pricing.marketSpecificPricings.JP'; Rearranged = $re; Change = { param($n) $n['pricing']['marketSpecificPricings']['JP'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier2') } }
+      @{ Case = 'a market was removed'; Path = 'pricing.marketSpecificPricings.US'; Rearranged = $re; Change = { param($n) [void]$n['pricing']['marketSpecificPricings'].AsObject().Remove('US') } }
+      @{ Case = 'the market prices are not an object'; Path = 'pricing.marketSpecificPricings'; Rearranged = $re; Change = { param($n) $n['pricing']['marketSpecificPricings'] = [System.Text.Json.Nodes.JsonArray]::new() } }
+      @{ Case = 'the market prices are gone'; Path = 'pricing.marketSpecificPricings'; Rearranged = $re; Change = { param($n) [void]$n['pricing'].AsObject().Remove('marketSpecificPricings') } }
+    }
+  ) {
+    $re = $Rearranged; $edit = $Change
+    $after = Edit-Submission {
+      param($n)
+      if ($re -ceq 'renamed and rearranged too') {
+        $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+        $f = [System.Text.Json.Nodes.JsonNode]::Parse((Edit-FakeFieldsOnPut ([System.Text.Json.Nodes.JsonNode]::Parse($n.ToJsonString(), $o)) 'Submission 2' ''), $o)
+        foreach ($k in 'friendlyName', 'pricing') { $n[$k] = [System.Text.Json.Nodes.JsonNode]::Parse($f[$k].ToJsonString()) }
+      }
+      & $edit $n
+    }.GetNewClosure()
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
+    @($d.Changed) | Should -Be @('pricing')
+    @($d.Paths) | Should -Be @($Path)
+  }
+
+  It 'reports pricing when pricing is <Case>' -ForEach @(
+    @{ Case = 'null'; Change = { param($n) $n['pricing'] = $null } }
+    @{ Case = 'gone'; Change = { param($n) [void]$n.Remove('pricing') } }
+    @{ Case = 'a list'; Change = { param($n) $n['pricing'] = [System.Text.Json.Nodes.JsonNode]::Parse('[{"priceId":"Free"}]') } }
+  ) {
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson (Edit-Submission $Change)
+    @($d.Changed) | Should -Be @('pricing')
+    @($d.Paths) | Should -Be @('pricing')
+  }
+
+  It 'names every path that differs, values never (several changes at once)' {
+    $after = Edit-Submission {
+      param($n)
+      $n['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier7')
+      $n['pricing']['marketSpecificPricings']['GB'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier9')
+      $n['listings']['en-us']['baseListing']['title'] = [System.Text.Json.Nodes.JsonValue]::Create('Planted title value')
+      $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate')
+    }
+    $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
+    @($d.Changed | Sort-Object) | Should -Be @('listings', 'pricing', 'targetPublishMode')
+    @($d.Paths | Sort-Object) | Should -Be @('listings.en-us.baseListing.title', 'pricing.marketSpecificPricings.GB', 'pricing.priceId', 'targetPublishMode')
+    ($d.Paths -join ' ') | Should -Not -Match 'Tier|Planted|Immediate|Free|Manual'
   }
   It 'reports nothing for other key order and key case' {
     $after = '{"Trailers":[],' + $Before.Substring(1).Replace('"pricing"', '"Pricing"')
     $after = $after.Replace(',"trailers":[]', '')
     (Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after).Changed | Should -BeNullOrEmpty
   }
-  It 'reports <Field> when <Case>' -ForEach @(
-    @{ Case = 'the price changed'; Field = 'pricing'; Change = { param($n) $n['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') } }
-    @{ Case = 'a market price changed'; Field = 'pricing'; Change = { param($n) $n['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Free') } }
-    @{ Case = 'a listing was dropped'; Field = 'listings'; Change = { param($n) [void]$n['listings'].AsObject().Remove('zh-hk') } }
-    @{ Case = 'a listing title changed'; Field = 'listings'; Change = { param($n) $n['listings']['en-us']['baseListing']['title'] = [System.Text.Json.Nodes.JsonValue]::Create('X') } }
-    @{ Case = 'visibility is gone'; Field = 'visibility'; Change = { param($n) [void]$n.Remove('visibility') } }
-    @{ Case = 'the publish mode changed'; Field = 'targetPublishMode'; Change = { param($n) $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate') } }
-    @{ Case = 'the publish date changed'; Field = 'targetPublishDate'; Change = { param($n) $n['targetPublishDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00Z') } }
-    @{ Case = 'a device family changed'; Field = 'allowTargetFutureDeviceFamilies'; Change = { param($n) $n['allowTargetFutureDeviceFamilies']['Xbox'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
-    @{ Case = 'a listed field was added'; Field = 'fallbackSubmissionId'; Change = { param($n) $n['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
-    @{ Case = 'a listed field was added in another case'; Field = 'fallbackSubmissionId'; Change = { param($n) $n['FALLBACKSUBMISSIONID'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
-    @{ Case = 'a field not listed here was added'; Field = '[unlisted field name]'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
-    @{ Case = 'a field named like a token was added'; Field = '[unlisted field name]'; Change = { param($n) $n['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
-    @{ Case = 'a field with an odd name was added'; Field = '[unlisted field name]'; Change = { param($n) $n["x`n::error::pwned"] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+  It 'reports <Field> at <Path> when <Case>' -ForEach @(
+    @{ Case = 'the price changed'; Field = 'pricing'; Path = 'pricing.priceId'; Change = { param($n) $n['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') } }
+    @{ Case = 'a market price changed'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.HK'; Change = { param($n) $n['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Free') } }
+    @{ Case = 'a listing was dropped'; Field = 'listings'; Path = 'listings.zh-hk'; Change = { param($n) [void]$n['listings'].AsObject().Remove('zh-hk') } }
+    @{ Case = 'a listing title changed'; Field = 'listings'; Path = 'listings.en-us.baseListing.title'; Change = { param($n) $n['listings']['en-us']['baseListing']['title'] = [System.Text.Json.Nodes.JsonValue]::Create('X') } }
+    @{ Case = 'visibility is gone'; Field = 'visibility'; Path = 'visibility'; Change = { param($n) [void]$n.Remove('visibility') } }
+    @{ Case = 'the publish mode changed'; Field = 'targetPublishMode'; Path = 'targetPublishMode'; Change = { param($n) $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate') } }
+    @{ Case = 'the publish date changed'; Field = 'targetPublishDate'; Path = 'targetPublishDate'; Change = { param($n) $n['targetPublishDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00Z') } }
+    @{ Case = 'a device family changed'; Field = 'allowTargetFutureDeviceFamilies'; Path = 'allowTargetFutureDeviceFamilies.[unlisted field name]'; Change = { param($n) $n['allowTargetFutureDeviceFamilies']['Xbox'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    # packageDeliveryOptions is what the PUT sends: all of it but the two
+    # rollout fields Partner Center sets is compared, and only where the docs
+    # put those two.
+    @{ Case = 'isPackageRollout changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.isPackageRollout'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['isPackageRollout'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'packageRolloutPercentage changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['packageRolloutPercentage'] = [System.Text.Json.Nodes.JsonValue]::Create(50.0) } }
+    @{ Case = 'packageRolloutPercentage changed, and Partner Center set its rollout fields too'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage'; Change = {
+        param($n)
+        $r = $n['packageDeliveryOptions']['packageRollout']
+        $r['packageRolloutPercentage'] = [System.Text.Json.Nodes.JsonValue]::Create(50.0); $r['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress'); $r['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000042')
+      } }
+    @{ Case = 'isMandatoryUpdate changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.isMandatoryUpdate'; Change = { param($n) $n['packageDeliveryOptions']['isMandatoryUpdate'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'mandatoryUpdateEffectiveDate changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.mandatoryUpdateEffectiveDate'; Change = { param($n) $n['packageDeliveryOptions']['mandatoryUpdateEffectiveDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00.0000000Z') } }
+    @{ Case = 'packageRollout is gone'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout'; Change = { param($n) [void]$n['packageDeliveryOptions'].AsObject().Remove('packageRollout') } }
+    @{ Case = 'packageRollout is not an object'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout'] = [System.Text.Json.Nodes.JsonArray]::new() } }
+    @{ Case = 'packageRolloutStatus was added outside packageRollout'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRolloutStatus'; Change = { param($n) $n['packageDeliveryOptions']['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress') } }
+    @{ Case = 'a listed field was added'; Field = 'fallbackSubmissionId'; Path = 'fallbackSubmissionId'; Change = { param($n) $n['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
+    @{ Case = 'a listed field was added in another case'; Field = 'fallbackSubmissionId'; Path = 'fallbackSubmissionId'; Change = { param($n) $n['FALLBACKSUBMISSIONID'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
+    @{ Case = 'a field not listed here was added'; Field = '[unlisted field name]'; Path = '[unlisted field name]'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a field named like a token was added'; Field = '[unlisted field name]'; Path = '[unlisted field name]'; Change = { param($n) $n['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
+    @{ Case = 'a field with an odd name was added'; Field = '[unlisted field name]'; Path = '[unlisted field name]'; Change = { param($n) $n["x`n::error::pwned"] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
   ) {
     $after = Edit-Submission $Change
     $d = Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson $after
     @($d.Changed) | Should -Be @($Field)
+    @($d.Paths) | Should -Be @($Path)
   }
   It 'throws on JSON that is not an object' {
     { Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson 'Error' } | Should -Throw '*not an object*'
     { Compare-SubmissionFields -ExpectedJson $Kept -SubmissionJson '[1]' } | Should -Throw '*not an object*'
+  }
+}
+
+# mode=diagnose (msstore-publish.yml): Show-StoreSubmissionDiagnosis reads the
+# app, the named submission and the last published submission, by GET only,
+# and prints which friendlyName and pricing sub-fields (and other fields)
+# differ, as paths, never values.
+Describe 'Show-StoreSubmissionDiagnosis (mode=diagnose, read-only)' {
+  BeforeAll {
+    $script:Mod = Get-Module MsStoreRunner
+    $script:Draft = '1152921505000000007'
+    $script:Published = '1152921505000000001'
+    # Values in the fake's fields; none may be printed.
+    $script:Values = 'Tier\d|Launch sale|Submission [12]|NoFreeTrial|"Free"|JerisLink remote desktop|PackageRollout(NotStarted|InProgress)|1152921505000000042'
+  }
+  AfterEach { & $Mod { $script:ReadOnlyCalls = $false }; Remove-Variable -Name DiagWrite -Scope Global -ErrorAction Ignore }
+
+  # The proof that diagnose is read-only: every call it makes, in every case
+  # (it passes, it finds drift, there is nothing published, a read fails), is
+  # a GET to the Store API; no POST, PUT or DELETE reaches Invoke-StoreHttp,
+  # and the fake Store is left exactly as it was.
+  It 'sends only GET calls to the Store API, never a write (<Case>)' -ForEach @(
+    @{ Case = 'the draft run 45524510567 left: renamed, pricing rearranged'; Opt = @{ PendingId = '1152921505000000007' }; Id = '1152921505000000007'; Fails = $false }
+    @{ Case = 'a draft whose price changed'; Opt = @{ PendingId = '1152921505000000007'; DriftOnPut = 'Pricing' }; Id = '1152921505000000007'; Fails = $false }
+    @{ Case = 'a draft that lost a market'; Opt = @{ PendingId = '1152921505000000007'; DriftOnPut = 'RemoveMarket' }; Id = '1152921505000000007'; Fails = $false }
+    @{ Case = 'a pending submission in certification'; Opt = @{ PendingId = '1152921505000000007'; PendingStatus = 'Certification' }; Id = '1152921505000000007'; Fails = $false }
+    @{ Case = 'nothing published yet'; Opt = @{ PendingId = '1152921505000000007'; NoPublished = $true }; Id = '1152921505000000007'; Fails = $false }
+    @{ Case = 'the last published submission itself'; Opt = @{}; Id = '1152921505000000001'; Fails = $false }
+    @{ Case = 'a submission that does not exist'; Opt = @{ PendingId = '1152921505000000007' }; Id = '1152921505000000555'; Fails = $true }
+    @{ Case = 'the app read fails'; Opt = @{ PendingId = '1152921505000000007'; FailReadOn = 'AppRead'; FailReadStatus = 500 }; Id = '1152921505000000007'; Fails = $true }
+    @{ Case = 'the read of the last published submission fails'; Opt = @{ PendingId = '1152921505000000007'; FailReadOn = 'SubmissionRead'; FailReadAt = 2; FailReadStatus = 503 }; Id = '1152921505000000007'; Fails = $true }
+  ) {
+    $s = New-FakeStore @Opt; Use-FakeStore $s
+    $fields = $s.Fields; $pending = $s.PendingId
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Id }
+    if ($Fails) { $r.Err | Should -Not -BeNullOrEmpty } else { $r.Err | Should -BeNullOrEmpty }
+    @($s.Calls).Count | Should -BeGreaterThan 0
+    foreach ($c in @($s.Calls)) { $c | Should -Match '^GET /v1\.0/my/applications/9NM3VWQ9MD7N(/submissions/\d+)? timeout=\d+$' }
+    foreach ($l in @($s.Log)) { $l | Should -Match '^GET ' }
+    # The one sign-in is the test's own (Use-FakeStore), before diagnose runs.
+    Should -Invoke Invoke-StoreHttp -ModuleName MsStoreRunner -Times 1 -Exactly -ParameterFilter { $Kind -ceq 'Token' }
+    Should -Invoke Invoke-StoreHttp -ModuleName MsStoreRunner -Times 0 -Exactly -ParameterFilter { $Kind -cne 'Token' -and ($Method -cne 'GET' -or $Kind -cne 'Api') }
+    $s.Sub | Should -BeNullOrEmpty
+    $s.Fields | Should -BeExactly $fields
+    $s.PendingId | Should -BeExactly $pending
+    $s.Blob | Should -BeNullOrEmpty
+    & $Mod { $script:ReadOnlyCalls } | Should -BeFalse
+    $r.All | Should -Not -Match $Leak
+    $r.All | Should -Not -MatchExactly $Values
+  }
+
+  # The guard behind that proof: while diagnose runs, a write is refused
+  # before it is sent, even if a later change made diagnose ask for one.
+  It 'refuses a <Method> that diagnose asks for, before it is sent, and touches nothing' -ForEach @(
+    @{ Method = 'POST'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007/commit' }
+    @{ Method = 'PUT'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }
+    @{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }
+  ) {
+    $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
+    $global:DiagWrite = @{ Method = $Method; Path = $Path }
+    Mock -ModuleName MsStoreRunner Get-DiagnosedSubmission {
+      & (Get-Module MsStoreRunner) { param($m, $p) Invoke-StoreApi -Method $m -Path $p -Body '{}' } $global:DiagWrite.Method $global:DiagWrite.Path
+    }
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Draft }
+    $r.Err | Should -BeExactly "Store API $Method /v1.0/my/$Path refused: this is a read-only run (GET calls only); nothing was sent"
+    @($s.Calls) | Should -Be @("GET $Base timeout=60")
+    Should -Invoke Invoke-StoreHttp -ModuleName MsStoreRunner -Times 0 -Exactly -ParameterFilter { $Kind -cne 'Token' -and $Method -cne 'GET' }
+    $s.PendingId | Should -BeExactly $Draft
+    & $Mod { $script:ReadOnlyCalls } | Should -BeFalse
+  }
+
+  # The second guard, in the real Invoke-StoreHttp (no mock): in a read-only
+  # run only a GET to the Store API goes out; anything else is refused before
+  # a connection is made.
+  It 'the real Invoke-StoreHttp refuses <Method> <Kind> in a read-only run, before anything is sent' -ForEach @(
+    @{ Method = 'POST'; Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N/submissions' }
+    @{ Method = 'PUT'; Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }
+    @{ Method = 'DELETE'; Kind = 'Api'; Uri = 'https://manage.devcenter.microsoft.com/v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }
+    @{ Method = 'POST'; Kind = 'Token'; Uri = 'https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token' }
+    @{ Method = 'PUT'; Kind = 'Upload'; Uri = 'https://jlfakeupload.blob.core.windows.net/c/upload.zip' }
+    @{ Method = 'GET'; Kind = 'Upload'; Uri = 'https://jlfakeupload.blob.core.windows.net/c/upload.zip' }
+  ) {
+    $e = $null
+    try { & $Mod { param($m, $k, $u) $script:ReadOnlyCalls = $true; try { Invoke-StoreHttp -Method $m -Uri $u -Kind $k -TimeoutSec 1 } finally { $script:ReadOnlyCalls = $false } } $Method $Kind $Uri }
+    catch { $e = $_ }
+    "$e" | Should -BeExactly 'refused: this is a read-only run (GET calls to the Store API only); nothing was sent'
+    $e.Exception.Data['StoreNotSent'] | Should -BeTrue
+  }
+
+  It 'leaves the read-only guard off after it ends, so a publish run is not changed by it' {
+    $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
+    (Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId '1152921505000000555' }).Err | Should -Match 'HTTP 404'
+    & $Mod { $script:ReadOnlyCalls } | Should -BeFalse
+    $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
+    (Invoke-Captured { Invoke-SubmissionCommit -ProductId $App -SubmissionId $SubId }).Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$SubId/commit"
+  }
+
+  It 'prints which friendlyName and pricing sub-fields differ, by path, never the values (<Case>)' -ForEach @(
+    @{ Case = 'the draft run 45524510567 left: renamed, pricing rearranged'; Drift = ''; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would pass' }
+    @{ Case = 'and its price changed'; Drift = 'Pricing'; Pricing = 'pricing.sales, pricing.priceId, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.priceId' }
+    @{ Case = 'and a market price changed'; Drift = 'MarketPrice'; Pricing = 'pricing.marketSpecificPricings.HK, pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.marketSpecificPricings.HK' }
+    @{ Case = 'and a market was added'; Drift = 'AddMarket'; Pricing = 'pricing.marketSpecificPricings.JP, pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.marketSpecificPricings.JP' }
+    @{ Case = 'and a market was removed'; Drift = 'RemoveMarket'; Pricing = 'pricing.marketSpecificPricings.US, pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.marketSpecificPricings.US' }
+    @{ Case = 'and a listing was dropped'; Drift = 'DropListing'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'; Other = 'listings.zh-hk'; Check = 'would stop on listings.zh-hk' }
+    # Diagnose shows the rollout fields Partner Center sets; the publish run's
+    # check does not stop on them.
+    @{ Case = 'and Partner Center set its package rollout fields'; Drift = 'StoreSetRollout'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'
+      Other = 'packageDeliveryOptions.packageRollout.packageRolloutStatus, packageDeliveryOptions.packageRollout.fallbackSubmissionId'; Check = 'would pass' }
+    @{ Case = 'and the rollout percentage changed too'; Drift = 'RolloutPercentage'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'
+      Other = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage, packageDeliveryOptions.packageRollout.packageRolloutStatus, packageDeliveryOptions.packageRollout.fallbackSubmissionId'
+      Check = 'would stop on packageDeliveryOptions.packageRollout.packageRolloutPercentage' }
+  ) {
+    $s = New-FakeStore -PendingId $Draft -DriftOnPut $Drift; Use-FakeStore $s
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Draft }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Out | Should -BeExactly (@(
+      'diagnose (read-only): GET calls only; nothing is created, changed, committed or deleted'
+      "app ${App}: pending submission $Draft, last published submission $Published"
+      "submission ${Draft}: status PendingCommit"
+      "last published submission ${Published}: status Published"
+      "compared last published submission $Published with submission $Draft (field paths only, values not printed)"
+      'friendlyName: differs'
+      "pricing sub-fields that differ: $Pricing"
+      "other fields that differ (applicationPackages not compared): $Other"
+      "the publish run's field check (Compare-SubmissionFields; last published as before, submission $Draft as after): $Check"
+      'diagnose done: GET calls only; nothing was created, changed, committed or deleted') -join "`n")
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/$Draft", "GET $Base/submissions/$Published")
+    $r.All | Should -Not -Match $Leak
+    $r.All | Should -Not -MatchExactly $Values
+  }
+
+  It 'says friendlyName is the same and nothing differs for the last published submission itself, and notes it is not pending' {
+    $s = New-FakeStore; Use-FakeStore $s
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Published }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Out | Should -Match "app ${App}: pending submission \[none\], last published submission $Published"
+    $r.Out | Should -Match "note: submission $Published is not the app's pending submission"
+    $r.Out | Should -Match '(?m)^friendlyName: same$'
+    $r.Out | Should -Match '(?m)^pricing sub-fields that differ: none$'
+    $r.Out | Should -Match '(?m)^other fields that differ \(applicationPackages not compared\): none$'
+    $r.Out | Should -Match '(?m)would pass$'
+  }
+
+  It 'reads the draft and says there is nothing to compare with when nothing is published' {
+    $s = New-FakeStore -PendingId $Draft -NoPublished; Use-FakeStore $s
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Draft }
+    $r.Err | Should -BeNullOrEmpty
+    $r.Out | Should -Match "pending submission $Draft, last published submission \[none\]"
+    $r.Out | Should -Match 'no last published submission with a usable id: nothing to compare submission fields with'
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/$Draft")
+  }
+
+  It 'stops with fixed text, and sends nothing, for a submission id that is not a number' {
+    $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId "1/../2`n::error::pwned" }
+    $r.Err | Should -Match 'not a number'
+    @($s.Calls) | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match $Injected
   }
 }
 
@@ -2997,6 +3400,51 @@ Describe 'Assert-SubmissionHasPackage (fake Store)' {
 # The real HTTP path (Invoke-StoreHttp is not mocked) against the fake Store
 # served on 127.0.0.1, signed in with -LoopbackTestServer.
 Describe 'HTTP path (fake Store on 127.0.0.1)' {
+  BeforeAll {
+    # The run script of the diagnose job's step (id: diagnose) in
+    # msstore-publish.yml, dedented, exactly as the job runs it.
+    $lines = @(Get-Content -LiteralPath (Join-Path $PSScriptRoot '..' '..' 'workflows' 'msstore-publish.yml'))
+    $at = [array]::IndexOf($lines, '        id: diagnose')
+    if ($at -lt 0) { throw 'msstore-publish.yml has no step with id diagnose' }
+    while ($lines[$at] -cne '        run: |') { $at++ }
+    $body = [System.Collections.Generic.List[string]]::new()
+    for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+      $l = $lines[$i]
+      if ($l.Trim() -and -not $l.StartsWith('          ')) { break }
+      $body.Add($(if ($l.Length -ge 10) { $l.Substring(10) } else { '' }))
+    }
+    $script:DiagnoseStep = $body -join "`n"
+    # Runs that script as GitHub's pwsh shell does ($ErrorActionPreference
+    # Stop), from the repository root, with the step's environment variables.
+    # The one change: its Connect-StoreApi call also gets this server as the
+    # sign-in and API host (-LoopbackTestServer); every other call is as written.
+    function script:Invoke-DiagnoseJobStep([string]$SubmissionId) {
+      $names = 'SUBMISSION_ID', 'STORE_PRODUCT_ID', 'PC_TENANT_ID', 'PC_CLIENT_ID', 'PC_CLIENT_SECRET'
+      $saved = @{}; foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+      $global:DiagnoseUrl = $Url; $global:DiagnoseStepScript = $DiagnoseStep
+      Push-Location (Join-Path $PSScriptRoot '..' '..' '..')
+      try {
+        [Environment]::SetEnvironmentVariable('SUBMISSION_ID', $SubmissionId)
+        [Environment]::SetEnvironmentVariable('STORE_PRODUCT_ID', $App)
+        [Environment]::SetEnvironmentVariable('PC_TENANT_ID', 'tenant-1')
+        [Environment]::SetEnvironmentVariable('PC_CLIENT_ID', 'client-1')
+        [Environment]::SetEnvironmentVariable('PC_CLIENT_SECRET', $Secret)
+        Invoke-Captured {
+          & {
+            $ErrorActionPreference = 'Stop'
+            function Connect-StoreApi([string]$TenantId, [string]$ClientId, [string]$ClientSecret) {
+              MsStoreRunner\Connect-StoreApi -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -AuthorityHost $global:DiagnoseUrl -ApiBase $global:DiagnoseUrl -LoopbackTestServer
+            }
+            . ([scriptblock]::Create($global:DiagnoseStepScript))
+          }
+        }
+      } finally {
+        Pop-Location
+        foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+        Remove-Variable -Name DiagnoseUrl, DiagnoseStepScript -Scope Global -ErrorAction SilentlyContinue
+      }
+    }
+  }
   BeforeEach {
     $script:Pkg = New-TestPackage
     $o = if ($Opt) { $Opt } else { @{} }
@@ -3053,6 +3501,56 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match "GET $([regex]::Escape($Base)) failed: HTTP 302"
     @($Srv.Log) | Should -Not -Match '/redirected/'
+  }
+  # mode=diagnose over real HTTP: what reached the server is the sign-in and
+  # GET requests only (the server's own log of every request it read).
+  It 'diagnose sends only GET requests over HTTP after the sign-in, and the server is left as it was' -ForEach @(@{ Opt = @{ PendingId = '1152921505000000007'; DriftOnPut = 'MarketPrice' } }) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $fields = $Srv.Fields
+    $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId '1152921505000000007' }
+    $r.Err | Should -BeNullOrEmpty
+    $want = @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "GET $Base/submissions/1152921505000000007", "GET $Base/submissions/1152921505000000001")
+    @($Srv.Log) | Should -Be $want
+    @($Srv.Seen | ForEach-Object { $_.Line }) | Should -Be $want
+    $r.Out | Should -Match '(?m)^pricing sub-fields that differ: pricing\.marketSpecificPricings\.HK, pricing\.sales, pricing\.isAdvancedPricingModel$'
+    $r.Out | Should -Match '(?m)would stop on pricing\.marketSpecificPricings\.HK$'
+    $Srv.PendingId | Should -BeExactly '1152921505000000007'
+    $Srv.Fields | Should -BeExactly $fields
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))"
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission [12]|NoFreeTrial'
+  }
+  # The diagnose job's own step script (msstore-publish.yml), run as written
+  # against this server: after the sign-in, GET requests only.
+  It 'the diagnose job of msstore-publish.yml, its step run as written, sends only GET requests after the sign-in and changes nothing' -ForEach @(@{ Opt = @{ PendingId = '1152921505000000007'; DriftOnPut = 'MarketPrice' } }) {
+    $fields = $Srv.PendingFields
+    $r = Invoke-DiagnoseJobStep '1152921505000000007'
+    $r.Err | Should -BeNullOrEmpty
+    $want = @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "GET $Base/submissions/1152921505000000007", "GET $Base/submissions/1152921505000000001")
+    @($Srv.Log) | Should -Be $want
+    @($Srv.Seen | ForEach-Object { $_.Line }) | Should -Be $want
+    $r.Out | Should -Match '(?m)^diagnose \(read-only\): GET calls only; nothing is created, changed, committed or deleted$'
+    $r.Out | Should -Match '(?m)^submission 1152921505000000007: status PendingCommit$'
+    $r.Out | Should -Match '(?m)would stop on pricing\.marketSpecificPricings\.HK$'
+    $r.Out | Should -Match '(?m)^diagnose done: GET calls only; nothing was created, changed, committed or deleted$'
+    $Srv.PendingId | Should -BeExactly '1152921505000000007'
+    $Srv.PendingFields | Should -BeExactly $fields
+    $Srv.Sub | Should -BeNullOrEmpty
+    $Srv.Blob | Should -BeNullOrEmpty
+    $r.All | Should -Not -Match "$Leak|$([regex]::Escape($Srv.Token))|$([regex]::Escape($Url))"
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission [12]|NoFreeTrial'
+  }
+  It 'the diagnose job of msstore-publish.yml stops before the sign-in, sending nothing, when submission_id is <Case>' -ForEach @(
+    @{ Case = 'empty'; Id = '' }
+    @{ Case = 'not digits'; Id = '1152921505000000007; Remove-Item x' }
+    @{ Case = 'more than 20 digits'; Id = '1' * 21 }
+    @{ Case = 'digits and a newline'; Id = "1152921505000000007`n" }
+    @{ Case = 'digits in another script'; Id = '١١٥٢' }
+  ) {
+    $r = Invoke-DiagnoseJobStep $Id
+    $r.Err | Should -BeExactly 'submission_id must be a number'
+    $r.Out | Should -BeNullOrEmpty
+    @($Srv.Log).Count | Should -Be 0
+    @($Srv.Seen).Count | Should -Be 0
   }
   # Run 45185550541 over HTTP: the create gets a 400 whose message carries secrets, advice and commands.
   It 'prints the listed target and the hint, not the message, of a create refused with HTTP 400, sends the query, deletes nothing' -ForEach @(@{ Opt = @{ CreateErrorStatus = 400 } }) {
@@ -4263,7 +4761,7 @@ Describe 'Store answers are read only as one strict JSON object, every signature
     @{ Case = 'priceId twice, in another case'; Json = '{"pricing":{"PriceId":"Base","priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
     @{ Case = 'the answer in a list'; Json = '[{"pricing":{"priceId":"Tier1"}}]'; Result = 'Unread'; Reason = '<unread>' }
     @{ Case = 'text before it'; Json = 'Answer: {"pricing":{"priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
-    @{ Case = 'one JSON object (the control)'; Json = '{"pricing":{"priceId":"Tier1"}}'; Result = 'Pass'; Reason = 'pricing.priceId=Tier1 is kept as is' }
+    @{ Case = 'one JSON object (the control)'; Json = '{"pricing":{"priceId":"Tier1"}}'; Result = 'Pass'; Reason = 'pricing.priceId is set and is kept as is (the price is not printed)' }
   ) {
     $r = Test-SubmissionPricing -SubmissionJson $Json
     $r.Result | Should -Be $Result -Because '[result]'
@@ -4299,15 +4797,21 @@ Describe 'Store answers are read only as one strict JSON object, every signature
       }
       $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}')
     }.GetNewClosure()) })
-    $x.Log | Should -Be @("GET $Base") -Because '[sent]'
     if ($Where -ceq 'another field') {
-      $want = ("Partner Center already has a pending submission $R10Sig for $App. This run did not create it, " +
-        "so it stops and touches nothing (it never deletes a submission it did not create). $ApiNote " +
+      # The usable id: one more GET, of that submission by its id, for its
+      # status (the fake has no such submission: HTTP 404, status not read).
+      $x.Log | Should -Be @("GET $Base", "GET $Base/submissions/$R10Sig") -Because '[sent]'
+      $want = ("Partner Center already has a pending submission $R10Sig for $App (its status was not read). This run did not create it, " +
+        "so it stops and touches nothing (it never deletes, changes or commits a submission it did not create). " +
+        "A person decides what happens to submission $R10Sig. To look at it without changing anything, run this workflow with " +
+        "mode=diagnose and submission_id=$R10Sig (GET calls only). $ApiNote " +
         "If it is in certification, let certification finish. If it is an uncommitted draft: " + (& $Mod { param($a, $b) Get-DeleteByIdText $a $b } $App $R10Sig))
       $x.R.Err | Should -BeExactly $want
+      $x.R.Out | Should -Match "the status of pending submission $R10Sig was not read: "
       $x.R.All | Should -Not -Match "\[redacted\]|$Leak|r10-planted" -Because '[printed]'
       $x.R.Out | Should -Not -Match 'verified submission' -Because '[verified]'
     } else {
+      $x.Log | Should -Be @("GET $Base") -Because '[sent]'
       $x.R.Err | Should -BeExactly ("Partner Center already has a pending submission (no usable id) for $App. This run did not create it, " +
         "so it stops and touches nothing. Check GET /v1.0/my/applications/$App before doing anything. $ApiNote")
       Assert-R10Safe $x
