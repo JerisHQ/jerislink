@@ -29,20 +29,38 @@ name: msstore-publish
 # - Approving means shipping. Everything after approval goes straight to the
 #   Store submission API (no Store CLI), and every call after create names the
 #   submission id the create response returned (MsStoreRunner.psm1,
-#   Publish-StoreSubmission):
+#   Publish-StoreSubmission). Which 2xx count: a GET is used only when answered
+#   HTTP 200; a POST, PUT, DELETE or the upload counts as done only on HTTP
+#   200, 201 or 204. HTTP 202 Accepted (or any other 2xx) means accepted,
+#   completion unconfirmed (RFC 9110, 15.3.3): never taken as done, checked by
+#   id where there is one, and never given re-run or delete advice. On the
+#   create, PUT or upload the run stops there, uncommitted (steps 2 and 4); on
+#   the commit it is read back by id like any unconfirmed commit (step 6).
 #   1. GET the app: stop if any submission is pending. This run never deletes
 #      a submission it did not create;
 #   2. POST a new submission; its id comes from that response. If the service
-#      refuses (HTTP 409, e.g. a submission appeared after step 1), stop. If
-#      the POST gets no answer, the result is unconfirmed: read the app back
-#      and stop, reporting only what it shows. Without an id from a create
-#      response a pending submission there is of unconfirmed origin (someone
-#      may have created it after step 1), so no delete advice is given;
+#      refuses (any status but 2xx, 408 and 5xx, e.g. HTTP 409 when a
+#      submission appeared after step 1), stop. If the POST gets no answer,
+#      HTTP 408 or 5xx, the result is unconfirmed: read the app back and stop,
+#      reporting only what it shows. Without an id from a create response a
+#      pending submission there is of unconfirmed origin (someone may have
+#      created it after step 1). If it answers HTTP 200, 201 or 204 but its id
+#      cannot be read (the body was lost, or has no usable id), a submission
+#      was created with an unknown id: read the app back once and stop,
+#      reporting a pending submission by its id only; none shown yet (the
+#      Store may be slow to show it) or a failed read-back is left to a person
+#      to check. If it answers HTTP 202 or another 2xx, the create is
+#      accepted, completion unconfirmed: check once (the submission by the id
+#      the answer named, else the app) and stop, whatever that shows. None of
+#      these gives re-run or delete advice;
 #   3. GET the app again: its pending submission must be that id;
 #   4. GET the submission, check its price can be sent back unchanged, PUT it
 #      with every old package PendingDelete and the new .msixupload
 #      PendingUpload (minimumDirectXVersion and minimumSystemRam None), then
-#      PUT the zipped package to its SAS upload URL;
+#      PUT the zipped package to its SAS upload URL. If the PUT or the upload
+#      is answered HTTP 202 or another 2xx (not 200, 201 or 204), it is
+#      accepted, completion unconfirmed: read that id back once and stop,
+#      uncommitted, with no delete or re-run advice;
 #   5. GET it again and stop, uncommitted, unless every field other than
 #      applicationPackages (pricing, listings, visibility, publish mode and
 #      date, device families, ...) reads back as in step 4's GET
@@ -50,18 +68,27 @@ name: msstore-publish
 #      (Test-DraftReadyToCommit);
 #   6. print the submission id and how to check it by hand, then POST
 #      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
-#      gets no answer, print at once that the result is unconfirmed, with that
-#      id, then read that id back up to 10 times, 30 s apart, each GET waiting
-#      up to 30 s, all within 300 s (the commit API is asynchronous):
-#      CommitStarted or a committed status means carry on; any other status
-#      stops; still PendingCommit or no read-back means the result stays
-#      unconfirmed, so stop with no delete or retry advice and ask a person
-#      to check that id;
+#      gets no answer, HTTP 408 or 5xx, an HTTP 200, 201 or 204 whose body is
+#      lost (accepted, its status not read), or HTTP 202 or another 2xx
+#      (accepted, completion unconfirmed, body read or not), print at once
+#      that the result is unconfirmed, with that id, then read that id back up to 10 times, 30 s
+#      apart, each GET waiting up to 30 s, all within 300 s (the commit API
+#      is asynchronous): CommitStarted or a committed status means carry on;
+#      any other status stops; still PendingCommit or no read-back means the
+#      result stays unconfirmed, so stop with no delete or retry advice and
+#      ask a person to check that id;
 #   7. the next step reads that id back until it reaches a committed status
 #      (Published included) with exactly one Uploaded package, the release's
 #      version, and no other Uploaded package.
-#   Any stop in steps 3-5 leaves this run's draft uncommitted, and the error
-#   gives the exact DELETE for that id (Remove-StoreDraftSubmission).
+#   Any stop in steps 3-5 leaves this run's draft uncommitted. When a read in
+#   steps 3-5 shows the draft is wrong (another pending id, a changed field, a
+#   package left over), the error gives the exact DELETE for that id
+#   (Remove-StoreDraftSubmission). When a read in steps 3-5 gives no usable
+#   answer (no answer, HTTP 202 or another 2xx that is not 200, an error
+#   status, an unreadable body, no usable pending id), the draft could not be
+#   verified: the run stops, keeps it, and only says how to look it up by id,
+#   with no delete or re-run advice. An accepted, unconfirmed PUT or upload
+#   (step 4) gets no delete advice either.
 #   Time budget: when a step times out the runner is killed and nothing more
 #   is printed. The submit step therefore gives Publish-StoreSubmission a
 #   deadline 2 min before its timeout. The last 6 min before that deadline are
@@ -69,10 +96,10 @@ name: msstore-publish
 #   call in steps 1-5 (the upload too) waits at most until that time starts,
 #   and once it has started the commit is not sent (stop uncommitted, with the
 #   DELETE for that id). The id and how to check it by hand are printed before
-#   the commit is sent and again as soon as it gets no answer, so they are in
-#   the log even if the step is killed. Every step of the publish job has a
-#   timeout, and they add up to the job's, so the job timeout cannot cut the
-#   submit step short.
+#   the commit is sent and again as soon as its result is unconfirmed, so they
+#   are in the log even if the step is killed. Every step of the publish job
+#   has a timeout, and they add up to the job's, so the job timeout cannot cut
+#   the submit step short.
 #   A submission this workflow creates is changed, committed or deleted only
 #   through the API, never in the Partner Center UI: Microsoft only takes in
 #   the uploaded package on an API commit, and a submission changed in the UI
@@ -157,33 +184,125 @@ jobs:
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
-          if ($env:EVENT -eq 'release') {
-            if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "release tag '$env:TAG' is not vMAJOR.MINOR.PATCH" }
-            $sha = (gh api "repos/$repo/commits/$env:TAG" | ConvertFrom-Json).sha
-            if ($sha -ne $env:GITHUB_SHA) { throw "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
-            $runs = (gh api "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20" | ConvertFrom-Json).workflow_runs |
-              Where-Object { $_.head_sha -eq $sha -and $_.head_repository.full_name -eq $repo -and $_.conclusion -eq 'success' } |
-              Sort-Object { [datetime]$_.created_at } -Descending
-            if (-not $runs) { throw "no successful msix push run for $sha yet; re-run this job once it has finished" }
-            $run = @($runs)[0]
-            $version = $env:TAG.Substring(1) + '.0'
-          } else {
-            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-            $run = gh api "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-            if ($run.name -ne 'msix')          { throw "run is not the msix workflow" }
-            if ($run.event -ne 'push')         { throw "run was not triggered by a push" }
-            if ($run.conclusion -ne 'success') { throw "run did not succeed" }
-            if ($run.head_repository.full_name -ne $repo) { throw "run is from another repository" }
-            $sha = $run.head_sha
-            $version = ''
+          # Only fixed text and values of a fixed shape from the GitHub API
+          # reach the log or the outputs (Pepper, PR #74 r8 and r9). gh's error
+          # output (the API's message) is kept out of the log. An answer that
+          # is not exactly one complete JSON object (Test-JsonObject: a key
+          # given twice at any depth, also in another case, text before or after
+          # it, a comment, a bad literal, an array) or a field that is missing,
+          # not text or of another shape stops the job with fixed text: a
+          # parser's or a cast's own message can quote the answer, so every error
+          # but this step's own (Stop-Lookup) is replaced by fixed text. The
+          # branch of the run is never printed, only whether it is main or this
+          # release's tag.
+          # Each path below holds only values checked before it is built.
+          function Stop-Lookup([string]$Text) { $e = [System.InvalidOperationException]::new($Text); $e.Data['Lookup'] = $true; throw $e }
+          # True when Text is exactly one complete JSON object as System.Text.Json
+          # reads it by default (nothing before or after it, no comments, trailing
+          # commas or single quotes, all of which ConvertFrom-Json takes) in which
+          # no object, at any depth, has a key twice, also not in another case
+          # (ConvertFrom-Json keeps the last of two equal keys; a lookup here does
+          # not tell them apart). Pepper, PR #74 r10. Never throws.
+          function Test-JsonObject([string]$Text) {
+            $doc = $null
+            try {
+              $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+              if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+              $todo = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+              $todo.Push($doc.RootElement)
+              while ($todo.Count -gt 0) {
+                $e = $todo.Pop()
+                if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                  $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                  foreach ($p in $e.EnumerateObject()) { if (-not $seen.Add($p.Name)) { return $false }; $todo.Push($p.Value) }
+                } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                  foreach ($i in $e.EnumerateArray()) { $todo.Push($i) }
+                }
+              }
+              $true
+            } catch { $false } finally { if ($null -ne $doc) { $doc.Dispose() } }
           }
-          Write-Host "msix run $($run.id): event=$($run.event) ref=$($run.head_branch) sha=$($run.head_sha) conclusion=$($run.conclusion)"
-          $cmp = gh api "repos/$repo/compare/$sha...main" | ConvertFrom-Json
-          Write-Host "main vs $sha : $($cmp.status)"
-          if ($cmp.status -notin @('ahead','identical')) { throw "commit $sha is not in main's history ($($cmp.status))" }
-          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
-          "sha=$sha" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          function Invoke-GitHubApi([string]$Path) {
+            $out = gh api $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { Stop-Lookup "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
+            $o = $null
+            $text = $out -join "`n"
+            if (Test-JsonObject $text) { try { $o = ConvertFrom-Json -InputObject $text -NoEnumerate -ErrorAction Stop } catch { } }
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { Stop-Lookup "the GitHub API answer to GET $Path is not one JSON object that parses (not printed)" }
+            $o
+          }
+          # A field by its exact name: its value, or $null when it is missing.
+          function Get-Field($Object, [string]$Name) {
+            if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $p = $Object.PSObject.Properties[$Name]
+            if ($p -and $p.Name -ceq $Name) { , $p.Value }
+          }
+          # A field as text: '' when it is missing, null or not a JSON string.
+          function Get-Text($Object, [string]$Name) {
+            $v = Get-Field $Object $Name
+            if ($v -is [string]) { $v } else { '' }
+          }
+          # The run id (GitHub sends a JSON number), as digits, or ''.
+          function Get-RunId($Run) {
+            $v = Get-Field $Run 'id'
+            if (($v -is [long] -or $v -is [int]) -and $v -gt 0) { [string]$v } else { '' }
+          }
+          # created_at as a UTC date: ConvertFrom-Json makes GitHub's ISO 8601
+          # text a [datetime]; anything else stops with fixed text.
+          function Get-RunDate($Run) {
+            $v = Get-Field $Run 'created_at'
+            $d = [datetime]::MinValue
+            if ($v -is [datetime]) { return $v.ToUniversalTime() }
+            if ($v -is [string] -and [datetime]::TryParseExact($v, 'yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]'AssumeUniversal, AdjustToUniversal', [ref]$d)) { return $d }
+            Stop-Lookup 'a run in the GitHub API answer has no created_at date (not printed)'
+          }
+          try {
+            if ($env:EVENT -eq 'release') {
+              if ($env:TAG -cnotmatch '^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\z') { Stop-Lookup 'the release tag is not vMAJOR.MINOR.PATCH (not printed)' }
+              $sha = Get-Text (Invoke-GitHubApi "repos/$repo/commits/$env:TAG") 'sha'
+              if ($sha -cnotmatch '^[0-9a-f]{40}\z') { Stop-Lookup "the GitHub API answered no commit sha for tag $env:TAG (its answer is not printed)" }
+              if ($sha -cne $env:GITHUB_SHA) { Stop-Lookup "tag $env:TAG points at $sha, but the event is for $env:GITHUB_SHA" }
+              $list = Get-Field (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?head_sha=$sha&event=push&status=success&per_page=20") 'workflow_runs'
+              if ($list -isnot [array]) { Stop-Lookup 'the GitHub API answer has no list of workflow runs (not printed)' }
+              $runs = @(@(foreach ($r in $list) {
+                if ((Get-Text $r 'head_sha') -ceq $sha -and (Get-Text (Get-Field $r 'head_repository') 'full_name') -eq $repo -and
+                    (Get-Text $r 'event') -ceq 'push' -and (Get-Text $r 'conclusion') -ceq 'success') {
+                  [pscustomobject]@{ Run = $r; Date = Get-RunDate $r }
+                }
+              }) | Sort-Object Date -Descending)
+              if ($runs.Count -eq 0) { Stop-Lookup "no successful msix push run for $sha yet; re-run this job once it has finished" }
+              $run = $runs[0].Run
+              $version = $env:TAG.Substring(1) + '.0'
+            } else {
+              if ($env:RUN_ID -cnotmatch '^[0-9]{1,20}\z') { Stop-Lookup 'msix_run_id must be a number' }
+              $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID"
+              if ((Get-RunId $run) -cne $env:RUN_ID)            { Stop-Lookup "the GitHub API did not answer with run $env:RUN_ID" }
+              if ((Get-Text $run 'name') -cne 'msix')           { Stop-Lookup 'run is not the msix workflow' }
+              if ((Get-Text $run 'event') -cne 'push')          { Stop-Lookup 'run was not triggered by a push' }
+              if ((Get-Text $run 'conclusion') -cne 'success')  { Stop-Lookup 'run did not succeed' }
+              if ((Get-Text (Get-Field $run 'head_repository') 'full_name') -ne $repo) { Stop-Lookup 'run is from another repository' }
+              $sha = Get-Text $run 'head_sha'
+              $version = ''
+            }
+            $runId = Get-RunId $run
+            if ($runId -cnotmatch '^[0-9]{1,20}\z' -or $sha -cnotmatch '^[0-9a-f]{40}\z') {
+              Stop-Lookup 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+            }
+            $branch = Get-Text $run 'head_branch'
+            $ref = if ($branch -ceq 'main') { 'main' } elseif ($env:TAG -and $branch -ceq $env:TAG) { $env:TAG } else { '[not shown]' }
+            Write-Host "msix run ${runId}: event=push ref=$ref sha=$sha conclusion=success"
+            $status = Get-Text (Invoke-GitHubApi "repos/$repo/compare/$sha...main") 'status'
+            $ahead = if ($status -cin @('ahead', 'identical', 'behind', 'diverged')) { $status } else { '[unlisted]' }
+            Write-Host "main vs $sha : $ahead"
+            if ($ahead -cnotin @('ahead', 'identical')) { Stop-Lookup "commit $sha is not in main's history ($ahead)" }
+            "run_id=$runId" >> $env:GITHUB_OUTPUT
+            "sha=$sha" >> $env:GITHUB_OUTPUT
+            "version=$version" >> $env:GITHUB_OUTPUT
+          } catch {
+            if ($_.Exception.Data['Lookup']) { throw }
+            throw 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)'
+          }
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
@@ -280,17 +399,20 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
           $id = Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline
-          if ($id -notmatch '^\d+$') { throw "submission id is not a number" }
+          if ($id -isnot [string] -or $id -cnotmatch '^[0-9]{1,20}\z') { throw "submission id is not a number" }
           "submission_id=$id" >> $env:GITHUB_OUTPUT
 
       - name: Read the submission back by its id and fail unless it holds the new package
         timeout-minutes: 35
         env:
           SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+          PKG_NAME: ${{ needs.inspect.outputs.file_name }}
           PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
           PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
           PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
         run: |
+          # The file name shown before approval: the log prints a package's
+          # file name only when it is exactly this one.
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
-          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 30 -IntervalSeconds 60
+          Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes 30 -IntervalSeconds 60

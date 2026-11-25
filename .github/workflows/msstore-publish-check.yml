@@ -23,15 +23,19 @@ name: msstore-publish-check
 #   else creates after the pending check, with a create that gets a 504, is
 #   reported as of unconfirmed origin with no delete advice; a commit that
 #   never answers prints the id before it is sent and "result unconfirmed"
-#   before the first read-back, then stops unconfirmed; without
-#   -LoopbackTestServer nothing is sent to the stand-in.
+#   before the first read-back, then stops unconfirmed; a read of the new
+#   submission before its update answered HTTP 202, with a token, a secret
+#   and a SAS URL in its body, stops it uncommitted with "Could not verify",
+#   look-by-id only, no delete or re-run advice and none of that body
+#   printed; without -LoopbackTestServer nothing is sent to the stand-in.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
 # The `pester` job runs .github/scripts/tests (the same flow with a mocked HTTP
 # layer, the draft check, the field comparison, the read-back, unconfirmed
-# create and commit, URL rules, redirects, fixed error text, pricing and
-# delete-by-id).
+# create and commit, URL rules, redirects, fixed error text, pricing,
+# delete-by-id, and the msix run lookup steps of both Store workflows against
+# stand-in GitHub API answers).
 
 on:
   pull_request:
@@ -65,7 +69,8 @@ env:
 
 jobs:
   pester:
-    # Unit tests: .github/scripts/tests.
+    # Unit tests: .github/scripts/tests. They also run the msix run lookup
+    # steps of the two Store workflows, so .github/workflows is checked out.
     runs-on: windows-latest
     timeout-minutes: 10
     defaults:
@@ -75,7 +80,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
 
       - name: Run Pester
         run: |
@@ -108,6 +115,14 @@ jobs:
       - name: Check the publish job in msstore-publish.yml
         run: |
           $wf = Get-Content .github/workflows/msstore-publish.yml -Raw
+          # Every gh api call keeps gh's error output (the API's message) out of
+          # the log (Pepper, PR #74 r8).
+          foreach ($f in '.github/workflows/msstore-publish.yml', '.github/workflows/msstore-publish-check.yml') {
+            $calls = @(Get-Content $f | Where-Object { $_ -match '\bgh\s+api\s+[$"]' })
+            if ($calls.Count -eq 0 -or @($calls | Where-Object { $_ -notmatch '\bgh\s+api\s+\$Path\b[^}]*\s2>\$null' }).Count -gt 0) {
+              throw "$f calls gh api without keeping its error output out of the log"
+            }
+          }
           $code = ($wf -split "`n" | Where-Object { $_.TrimStart() -notlike "#*" }) -join "`n"
           if ($code -match '(?m)^\s*msstore\s|microsoft-store-apppublisher|STORE_CLI_VERSION') { throw "msstore-publish.yml still uses the Store CLI" }
           if ($code -match '-ApiBase|-AuthorityHost|-LoopbackTestServer') { throw "msstore-publish.yml must use the default Store API and sign-in hosts" }
@@ -116,7 +131,7 @@ jobs:
             $connect,
             'Publish-StoreSubmission -ProductId $env:STORE_PRODUCT_ID -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION -DeadlineUtc $deadline',
             $connect,
-            'Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION'
+            'Assert-SubmissionHasPackage -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME'
           )
           $at = -1
           foreach ($st in $steps) {
@@ -126,7 +141,7 @@ jobs:
           }
           if (([regex]::Matches($code, 'Publish-StoreSubmission ')).Count -ne 1) { throw "msstore-publish.yml must run Publish-StoreSubmission exactly once" }
           if ($code -notmatch 'SUBMISSION_ID: \$\{\{ steps\.submit\.outputs\.submission_id \}\}') { throw "the read-back does not use the submission id the publish step returned" }
-          if ($code -notmatch 'PKG_NAME: \$\{\{ needs\.inspect\.outputs\.file_name \}\}') { throw "the publish step does not check the file name inspect showed" }
+          if (([regex]::Matches($code, 'PKG_NAME: \$\{\{ needs\.inspect\.outputs\.file_name \}\}')).Count -ne 2) { throw "the publish step and the read-back must both get the file name inspect showed (PKG_NAME)" }
           # Time budget: a step that times out prints nothing more. The publish
           # step sets its deadline before anything else, at least 2 min before
           # its timeout; every step of the publish job has a timeout, and they
@@ -158,20 +173,99 @@ jobs:
           RUN_ID: ${{ inputs.msix_run_id }}
         run: |
           $repo = $env:GITHUB_REPOSITORY
-          if ($env:RUN_ID) {
-            if ($env:RUN_ID -notmatch '^\d+$') { throw "msix_run_id must be a number" }
-            $run = gh api "repos/$repo/actions/runs/$env:RUN_ID" | ConvertFrom-Json
-            if ($run.name -ne 'msix' -or $run.event -ne 'push' -or $run.conclusion -ne 'success') { throw "not a successful msix push run" }
-          } else {
-            $run = @((gh api "repos/$repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1" | ConvertFrom-Json).workflow_runs)[0]
-            if (-not $run) { throw "no successful msix push run on main" }
+          # Only fixed text and values of a fixed shape from the GitHub API
+          # reach the log or the outputs (Pepper, PR #74 r8 and r9). gh's error
+          # output (the API's message) is kept out of the log. An answer that
+          # is not exactly one complete JSON object (Test-JsonObject: a key
+          # given twice at any depth, also in another case, text before or after
+          # it, a comment, a bad literal, an array) or a field that is missing,
+          # not text or of another shape stops the job with fixed text: a
+          # parser's or a cast's own message can quote the answer, so every error
+          # but this step's own (Stop-Lookup) is replaced by fixed text. The
+          # branch of the run is never printed, only whether it is main.
+          # Each path below holds only values checked before it is built.
+          function Stop-Lookup([string]$Text) { $e = [System.InvalidOperationException]::new($Text); $e.Data['Lookup'] = $true; throw $e }
+          # True when Text is exactly one complete JSON object as System.Text.Json
+          # reads it by default (nothing before or after it, no comments, trailing
+          # commas or single quotes, all of which ConvertFrom-Json takes) in which
+          # no object, at any depth, has a key twice, also not in another case
+          # (ConvertFrom-Json keeps the last of two equal keys; a lookup here does
+          # not tell them apart). Pepper, PR #74 r10. Never throws.
+          function Test-JsonObject([string]$Text) {
+            $doc = $null
+            try {
+              $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+              if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+              $todo = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+              $todo.Push($doc.RootElement)
+              while ($todo.Count -gt 0) {
+                $e = $todo.Pop()
+                if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                  $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                  foreach ($p in $e.EnumerateObject()) { if (-not $seen.Add($p.Name)) { return $false }; $todo.Push($p.Value) }
+                } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                  foreach ($i in $e.EnumerateArray()) { $todo.Push($i) }
+                }
+              }
+              $true
+            } catch { $false } finally { if ($null -ne $doc) { $doc.Dispose() } }
           }
-          $sha = $run.head_sha
-          $v = gh api "repos/$repo/contents/VERSION?ref=$sha" --jq .content
-          $version = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v -join '')).Split("`n")[0].Trim()) + '.0'
-          Write-Host "msix run $($run.id): event=$($run.event) ref=$($run.head_branch) sha=$sha -> expected package version $version"
-          "run_id=$($run.id)" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
+          function Invoke-GitHubApi([string]$Path) {
+            $out = gh api $Path 2>$null
+            if ($LASTEXITCODE -ne 0) { Stop-Lookup "GitHub API GET $Path failed (gh exit code $LASTEXITCODE; its answer is not printed)" }
+            $o = $null
+            $text = $out -join "`n"
+            if (Test-JsonObject $text) { try { $o = ConvertFrom-Json -InputObject $text -NoEnumerate -ErrorAction Stop } catch { } }
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { Stop-Lookup "the GitHub API answer to GET $Path is not one JSON object that parses (not printed)" }
+            $o
+          }
+          # A field by its exact name: its value, or $null when it is missing.
+          function Get-Field($Object, [string]$Name) {
+            if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $p = $Object.PSObject.Properties[$Name]
+            if ($p -and $p.Name -ceq $Name) { , $p.Value }
+          }
+          # A field as text: '' when it is missing, null or not a JSON string.
+          function Get-Text($Object, [string]$Name) {
+            $v = Get-Field $Object $Name
+            if ($v -is [string]) { $v } else { '' }
+          }
+          # The run id (GitHub sends a JSON number), as digits, or ''.
+          function Get-RunId($Run) {
+            $v = Get-Field $Run 'id'
+            if (($v -is [long] -or $v -is [int]) -and $v -gt 0) { [string]$v } else { '' }
+          }
+          try {
+            if ($env:RUN_ID) {
+              if ($env:RUN_ID -cnotmatch '^[0-9]{1,20}\z') { Stop-Lookup 'msix_run_id must be a number' }
+              $run = Invoke-GitHubApi "repos/$repo/actions/runs/$env:RUN_ID"
+              if ((Get-RunId $run) -cne $env:RUN_ID) { Stop-Lookup "the GitHub API did not answer with run $env:RUN_ID" }
+            } else {
+              $list = Get-Field (Invoke-GitHubApi "repos/$repo/actions/workflows/msix.yml/runs?branch=main&event=push&status=success&per_page=1") 'workflow_runs'
+              if ($list -isnot [array]) { Stop-Lookup 'the GitHub API answer has no list of workflow runs (not printed)' }
+              if ($list.Count -eq 0) { Stop-Lookup 'no successful msix push run on main' }
+              $run = $list[0]
+              if ((Get-Text $run 'head_branch') -cne 'main') { Stop-Lookup 'the newest run the GitHub API answered is not on main' }
+            }
+            if ((Get-Text $run 'name') -cne 'msix' -or (Get-Text $run 'event') -cne 'push' -or (Get-Text $run 'conclusion') -cne 'success' -or
+                (Get-Text (Get-Field $run 'head_repository') 'full_name') -ne $repo) { Stop-Lookup 'not a successful msix push run of this repository' }
+            $runId = Get-RunId $run
+            $sha = Get-Text $run 'head_sha'
+            if ($runId -cnotmatch '^[0-9]{1,20}\z' -or $sha -cnotmatch '^[0-9a-f]{40}\z') {
+              Stop-Lookup 'the GitHub API answered a run id or commit sha of an unexpected shape (not printed)'
+            }
+            $file = Invoke-GitHubApi "repos/$repo/contents/VERSION?ref=$sha"
+            if ((Get-Text $file 'encoding') -cne 'base64') { Stop-Lookup "the GitHub API answered VERSION at $sha without base64 content (not printed)" }
+            $version = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Text $file 'content'))).Split("`n")[0].Trim() + '.0'
+            if ($version -cnotmatch '^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}\.0\z') { Stop-Lookup "VERSION at $sha is not MAJOR.MINOR.PATCH (its text is not printed)" }
+            $ref = if ((Get-Text $run 'head_branch') -ceq 'main') { 'main' } else { '[not shown]' }
+            Write-Host "msix run ${runId}: event=push ref=$ref sha=$sha -> expected package version $version"
+            "run_id=$runId" >> $env:GITHUB_OUTPUT
+            "version=$version" >> $env:GITHUB_OUTPUT
+          } catch {
+            if ($_.Exception.Data['Lookup']) { throw }
+            throw 'the msix run lookup failed; its error message is not printed (it can quote the GitHub API answer)'
+          }
 
       - name: Download the Store package artifact
         uses: actions/download-artifact@v4
@@ -247,6 +341,7 @@ jobs:
             if ($r.Text -notmatch 'fields unchanged: \d+ submission fields') { throw "the fields were not compared before commit" }
             $id = $s.NewId
             if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
+            if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
             $want = @("POST /tenant-dry-run/oauth2/v2.0/token", "GET $base", "POST $base/submissions", "GET $base", "GET $base/submissions/$id",
                       "PUT $base/submissions/$id", "PUT /blob/upload.zip", "GET $base/submissions/$id", "POST $base/submissions/$id/commit")
             $got = @($s.Log)
@@ -258,8 +353,9 @@ jobs:
             $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$z[0].Bytes)).ToLower()
             if ($sha -ne $env:PKG_SHA256) { throw "the uploaded package differs from the checked one" }
             Write-Host "uploaded zip: $($z[0].Name) SHA256=$sha (same as the checked package)"
-            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 0 -IntervalSeconds 0 }
+            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes 0 -IntervalSeconds 0 }
             if ($r.Err) { throw "read-back failed against the stand-in" }
+            if ($r.Text -notmatch "(?m)^  package fileName=$([regex]::Escape($env:PKG_NAME)) version=$([regex]::Escape($env:EXPECTED_VERSION)) fileStatus=Uploaded$") { throw "the read-back did not show the package file name inspect showed" }
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
 
@@ -319,7 +415,7 @@ jobs:
             $tail = @($s.Log)[-3..-1]
             if (($tail -join "`n") -cne (@("POST $base/submissions/$id/commit", "GET $base/submissions/$id", "GET $base/submissions/$id") -join "`n")) { throw "calls after the commit: $($tail -join ', ')" }
             if (@($s.Log) -match '^DELETE ') { throw "a DELETE was sent" }
-            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -TimeoutMinutes 0 -IntervalSeconds 0 }
+            $r = Invoke-Shown { Assert-SubmissionHasPackage -ProductId $app -SubmissionId $id -ExpectedVersion $env:EXPECTED_VERSION -ExpectedFileName $env:PKG_NAME -TimeoutMinutes 0 -IntervalSeconds 0 }
             if ($r.Err) { throw "read-back after the delayed commit failed" }
             Assert-NoLeak $r.Text $s
           } finally { Stop-FakeStoreServer -Store $s }
@@ -361,5 +457,58 @@ jobs:
             if ($sw.Elapsed.TotalSeconds -gt 30) { throw "the commit timeout and read-backs took $([int]$sw.Elapsed.TotalSeconds) s" }
             Write-Host "commit with no answer: unconfirmed after $([int]$sw.Elapsed.TotalSeconds) s"
             Assert-NoLeak $r.Text $s
+          } finally { Stop-FakeStoreServer -Store $s }
+          # 9. The create is refused with HTTP 400 and a message that carries a SAS
+          #    URL, sig=, a bearer token, the access token, the client secret, delete
+          #    advice and both workflow command syntaxes (double colon, and the legacy
+          #    double hash with a bracket) mid-line and after a line break. The error
+          #    line shows the code, the target only when it is a listed submission
+          #    field name (else "[unlisted target]") and the module's own hint;
+          #    nothing of the message.
+          #    One read-only GET of the app follows; nothing is deleted.
+          $cc = ':' * 2; $hh = '#' * 2
+          foreach ($case in @(
+              @{ Target = 'applicationCategory'; Shown = 'applicationCategory' },
+              @{ Target = "applicationCategory $($hh)[warning]injected $($cc)error$($cc)injected"; Shown = '[unlisted target]' })) {
+            $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -CreateErrorStatus 400
+            $url = Start-FakeStoreServer -Store $s
+            try {
+              Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+              $planted = "Package rejected.`n$($cc)error$($cc)injected see $($hh)[error]injected https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789 " +
+                "sig=FAKE+SAS%2FSIGNATURE-0123456789 Bearer $($s.Token) token $($s.Token) client_secret=`"$secret`" eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl " +
+                "Delete submission 1152921505000000007 and create it again.`n$($hh)[set-output name=x;]injected"
+              $s.CreateErrorBody = @{ code = 'InvalidParameterValue'; target = $case.Target; message = $planted } | ConvertTo-Json -Compress
+              $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+              $line = "Store API POST $base/submissions?isMinimalResponse=true failed: HTTP 400 (InvalidParameterValue); target: $($case.Shown); " +
+                'hint: a parameter in the request body is invalid. No submission was created and none was deleted.'
+              if (-not $r.Err.StartsWith($line)) { throw "a refused create did not print the code, the target as '$($case.Shown)' and the hint" }
+              if (-not $r.Err.EndsWith('Read-back of the app after the refused create (one GET; nothing changed or deleted): no pendingApplicationSubmission.')) { throw "no read-back of the app after the refused create" }
+              if ($r.Text.Contains($cc + 'error') -or $r.Text.Contains($hh + '[') -or $r.Text -match 'injected|rejected|eyJ|sv=2020|client_secret|Bearer|DELETE /v1|Remove-StoreDraftSubmission|Delete exactly|Delete submission') {
+                throw "a workflow command, part of the API message or delete advice was printed"
+              }
+              if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
+              if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base") { throw "calls after the refused create: $(@($s.Log) -join ', ')" }
+              Assert-NoLeak $r.Text $s
+              Write-Host "refused create: target shown as $($case.Shown), no message text"
+            } finally { Stop-FakeStoreServer -Store $s }
+          }
+          # 10. The read of the new submission before its update is answered HTTP
+          #     202 (accepted, not a usable read) with a token, the client secret
+          #     and a SAS URL in its body: stop uncommitted with "Could not
+          #     verify" and look-by-id only, no delete or re-run advice, nothing
+          #     of that body printed, nothing sent after that GET.
+          $s = New-FakeStore -AppId $app -Version $env:EXPECTED_VERSION -FailReadOn SubmissionRead -FailReadStatus 202
+          $s.FailReadBody = @{ id = 'planted'; status = "Bearer $($s.Token)"; code = "client_secret=$secret"
+            applicationPackages = @(@{ fileName = 'https://jlfakeupload.blob.core.windows.net/blob/upload.zip?sv=2020-08-04&sig=FAKE+SAS%2FSIGNATURE-0123456789' }) } | ConvertTo-Json -Depth 5 -Compress
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $r = Invoke-Shown { Publish-StoreSubmission -ProductId $app -PackagePath $env:PKG_FILE -ExpectedFileName $env:PKG_NAME -ExpectedVersion $env:EXPECTED_VERSION }
+            $id = $s.NewId
+            if (-not $s.ReadFailed -or $r.Err -notmatch "^Store API GET $([regex]::Escape($base))/submissions/$id failed: HTTP 202 .*Could not verify: .*A person needs to check submission $id \(look only, change nothing in Partner Center\) with GET $([regex]::Escape($base))/submissions/$id\.") { throw "a read answered HTTP 202 did not stop with 'Could not verify' and look-by-id guidance" }
+            if ($r.Text -match 'DELETE /v1|DELETE |Remove-StoreDraftSubmission|Delete exactly|re-run|rerun|\bretry\b|planted|eyJ|sv=2020|client_secret|Bearer') { throw "delete or re-run advice, or part of the read's body, was printed" }
+            if ((@($s.Log) -join "`n") -cne "POST /tenant-dry-run/oauth2/v2.0/token`nGET $base`nPOST $base/submissions`nGET $base`nGET $base/submissions/$id") { throw "calls after the failed read: $(@($s.Log) -join ', ')" }
+            Assert-NoLeak $r.Text $s
+            Write-Host "read answered HTTP 202: could not verify, no delete or re-run advice"
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"
