@@ -30,4 +30,8 @@ JerisLink connects only to the peer machine you configure (over your own Tailsca
 
 ## macOS
 
-macOS builds are not covered by this policy. CI produces unsigned (ad-hoc) macOS builds; Developer ID signing and notarization are done by a maintainer on their own machine.
+macOS builds are not covered by this policy. The release workflow signs the macOS host with a Developer ID certificate, has Apple notarize it and staples the ticket when the signing secrets are set; without them it builds an ad-hoc signed zip whose name ends in `-unsigned.zip`. The macOS CI workflow (`.github/workflows/macos.yml`) builds ad-hoc only.
+
+## Microsoft Store
+
+The Microsoft Store version of the Windows viewer is signed by Microsoft when the Store delivers it. This policy covers the binaries on GitHub Releases.
