@@ -114,8 +114,18 @@ BeforeAll {
     $p
   }
 
+  # Prices: the fake's priceId, trialPeriod, market and sale prices, and the
+  # ones tests set. None may be printed, by any publish run (Pepper, PR #75
+  # r1: run 45524510567 printed "pricing.priceId=Free is kept as is").
+  # Matched in this case only, so fixed text such as "make the product free"
+  # does not count.
+  $script:PriceValues = '\bFree\b|\bBase\b|\bNotAvailable\b|Tier[0-9]|NoFreeTrial|OneWeek|Launch sale'
+  # Every publish run through this helper, whatever it ends with, is checked
+  # for prices.
   function script:Invoke-Publish([string]$Package) {
-    Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r = Invoke-Captured { Publish-StoreSubmission -ProductId $App -PackagePath $Package -ExpectedFileName $File -ExpectedVersion '0.4.1.0' -CommitReadBackAttempts 3 -CommitReadBackIntervalSeconds 0 }
+    $r.All | Should -Not -MatchExactly $PriceValues -Because 'a publish run never prints a price (Pepper, PR #75 r1)'
+    $r
   }
 
   $script:Base = "/v1.0/my/applications/$App"
@@ -704,7 +714,7 @@ Describe 'Strings from the API are printed only when they are plain values' {
   }
   It 'prints no injected priceId' {
     $r = Test-SubmissionPricing -SubmissionJson '{"pricing":{"priceId":"Free\n::error::pwned"}}'
-    $r.Reason | Should -BeExactly 'pricing.priceId=[unlisted] is kept as is'
+    $r.Reason | Should -BeExactly 'pricing.priceId is set and is kept as is (the price is not printed)'
   }
   It 'prints no injected pending submission id' {
     $appJson = "{`"id`":`"$App`",`"pendingApplicationSubmission`":{`"id`":`"1\n::error::pwned`"}}"
@@ -735,7 +745,7 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $s.Sub.status | Should -Be 'Certification'
     $r.Out | Should -Match "created submission id=$NewId \(from the create response\)"
     $r.Out | Should -Match 'package uploaded: Jerislink-0\.4\.1\.0-x64\.msixupload in Upload\.zip \(\d+ bytes\), HTTP 201'
-    $r.Out | Should -Match ([regex]::Escape('fields unchanged: 19 submission fields other than applicationPackages and friendlyName read back as before the update (pricing: priceId, trialPeriod and the market prices)'))
+    $r.Out | Should -Match ([regex]::Escape('fields unchanged: 19 submission fields other than applicationPackages and friendlyName read back as before the update (pricing: priceId, trialPeriod and the market prices; packageDeliveryOptions: all but the package rollout status and fallback submission id Partner Center sets)'))
     $r.All | Should -Not -Match $Leak
   }
 
@@ -766,6 +776,44 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2'
   }
 
+  # Pepper, PR #75 r1: the price check printed the priceId. It prints fixed
+  # text now, and no price (priceId, trialPeriod, a market or sale price) is
+  # printed anywhere in the run (Invoke-Publish checks that for every run).
+  It 'prints no price anywhere in a publish run; the price check line is fixed text (priceId <PriceId>)' -ForEach @(
+    @{ PriceId = 'Free' }, @{ PriceId = 'Tier7' }, @{ PriceId = 'NotAvailable' }
+  ) {
+    $s = New-FakeStore -PriceId $PriceId; Use-FakeStore $s
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$NewId/commit"
+    $r.Out | Should -Match '(?m)^price check: pricing\.priceId is set and is kept as is \(the price is not printed\)$'
+    $r.All | Should -Not -MatchExactly ([regex]::Escape($PriceId))
+    $r.All | Should -Not -MatchExactly $PriceValues
+  }
+
+  # Partner Center sets packageDeliveryOptions.packageRollout.packageRolloutStatus
+  # and fallbackSubmissionId itself ("Manage app submissions", Package rollout
+  # resource: "assigned by Partner Center, and are not intended to be set by
+  # the developer"). A change of them after the PUT does not stop the run.
+  It 'commits when Partner Center only set its own package rollout fields after the update (packageRolloutStatus, fallbackSubmissionId)' {
+    $s = New-FakeStore -DriftOnPut StoreSetRollout; Use-FakeStore $s
+    $before = ConvertFrom-Json $s.Fields -AsHashtable
+    $before.packageDeliveryOptions.packageRollout.packageRolloutStatus | Should -BeExactly 'PackageRolloutNotStarted'
+    $before.packageDeliveryOptions.packageRollout.fallbackSubmissionId | Should -BeExactly '0'
+    $r = Invoke-Publish $Pkg
+    $r.Err | Should -BeNullOrEmpty
+    @($s.Log) | Should -Contain "POST $Base/submissions/$NewId/commit"
+    $s.Sub.status | Should -Be 'Certification'
+    $after = ConvertFrom-Json $s.Fields -AsHashtable
+    $after.packageDeliveryOptions.packageRollout.packageRolloutStatus | Should -BeExactly 'PackageRolloutInProgress'
+    $after.packageDeliveryOptions.packageRollout.fallbackSubmissionId | Should -BeExactly '1152921505000000042'
+    $after.packageDeliveryOptions.packageRollout.packageRolloutPercentage | Should -Be 0
+    $after.packageDeliveryOptions.isMandatoryUpdate | Should -BeFalse
+    $r.Out | Should -Match 'fields unchanged: 19 submission fields'
+    $r.All | Should -Not -MatchExactly 'PackageRollout(NotStarted|InProgress)|1152921505000000042'
+    $r.All | Should -Not -Match $Leak
+  }
+
   # Item r3-1: the docs require these on every package object of the update.
   It 'sends minimumDirectXVersion and minimumSystemRam None on the new package entry' {
     $s = New-FakeStore; Use-FakeStore $s
@@ -787,12 +835,17 @@ Describe 'Publish-StoreSubmission (fake Store)' {
     @{ Case = 'the markets (one added)'; Drift = 'AddMarket'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.JP' }
     @{ Case = 'the markets (one removed)'; Drift = 'RemoveMarket'; Field = 'pricing'; Path = 'pricing.marketSpecificPricings.US' }
     @{ Case = 'the listings (one dropped)'; Drift = 'DropListing'; Field = 'listings'; Path = 'listings.zh-hk' }
+    # Partner Center also set its own rollout fields; only the field this run
+    # controls is named.
+    @{ Case = 'the package rollout percentage, with the rollout fields Partner Center sets'; Drift = 'RolloutPercentage'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage' }
+    @{ Case = 'the mandatory update setting, with the rollout fields Partner Center sets'; Drift = 'MandatoryUpdate'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.isMandatoryUpdate' }
   ) {
     $s = New-FakeStore -DriftOnPut $Drift; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
     $r.Err | Should -Match ("submission fields changed after this run's update: $Field\. Paths that differ \(values not printed\): " +
-      [regex]::Escape($Path) + '\. Only applicationPackages, friendlyName and the pricing fields other than priceId, trialPeriod and the market prices may change')
-    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2|NoFreeTrial'
+      [regex]::Escape($Path) + '\. Only applicationPackages, friendlyName, the pricing fields other than priceId, trialPeriod and the market ' +
+      'prices, and the package rollout status and fallback submission id Partner Center sets may change')
+    $r.All | Should -Not -MatchExactly 'Tier\d|Launch sale|Submission 2|NoFreeTrial|PackageRollout(NotStarted|InProgress)|1152921505000000042'
     $r.Err | Should -Match "Not committed: draft $NewId stays uncommitted"
     $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
@@ -997,11 +1050,14 @@ Describe 'Publish-StoreSubmission (fake Store)' {
   }
 
   It 'stops uncommitted, before the PUT, when pricing is <Case>' -ForEach @(
-    @{ Case = 'Base'; Opt = @{ PriceId = 'Base' }; Want = "'Base'" }, @{ Case = 'empty'; Opt = @{ PriceId = '' }; Want = 'empty' }, @{ Case = 'missing'; Opt = @{ NoPricing = $true }; Want = 'no pricing' }
+    @{ Case = 'Base'; Opt = @{ PriceId = 'Base' }; Want = 'pricing\.priceId is one the service rejects on PUT \(the price is not printed\)' }
+    @{ Case = 'base'; Opt = @{ PriceId = 'base' }; Want = 'pricing\.priceId is one the service rejects on PUT \(the price is not printed\)' }
+    @{ Case = 'empty'; Opt = @{ PriceId = '' }; Want = 'pricing\.priceId is empty' }, @{ Case = 'missing'; Opt = @{ NoPricing = $true }; Want = 'submission has no pricing' }
   ) {
     $s = New-FakeStore @Opt; Use-FakeStore $s
     $r = Invoke-Publish $Pkg
-    $r.Err | Should -Match "price check failed: .*$Want"
+    $r.Err | Should -Match "price check failed: $Want"
+    $r.All | Should -Not -Match "'base'|\bbase\b"
     $r.Err | Should -Match "DELETE /v1\.0/my/applications/$App/submissions/$NewId "
     @($s.Log) | Should -Not -Contain "PUT $Base/submissions/$NewId"
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
@@ -2938,6 +2994,17 @@ Describe 'Compare-SubmissionFields' {
         foreach ($k in @($old.Keys | Sort-Object -Descending)) { $p[$k] = [System.Text.Json.Nodes.JsonNode]::Parse((ConvertTo-Json -Compress -Depth 9 -InputObject $old[$k])) }
         $n['pricing'] = $p
       } }
+    # Partner Center sets these two itself ("Manage app submissions", Package
+    # rollout resource).
+    @{ Case = 'set packageDeliveryOptions.packageRollout.packageRolloutStatus'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress') } }
+    @{ Case = 'set packageDeliveryOptions.packageRollout.fallbackSubmissionId'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000042') } }
+    @{ Case = 'dropped both package rollout fields Partner Center sets'; Change = { param($n) foreach ($k in 'packageRolloutStatus', 'fallbackSubmissionId') { [void]$n['packageDeliveryOptions']['packageRollout'].AsObject().Remove($k) } } }
+    @{ Case = 'set both package rollout fields, as the fake Store does with StoreSetRollout'; Change = {
+        param($n)
+        $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
+        $f = [System.Text.Json.Nodes.JsonNode]::Parse((Edit-FakeFieldsOnPut ([System.Text.Json.Nodes.JsonNode]::Parse($n.ToJsonString(), $o)) 'Submission 2' 'StoreSetRollout'), $o)
+        $n['packageDeliveryOptions'] = [System.Text.Json.Nodes.JsonNode]::Parse($f['packageDeliveryOptions'].ToJsonString())
+      } }
     @{ Case = 'renamed the draft and rearranged pricing, as the fake Store does on every PUT'; Change = {
         param($n)
         $o = [System.Text.Json.Nodes.JsonNodeOptions]::new(); $o.PropertyNameCaseInsensitive = $true
@@ -3018,6 +3085,21 @@ Describe 'Compare-SubmissionFields' {
     @{ Case = 'the publish mode changed'; Field = 'targetPublishMode'; Path = 'targetPublishMode'; Change = { param($n) $n['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create('Immediate') } }
     @{ Case = 'the publish date changed'; Field = 'targetPublishDate'; Path = 'targetPublishDate'; Change = { param($n) $n['targetPublishDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00Z') } }
     @{ Case = 'a device family changed'; Field = 'allowTargetFutureDeviceFamilies'; Path = 'allowTargetFutureDeviceFamilies.[unlisted field name]'; Change = { param($n) $n['allowTargetFutureDeviceFamilies']['Xbox'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    # packageDeliveryOptions is what the PUT sends: all of it but the two
+    # rollout fields Partner Center sets is compared, and only where the docs
+    # put those two.
+    @{ Case = 'isPackageRollout changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.isPackageRollout'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['isPackageRollout'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'packageRolloutPercentage changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout']['packageRolloutPercentage'] = [System.Text.Json.Nodes.JsonValue]::Create(50.0) } }
+    @{ Case = 'packageRolloutPercentage changed, and Partner Center set its rollout fields too'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage'; Change = {
+        param($n)
+        $r = $n['packageDeliveryOptions']['packageRollout']
+        $r['packageRolloutPercentage'] = [System.Text.Json.Nodes.JsonValue]::Create(50.0); $r['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress'); $r['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000042')
+      } }
+    @{ Case = 'isMandatoryUpdate changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.isMandatoryUpdate'; Change = { param($n) $n['packageDeliveryOptions']['isMandatoryUpdate'] = [System.Text.Json.Nodes.JsonValue]::Create($true) } }
+    @{ Case = 'mandatoryUpdateEffectiveDate changed'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.mandatoryUpdateEffectiveDate'; Change = { param($n) $n['packageDeliveryOptions']['mandatoryUpdateEffectiveDate'] = [System.Text.Json.Nodes.JsonValue]::Create('2027-01-01T00:00:00.0000000Z') } }
+    @{ Case = 'packageRollout is gone'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout'; Change = { param($n) [void]$n['packageDeliveryOptions'].AsObject().Remove('packageRollout') } }
+    @{ Case = 'packageRollout is not an object'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRollout'; Change = { param($n) $n['packageDeliveryOptions']['packageRollout'] = [System.Text.Json.Nodes.JsonArray]::new() } }
+    @{ Case = 'packageRolloutStatus was added outside packageRollout'; Field = 'packageDeliveryOptions'; Path = 'packageDeliveryOptions.packageRolloutStatus'; Change = { param($n) $n['packageDeliveryOptions']['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress') } }
     @{ Case = 'a listed field was added'; Field = 'fallbackSubmissionId'; Path = 'fallbackSubmissionId'; Change = { param($n) $n['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
     @{ Case = 'a listed field was added in another case'; Field = 'fallbackSubmissionId'; Path = 'fallbackSubmissionId'; Change = { param($n) $n['FALLBACKSUBMISSIONID'] = [System.Text.Json.Nodes.JsonValue]::Create('x') } }
     @{ Case = 'a field not listed here was added'; Field = '[unlisted field name]'; Path = '[unlisted field name]'; Change = { param($n) $n['newSetting'] = [System.Text.Json.Nodes.JsonValue]::Create(1) } }
@@ -3045,7 +3127,7 @@ Describe 'Show-StoreSubmissionDiagnosis (mode=diagnose, read-only)' {
     $script:Draft = '1152921505000000007'
     $script:Published = '1152921505000000001'
     # Values in the fake's fields; none may be printed.
-    $script:Values = 'Tier\d|Launch sale|Submission [12]|NoFreeTrial|"Free"|JerisLink remote desktop'
+    $script:Values = 'Tier\d|Launch sale|Submission [12]|NoFreeTrial|"Free"|JerisLink remote desktop|PackageRollout(NotStarted|InProgress)|1152921505000000042'
   }
   AfterEach { & $Mod { $script:ReadOnlyCalls = $false }; Remove-Variable -Name DiagWrite -Scope Global -ErrorAction Ignore }
 
@@ -3137,6 +3219,13 @@ Describe 'Show-StoreSubmissionDiagnosis (mode=diagnose, read-only)' {
     @{ Case = 'and a market was added'; Drift = 'AddMarket'; Pricing = 'pricing.marketSpecificPricings.JP, pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.marketSpecificPricings.JP' }
     @{ Case = 'and a market was removed'; Drift = 'RemoveMarket'; Pricing = 'pricing.marketSpecificPricings.US, pricing.sales, pricing.isAdvancedPricingModel'; Other = 'none'; Check = 'would stop on pricing.marketSpecificPricings.US' }
     @{ Case = 'and a listing was dropped'; Drift = 'DropListing'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'; Other = 'listings.zh-hk'; Check = 'would stop on listings.zh-hk' }
+    # Diagnose shows the rollout fields Partner Center sets; the publish run's
+    # check does not stop on them.
+    @{ Case = 'and Partner Center set its package rollout fields'; Drift = 'StoreSetRollout'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'
+      Other = 'packageDeliveryOptions.packageRollout.packageRolloutStatus, packageDeliveryOptions.packageRollout.fallbackSubmissionId'; Check = 'would pass' }
+    @{ Case = 'and the rollout percentage changed too'; Drift = 'RolloutPercentage'; Pricing = 'pricing.sales, pricing.isAdvancedPricingModel'
+      Other = 'packageDeliveryOptions.packageRollout.packageRolloutPercentage, packageDeliveryOptions.packageRollout.packageRolloutStatus, packageDeliveryOptions.packageRollout.fallbackSubmissionId'
+      Check = 'would stop on packageDeliveryOptions.packageRollout.packageRolloutPercentage' }
   ) {
     $s = New-FakeStore -PendingId $Draft -DriftOnPut $Drift; Use-FakeStore $s
     $r = Invoke-Captured { Show-StoreSubmissionDiagnosis -ProductId $App -SubmissionId $Draft }
@@ -4672,7 +4761,7 @@ Describe 'Store answers are read only as one strict JSON object, every signature
     @{ Case = 'priceId twice, in another case'; Json = '{"pricing":{"PriceId":"Base","priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
     @{ Case = 'the answer in a list'; Json = '[{"pricing":{"priceId":"Tier1"}}]'; Result = 'Unread'; Reason = '<unread>' }
     @{ Case = 'text before it'; Json = 'Answer: {"pricing":{"priceId":"Tier1"}}'; Result = 'Unread'; Reason = '<unread>' }
-    @{ Case = 'one JSON object (the control)'; Json = '{"pricing":{"priceId":"Tier1"}}'; Result = 'Pass'; Reason = 'pricing.priceId=Tier1 is kept as is' }
+    @{ Case = 'one JSON object (the control)'; Json = '{"pricing":{"priceId":"Tier1"}}'; Result = 'Pass'; Reason = 'pricing.priceId is set and is kept as is (the price is not printed)' }
   ) {
     $r = Test-SubmissionPricing -SubmissionJson $Json
     $r.Result | Should -Be $Result -Because '[result]'

@@ -71,7 +71,13 @@ function ConvertTo-FakeNode([string]$Json) {
 # (priceId, trialPeriod, the price of each market) stays. Then Drift, a change
 # the service must not make: 'Pricing' (priceId becomes Tier1), 'MarketPrice'
 # (the HK price becomes Tier5), 'AddMarket' (JP is added), 'RemoveMarket' (US
-# is gone), 'DropListing' (the zh-hk listing is gone). Returns the new JSON.
+# is gone), 'DropListing' (the zh-hk listing is gone); or one the docs say
+# Partner Center makes itself: 'StoreSetRollout' (it sets
+# packageDeliveryOptions.packageRollout.packageRolloutStatus and
+# fallbackSubmissionId, which "are assigned by Partner Center"); or that one
+# with a change the service must not make on top: 'RolloutPercentage'
+# (packageRolloutPercentage becomes 50), 'MandatoryUpdate' (isMandatoryUpdate
+# becomes true). Returns the new JSON.
 function Edit-FakeFieldsOnPut([System.Text.Json.Nodes.JsonObject]$Fields, [string]$OldFriendlyName, [string]$Drift) {
   $Fields['friendlyName'] = [System.Text.Json.Nodes.JsonValue]::Create("$(if ($OldFriendlyName) { $OldFriendlyName } else { 'Submission' }) (updated)")
   $p = $Fields['pricing']
@@ -95,13 +101,20 @@ function Edit-FakeFieldsOnPut([System.Text.Json.Nodes.JsonObject]$Fields, [strin
     $Fields['pricing'] = $new
   }
   # A pricing drift needs pricing (NoPricing has none).
-  if ($Drift -cne 'DropListing' -and $Fields['pricing'] -isnot [System.Text.Json.Nodes.JsonObject]) { $Drift = '' }
+  if ($Drift -cin 'Pricing', 'MarketPrice', 'AddMarket', 'RemoveMarket' -and $Fields['pricing'] -isnot [System.Text.Json.Nodes.JsonObject]) { $Drift = '' }
+  if ($Drift -cin 'StoreSetRollout', 'RolloutPercentage', 'MandatoryUpdate') {
+    $r = $Fields['packageDeliveryOptions']['packageRollout']
+    $r['packageRolloutStatus'] = [System.Text.Json.Nodes.JsonValue]::Create('PackageRolloutInProgress')
+    $r['fallbackSubmissionId'] = [System.Text.Json.Nodes.JsonValue]::Create('1152921505000000042')
+  }
   switch ($Drift) {
     'Pricing' { $Fields['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') }
     'MarketPrice' { $Fields['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier5') }
     'AddMarket' { $Fields['pricing']['marketSpecificPricings']['JP'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier2') }
     'RemoveMarket' { [void]$Fields['pricing']['marketSpecificPricings'].AsObject().Remove('US') }
     'DropListing' { [void]$Fields['listings'].AsObject().Remove('zh-hk') }
+    'RolloutPercentage' { $Fields['packageDeliveryOptions']['packageRollout']['packageRolloutPercentage'] = [System.Text.Json.Nodes.JsonValue]::Create(50.0) }
+    'MandatoryUpdate' { $Fields['packageDeliveryOptions']['isMandatoryUpdate'] = [System.Text.Json.Nodes.JsonValue]::Create($true) }
   }
   $Fields.ToJsonString()
 }
@@ -128,7 +141,10 @@ function Edit-FakeFieldsOnPut([System.Text.Json.Nodes.JsonObject]$Fields, [strin
 # Store does (Edit-FakeFieldsOnPut). DriftOnPut: the PUT also changes a field
 # it should keep ('Pricing': priceId becomes Tier1; 'MarketPrice': the HK
 # price changes; 'AddMarket': JP is added; 'RemoveMarket': US is gone;
-# 'DropListing': the zh-hk listing is gone).
+# 'DropListing': the zh-hk listing is gone), or makes a change Partner Center
+# makes itself ('StoreSetRollout': it sets the package rollout status and
+# fallback submission id), alone or with one it should not make on top
+# ('RolloutPercentage', 'MandatoryUpdate'; see Edit-FakeFieldsOnPut).
 # GET app shows lastPublishedApplicationSubmission 1152921505000000001 (none
 # with NoPublished); a GET of it by id shows it with status Published and the
 # fields as they were before any PUT (friendlyName "Submission 1").
@@ -219,7 +235,8 @@ function New-FakeStore {
     [string]$CreateErrorBody = '',
     [switch]$KeepOldPackage,
     [string]$CommitStatus = 'Certification',
-    [ValidateSet('', 'Pricing', 'MarketPrice', 'AddMarket', 'RemoveMarket', 'DropListing')][string]$DriftOnPut = '',
+    [ValidateSet('', 'Pricing', 'MarketPrice', 'AddMarket', 'RemoveMarket', 'DropListing', 'StoreSetRollout', 'RolloutPercentage',
+      'MandatoryUpdate')][string]$DriftOnPut = '',
     [string]$PendingStatus = 'PendingCommit',
     [switch]$NoPublished,
     [ValidateSet('', 'Create', 'Commit')][string]$LoseResponse = '',

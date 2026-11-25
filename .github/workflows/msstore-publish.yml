@@ -63,7 +63,8 @@ name: msstore-publish
 #      the answer named, else the app) and stop, whatever that shows. None of
 #      these gives re-run or delete advice;
 #   3. GET the app again: its pending submission must be that id;
-#   4. GET the submission, check its price can be sent back unchanged, PUT it
+#   4. GET the submission, check its price can be sent back unchanged (the
+#      log says only whether it can, never the price), PUT it
 #      with every old package PendingDelete and the new .msixupload
 #      PendingUpload (minimumDirectXVersion and minimumSystemRam None), then
 #      PUT the zipped package to its SAS upload URL. If the PUT or the upload
@@ -79,8 +80,12 @@ name: msstore-publish
 #      isAdvancedPricingModel changed), so pricing is compared only on
 #      priceId, trialPeriod and marketSpecificPricings, each market on its
 #      own and in any order: a changed price, or a market added, removed or
-#      priced differently, still stops the run. The error names the paths
-#      that differ (such as pricing.priceId), never their values;
+#      priced differently, still stops the run. Partner Center sets
+#      packageDeliveryOptions.packageRollout.packageRolloutStatus and
+#      fallbackSubmissionId itself (the docs: "assigned by Partner Center"),
+#      so those two are not compared either; the rest of
+#      packageDeliveryOptions is. The error names the paths that differ
+#      (such as pricing.priceId), never their values;
 #   6. print the submission id and how to check it by hand, then POST
 #      .../submissions/{id}/commit, waiting up to 60 s for the answer. If it
 #      gets no answer, HTTP 408 or 5xx, an HTTP 200, 201 or 204 whose body is

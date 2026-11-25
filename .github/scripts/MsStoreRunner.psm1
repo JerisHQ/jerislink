@@ -22,7 +22,8 @@
 #   pending submission must be that id -> GET submission -> price check -> PUT
 #   with every old package PendingDelete and the new file PendingUpload -> PUT
 #   the zip to the SAS upload URL -> GET submission: every field except the
-#   packages, friendlyName and the pricing fields the service rewrites is
+#   packages, friendlyName, the pricing fields the service rewrites and the
+#   package rollout status and fallback submission id Partner Center sets is
 #   unchanged (Compare-SubmissionFields) and Test-DraftReadyToCommit passes ->
 #   POST .../submissions/{id}/commit. Assert-SubmissionHasPackage then reads
 #   that id back until it is committed with the new package. When create or
@@ -991,22 +992,18 @@ function Test-StoreId([AllowNull()][AllowEmptyString()][string]$Value) {
 # anything else is [unlisted]. Values from "Manage app submissions"
 # (learn.microsoft.com, Windows Store submission API): the submission status
 # (also the commit response's status), the publish mode, a package's file
-# status, and the price ids Base, NotAvailable, Free and Tier<number>
-# (Get-ListedPriceId).
+# status and a package's file status. A price (priceId, a market price) is
+# never printed, listed or not (Pepper, PR #75 r1): the price check says
+# only whether it passed (Test-SubmissionPricing).
 $script:SubmissionStatuses = @('None', 'Canceled', 'PendingCommit', 'CommitStarted', 'CommitFailed', 'PendingPublication',
   'Publishing', 'Published', 'PublishFailed', 'PreProcessing', 'PreProcessingFailed', 'Certification', 'CertificationFailed',
   'Release', 'ReleaseFailed')
 $script:PublishModes = @('Immediate', 'Manual', 'SpecificDate')
 $script:FileStatuses = @('None', 'PendingUpload', 'Uploaded', 'PendingDelete')
-$script:PriceIds = @('Base', 'NotAvailable', 'Free')
 function Get-ListedValue([AllowNull()][AllowEmptyString()][string]$Value, [string[]]$List) {
   if (-not $Value) { return '' }
   foreach ($v in $List) { if ($v -ceq $Value) { return $v } }
   '[unlisted]'
-}
-function Get-ListedPriceId([AllowNull()][AllowEmptyString()][string]$Value) {
-  if ($Value -cmatch '^Tier[0-9]{1,5}\z') { return "Tier$($Value.Substring(4))" }
-  Get-ListedValue $Value $script:PriceIds
 }
 
 # A package file name from the API is printed only when it is exactly
@@ -1475,7 +1472,9 @@ function Resolve-UnconfirmedCreate([string]$ProductId, [string]$Failure) {
 # priceId (a PUT with it makes the product free) or 'Base': Result Fail.
 # An answer it cannot read (ConvertFrom-StoreJson), pricing that is not a JSON
 # object or a priceId that is not text: Result Unread, which the publish flow
-# stops on as "Could not verify" (Pepper, PR #74 r10). Pure.
+# stops on as "Could not verify" (Pepper, PR #74 r10). Each Reason is fixed
+# text: the price is never in it (Pepper, PR #75 r1: run 45524510567 printed
+# the priceId). Pure.
 function Test-SubmissionPricing {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson)
   $s = ConvertFrom-StoreJson $SubmissionJson
@@ -1486,8 +1485,8 @@ function Test-SubmissionPricing {
   $price = Get-JsonField $p.Value 'priceId'
   if ($price -ceq $script:NotText) { return [pscustomobject]@{ Result = 'Unread'; Reason = 'pricing.priceId is not text; this run does not send a price it cannot read' } }
   if (-not $price) { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is empty; a PUT with it would make the product free' } }
-  if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = "pricing.priceId is 'Base', which the service rejects on PUT" } }
-  [pscustomobject]@{ Result = 'Pass'; Reason = "pricing.priceId=$(Get-ListedPriceId $price) is kept as is" }
+  if ($price -eq 'Base') { return [pscustomobject]@{ Result = 'Fail'; Reason = 'pricing.priceId is one the service rejects on PUT (the price is not printed)' } }
+  [pscustomobject]@{ Result = 'Pass'; Reason = 'pricing.priceId is set and is kept as is (the price is not printed)' }
 }
 
 # Returns the submission JSON for the PUT: every existing package is marked
@@ -1543,15 +1542,28 @@ function Set-SubmissionPackage {
 # visibility, targetPublishMode, targetPublishDate,
 # allowTargetFutureDeviceFamilies, ...), must come back from the PUT
 # unchanged; pricing is compared by its price fields only
-# (Compare-SubmissionPricing).
+# (Compare-SubmissionPricing), and packageDeliveryOptions without the two
+# package rollout fields Partner Center sets (UncomparedRolloutFields).
 $script:UncomparedFields = @('id', 'status', 'statusDetails', 'fileUploadUrl', 'applicationPackages', 'friendlyName')
+# packageDeliveryOptions.packageRollout fields Partner Center sets itself, so
+# a change of them after the PUT is the Store's, like friendlyName, and is not
+# compared. "Manage app submissions", Package rollout resource
+# (https://learn.microsoft.com/en-us/windows/uwp/monetize/manage-app-submissions):
+# "The packageRolloutStatus and fallbackSubmissionId values are assigned by
+# Partner Center, and are not intended to be set by the developer. If you
+# include these values in a request body, these values will be ignored."
+# The rest of packageDeliveryOptions (isPackageRollout,
+# packageRolloutPercentage, isMandatoryUpdate, mandatoryUpdateEffectiveDate)
+# is what the PUT sends and stays compared.
+$script:UncomparedRolloutFields = @('packageRolloutStatus', 'fallbackSubmissionId')
 
 # Parses Json into a JsonObject without the uncompared fields. Throws fixed
 # text only (a System.Text.Json message quotes the JSON; Pepper, PR #74 r8).
 # A JsonObject reads its properties only on first use, and a duplicate key
 # throws then, so the Remove calls stay inside the try.
-# KeepFriendlyName (Get-SubmissionDiagnosis): friendlyName is kept.
-function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json, [switch]$KeepFriendlyName) {
+# KeepStoreSetFields (Get-SubmissionDiagnosis): friendlyName and the package
+# rollout fields Partner Center sets (UncomparedRolloutFields) are kept.
+function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json, [switch]$KeepStoreSetFields) {
   $o = [System.Text.Json.Nodes.JsonNodeOptions]::new()
   $o.PropertyNameCaseInsensitive = $true
   $n = $null
@@ -1559,7 +1571,14 @@ function ConvertTo-SubmissionNode([AllowEmptyString()][string]$Json, [switch]$Ke
     # Only an answer ConvertFrom-StoreJson would read (Pepper, PR #74 r10).
     if (Test-StoreJsonObject $Json) { $n = [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o) }
     if ($n -is [System.Text.Json.Nodes.JsonObject]) {
-      foreach ($f in $script:UncomparedFields) { if (-not ($KeepFriendlyName -and $f -ceq 'friendlyName')) { [void]$n.Remove($f) } }
+      foreach ($f in $script:UncomparedFields) { if (-not ($KeepStoreSetFields -and $f -ceq 'friendlyName')) { [void]$n.Remove($f) } }
+      # Only where the docs put them: packageDeliveryOptions.packageRollout,
+      # both objects. Anything else there is compared as it is.
+      $r = $n['packageDeliveryOptions']
+      if (-not $KeepStoreSetFields -and $r -is [System.Text.Json.Nodes.JsonObject]) {
+        $r = $r['packageRollout']
+        if ($r -is [System.Text.Json.Nodes.JsonObject]) { foreach ($f in $script:UncomparedRolloutFields) { [void]$r.Remove($f) } }
+      }
     }
   } catch { $n = $null }
   if ($n -isnot [System.Text.Json.Nodes.JsonObject]) { throw (Hide-StoreSecret 'submission JSON is not an object that can be read (the parser''s message is not printed)') }
@@ -1714,8 +1733,8 @@ function Compare-SubmissionFields {
 # pass). Throws fixed text only.
 function Get-SubmissionDiagnosis {
   param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmissionJson, [Parameter(Mandatory)][AllowEmptyString()][string]$PublishedJson)
-  $a = ConvertTo-SubmissionNode $PublishedJson -KeepFriendlyName
-  $b = ConvertTo-SubmissionNode $SubmissionJson -KeepFriendlyName
+  $a = ConvertTo-SubmissionNode $PublishedJson -KeepStoreSetFields
+  $b = ConvertTo-SubmissionNode $SubmissionJson -KeepStoreSetFields
   $pricing = [System.Collections.Generic.List[string]]::new()
   $other = [System.Collections.Generic.List[string]]::new()
   $friendly = ''
@@ -2225,12 +2244,14 @@ function Publish-StoreSubmission {
     $now = $null
     if ($diff.Changed.Count -gt 0) {
       throw (Hide-StoreSecret ("submission fields changed after this run's update: $($diff.Changed -join ', '). Paths that differ " +
-        "(values not printed): $($diff.Paths -join ', '). Only applicationPackages, friendlyName and the pricing fields other " +
-        "than priceId, trialPeriod and the market prices may change; every other field (the price, the market prices, " +
-        "listings, visibility, publish mode and date, device families, ...) must read back as it was before the update"))
+        "(values not printed): $($diff.Paths -join ', '). Only applicationPackages, friendlyName, the pricing fields other " +
+        "than priceId, trialPeriod and the market prices, and the package rollout status and fallback submission id Partner " +
+        "Center sets may change; every other field (the price, the market prices, listings, visibility, publish mode and " +
+        "date, device families, package delivery options, ...) must read back as it was before the update"))
     }
     Write-StoreHost ("fields unchanged: $($diff.Compared) submission fields other than applicationPackages and friendlyName read " +
-      "back as before the update (pricing: priceId, trialPeriod and the market prices)")
+      "back as before the update (pricing: priceId, trialPeriod and the market prices; packageDeliveryOptions: all but the " +
+      "package rollout status and fallback submission id Partner Center sets)")
     Write-StoreHost "draft verified: $($check.Reason)"
     if ((Get-StoreUtcNow) -ge $commitBy) {
       throw (Hide-StoreSecret ("no time left for the commit: it and its read-backs need the last $reserve s before the deadline " +

@@ -25,7 +25,7 @@ name: msstore-publish-check
 #   the real Store does (run 45524510567), and the flow still commits.
 #   Also: a pending PendingCommit draft stops the run before create, names
 #   the draft, says a person decides and sends it nothing; a PUT that changes
-#   the price stops it uncommitted and names the path; a commit that gets a 504 while still
+#   the price stops it uncommitted and names the path; no output shows a price; a commit that gets a 504 while still
 #   processing is read back by id until it shows CommitStarted; a draft someone
 #   else creates after the pending check, with a create that gets a 504, is
 #   reported as of unconfirmed origin with no delete advice; a commit that
@@ -360,6 +360,8 @@ jobs:
             foreach ($bad in @($secret, $store.Token, 'FAKE+SAS', 'FAKE%2BSAS', 'SIGNATURE-0123456789', '/blob/')) {
               if ($text.Contains($bad)) { throw "output contains a secret, token or SAS URL part" }
             }
+            # No price either: the stand-in's priceId, trialPeriod, market and sale prices.
+            if ($text -cmatch '\bFree\b|Tier[0-9]|NoFreeTrial|Launch sale') { throw "output contains a price" }
           }
           $app = $env:STORE_PRODUCT_ID
           $base = "/v1.0/my/applications/$app"
@@ -374,6 +376,7 @@ jobs:
             if ($r.Err) { throw "publish flow failed against the stand-in" }
             Assert-NoLeak $r.Text $s
             if ($r.Text -notmatch 'fields unchanged: \d+ submission fields') { throw "the fields were not compared before commit" }
+            if ($r.Text -cnotmatch 'price check: pricing\.priceId is set and is kept as is \(the price is not printed\)') { throw "the price check line is not the fixed text" }
             $id = $s.NewId
             if (@($r.Value) -join ',' -ne $id) { throw "Publish-StoreSubmission returned '$(@($r.Value) -join ',')', not $id" }
             if ($s.CreateQuery -cne '?isMinimalResponse=true') { throw "the create was not sent with ?isMinimalResponse=true" }
