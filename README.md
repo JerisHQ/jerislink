@@ -1,6 +1,6 @@
 # JerisLink
 
-JerisLink is a low-latency remote desktop for your [Tailscale](https://tailscale.com) tailnet: a Mac runs the host, a Windows PC runs the viewer, and you control the Mac from the PC. The connection stays inside your tailnet. There is no JerisLink account and no JerisLink server.
+JerisLink is a low-latency remote desktop for your [Tailscale](https://tailscale.com) tailnet: a Mac runs the host, a Windows PC runs the viewer, and you control the Mac from the PC. Set up as in the [quick start](#quick-start), with both machines' Tailscale addresses, the connection stays inside your tailnet and Tailscale encrypts it. JerisLink adds no encryption of its own: pointed at an address outside a tailnet, it sends everything unencrypted (see [PRIVACY.md](PRIVACY.md)). There is no JerisLink account and no JerisLink server.
 
 > Status: experimental. Not security audited. Use it only on networks and machines you control.
 
@@ -14,54 +14,57 @@ JerisLink is a low-latency remote desktop for your [Tailscale](https://tailscale
 | What | Where | Signing |
 |---|---|---|
 | Mac host (Apple silicon, macOS 14 or later) | `JerisLink-<version>-macos-arm64.zip` on [GitHub Releases](https://github.com/JerisHQ/jerislink/releases/latest) | Developer ID signed and notarized by Apple, ticket stapled |
-| Windows viewer (recommended) | [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N) | Signed by Microsoft through the Store |
-| Windows viewer, installer | `Jerislink-<version>-windows-x64-setup.exe` on GitHub Releases | Not code-signed yet |
-| Windows viewer, no install | `Jerislink-<version>-windows-x64-portable.zip` on GitHub Releases | Not code-signed yet |
+| Windows viewer (recommended; Windows 10 version 1809 or later, or Windows 11) | [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N) | Signed by Microsoft through the Store |
+| Windows viewer, installer (Windows 10 or 11 x64) | `Jerislink-<version>-windows-x64-setup.exe` on GitHub Releases | Not code-signed yet |
+| Windows viewer, no install (Windows 10 or 11 x64) | `Jerislink-<version>-windows-x64-portable.zip` on GitHub Releases | Not code-signed yet |
 
-Every release has a `SHA256SUMS.txt` to check the downloads against. Details: [Code signing](#code-signing).
+Each release's `SHA256SUMS.txt` covers the files the release workflow builds: the Mac zip, `setup.exe` and the portable zip. A `-store-signed.msix` attached to a release later is not in it; its SHA-256 is the `sha256:` digest shown next to the file on the release page. Details: [Code signing](#code-signing).
 
 ## Quick start
 
-You need a Mac with Apple silicon on macOS 14 or later, a Windows 10 or 11 x64 PC, and Tailscale signed in to the same tailnet on both. Note each machine's Tailscale IPv4 address (`100.x.y.z`, shown in the Tailscale menu or by `tailscale ip -4`).
+You need a Mac with Apple silicon on macOS 14 or later, a Windows 10 or 11 x64 PC (Windows 10 version 1809 or later for the Microsoft Store version), and Tailscale signed in to the same tailnet on both. Note each machine's Tailscale IPv4 address (`100.x.y.z`, shown in the Tailscale menu or by `tailscale ip -4`).
 
 On the Mac:
 
 1. Download `JerisLink-<version>-macos-arm64.zip` from the [latest release](https://github.com/JerisHQ/jerislink/releases/latest), unpack it, and move `JerisLink.app` into the `Applications` folder in your home folder (`~/Applications`; create it if it is missing).
 2. Open `JerisLink.app`. It starts its background services. Allow what macOS asks for in System Settings > Privacy & Security: **Screen Recording** for JerisLink and **Accessibility** for JerisLink Input Helper. If it asks, also turn on JerisLink under General > Login Items & Extensions. Open the app again: all three services should show `enabled`.
-3. Allow your PC. The host app's **連線設定…** window has an allowed-address list (白名單), but it can only save to `listen.plist`, and the app does not create that file yet. So create it once in Terminal, with the **Windows PC's** Tailscale IPv4 in place of `100.x.y.z`:
+3. Create the settings file `listen.plist` once in Terminal. The app does not create it yet, and its **連線設定…** window has no setting for the listen mode:
 
    ```sh
    mkdir -p ~/Library/Application\ Support/JerisLink
    cd ~/Library/Application\ Support/JerisLink
    /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy \
-     -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' listen.plist
+     -c 'Add :mode string tailnet' listen.plist
    ```
 
-4. Set a connection password: open `JerisLink.app`, click **連線設定…** (connection settings) and set it there. Without a password, the allowed PC connects on its address alone. More PCs and blocked addresses are added in the same window from now on.
+   The host does not listen yet: it waits for a password or an allowed address.
+4. Set a connection password: open `JerisLink.app`, click **連線設定…** (connection settings), type the password twice and click **設定／更改密碼**. It needs at least 10 characters, with an upper-case letter, a lower-case letter and a symbol. The background services pick it up within a few seconds; no restart is needed. From then on, any device in your tailnet that can reach the Mac connects with the password (Tailscale's access controls decide which devices can reach it).
+
+   Optional: to allow only some PCs, put their Tailscale IPv4 addresses in **白名單** (allowed addresses) in the same window and click **儲存白名單**. Blocked addresses (**黑名單**) and the password are changed there too.
 
 On the PC:
 
-5. Install JerisLink from the [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N), or the installer from GitHub Releases, and open it.
+5. Install JerisLink from the [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N) (Windows 10 version 1809 or later), or run `setup.exe` from GitHub Releases, or unpack the portable zip. Open it.
 6. On the launch screen, type the **Mac's** Tailscale IPv4 in **Mac host address** and the password in **Connection password**, then click **Connect to Mac**. The address is saved for the next start; turn on **Remember password on this PC** to skip typing the password next time.
 
 This PC's own address is chosen automatically. More detail: [Mac host install guide](personal/mac-host/Deploy/README.md) and [Windows viewer notes](personal/windows-client/README-Windows.txt).
 
 ## Features
 
-- The Mac's main display at its native resolution, up to 60 fps. Hardware H.264 or HEVC encoding on the Mac (VideoToolbox), hardware decoding on the PC (Media Foundation, Direct3D 11).
+- The Mac's main display at its native resolution, up to 60 fps. By default the stream is at most 3840×2160 pixels of area: a larger display, such as a 5K one, is scaled down to fit, with its aspect ratio kept. Hardware H.264 or HEVC encoding on the Mac (VideoToolbox), hardware decoding on the PC (Media Foundation, Direct3D 11).
 - Lost video packets are sent again, and the bitrate follows the network.
 - The Mac's sound plays on the PC (Opus), with a volume slider.
 - Keyboard and mouse, with Mac or Windows keyboard layout presets. The overlay can open the Mac's Force Quit window.
 - Text clipboard in both directions.
-- Files in both directions: copy in Explorer and paste in Finder or the other way round, drag files onto the viewer, or right-click and use Send to JerisLink in Explorer or the Finder. Files that arrive on Windows carry the internet zone mark.
-- Connection password. The password itself is never sent; the Mac keeps only a key derived from it, in the Keychain. Repeated wrong passwords lock that address out for a while, then block it. With a password set, every video, audio and mouse packet is tied to the logged-in session, and other packets are dropped. Allowed and blocked addresses are edited in the host app's 連線設定 window; the first allowed address is set once in Terminal (quick start, step 3).
+- Files in both directions: copy in Explorer and paste in Finder or the other way round, or drag files onto the viewer. On the Mac, Finder has a **Send to JerisLink** service. In Explorer's right-click menu, the Microsoft Store version has its own **Send to JerisLink** item (not yet verified on Windows 10), the GitHub installer adds **Send to > JerisLink**, and the portable zip adds nothing. Files that arrive on Windows carry the internet zone mark.
+- Connection password. The password itself is never sent; the Mac keeps only a key derived from it, in the Keychain. Repeated wrong passwords lock that address out for a while, then block it. With a password set, every video, audio and mouse packet is tied to the logged-in session, and other packets are dropped. The password, the optional allowed addresses and the blocked addresses are set in the host app's 連線設定 window once `listen.plist` exists (quick start, step 3).
 - Launch screen with a green or blue theme, and an overlay during the session instead of a menu bar.
 - No analytics, crash reporting or update check. See [PRIVACY.md](PRIVACY.md).
 
 ## Code signing
 
 - **macOS:** the [release workflow](.github/workflows/release.yml) signs `JerisLink.app` with a Developer ID certificate, has Apple notarize it and staples the ticket (`personal/mac-host/Deploy/notarize.sh`). A zip whose name ends in `-unsigned.zip` was built without the signing secrets and is only ad-hoc signed (so far only v0.1.0); do not use it.
-- **Windows, Microsoft Store:** the Store delivers the package signed by Microsoft. A release can also carry `Jerislink-<version>-windows-x64-store-signed.msix`, a copy of that Store-signed package, which [`store-msix-to-release`](https://github.com/JerisHQ/jerislink/blob/main/.github/workflows/store-msix-to-release.yml) downloads from the Store and checks before attaching it.
+- **Windows, Microsoft Store:** the Store delivers the package signed by Microsoft. A release can also carry `Jerislink-<version>-windows-x64-store-signed.msix`, a copy of that Store-signed package, which [`store-msix-to-release`](https://github.com/JerisHQ/jerislink/blob/main/.github/workflows/store-msix-to-release.yml) downloads from the Store and checks before attaching it. It is attached after `SHA256SUMS.txt` is made, so it is not listed there; check it against the `sha256:` digest on the release page or in that workflow run's summary.
 - **Windows, GitHub Releases:** the installer and the portable `Jerislink.exe` are not code-signed yet, so Windows may warn before running them. Signing through the SignPath Foundation is planned; see the [code signing policy](CODE_SIGNING_POLICY.md).
 
 ## Security
