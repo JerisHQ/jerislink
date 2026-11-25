@@ -137,7 +137,8 @@ function Get-StorePackage {
 # client secret, the access token, and each upload URL with what is read from
 # it (Register-StoreUploadUrl): the URL a package is sent to, and every
 # fileUploadUrl of a Store answer (Register-StoreAnswerUploadUrl), the field
-# the API hands an upload URL in. A "sig=" anywhere else in an answer (a
+# the API hands an upload URL in, also one cut off before its closing quote
+# (Register-StoreCutUploadUrl). A "sig=" anywhere else in an answer (a
 # listing's description, a document link, the app's name, another field, an
 # answer that is not JSON) is not a credential this run was given, and no
 # answer's text is printed (only ids, versions and listed values read from
@@ -154,11 +155,14 @@ $script:SecretText = '[redacted]'
 # KnownSecrets.
 $script:SecretInputs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
-function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value) {
+# A form shorter than MinLength is not registered (used only for what is
+# left of a fileUploadUrl cut off, Register-StoreCutUploadUrl).
+function Register-StoreSecret([AllowNull()][AllowEmptyString()][string]$Value, [int]$MinLength = 1) {
   if (-not $Value -or $Value -ceq $script:NotText) { return }
   $forms = @($Value, $Value.Replace('+', '%2B'), $Value.Replace('+', ' '))
   try { $forms += [uri]::UnescapeDataString($Value) } catch { }
   try { $forms += [uri]::EscapeDataString($Value) } catch { }
+  if ($MinLength -gt 1) { $forms = @($forms | Where-Object { $_.Length -ge $MinLength }) }
   $new = $false
   foreach ($f in $forms) {
     if (-not $f) { continue }
@@ -184,12 +188,12 @@ function Register-StoreUploadUrl([AllowNull()][AllowEmptyString()][string]$Url) 
   Register-StoreUrlSecret $Url
   [void]$script:SecretInputs.Add("url:$Url")
 }
-function Register-StoreUrlSecret([string]$Url) {
-  Register-StoreSecret $Url
+function Register-StoreUrlSecret([string]$Url, [int]$MinLength = 1) {
+  Register-StoreSecret $Url $MinLength
   $hash = $Url.IndexOf('#')
   if ($hash -ge 0) {
-    Register-StoreSecret $Url.Substring(0, $hash)
-    Register-StoreQuerySecret $Url.Substring($hash + 1)
+    Register-StoreSecret $Url.Substring(0, $hash) $MinLength
+    Register-StoreQuerySecret $Url.Substring($hash + 1) $MinLength
   }
   $u = $null
   if ([uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$u)) {
@@ -197,20 +201,20 @@ function Register-StoreUrlSecret([string]$Url) {
       $q = ''
       try { $q = $u.GetComponents([UriComponents]::Query, $f) } catch { }
       if (-not $q) { continue }
-      Register-StoreSecret $q
-      Register-StoreSecret "?$q"
-      Register-StoreQuerySecret $q
+      Register-StoreSecret $q $MinLength
+      Register-StoreSecret "?$q" $MinLength
+      Register-StoreQuerySecret $q $MinLength
     }
   }
   $at = $Url.IndexOf('?')
   if ($at -lt 0) { return }
   # As before: from "?" to the end, and to the fragment.
-  Register-StoreSecret $Url.Substring($at)
-  Register-StoreSecret $Url.Substring($at + 1)
+  Register-StoreSecret $Url.Substring($at) $MinLength
+  Register-StoreSecret $Url.Substring($at + 1) $MinLength
   $q = $Url.Substring($at + 1)
   $hash = $q.IndexOf('#')
-  if ($hash -ge 0) { $q = $q.Substring(0, $hash); Register-StoreSecret $q; Register-StoreSecret "?$q" }
-  Register-StoreQuerySecret $q
+  if ($hash -ge 0) { $q = $q.Substring(0, $hash); Register-StoreSecret $q $MinLength; Register-StoreSecret "?$q" $MinLength }
+  Register-StoreQuerySecret $q $MinLength
 }
 
 # The name of a query parameter as a server reads it: percent escapes and
@@ -230,15 +234,15 @@ function ConvertFrom-StoreQueryName([AllowEmptyString()][string]$Name) {
 # Registers the value of each signature parameter of a query (or fragment)
 # text: a name=value pair between "&" or ";" whose decoded name
 # (ConvertFrom-StoreQueryName) is sig in any case, also trimmed.
-function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Query) {
+function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Query, [int]$MinLength = 1) {
   if (-not $Query) { return }
   foreach ($kv in $Query.TrimStart('?').Split([char[]]@('&', ';'))) {
     $eq = $kv.IndexOf('=')
     if ($eq -le 0) { continue }
     if ((ConvertFrom-StoreQueryName $kv.Substring(0, $eq)) -ine 'sig') { continue }
     $v = $kv.Substring($eq + 1)
-    Register-StoreSecret $v
-    Register-StoreSecret $v.Trim()
+    Register-StoreSecret $v $MinLength
+    Register-StoreSecret $v.Trim() $MinLength
   }
 }
 
@@ -251,9 +255,11 @@ function Register-StoreQuerySecret([AllowNull()][AllowEmptyString()][string]$Que
 # Read only in the text as it came, never with its escapes undone: inside a
 # JSON string every quote is escaped, so in a JSON text this matches real
 # members only, and text inside a field (a listing's description, a link
-# that holds "fileUploadUrl": "...") is never taken for one. A text already
-# done (SecretInputs) is not read again. Never throws.
-$script:JsonMemberPattern = [regex]::new('"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+# that holds "fileUploadUrl": "...") is never taken for one. A value cut
+# off before its closing quote, the text ending inside it (group 3 is not a
+# quote), is read too (Register-StoreCutUploadUrl). A text already done
+# (SecretInputs) is not read again. Never throws.
+$script:JsonMemberPattern = [regex]::new('"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)("|\\?\z)', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 $script:JsonEscapePattern = [regex]::new('\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
 # Made once: a script block made a MatchEvaluator on every call cost more
 # than the rest of the scan (PR #74 r12, pester job timed out).
@@ -276,10 +282,37 @@ function Register-StoreTextUploadUrl([AllowNull()][AllowEmptyString()][string]$T
       # with no call per member (an answer has dozens).
       $k = $m.Groups[1].Value
       if ($k.IndexOf([char]'\') -ge 0) { $k = ConvertFrom-StoreJsonEscape $k }
-      if ($k -ieq 'fileUploadUrl') { Register-StoreUploadUrl (ConvertFrom-StoreJsonEscape $m.Groups[2].Value) }
+      if ($k -ine 'fileUploadUrl') { continue }
+      if ($m.Groups[3].Value -ceq '"') { Register-StoreUploadUrl (ConvertFrom-StoreJsonEscape $m.Groups[2].Value) }
+      else { Register-StoreCutUploadUrl $m.Groups[2].Value }
     }
     [void]$script:SecretInputs.Add("text:$Text")
   } catch { }
+}
+
+# A fileUploadUrl cut off before its closing quote, the answer ending inside
+# it (Pepper, PR #74 r12 review, point 1: until then nothing of it was
+# registered, and the strict reader does not read such an answer). Raw is
+# the value as it came, JSON escapes and all. A JSON escape or a percent
+# escape cut in half at its end is dropped, the JSON escapes are undone, and
+# what is left is read as an upload URL (Register-StoreUrlSecret), so its
+# signature, as far as it goes, is masked before any other field is read. A
+# cut may fall anywhere, so a piece of it shorter than CutMinLength is not
+# registered: a signature cut to a few characters is no credential anyone
+# can tell, and masking it would cut the ids and the GET paths out of the
+# lines that tell a person what to check. A value already done
+# (SecretInputs) is not read again.
+$script:CutMinLength = 8
+$script:CutJsonEscapePattern = [regex]::new('\A(?:[^\\]|\\.)*?(\\u[0-9A-Fa-f]{0,3})\z', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+function Register-StoreCutUploadUrl([AllowEmptyString()][string]$Raw) {
+  if ($Raw.IndexOf([char]'\') -ge 0) {
+    $m = $script:CutJsonEscapePattern.Match($Raw)
+    if ($m.Success) { $Raw = $Raw.Substring(0, $m.Groups[1].Index) }
+  }
+  $url = (ConvertFrom-StoreJsonEscape $Raw) -creplace '%[0-9A-Fa-f]?\z', ''
+  if (-not $url -or $script:SecretInputs.Contains("cut:$url")) { return }
+  Register-StoreUrlSecret $url $script:CutMinLength
+  [void]$script:SecretInputs.Add("cut:$url")
 }
 
 # Store API answers are read strictly (Pepper, PR #74 r10). An answer is read

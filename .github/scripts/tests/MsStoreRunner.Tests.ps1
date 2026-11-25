@@ -4396,6 +4396,123 @@ Describe 'Store answers are read only as one strict JSON object, every signature
     }
   }
 
+  # Pepper, PR #74 r12 review, point 1: the create is answered HTTP 201, its
+  # JSON cut off inside the fileUploadUrl, after the (synthetic, numeric)
+  # signature and before the closing quote; the app read after it shows that
+  # signature as the pending id. The answer is still not read (strict JSON),
+  # so the id is unknown, but what is left of the fileUploadUrl is registered
+  # before any field is read (Register-StoreCutUploadUrl): the pending id
+  # holds a confirmed credential, so it is never printed, and the lookup
+  # guidance names the app's GET path in full. The 99de31b and a73e156
+  # modules registered nothing of a value without its closing quote and
+  # printed the signature as the pending id, in the error and in the GET path
+  # to check.
+  It 'the create answer is cut off inside its fileUploadUrl, <Case>, and the app read after it shows the signature as pending: never printed, the GET path in full (r12 review)' -ForEach @(
+    @{ Case = 'right after the signature (Pepper''s repro)' }
+    @{ Case = 'on a backslash after the signature'; Cut = '\' }
+    @{ Case = 'in a JSON escape after the signature'; Cut = '\u00' }
+    @{ Case = 'in a percent escape after the signature'; Cut = '%2' }
+    @{ Case = 'the "&" JSON-escaped, right after the signature'; Escaped = $true }
+    @{ Case = 'a percent-encoded name (%73ig), right after the signature'; Query = '&%73ig=' }
+    @{ Case = 'a nested fileUploadUrl, right after the signature'; Nested = $true }
+  ) {
+    # Locals only: a closure does not see this script's variables.
+    $q = if ($Query) { $Query } else { '&sig=' }
+    $url = $R10Url + $q + $R10Sig; $sig = $R10Sig; $opt = $R10Out; $cut = [string]$Cut; $esc = [bool]$Escaped; $nest = [bool]$Nested
+    $create = {
+      param($b)
+      $n = [System.Text.Json.Nodes.JsonNode]::Parse($b)
+      if ($nest) { $n['r10'] = [System.Text.Json.Nodes.JsonObject]::new(); $n['r10']['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+      else { $n['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url) }
+      $t = $n.ToJsonString($opt)
+      if ($esc) { $t = $t.Replace($q + $sig, '&' + $q.Substring(1) + $sig) }
+      $t.Substring(0, $t.IndexOf($sig) + $sig.Length) + $cut
+    }.GetNewClosure()
+    $pending = New-R10JsonMap { param($o) $o['pendingApplicationSubmission'] = [System.Text.Json.Nodes.JsonNode]::Parse('{"id":"' + $sig + '","resourceLocation":"y"}') }.GetNewClosure()
+    $x = Invoke-R10Run @(@{ Kind = 'Create'; At = 1; Map = $create }, @{ Kind = 'AppRead'; At = 2; Map = $pending })
+    $look = "A person needs to check the app's pending submission in Partner Center (look only, change nothing there) or with GET /v1.0/my/applications/$App (pendingApplicationSubmission.id)"
+    $x.R.Err | Should -Match ([regex]::Escape('the create response (HTTP 200, 201 or 204) has no usable submission id. Created, id unknown'))
+    $x.R.Err | Should -Match ([regex]::Escape("Read-back of the app (one GET): a pending submission without a usable id. $look. $ApiNote"))
+    $x.R.Out | Should -Match ([regex]::Escape("If this step ends before a result is printed below: $look;"))
+    $x.Sent | Should -BeExactly "POST $Base/submissions" -Because '[sent]'
+    $x.R.All | Should -Not -Match '\[redacted\]|\[invalid\]' -Because '[masked]: nothing printed holds it'
+    Assert-R10Safe $x
+  }
+
+  # The same answers read on their own: what is left of the fileUploadUrl is
+  # masked (its signature as far as it goes, at least CutMinLength
+  # characters), and the answer is still not read.
+  It 'an answer cut off inside its fileUploadUrl, <Case>: what is left of the signature masked, the answer still not read (r12 review)' -ForEach @(
+    @{ Case = 'right after the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>' }
+    @{ Case = 'on a backslash after the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>\' }
+    @{ Case = 'in a JSON escape after the signature (\u)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>\u' }
+    @{ Case = 'in a JSON escape after the signature (\u002)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>\u002' }
+    @{ Case = 'in a percent escape after the signature (%)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>%' }
+    @{ Case = 'in a percent escape after the signature (%2)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>%2' }
+    @{ Case = 'a space after the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v> ' }
+    @{ Case = 'in the parameter after the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>&se=2026-11' }
+    @{ Case = 'in the fragment after the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>#r1' }
+    @{ Case = 'the signature in the fragment'; Body = '{"id":"1","fileUploadUrl":"<u>#sig=<v>' }
+    @{ Case = 'a ; before the signature'; Body = '{"id":"1","fileUploadUrl":"<u>;sig=<v>' }
+    @{ Case = 'a percent-encoded name (%73ig)'; Body = '{"id":"1","fileUploadUrl":"<u>&%73ig=<v>' }
+    @{ Case = 'the key and the "&" JSON-escaped'; Body = '{"FileUploadURL":"<u>&sig=<v>' }
+    @{ Case = 'a nested fileUploadUrl'; Body = '{"id":"1","r10":{"fileUploadUrl":"<u>&sig=<v>' }
+    @{ Case = 'a fileUploadUrl in a list'; Body = '{"id":"1","r10":[{"fileUploadUrl":"<u>&sig=<v>' }
+    @{ Case = 'text before the answer'; Body = 'Answer: {"fileUploadUrl":"<u>&sig=<v>' }
+    @{ Case = 'a complete fileUploadUrl before it, without a signature'; Body = '{"fileUploadUrl":"https://jlfakeupload.blob.core.windows.net/blob/x.zip","r10":{"fileUploadUrl":"<u>&sig=<v>' }
+    @{ Case = 'eight characters into the signature (the shortest piece masked)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=<v>'; Sig = '11529215' }
+  ) {
+    $v = if ($Sig) { $Sig } else { $R10Sig }
+    $b = $Body.Replace('<u>', $R10Url).Replace('<v>', $v)
+    Reset-StoreSecrets
+    $t = & $Mod { param($a, $v) $o = ConvertFrom-StoreJson $a; [pscustomobject]@{ Read = ($null -ne $o); Hidden = (Hide-StoreSecret "pending submission $v"); Id = (Test-StoreId $v) } } $b $v
+    Reset-StoreSecrets
+    $t.Hidden | Should -BeExactly 'pending submission [redacted]' -Because '[printed]'
+    $t.Id | Should -BeFalse
+    $t.Read | Should -BeFalse -Because 'strict JSON: a cut-off answer is not read'
+  }
+
+  # Guards: a cut may fall anywhere, so a piece of a cut-off fileUploadUrl
+  # shorter than CutMinLength is not registered (it would cut the draft id
+  # and the GET path out of the lines that say what to check), and a cut-off
+  # value of another field is not a fileUploadUrl (r12, point 2).
+  It 'an answer cut off <Case>: nothing masked, the draft id and the GET path whole (r12 review)' -ForEach @(
+    @{ Case = 'one character into the signature of its fileUploadUrl'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=1' }
+    @{ Case = 'seven characters into the signature of its fileUploadUrl (one short of a piece masked)'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=1152921' }
+    @{ Case = 'one character into its fileUploadUrl'; Body = '{"id":"1","fileUploadUrl":"1' }
+    @{ Case = 'in a JSON escape one character into the signature'; Body = '{"id":"1","fileUploadUrl":"<u>&sig=5\u00' }
+    @{ Case = 'inside another field, after a signature'; Body = '{"id":"1","note":"upload to <u>&sig=<v>' }
+    @{ Case = 'inside another field holding the text "fileUploadUrl": "..."'; Body = '{"id":"1","description":"See \"fileUploadUrl\": \"<u>&sig=<v>' }
+  ) {
+    $b = $Body.Replace('<u>', $R10Url).Replace('<v>', $R10Sig)
+    $get = "GET /v1.0/my/applications/$App/submissions/$NewId"
+    Reset-StoreSecrets
+    $t = & $Mod { param($a, $g, $i, $v) [void](ConvertFrom-StoreJson $a); [pscustomobject]@{ Get = (Hide-StoreSecret $g); Id = (Test-StoreId $i); Sig = (Hide-StoreSecret "pending submission $v") } } $b $get $NewId $R10Sig
+    Reset-StoreSecrets
+    $t.Get | Should -BeExactly $get
+    $t.Id | Should -BeTrue
+    $t.Sig | Should -BeExactly "pending submission $R10Sig"
+  }
+
+  # The same end to end: the GET of the draft before the PUT is answered with
+  # its JSON cut off a few characters into the fileUploadUrl's signature (a
+  # part of the draft id); the stop names the draft id and its GET path in
+  # full, nothing masked.
+  It 'the draft read before the PUT is cut off <Case>: the stop names the draft id and the GET path in full (r12 review)' -ForEach @(
+    @{ Case = 'one character into the signature of its fileUploadUrl'; Frag = '1' }
+    @{ Case = 'seven characters into the signature of its fileUploadUrl'; Frag = '1152921' }
+  ) {
+    $url = $R10Url + '&sig=' + $Frag; $opt = $R10Out
+    $map = { param($b) $n = [System.Text.Json.Nodes.JsonNode]::Parse($b); $n['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create($url); $t = $n.ToJsonString($opt); $t.Substring(0, $t.IndexOf($url) + $url.Length) }.GetNewClosure()
+    $want = Get-R10Unverified "GET submission $NewId returned $UnreadSubmission" $R10Read1
+    $x = Invoke-R10Run @(@{ Kind = 'SubmissionRead'; At = 1; Map = $map })
+    $x.R.Err | Should -BeExactly $want
+    $x.R.Err | Should -Match ([regex]::Escape("GET /v1.0/my/applications/$App/submissions/$NewId."))
+    $x.Sent | Should -BeExactly "POST $Base/submissions" -Because '[sent]'
+    $x.R.All | Should -Not -Match '\[redacted\]' -Because '[masked]'
+    Assert-R10Safe $x
+  }
+
   It 'Register-StoreUploadUrl, a URL with <Case>: its signature masked' -ForEach @($urlCases) {
     $u = $R10Url + $Query + $R10Sig + $After
     Reset-StoreSecrets
