@@ -1,6 +1,6 @@
 # JerisLink Privacy Policy
 
-Effective date: 2026-11-17
+Effective date: 2026-11-25
 
 This policy covers the JerisLink Windows viewer (including the Microsoft Store
 package) and the JerisLink Mac host in this repository.
@@ -15,8 +15,11 @@ sends goes directly between the two devices you set up.
 ## What is sent, and where
 
 The viewer connects only to the Mac address you enter (or start it with). The
-Mac host accepts only the one viewer address it is configured for. Between
-those two devices JerisLink sends:
+Mac host accepts a viewer only as set in its 連線設定 window: with a
+connection password, a device that reaches the Mac must give that password,
+and if you also saved allowed addresses, only those addresses may try; without
+a password, only the allowed addresses are accepted. Blocked addresses are
+always refused. Between those two devices JerisLink sends:
 
 - **Screen video** from the Mac to the PC.
 - **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
@@ -64,6 +67,11 @@ On the Windows PC:
   the Mac's address, codec and bitrate. This PC's address is chosen
   automatically each time and is not saved; a value saved by an older
   version is deleted when you save settings.
+- Only if you tick **Remember password on this PC**: a key derived from the
+  connection password, protected with Windows DPAPI for your user account, in
+  `%LOCALAPPDATA%\JerisLink\hosts` (Windows may keep the Microsoft Store
+  version's copy in that app's own package data instead). The password itself
+  is never stored.
 - Diagnostic logs in your temporary folder (`%TEMP%`):
   `jerislink-viewer.log` and `jerislink-viewer-history.log` (each capped at
   about 10 MB). They contain connection details such as the two IP addresses,
@@ -73,8 +81,11 @@ On the Windows PC:
 
 On the Mac:
 
-- Settings in `~/Library/Application Support/JerisLink/` (listen address, the
-  allowed viewer address, video settings, and status files).
+- Settings in `~/Library/Application Support/JerisLink/` (listen mode, the
+  allowed and blocked viewer addresses, whether a password is set, video
+  settings, and status files).
+- When a connection password is set: a key derived from it, in the Keychain.
+  The password itself is never stored.
 - Service logs in `/tmp/jerislink-*.log` and `/tmp/jerislink-*.err`, with the
   same kind of content as the Windows logs: addresses, statistics and event
   counts, not clipboard text or typed keys.
