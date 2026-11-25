@@ -15,10 +15,14 @@ $script:DefaultUploadBase = 'https://jlfakeupload.blob.core.windows.net'
 # The submission fields other than id, status, statusDetails, fileUploadUrl and
 # applicationPackages, shaped after the app submission resource in the docs.
 # Two listings, one with non-ASCII text, so a dropped or re-encoded listing shows.
+# Three markets and a sale, so a market price, a market order and the sales the
+# service rewrites after a PUT (Edit-FakeFieldsOnPut) show.
 $script:FieldsTemplate = @'
 {
   "applicationCategory": "Productivity",
-  "pricing": { "trialPeriod": "NoFreeTrial", "marketSpecificPricings": { "HK": "Tier2" }, "sales": [], "priceId": "Free", "isAdvertisingFunded": false },
+  "pricing": { "trialPeriod": "NoFreeTrial", "marketSpecificPricings": { "HK": "Tier2", "US": "Tier3", "GB": "Tier4" },
+    "sales": [ { "name": "Launch sale", "basePriceId": "Tier1", "startDate": "2026-01-01T00:00:00Z", "endDate": "2026-02-01T00:00:00Z",
+      "marketSpecificPricings": { "HK": "Tier1" } } ], "priceId": "Free", "isAdvancedPricingModel": false, "isAdvertisingFunded": false },
   "visibility": "Public",
   "targetPublishMode": "Manual",
   "targetPublishDate": "1601-01-01T00:00:00Z",
@@ -49,7 +53,8 @@ $script:FieldsTemplate = @'
   "trailers": []
 }
 '@
-# Fields the service owns: a PUT cannot change them.
+# Fields the service owns: a PUT cannot change them (friendlyName: the service
+# rewrites it after every PUT, Edit-FakeFieldsOnPut).
 $script:ServerOwned = @('id', 'status', 'statusDetails', 'fileUploadUrl', 'friendlyName')
 
 function ConvertTo-FakeNode([string]$Json) {
@@ -58,8 +63,53 @@ function ConvertTo-FakeNode([string]$Json) {
   , [System.Text.Json.Nodes.JsonNode]::Parse($Json, $o)
 }
 
-# Options: PendingId (a pending submission that exists before the run),
-# HidePending (GET app does not show it, as if it appeared after the check),
+# What the service does to the fields a PUT sent (Fields: a JsonObject without
+# the server-owned fields), as the real Store did in run 45524510567: it
+# rewrites friendlyName (OldFriendlyName + " (updated)"), and it rearranges
+# pricing: sales emptied, isAdvancedPricingModel flipped, the pricing keys and
+# the markets of marketSpecificPricings in reverse order. The price itself
+# (priceId, trialPeriod, the price of each market) stays. Then Drift, a change
+# the service must not make: 'Pricing' (priceId becomes Tier1), 'MarketPrice'
+# (the HK price becomes Tier5), 'AddMarket' (JP is added), 'RemoveMarket' (US
+# is gone), 'DropListing' (the zh-hk listing is gone). Returns the new JSON.
+function Edit-FakeFieldsOnPut([System.Text.Json.Nodes.JsonObject]$Fields, [string]$OldFriendlyName, [string]$Drift) {
+  $Fields['friendlyName'] = [System.Text.Json.Nodes.JsonValue]::Create("$(if ($OldFriendlyName) { $OldFriendlyName } else { 'Submission' }) (updated)")
+  $p = $Fields['pricing']
+  if ($p -is [System.Text.Json.Nodes.JsonObject]) {
+    $old = ConvertTo-FakeNode $p.ToJsonString()
+    $new = [System.Text.Json.Nodes.JsonObject]::new()
+    $keys = @(foreach ($kv in $old) { $kv.Key }); [array]::Reverse($keys)
+    foreach ($k in $keys) {
+      $v = $old[$k]
+      $copy = if ($null -eq $v) { $null } else { ConvertTo-FakeNode $v.ToJsonString() }
+      if ($k -eq 'sales') { $copy = [System.Text.Json.Nodes.JsonArray]::new() }
+      elseif ($k -eq 'isAdvancedPricingModel') { $copy = [System.Text.Json.Nodes.JsonValue]::Create(-not ($null -ne $v -and $v.ToJsonString() -ceq 'true')) }
+      elseif ($k -eq 'marketSpecificPricings' -and $v -is [System.Text.Json.Nodes.JsonObject]) {
+        $m = [System.Text.Json.Nodes.JsonObject]::new()
+        $mk = @(foreach ($kv in $v) { $kv.Key }); [array]::Reverse($mk)
+        foreach ($c in $mk) { $m[$c] = if ($null -eq $v[$c]) { $null } else { ConvertTo-FakeNode $v[$c].ToJsonString() } }
+        $copy = $m
+      }
+      $new[$k] = $copy
+    }
+    $Fields['pricing'] = $new
+  }
+  # A pricing drift needs pricing (NoPricing has none).
+  if ($Drift -cne 'DropListing' -and $Fields['pricing'] -isnot [System.Text.Json.Nodes.JsonObject]) { $Drift = '' }
+  switch ($Drift) {
+    'Pricing' { $Fields['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') }
+    'MarketPrice' { $Fields['pricing']['marketSpecificPricings']['HK'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier5') }
+    'AddMarket' { $Fields['pricing']['marketSpecificPricings']['JP'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier2') }
+    'RemoveMarket' { [void]$Fields['pricing']['marketSpecificPricings'].AsObject().Remove('US') }
+    'DropListing' { [void]$Fields['listings'].AsObject().Remove('zh-hk') }
+  }
+  $Fields.ToJsonString()
+}
+
+# Options: PendingId (a pending submission that exists before the run; a GET
+# of it by id shows it with status PendingStatus, default PendingCommit, and
+# the fields of a draft an earlier run updated: Edit-FakeFieldsOnPut with
+# DriftOnPut), HidePending (GET app does not show it, as if it appeared after the check),
 # OtherDraftAfterCheck (someone else creates a pending submission with this id
 # right after the first GET app, i.e. after the run's pending check; a create
 # that lands afterwards gets 409),
@@ -74,8 +124,14 @@ function ConvertTo-FakeNode([string]$Json) {
 # id and status only, without it with the whole submission.
 # KeepOldPackage (the PUT leaves the old .msix Uploaded), CommitStatus (status
 # after commit), TargetPublishMode.
-# DriftOnPut: the PUT changes a field it should keep ('Pricing': priceId
-# becomes Tier1; 'DropListing': the zh-hk listing is gone).
+# Every PUT renames the submission and rearranges its pricing, as the real
+# Store does (Edit-FakeFieldsOnPut). DriftOnPut: the PUT also changes a field
+# it should keep ('Pricing': priceId becomes Tier1; 'MarketPrice': the HK
+# price changes; 'AddMarket': JP is added; 'RemoveMarket': US is gone;
+# 'DropListing': the zh-hk listing is gone).
+# GET app shows lastPublishedApplicationSubmission 1152921505000000001 (none
+# with NoPublished); a GET of it by id shows it with status Published and the
+# fields as they were before any PUT (friendlyName "Submission 1").
 # LoseResponse ('Create' or 'Commit'): that request gets no answer, either
 # After the service carried it out or Before; LoseAsStatus 0 means no
 # response at all (the mocked Invoke-StoreHttp throws), another value is the
@@ -163,7 +219,9 @@ function New-FakeStore {
     [string]$CreateErrorBody = '',
     [switch]$KeepOldPackage,
     [string]$CommitStatus = 'Certification',
-    [ValidateSet('', 'Pricing', 'DropListing')][string]$DriftOnPut = '',
+    [ValidateSet('', 'Pricing', 'MarketPrice', 'AddMarket', 'RemoveMarket', 'DropListing')][string]$DriftOnPut = '',
+    [string]$PendingStatus = 'PendingCommit',
+    [switch]$NoPublished,
     [ValidateSet('', 'Create', 'Commit')][string]$LoseResponse = '',
     [ValidateSet('After', 'Before', 'Delayed')][string]$LoseWhen = 'After',
     [int]$LoseAsStatus = 0,
@@ -197,7 +255,12 @@ function New-FakeStore {
   $f = ConvertTo-FakeNode $script:FieldsTemplate
   $f['targetPublishMode'] = [System.Text.Json.Nodes.JsonValue]::Create($TargetPublishMode)
   if ($NoPricing) { [void]$f.Remove('pricing') } else { $f['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create($PriceId) }
+  $published = ConvertTo-FakeNode $f.ToJsonString()
+  $published['friendlyName'] = [System.Text.Json.Nodes.JsonValue]::Create('Submission 1')
+  $pendingFields = Edit-FakeFieldsOnPut (ConvertTo-FakeNode $f.ToJsonString()) 'Submission 2' $DriftOnPut
   [hashtable]::Synchronized(@{
+    PresetPendingId = $PendingId; PendingStatus = $PendingStatus; PendingFields = $pendingFields
+    PublishedId = $(if ($NoPublished) { '' } else { '1152921505000000001' }); PublishedFields = $published.ToJsonString()
     AppId = $AppId; AppName = ''; Version = $Version; PendingId = $PendingId; HidePending = [bool]$HidePending
     OtherDraftAfterCheck = $OtherDraftAfterCheck; PendingAfterCreate = $PendingAfterCreate; PendingLag = [bool]$PendingLag; NoPendingAs = $NoPendingAs
     UploadStatus = $UploadStatus; UploadBody = $UploadBody; UploadBase = $UploadBase; CreateWithoutId = [bool]$CreateWithoutId
@@ -231,6 +294,20 @@ function Get-FakeSasUrl($Store) {
 function New-FakeResponse([int]$StatusCode, $Object, [string]$Location = '') {
   $body = if ($null -eq $Object) { '' } elseif ($Object -is [string]) { $Object } else { $Object | ConvertTo-Json -Depth 20 -Compress }
   [pscustomobject]@{ StatusCode = $StatusCode; Body = $body; Location = $Location; DripSeconds = 0 }
+}
+
+# A submission this run did not create (the last published one, or a pending
+# one from before the run) as JSON text: Fields plus id, status,
+# statusDetails, fileUploadUrl and the old packages, Uploaded.
+function Get-FakeOtherSubmission($Store, [string]$Id, [string]$Status, [string]$Fields) {
+  $n = ConvertTo-FakeNode $Fields
+  $n['id'] = [System.Text.Json.Nodes.JsonValue]::Create($Id)
+  $n['status'] = [System.Text.Json.Nodes.JsonValue]::Create($Status)
+  $n['statusDetails'] = ConvertTo-FakeNode '{"errors":[],"warnings":[],"certificationReports":[]}'
+  $n['fileUploadUrl'] = [System.Text.Json.Nodes.JsonValue]::Create((Get-FakeSasUrl $Store))
+  $n['applicationPackages'] = ConvertTo-FakeNode ('[{"id":"p1","fileName":"Jerislink-0.3.0.0-x64.msixupload","fileStatus":"Uploaded","version":"0.3.0.0",' +
+    '"minimumDirectXVersion":"None","minimumSystemRam":"None"}]')
+  $n.ToJsonString()
 }
 
 # The submission as JSON text: the stored fields plus id, status,
@@ -395,7 +472,8 @@ function Invoke-FakeStoreRoute {
 function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Text, [string]$App) {
   if ($Path -match "^/v1\.0/my/applications/$App$" -and $Method -eq 'GET') {
     # AppName: the app's name, when a test sets it (else JerisLink).
-    $o = [ordered]@{ id = $Store.AppId; primaryName = $(if ($Store.AppName) { $Store.AppName } else { 'JerisLink' }); lastPublishedApplicationSubmission = @{ id = '1152921505000000001'; resourceLocation = 'x' } }
+    $o = [ordered]@{ id = $Store.AppId; primaryName = $(if ($Store.AppName) { $Store.AppName } else { 'JerisLink' }) }
+    if ($Store.PublishedId) { $o.lastPublishedApplicationSubmission = @{ id = $Store.PublishedId; resourceLocation = 'x' } }
     $shown = if ($Store.Sub -and $Store.PendingAfterCreate) { $Store.PendingAfterCreate } elseif ($Store.HidePending -and -not $Store.Sub) { '' } elseif ($Store.PendingLag -and $Store.Sub) { '' } else { $Store.PendingId }
     if ($shown) { $o.pendingApplicationSubmission = @{ id = $shown; resourceLocation = 'y' } }
     elseif ($Store.NoPendingAs -eq 'Null') { $o.pendingApplicationSubmission = $null }
@@ -419,6 +497,14 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
   }
   if ($Path -match "^/v1\.0/my/applications/$App/submissions/(\d+)(/commit)?$") {
     $id = $Matches[1]; $commit = [bool]$Matches[2]
+    if ((-not $Store.Sub -or $Store.Sub.id -ne $id) -and -not $commit -and $Method -eq 'GET') {
+      # Read only: the last published submission, and a pending one from
+      # before the run while it is still pending.
+      if ($Store.PublishedId -and $id -eq $Store.PublishedId) { return New-FakeResponse 200 (Get-FakeOtherSubmission $Store $id 'Published' $Store.PublishedFields) }
+      if ($Store.PresetPendingId -and $id -eq $Store.PresetPendingId -and $Store.PendingId -eq $id) {
+        return New-FakeResponse 200 (Get-FakeOtherSubmission $Store $id $Store.PendingStatus $Store.PendingFields)
+      }
+    }
     if (-not $Store.Sub -or $Store.Sub.id -ne $id) { return New-FakeResponse 404 @{ code = 'NotFound'; message = "submission $id not found" } }
     if ($commit -and $Method -eq 'POST') {
       if ($Store.Sub.status -ne 'PendingCommit') { return New-FakeResponse 409 @{ code = 'InvalidState'; message = 'not PendingCommit' } }
@@ -449,12 +535,7 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
         $Store.Sub.applicationPackages = $pk
         $old = ConvertTo-FakeNode $Store.Fields
         foreach ($k in @($script:ServerOwned + 'applicationPackages')) { [void]$b.Remove($k) }
-        if ($null -ne $old['friendlyName']) { $b['friendlyName'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$old['friendlyName']) }
-        switch ($Store.DriftOnPut) {
-          'Pricing' { $b['pricing']['priceId'] = [System.Text.Json.Nodes.JsonValue]::Create('Tier1') }
-          'DropListing' { [void]$b['listings'].AsObject().Remove('zh-hk') }
-        }
-        $Store.Fields = $b.ToJsonString()
+        $Store.Fields = Edit-FakeFieldsOnPut $b ([string]$old['friendlyName']) $Store.DriftOnPut
         return New-FakeResponse 200 (Get-FakeSubmission $Store)
       }
       'DELETE' {
@@ -664,4 +745,4 @@ function Get-FakeUploadedZip {
   } finally { $z.Dispose() }
 }
 
-Export-ModuleMember -Function New-FakeStore, Invoke-FakeStoreRequest, Get-FakeSubmission, Start-FakeStoreServer, Stop-FakeStoreServer, Get-FakeUploadedZip
+Export-ModuleMember -Function New-FakeStore, Invoke-FakeStoreRequest, Get-FakeSubmission, Start-FakeStoreServer, Stop-FakeStoreServer, Get-FakeUploadedZip, Edit-FakeFieldsOnPut
