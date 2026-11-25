@@ -1496,7 +1496,7 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
     $script:ReadOnly200 = '(a read is used only when answered HTTP 200)'
     # Text that says a change was done; never printed for an accepted one
     # (the create adds 'created submission id=').
-    $script:SaysDone = 'Created, id unknown|so it created a submission|deleted draft|package uploaded|updated: old packages|commit requested through the API'
+    $script:SaysDone = 'Created, id unknown|so it created a submission|deleted draft|DELETE of submission \d+ answered|package uploaded|updated: old packages|commit requested through the API'
     # '' when the body is read; else the BodyLost text, with its leading "; ".
     function script:Get-LostPart([string]$End, [int]$Sec) {
       if (-not $End) { return '' }
@@ -1783,7 +1783,7 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
       "status PendingCommit; packages: $PutPkgs. $look. $ApiOnly")
     $r.Value | Should -BeNullOrEmpty
     # The PUT before it was done ("updated: old packages" is printed); nothing after it.
-    $r.All | Should -Not -Match "package uploaded|draft verified|commit requested through the API|deleted draft|$DeleteAdvice|$RetryAdvice|$Leak"
+    $r.All | Should -Not -Match "package uploaded|draft verified|commit requested through the API|deleted draft|DELETE of submission \d+ answered|$DeleteAdvice|$RetryAdvice|$Leak"
     @($s.Log)[-3..-1] | Should -Be @("PUT $Base/submissions/$NewId", "PUT /blob/upload.zip", "GET $Base/submissions/$NewId")
     @($s.Log) | Should -Not -Contain "POST $Base/submissions/$NewId/commit"
     if ($Done) { $s.Blob | Should -Not -BeNullOrEmpty } else { $s.Blob | Should -BeNullOrEmpty }
@@ -1848,16 +1848,18 @@ Describe 'HTTP 202 and other 2xx: accepted, completion unconfirmed (PR #74 r7, f
       $r.Err | Should -BeExactly "${head}status PendingCommit; packages: none.$end"
       $s.Sub.status | Should -Be 'PendingCommit'
     }
-    $r.Out | Should -Not -Match 'deleted draft'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered'
     $r.All | Should -Not -Match "Delete exactly|Remove-StoreDraftSubmission|$RetryAdvice|$Leak"
     @($s.Log) | Should -Be @("GET $Base/submissions/$SubId", "DELETE $Base/submissions/$SubId", "GET $Base/submissions/$SubId")
   }
-  It 'manual DELETE answered HTTP <Status>, body read: deleted' -ForEach @(@{ Status = 200 }, @{ Status = 201 }, @{ Status = 204 }) {
+  # Pepper, PR #76: an answered DELETE is only recorded (its status); it is
+  # not reported as deleted until a GET by id answers HTTP 404.
+  It 'manual DELETE answered HTTP <Status>, body read: the status recorded, not reported as deleted' -ForEach @(@{ Status = 200 }, @{ Status = 201 }, @{ Status = 204 }) {
     $o = Get-AcceptOpt 'Delete' $Status $true ''; $s = New-FakeStore @o; Use-FakeStore $s
     $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
     $r = Invoke-Captured { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $SubId }
     $r.Err | Should -BeNullOrEmpty
-    $r.Out | Should -BeExactly "deleted draft submission $SubId"
+    $r.Out | Should -BeExactly "DELETE of submission $SubId answered HTTP $Status; not counted as deleted until a GET by id answers HTTP 404"
     @($s.Log) | Should -Be @("GET $Base/submissions/$SubId", "DELETE $Base/submissions/$SubId")
   }
   It 'token answered HTTP <Status>, body <Body>: not signed in, the status printed, the token never' -ForEach @(
@@ -2047,7 +2049,7 @@ Describe 'A read before the commit that gives no usable answer: could not verify
       "A person needs to check submission $NewId (look only, change nothing in Partner Center) with GET $Base/submissions/$NewId. $ApiOnly")
     $r.Value | Should -BeNullOrEmpty
     $r.All | Should -Not -Match "$DeleteAdvice|$RetryAdvice|$Leak|$Injected|$PlantedAny"
-    $r.All | Should -Not -Match 'draft verified|commit requested through the API|deleted draft'
+    $r.All | Should -Not -Match 'draft verified|commit requested through the API|deleted draft|DELETE of submission \d+ answered'
     $s.ReadFailed | Should -BeTrue
     # Nothing is sent after the failed read (a read not sent is not logged).
     $n = if ($Status -eq -2) { $d.Log - 1 } else { $d.Log }
@@ -2571,12 +2573,12 @@ Describe 'Advice by status for each call (PR #74 r6 sweep, fake Store)' {
     $r.All | Should -Not -Match $Leak
   }
 
-  It 'manual DELETE answered HTTP 204 with its body lost: deleted (the body is not used)' {
+  It 'manual DELETE answered HTTP 204 with its body lost: the status recorded, not reported as deleted (the body is not used)' {
     $s = New-FakeStore -DripOn Delete -DripSeconds 30; Use-FakeStore $s
     $s.Sub = @{ id = $SubId; status = 'PendingCommit'; applicationPackages = @() }
     $r = Invoke-Captured { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $SubId }
     $r.Err | Should -BeNullOrEmpty
-    $r.Out | Should -BeExactly "deleted draft submission $SubId (HTTP 204; the answer's body was not read)"
+    $r.Out | Should -BeExactly "DELETE of submission $SubId answered HTTP 204 (the answer's body was not read); not counted as deleted until a GET by id answers HTTP 404"
     @($s.Log) | Should -Be @("GET $Base/submissions/$SubId", "DELETE $Base/submissions/$SubId")
     $s.Sub | Should -BeNullOrEmpty
   }
@@ -2605,7 +2607,7 @@ Describe 'Advice by status for each call (PR #74 r6 sweep, fake Store)' {
       $r.Err | Should -BeExactly "fake DELETE failed with $Status"
       Should -Invoke -ModuleName MsStoreRunner Get-StoreSubmissionJson -Times 1 -Exactly
     }
-    $r.Out | Should -Not -Match 'deleted draft'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered'
     Should -Invoke -ModuleName MsStoreRunner Invoke-StoreApi -Times 1 -Exactly -ParameterFilter { $Method -eq 'DELETE' }
     Should -Invoke -ModuleName MsStoreRunner Invoke-StoreApi -Times 1 -Exactly
   }
@@ -3283,6 +3285,10 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
     $script:Published = '1152921505000000001'
     $script:Values = 'Tier\d|Launch sale|Submission [12]|NoFreeTrial|"Free"|JerisLink remote desktop|PackageRollout(NotStarted|InProgress)|1152921505000000042'
     $script:Only = 'this run deletes one draft only (GET calls and one DELETE of that submission); nothing was sent'
+    # Says the draft is deleted or gone: printed only after the read-back by
+    # id answered HTTP 404 and the app shows nothing pending (Pepper, PR #76).
+    $script:SaysDeleted = 'deleted draft submission|delete-draft done|is deleted|\bgone\b'
+    $script:Recorded = "DELETE of submission 1152921505000000007 answered HTTP 204; not counted as deleted until a GET by id answers HTTP 404"
     function script:Invoke-DeleteDraft([string]$Id, [int]$Minutes = 4) {
       $d = [DateTime]::UtcNow.AddMinutes($Minutes)
       Invoke-Captured { Remove-StorePendingDraft -ProductId $App -SubmissionId $Id -DeadlineUtc $d }
@@ -3302,10 +3308,10 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
       "delete-draft: deletes submission $Draft only, and only while it is the app's pending, uncommitted PendingCommit draft; GET calls and that one DELETE only; nothing is created, changed or committed"
       "app $App before: pending submission $Draft, last published submission $Published"
       "submission $Draft before: status PendingCommit"
-      "deleted draft submission $Draft"
-      "submission $Draft after: HTTP 404 (gone)"
+      $Recorded
+      "submission $Draft after: GET by id answered HTTP 404"
       "app $App after: pending submission [none]"
-      "delete-draft done: submission $Draft is gone and the app has no pending submission; nothing else was sent") -join "`n")
+      "delete-draft done: submission $Draft is deleted (GET by id answers HTTP 404) and the app has no pending submission; nothing else was sent") -join "`n")
     @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/$Draft", "GET $Base/submissions/$Draft", "DELETE $Base/submissions/$Draft", "GET $Base/submissions/$Draft", "GET $Base")
     foreach ($c in @($s.Calls)) { $c | Should -Match ' timeout=30$' }
     Should -Invoke Invoke-StoreHttp -ModuleName MsStoreRunner -Times 1 -Exactly -ParameterFilter { $Method -ceq 'DELETE' }
@@ -3340,7 +3346,7 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
     foreach ($l in @($s.Log)) { $l | Should -Match '^GET ' }
     Should -Invoke Invoke-StoreHttp -ModuleName MsStoreRunner -Times 0 -Exactly -ParameterFilter { $Kind -cne 'Token' -and $Method -cne 'GET' }
     $s.PendingId | Should -BeExactly $pending
-    $r.Out | Should -Not -Match 'deleted draft|delete-draft done'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered|delete-draft done'
     & $Mod { $script:DeleteOnlyPath } | Should -BeExactly ''
     $r.All | Should -Not -Match $Leak
     $r.All | Should -Not -MatchExactly $Values
@@ -3353,9 +3359,10 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
     $r.Err | Should -BeExactly "submission $Draft is not an uncommitted PendingCommit draft; nothing deleted"
   }
 
-  # The guard: while it runs, only GET calls and one DELETE of exactly that
-  # id go out; anything else is refused before it is sent, even if a later
-  # change made it ask for one.
+  # The guard: while it runs, only GET calls and a DELETE of exactly that id
+  # go out; anything else is refused before it is sent, even if a later
+  # change made it ask for one. That the DELETE goes out once only is checked
+  # in Invoke-StoreHttp, so it is tested over HTTP (Describe 'HTTP path').
   It 'refuses <Case>, before it is sent, and touches nothing else' -ForEach @(
     @{ Case = 'a commit of that draft'; Writes = @(@{ Method = 'POST'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007/commit' }); Sent = 0 }
     @{ Case = 'a PUT of that draft'; Writes = @(@{ Method = 'PUT'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }); Sent = 0 }
@@ -3363,7 +3370,6 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
     @{ Case = 'a DELETE of another id'; Writes = @(@{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000001' }); Sent = 0 }
     @{ Case = 'a DELETE of that id under another app'; Writes = @(@{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7X/submissions/1152921505000000007' }); Sent = 0 }
     @{ Case = 'a DELETE of that id with a query'; Writes = @(@{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007?x=1' }); Sent = 0 }
-    @{ Case = 'a second DELETE of that id'; Writes = @(@{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }, @{ Method = 'DELETE'; Path = 'applications/9NM3VWQ9MD7N/submissions/1152921505000000007' }); Sent = 1 }
   ) {
     $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
     $global:DelWrites = $Writes
@@ -3412,25 +3418,30 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
 
   It 'after the DELETE: <Case>; never reported as done, nothing sent again' -ForEach @(
     @{ Case = 'HTTP 202, carried out: accepted, completion unconfirmed, read back once'; Opt = @{ AcceptOn = 'Delete' }
-       Err = 'accepted, completion unconfirmed'; After = @('GET') }
+       Err = 'accepted, completion unconfirmed'; After = @('GET'); Answered = $false }
     @{ Case = 'HTTP 202, not carried out: accepted, completion unconfirmed, read back once'; Opt = @{ AcceptOn = 'Delete'; AcceptNotDone = $true }
-       Err = 'accepted, completion unconfirmed'; After = @('GET') }
+       Err = 'accepted, completion unconfirmed'; After = @('GET'); Answered = $false }
     @{ Case = 'no answer, carried out: result unconfirmed, read back once'; Opt = @{ EditAnswer = { param($k, $a) if ($k -eq 'Delete') { $a.StatusCode = 0 } } }
-       Err = 'Result unconfirmed: the delete request for submission 1152921505000000007 got no answer'; After = @('GET') }
+       Err = 'Result unconfirmed: the delete request for submission 1152921505000000007 got no answer'; After = @('GET'); Answered = $false }
     @{ Case = 'HTTP 204 but still there: not confirmed'; Opt = @{ AcceptOn = 'Delete'; AcceptStatus = 204; AcceptNotDone = $true }
-       Err = 'submission 1152921505000000007 can still be read after the delete (HTTP 200): the delete is not confirmed; nothing more is sent. A person needs to check GET /v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007 later: HTTP 404 there means it is gone.'; After = @('GET') }
+       Err = 'submission 1152921505000000007 can still be read after the delete (HTTP 200): the delete is not confirmed; nothing more is sent. A person needs to check GET /v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007 later: HTTP 404 there means it is gone.'; After = @('GET'); Answered = $true }
     @{ Case = 'the read-back by id fails: not confirmed'; Opt = @{ FailReadOn = 'SubmissionRead'; FailReadAt = 3; FailReadStatus = 503 }
-       Err = 'the delete of submission 1152921505000000007 is not confirmed; nothing more is sent. A person needs to check GET /v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007 later: HTTP 404 there means it is gone.'; After = @('GET') }
+       Err = 'the delete of submission 1152921505000000007 is not confirmed; nothing more is sent. A person needs to check GET /v1.0/my/applications/9NM3VWQ9MD7N/submissions/1152921505000000007 later: HTTP 404 there means it is gone.'; After = @('GET'); Answered = $true }
+    @{ Case = 'the app cannot be read back: not confirmed'; Opt = @{ FailReadOn = 'AppRead'; FailReadAt = 2; FailReadStatus = 503 }
+       Err = 'HTTP 503*; submission 1152921505000000007 answers HTTP 404 by id, but the app could not be read back: the delete is not confirmed'; After = @('GET', 'GET'); Answered = $true }
     @{ Case = 'the app still shows it pending: not confirmed'; Opt = @{ EditAnswer = { param($k, $a) if ($k -eq 'AppRead' -and -not $global:FakeStore.PendingId) { $a.Body = '{"id":"9NM3VWQ9MD7N","pendingApplicationSubmission":{"id":"1152921505000000007"}}' } } }
-       Err = 'the app still shows submission 1152921505000000007 as pending: the delete is not confirmed'; After = @('GET', 'GET') }
+       Err = 'the app still shows submission 1152921505000000007 as pending: the delete is not confirmed'; After = @('GET', 'GET'); Answered = $true }
     @{ Case = 'the app shows another pending submission: not touched'; Opt = @{ EditAnswer = { param($k, $a) if ($k -eq 'AppRead' -and -not $global:FakeStore.PendingId) { $a.Body = '{"id":"9NM3VWQ9MD7N","pendingApplicationSubmission":{"id":"1152921505000000008"}}' } } }
-       Err = 'submission 1152921505000000007 is gone (HTTP 404), but the app shows another pending submission 1152921505000000008, which this run did not touch'; After = @('GET', 'GET') }
+       Err = 'submission 1152921505000000007 answers HTTP 404 by id, but the app shows another pending submission 1152921505000000008, which this run did not touch'; After = @('GET', 'GET'); Answered = $true }
   ) {
     $o = @{ PendingId = $Draft } + $Opt
     $s = New-FakeStore @o; Use-FakeStore $s
     $r = Invoke-DeleteDraft $Draft
     if ($Err.StartsWith('submission ') -or $Err.StartsWith('the app ')) { $r.Err | Should -BeExactly $Err } else { $r.Err | Should -BeLike "*$Err*" }
-    $r.Out | Should -Not -Match 'delete-draft done'
+    # Pepper, PR #76: a failed check after the DELETE never leaves a printed
+    # "deleted" or "gone" behind; an answered DELETE is printed as its status only.
+    $r.Out | Should -Not -Match $SaysDeleted
+    if ($Answered) { $r.Out | Should -Match ('(?m)^' + [regex]::Escape($Recorded) + '$') } else { $r.Out | Should -Not -Match 'DELETE of submission \d+ answered' }
     $want = @("GET $Base", "GET $Base/submissions/$Draft", "GET $Base/submissions/$Draft", "DELETE $Base/submissions/$Draft", "GET $Base/submissions/$Draft")
     if ($After.Count -eq 2) { $want += "GET $Base" }
     @($s.Log) | Should -Be $want
@@ -3444,8 +3455,38 @@ Describe 'Remove-StorePendingDraft (mode=delete-draft: one draft, by id)' {
     $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
     $r = Invoke-DeleteDraft $Draft -Minutes 1
     $r.Err | Should -BeExactly "not enough time left before this step's deadline for the delete and the checks after it; nothing deleted"
-    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/$Draft")
+    @($s.Log) | Should -Be @("GET $Base", "GET $Base/submissions/$Draft", "GET $Base/submissions/$Draft")
     $s.PendingId | Should -BeExactly $Draft
+  }
+
+  # Pepper, PR #76: the time kept for the DELETE and both checks after it is
+  # checked after the last GET before the DELETE (the PendingCommit check in
+  # Remove-StoreDraftSubmission), so that GET cannot use it up. Each call
+  # takes 5 s on a fake clock: after 3 GET calls, 85 s are left of 100 (less
+  # than 3 x 30 s: it stops), 90 s of 105 (enough: it deletes).
+  It 'with <Seconds> s to the deadline and 5 s per call: <Case> after the last GET before the DELETE' -ForEach @(
+    @{ Seconds = 100; Case = 'stops, deleting nothing,'; Deletes = $false }
+    @{ Seconds = 105; Case = 'deletes'; Deletes = $true }
+  ) {
+    $s = New-FakeStore -PendingId $Draft; Use-FakeStore $s
+    $global:FakeClock = [DateTime]::UtcNow
+    try {
+      Mock -ModuleName MsStoreRunner Get-StoreUtcNow { $global:FakeClock }
+      $s.CallSeconds = 5
+      $d = $global:FakeClock.AddSeconds($Seconds)
+      $r = Invoke-Captured { Remove-StorePendingDraft -ProductId $App -SubmissionId $Draft -DeadlineUtc $d }
+      $gets = @("GET $Base timeout=30", "GET $Base/submissions/$Draft timeout=30", "GET $Base/submissions/$Draft timeout=30")
+      if ($Deletes) {
+        $r.Err | Should -BeNullOrEmpty
+        @($s.Calls) | Should -Be @($gets + @("DELETE $Base/submissions/$Draft timeout=30", "GET $Base/submissions/$Draft timeout=30", "GET $Base timeout=30"))
+        $s.PendingId | Should -BeExactly ''
+      } else {
+        $r.Err | Should -BeExactly "not enough time left before this step's deadline for the delete and the checks after it; nothing deleted"
+        @($s.Calls) | Should -Be $gets
+        $s.PendingId | Should -BeExactly $Draft
+        $r.Out | Should -Not -Match "$SaysDeleted|DELETE of submission"
+      }
+    } finally { Remove-Variable -Name FakeClock -Scope Global -ErrorAction Ignore }
   }
 
   It 'caps every call at the deadline: a call with less than 1 s left is not sent' {
@@ -3755,8 +3796,8 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
   }
   # mode=delete-draft, the job's own step script (msstore-publish.yml) run as
   # written against this server: after the sign-in, GET requests and one
-  # DELETE of exactly that id; then that id is gone (HTTP 404) and the app
-  # shows no pending submission.
+  # DELETE of exactly that id; then a GET of that id answers HTTP 404 and the
+  # app shows no pending submission, and only then is it printed as deleted.
   It 'the delete-draft job of msstore-publish.yml, its step run as written, deletes only that draft and checks it is gone' -ForEach @(@{ Opt = @{ PendingId = '1152921505000000007' } }) {
     $fields = $Srv.Fields
     $r = Invoke-DiagnoseJobStep '1152921505000000007' $DeleteDraftStep
@@ -3766,10 +3807,11 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     @($Srv.Log) | Should -Be $want
     @($Srv.Seen | ForEach-Object { $_.Line }) | Should -Be $want
     $r.Out | Should -Match '(?m)^submission 1152921505000000007 before: status PendingCommit$'
-    $r.Out | Should -Match '(?m)^deleted draft submission 1152921505000000007$'
-    $r.Out | Should -Match '(?m)^submission 1152921505000000007 after: HTTP 404 \(gone\)$'
-    $r.Out | Should -Match "(?m)^app $App after: pending submission \[none\]$"
-    $r.Out | Should -Match '(?m)^delete-draft done: '
+    $lines = @($r.Out -split "`n")
+    $lines[-4..-1] | Should -Be @('DELETE of submission 1152921505000000007 answered HTTP 204; not counted as deleted until a GET by id answers HTTP 404',
+      'submission 1152921505000000007 after: GET by id answered HTTP 404', "app $App after: pending submission [none]",
+      'delete-draft done: submission 1152921505000000007 is deleted (GET by id answers HTTP 404) and the app has no pending submission; nothing else was sent')
+    @($lines[0..($lines.Count - 2)] | Where-Object { $_ -match '\bgone\b|is deleted|deleted draft' }) | Should -BeNullOrEmpty
     $Srv.PendingId | Should -BeExactly ''
     $Srv.Fields | Should -BeExactly $fields
     $Srv.Sub | Should -BeNullOrEmpty
@@ -3798,10 +3840,52 @@ Describe 'HTTP path (fake Store on 127.0.0.1)' {
     $script:Url = Start-FakeStoreServer $Srv -Tcp
     $r = Invoke-DiagnoseJobStep '1152921505000000007' $DeleteDraftStep
     $r.Err | Should -Match 'Result unconfirmed: the delete request for submission 1152921505000000007 got no answer'
-    $r.Out | Should -Not -Match 'deleted draft|delete-draft done'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered|delete-draft done'
     @($Srv.Seen | ForEach-Object { $_.Line }) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "GET $Base", "GET $Base/submissions/1152921505000000007",
       "GET $Base/submissions/1152921505000000007", "DELETE $Base/submissions/1152921505000000007", "GET $Base/submissions/1152921505000000007")
     $Srv.Dropped | Should -Be 1
+  }
+  # Pepper, PR #76: the one-time allowance for that DELETE is checked and
+  # used up in Invoke-StoreHttp right before the request goes out, so a
+  # second DELETE of the same URL never reaches the server, whether it comes
+  # through Invoke-StoreHttp itself, Invoke-StoreApi or the whole run.
+  It 'sends the DELETE of that draft over the wire once: a second one to the same URL (<Via>) is refused before it is sent' -ForEach @(
+    @{ Via = 'Invoke-StoreHttp'; Opt = @{ PendingId = '1152921505000000007' } }
+    @{ Via = 'Invoke-StoreApi'; Opt = @{ PendingId = '1152921505000000007' } }
+  ) {
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $res = & (Get-Module MsStoreRunner) { param($via, $p)
+      $script:DeleteOnlyPath = $p; $script:DeleteOnlySent = $false
+      $uri = "$script:ApiBase/v1.0/my/$p"; $h = @{ Authorization = "Bearer $script:Token" }
+      $out = @{}
+      try {
+        $out.First = (Invoke-StoreHttp -Method DELETE -Uri $uri -Kind Api -Headers $h -TimeoutSec 10).StatusCode
+        try {
+          if ($via -eq 'Invoke-StoreHttp') { $null = Invoke-StoreHttp -Method DELETE -Uri $uri -Kind Api -Headers $h -TimeoutSec 10 }
+          else { $null = Invoke-StoreApi -Method DELETE -Path $p -TimeoutSec 10 }
+          $out.Second = 'sent'
+        } catch { $out.Second = "$_"; $out.NotSent = [bool]$_.Exception.Data['StoreNotSent']; $out.Unknown = [bool]$_.Exception.Data['StoreOutcomeUnknown'] }
+      } finally { $script:DeleteOnlyPath = ''; $script:DeleteOnlySent = $false }
+      $out } $Via "applications/$App/submissions/1152921505000000007"
+    $res.First | Should -Be 204
+    $refused = 'refused: this run sends the DELETE of that submission once only, and it was already sent; nothing was sent'
+    if ($Via -eq 'Invoke-StoreHttp') { $res.Second | Should -BeExactly $refused; $res.NotSent | Should -BeTrue }
+    else { $res.Second | Should -BeExactly "Store API DELETE /v1.0/my/applications/$App/submissions/1152921505000000007 failed: $refused"; $res.Unknown | Should -BeFalse }
+    @($Srv.Seen | ForEach-Object { $_.Line }) | Should -Be @('POST /tenant-1/oauth2/v2.0/token', "DELETE $Base/submissions/1152921505000000007")
+  }
+  It 'the delete-draft run sends that DELETE once even when asked to send it twice: the second never reaches the server' -ForEach @(@{ Opt = @{ PendingId = '1152921505000000007' } }) {
+    Mock -ModuleName MsStoreRunner Remove-StoreDraftSubmission {
+      & (Get-Module MsStoreRunner) { param($p)
+        foreach ($i in 1, 2) { Invoke-StoreApi -Method DELETE -Path $p -TimeoutSec 10 | Out-Null } } "applications/$ProductId/submissions/$SubmissionId"
+    }
+    Connect-StoreApi -TenantId 'tenant-1' -ClientId 'client-1' -ClientSecret $Secret -AuthorityHost $Url -ApiBase $Url -LoopbackTestServer 6>$null
+    $d = [DateTime]::UtcNow.AddMinutes(4)
+    $r = Invoke-Captured { Remove-StorePendingDraft -ProductId $App -SubmissionId '1152921505000000007' -DeadlineUtc $d }
+    $r.Err | Should -BeExactly "Store API DELETE /v1.0/my/applications/$App/submissions/1152921505000000007 failed: refused: this run sends the DELETE of that submission once only, and it was already sent; nothing was sent"
+    @($Srv.Seen | Where-Object { $_.Line -like 'DELETE *' }).Count | Should -Be 1
+    $r.Out | Should -Not -Match 'is deleted|delete-draft done|\bgone\b'
+    & (Get-Module MsStoreRunner) { $script:DeleteOnlyPath } | Should -BeExactly ''
+    & (Get-Module MsStoreRunner) { $script:DeleteOnlySent } | Should -BeFalse
   }
   It 'the delete-draft job of msstore-publish.yml stops before the sign-in, sending nothing, when submission_id is <Case>' -ForEach @(
     @{ Case = 'empty'; Id = '' }
@@ -4283,7 +4367,7 @@ Describe 'HTTP 202 Accepted over real HTTP: accepted, completion unconfirmed (PR
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API DELETE $Base/submissions/$SubId answered HTTP 202: accepted, completion unconfirmed. Accepted, completion unconfirmed: the Store accepted the delete of submission $SubId but has not confirmed it is done, so it is not reported as deleted; nothing more is sent. Read-back of submission $SubId by id (one GET; nothing changed): "))
     $tail = if ($Done) { "failed (Store API GET $Base/submissions/$SubId failed: HTTP 404 (NotFound); hint: the app or submission was not found)." } else { 'status PendingCommit; packages: none.' }
     $r.Err | Should -Match ([regex]::Escape(" $tail A person needs to check GET $Base/submissions/$SubId later: HTTP 404 there means it is gone.") + '$')
-    $r.Out | Should -Not -Match 'deleted draft'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered'
     @($Srv.Log) | Should -Be @($Token1, "GET $Base/submissions/$SubId", "DELETE $Base/submissions/$SubId", "GET $Base/submissions/$SubId")
   }
   It 'token answered HTTP 202, body read: not signed in, the token is not printed, no API call' -ForEach @(@{ Opt = @{ AcceptOn = 'Token' } }) {
@@ -5359,14 +5443,14 @@ Describe 'Store answers are read only as one strict JSON object, every signature
       $x.Sent | Should -BeExactly '' -Because '[sent]'
     }
 
-    It 'a delete by hand, <Case>: deleted' -ForEach $listingCases {
+    It 'a delete by hand, <Case>: sent, its status recorded' -ForEach $listingCases {
       $x = Invoke-R10Run @() @{} { Remove-StoreDraftSubmission -ProductId $App -SubmissionId $NewId } {
         param($s) $s.Sub = @{ id = $NewId; status = 'PendingCommit'; applicationPackages = @(
           [ordered]@{ id = 'p1'; fileName = $File; fileStatus = 'PendingUpload'; minimumDirectXVersion = 'None'; minimumSystemRam = 'None' }) }; $s.PendingId = $NewId
         Set-R11Listing $s $Lang $Field $Text }
       $x.R.Err | Should -BeNullOrEmpty
       $x.Sent | Should -BeExactly "DELETE $Base/submissions/$NewId" -Because '[sent]'
-      $x.R.Out | Should -Match 'deleted draft submission '
+      $x.R.Out | Should -Match 'DELETE of submission \d+ answered HTTP 2\d\d; not counted as deleted until a GET by id answers HTTP 404'
     }
 
     # r12: a "sig=" outside a fileUploadUrl (a listing, a link, the app's
@@ -5632,7 +5716,7 @@ Describe 'A change is sent at most once: the server read it whole, then closed t
     @($Srv.Seen | Where-Object { $_.Line -ceq "DELETE $Base/submissions/$NewId" }).Count | Should -Be 1
     @($Srv.Log) | Should -Be @("GET $Base/submissions/$NewId", "DELETE $Base/submissions/$NewId", "GET $Base/submissions/$NewId")
     $Srv.Sub | Should -BeNullOrEmpty
-    $r.Out | Should -Not -Match 'deleted draft'
+    $r.Out | Should -Not -Match 'deleted draft|DELETE of submission \d+ answered'
     $r.Err | Should -Match ('^' + [regex]::Escape("Store API DELETE $Base/submissions/$NewId failed: "))
     $r.Err | Should -Match ([regex]::Escape("Result unconfirmed: the delete request for submission $NewId got no answer that says what happened, so it may or may not have been deleted; it is not sent again. Read-back of submission $NewId by id (one GET; nothing changed): failed ("))
     $r.Err | Should -Match ([regex]::Escape("A person needs to check GET /v1.0/my/applications/$App/submissions/$NewId later: HTTP 404 there means it is gone.") + '$')

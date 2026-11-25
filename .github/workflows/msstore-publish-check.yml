@@ -42,8 +42,9 @@ name: msstore-publish-check
 #   mode=diagnose (Show-StoreSubmissionDiagnosis) sends only GET requests
 #   after the sign-in, changes nothing and prints field paths, not values;
 #   mode=delete-draft (Remove-StorePendingDraft) sends GET requests and one
-#   DELETE of exactly the given draft, then reads it back as gone (HTTP 404)
-#   and the app with no pending submission.
+#   DELETE of exactly the given draft, records the DELETE's status only, then
+#   reads it back by id (HTTP 404) and the app with no pending submission,
+#   and only then prints that it is deleted.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
@@ -615,8 +616,9 @@ jobs:
           } finally { Stop-FakeStoreServer -Store $s }
 
           # 12. mode=delete-draft on the pending PendingCommit draft: after the
-          # sign-in, GET requests and one DELETE of exactly that id; then it
-          # is gone (HTTP 404) and the app shows no pending submission.
+          # sign-in, GET requests and one DELETE of exactly that id; then a GET
+          # of it by id is HTTP 404 and the app shows no pending submission,
+          # and only after both is it printed as deleted.
           $s = New-FakeStore -AppId $app -PendingId '1152921505000000007'
           $url = Start-FakeStoreServer -Store $s
           try {
@@ -630,10 +632,20 @@ jobs:
             if (($got -join "`n") -cne ($want -join "`n")) { throw "delete-draft sent other requests than the sign-in, the GETs and one DELETE of that id" }
             if (@($s.Seen | Where-Object { $_.Line -cnotmatch '^(GET /v1\.0/|DELETE /v1\.0/my/applications/[^/]+/submissions/1152921505000000007$|POST /tenant-dry-run/oauth2/v2\.0/token$)' }).Count) { throw "a request other than a GET or that DELETE reached the stand-in" }
             if ($s.PendingId -or $s.Sub -or $s.Blob) { throw "delete-draft left a pending submission or created something" }
-            if ($r.Text -notmatch '(?m)^submission 1152921505000000007 before: status PendingCommit$' -or $r.Text -notmatch '(?m)^submission 1152921505000000007 after: HTTP 404 \(gone\)$' -or
-                $r.Text -notmatch '(?m)^app \S+ after: pending submission \[none\]$') { throw "delete-draft did not print the status before and that it is gone after" }
+            $lines = @($r.Text -split "`n")
+            $order = @('^submission 1152921505000000007 before: status PendingCommit$',
+              '^DELETE of submission 1152921505000000007 answered HTTP 204; not counted as deleted until a GET by id answers HTTP 404$',
+              '^submission 1152921505000000007 after: GET by id answered HTTP 404$', '^app \S+ after: pending submission \[none\]$',
+              '^delete-draft done: submission 1152921505000000007 is deleted \(GET by id answers HTTP 404\) and the app has no pending submission')
+            $at = -1
+            foreach ($p in $order) {
+              $i = -1; for ($k = $at + 1; $k -lt $lines.Count; $k++) { if ($lines[$k] -cmatch $p) { $i = $k; break } }
+              if ($i -lt 0) { throw "delete-draft did not print, in order, the status before, the DELETE's status, the read-backs and then that it is deleted" }
+              $at = $i
+            }
+            if (@($lines | Where-Object { $_ -cmatch '\bdeleted\b|\bgone\b' -and $_ -cnotmatch '^(DELETE of submission|delete-draft done:)' }).Count) { throw "delete-draft said deleted or gone before both read-backs" }
             if ($r.Text -cmatch 'Tier\d|Launch sale|Submission [12]|NoFreeTrial') { throw "delete-draft printed a field value" }
             Assert-NoLeak $r.Text $s
-            Write-Host "delete-draft: GET requests and one DELETE of that id after the sign-in; gone afterwards"
+            Write-Host "delete-draft: GET requests and one DELETE of that id after the sign-in; deleted only after both read-backs"
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"
