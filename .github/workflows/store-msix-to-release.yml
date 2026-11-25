@@ -18,8 +18,9 @@ name: store-msix-to-release
 # - verify (windows, contents: read): same SHA-256 as fetch; Identity
 #   jerisHQ.JerisLink x64 from publisher CN=89A018EB-...; Authenticode status
 #   Valid on a clean runner; signer subject = publisher, issued by a Microsoft
-#   Marketplace CA, chain root = Microsoft Root Certificate Authority 2011 (by
-#   thumbprint); not our self-signed sideload test certificate. Then its version
+#   Marketplace CA with OU=AOC or OU=EOC, chain root = Microsoft Root
+#   Certificate Authority 2011 (by thumbprint); not our self-signed sideload
+#   test certificate (store-msix-signer.psm1, unit-tested first). Then its version
 #   must equal the tag (v0.4.1 -> 0.4.1.0). If the Store still serves an older
 #   version, nothing is uploaded and the run ends green with a notice.
 # - upload (ubuntu, the only job with contents: write): runs only for a manual
@@ -55,6 +56,8 @@ on:
       - .github/scripts/store-msix-fetch.mjs
       - .github/scripts/store-msix-url.mjs
       - .github/scripts/store-msix-url.test.mjs
+      - .github/scripts/store-msix-signer.psm1
+      - .github/scripts/store-msix-signer.test.ps1
 
 permissions:
   contents: read
@@ -149,6 +152,14 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Test the signer check
+        run: pwsh -NoProfile -File .github/scripts/store-msix-signer.test.ps1
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: store-msix
@@ -186,10 +197,6 @@ jobs:
           Write-Host "Authenticode: $($sig.Status) $($sig.StatusMessage)"
           if ($sig.Status -ne 'Valid' -or -not $cert) { throw "signature status is $($sig.Status), not Valid" }
           Write-Host "Signer: $($cert.Subject) | issuer $($cert.Issuer) | $($cert.Thumbprint)"
-          if ($cert.Thumbprint -eq $env:TEST_CERT_THUMBPRINT) { throw "signed with the sideload test certificate" }
-          if ($cert.Subject -eq $cert.Issuer) { throw "signer certificate is self-signed" }
-          if ($cert.Subject -cne $env:EXPECTED_PUBLISHER) { throw "signer subject is not the package publisher" }
-          if ($cert.Issuer -notmatch '^CN=Microsoft Marketplace CA G \d+, OU=AOC, O=Microsoft Corporation,') { throw "signer issuer is not a Microsoft Marketplace CA" }
           $chain = New-Object Security.Cryptography.X509Certificates.X509Chain
           $chain.ChainPolicy.RevocationMode = 'NoCheck'
           # Store signing certificates are short-lived and usually expired by now;
@@ -200,7 +207,13 @@ jobs:
           if (-not $chain.Build($cert)) { throw "chain does not build: $(($chain.ChainStatus | ForEach-Object Status) -join ', ')" }
           $chain.ChainElements | ForEach-Object { Write-Host "  chain: $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)" }
           $root = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
-          if ($root.Thumbprint -ne $env:MS_ROOT_2011_THUMBPRINT) { throw "chain root is not Microsoft Root Certificate Authority 2011: $($root.Subject) $($root.Thumbprint)" }
+          # Test certificate, self-signed, subject = publisher, issuer OU=AOC or
+          # OU=EOC, root = Microsoft Root Certificate Authority 2011.
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/store-msix-signer.psm1')
+          Assert-StoreSigner -Subject $cert.Subject -Issuer $cert.Issuer -Thumbprint $cert.Thumbprint `
+            -RootSubject $root.Subject -RootThumbprint $root.Thumbprint -ExpectedPublisher $env:EXPECTED_PUBLISHER `
+            -TestCertThumbprint $env:TEST_CERT_THUMBPRINT -MsRootThumbprint $env:MS_ROOT_2011_THUMBPRINT
+          Write-Host "Signer check passed"
 
           $ready = ($id.Version -eq $env:EXPECTED_VERSION)
           "ready=$($ready.ToString().ToLower())" >> $env:GITHUB_OUTPUT
