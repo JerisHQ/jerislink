@@ -85,8 +85,9 @@ Video, mouse UDP and control all use one endpoint, so the screen and the input a
 
 - `~/Library/Application Support/JerisLink/listen.plist`, when present, decides it:
   - `mode` = `tailnet`: bind this Mac's tailnet address (the `utun` IPv4 in 100.64.0.0/10, or `bindIP` if set). Who may connect:
-    - `passwordSet` true (set by 連線設定; the key derived from the password is in the Keychain): every connection must pass the password check. With no `allowedIPs` (or an empty list), any address that reaches the listener may try; with `allowedIPs`, only those addresses.
-    - No password: only the addresses in `allowedIPs`, with no password check, as in v0.3. A file from before v0.4.0 with only `clientIP` gets `allowedIPs` = [`clientIP`] when the control service starts, and that list follows `clientIP` until 連線設定 saves a whitelist.
+    - `passwordSet` true (set by 連線設定; the key derived from the password is in the Keychain): every connection must pass the password check, and only addresses on the whitelist (below) may try. An empty whitelist means any address that reaches the listener.
+    - No password: only the addresses on the whitelist, with no password check, as in v0.3.
+    - The whitelist, with or without a password: `allowedIPs`, as saved by 連線設定 (**白名單**). Exception for older setups: when the file has no `allowedIPs`, or `allowedIPs` is still the copy that migration made (`allowedIPsSource` = `clientIP`), the whitelist is `clientIP` alone, so even with a password only that address may try. A file from before v0.4.0 with `clientIP` gets that copy when the control service starts. Saving a whitelist in 連線設定 removes `clientIP` and `allowedIPsSource`; from then on `allowedIPs` is the whitelist, and an empty one (allowed only with a password) admits any address.
     - Neither a password nor `allowedIPs` nor `clientIP`: not configured; the services do not listen. A `clientIP`, when set, must be in 100.64.0.0/10.
     - `blockedIPs` (連線設定's **黑名單**, and addresses blocked after repeated wrong passwords) are refused in every case.
     - Do not set `passwordSet` by hand: without the Keychain item the host refuses every viewer.

@@ -16,11 +16,22 @@ sends goes directly between the two devices you set up.
 
 The viewer connects only to the Mac address you enter (or start it with). The
 Mac host accepts a viewer only as set in its 連線設定 window: with a
-connection password, a device that reaches the Mac must give that password,
-and if you also saved allowed addresses, only those addresses may try; without
-a password, only the allowed addresses are accepted. Blocked addresses are
-always refused. Between those two devices JerisLink sends:
+connection password, the viewer must prove that it knows the password (see
+"Password check" below), and if the Mac has allowed addresses (saved in
+連線設定, or the one viewer address of a setup from before v0.4.0), only those
+addresses may try; without a password, only the allowed addresses are
+accepted. Blocked addresses are always refused. Between those two devices
+JerisLink sends:
 
+- **Password check**, only when a connection password is set, once per
+  connection. The Mac sends a random challenge, the salt and settings for
+  deriving a key from the password (PBKDF2-HMAC-SHA256), and a random ID of
+  that Mac. The viewer answers with its own random value and a code
+  (HMAC-SHA256) computed from these with the derived key. The Mac answers with
+  the result and, when it matches, its own code and a session ID. Neither the
+  password nor the derived key is sent. In a session set up this way, every
+  video, audio and input packet carries a short code from a key for that
+  session.
 - **Screen video** from the Mac to the PC.
 - **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
   Opus at 48 kHz, only while a viewer with audio on is connected. The host

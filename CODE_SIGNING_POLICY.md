@@ -1,6 +1,6 @@
 # Code signing policy
 
-Status: planned. Windows binaries are not signed yet.
+Status: planned. The Windows viewer and installer that this repository's GitHub release workflow builds are not code-signed yet. The Microsoft Store package, also attached to some GitHub Releases as `-store-signed.msix`, is signed by Microsoft and is not covered by this policy (see [Microsoft Store](#microsoft-store)).
 
 Free code signing for Windows is planned through SignPath.io, with a certificate from the SignPath Foundation. Once active, signed releases will state:
 
@@ -34,4 +34,4 @@ macOS builds are not covered by this policy. The release workflow signs the macO
 
 ## Microsoft Store
 
-The Microsoft Store version of the Windows viewer is signed by Microsoft when the Store delivers it. This policy covers the binaries on GitHub Releases.
+The Microsoft Store version of the Windows viewer is signed by Microsoft through the Store. A release can also carry `Jerislink-X.Y.Z-windows-x64-store-signed.msix`: a copy of that same Microsoft-signed package, which `.github/workflows/store-msix-to-release.yml` downloads from the Store and checks before attaching it. JerisHQ does not sign it and never submits it to SignPath. This policy, and the planned SignPath signing, cover only the viewer `Jerislink.exe` and the installer `setup.exe` built by `.github/workflows/release.yml`.
