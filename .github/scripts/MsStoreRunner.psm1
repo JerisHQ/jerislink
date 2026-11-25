@@ -37,6 +37,14 @@
 # While it runs, any request but a GET to the Store API is refused before it
 # is sent ($script:ReadOnlyCalls, checked in Invoke-StoreApi and again in
 # Invoke-StoreHttp).
+# Delete-draft (Remove-StorePendingDraft; msstore-publish.yml
+# mode=delete-draft): deletes one given submission by id, only while it is the
+# app's pending, uncommitted PendingCommit draft and not its last published
+# one, then confirms it is gone (a GET of it by id is HTTP 404 and the app
+# shows no pending submission). While it runs, any request but a GET to the
+# Store API and one DELETE of exactly that submission is refused before it is
+# sent ($script:DeleteOnlyPath, checked in Invoke-StoreApi and again in
+# Invoke-StoreHttp).
 # Time budget: the publish step has one timeout, and nothing prints once the
 # runner kills it. Publish-StoreSubmission works to a deadline set before that
 # timeout: the commit and its read-backs keep their own time at the end, every
@@ -91,6 +99,12 @@ $script:LoopbackTestServer = $false
 # Invoke-StoreHttp refuse every request but a GET to the Store API, before
 # anything is sent.
 $script:ReadOnlyCalls = $false
+# Set only while Remove-StorePendingDraft runs (mode=delete-draft): the one
+# path, applications/<product>/submissions/<id>, it may DELETE. Then
+# Invoke-StoreApi and Invoke-StoreHttp refuse every request but a GET to the
+# Store API and one DELETE of exactly that path, before anything is sent.
+$script:DeleteOnlyPath = ''
+$script:DeleteOnlySent = $false
 
 # Finds the one Store package in $Dir and checks its identity and version.
 # Returns Path (the full path of the .msixupload that is uploaded), FileName, Version (the manifest Identity Version) and Sha256.
@@ -620,6 +634,10 @@ function Invoke-StoreHttp {
   if ($script:ReadOnlyCalls -and -not ($Kind -ceq 'Api' -and $Method -ceq 'GET')) {
     throw (New-StoreError "refused: this is a read-only run (GET calls to the Store API only); nothing was sent" -NotSent)
   }
+  if ($script:DeleteOnlyPath -and -not ($Kind -ceq 'Api' -and ($Method -ceq 'GET' -or
+        ($Method -ceq 'DELETE' -and $Uri -ceq "$script:ApiBase/v1.0/my/$script:DeleteOnlyPath")))) {
+    throw (New-StoreError "refused: this run deletes one draft only (GET calls to the Store API and the DELETE of that submission); nothing was sent" -NotSent)
+  }
   $clock = [System.Diagnostics.Stopwatch]::StartNew()
   $handler = [System.Net.Http.SocketsHttpHandler]::new()
   $handler.AllowAutoRedirect = $false
@@ -1108,6 +1126,14 @@ function Invoke-StoreApi {
   # A read-only run (Show-StoreSubmissionDiagnosis) sends GET calls only.
   if ($script:ReadOnlyCalls -and $Method -cne 'GET') {
     throw (New-StoreError "Store API $what refused: this is a read-only run (GET calls only); nothing was sent" -NotSent)
+  }
+  # A delete-draft run (Remove-StorePendingDraft) sends GET calls and at most
+  # one DELETE, of exactly that submission.
+  if ($script:DeleteOnlyPath -and $Method -cne 'GET') {
+    if ($Method -cne 'DELETE' -or $Path -cne $script:DeleteOnlyPath -or $script:DeleteOnlySent) {
+      throw (New-StoreError "Store API $what refused: this run deletes one draft only (GET calls and one DELETE of that submission); nothing was sent" -NotSent)
+    }
+    $script:DeleteOnlySent = $true
   }
   $a = @{ Method = $Method; Uri = "$script:ApiBase/v1.0/my/$Path"; Kind = 'Api'; Headers = @{ Authorization = "Bearer $script:Token" } }
   if ($PSBoundParameters.ContainsKey('Body')) { $a.Body = $Body; $a.ContentType = 'application/json; charset=utf-8' }
@@ -1903,7 +1929,10 @@ function Resolve-UnconfirmedCommit {
 }
 
 # Deletes one submission by id, only while it is an uncommitted draft
-# (PendingCommit). For recovery by hand; the publish workflow never deletes.
+# (PendingCommit). For recovery by hand and for mode=delete-draft
+# (Remove-StorePendingDraft); the publish run never deletes. TimeoutSec: how
+# long its GET and its DELETE each wait (the read-back after an unconfirmed
+# answer waits 30 s), all capped by $script:CallDeadline when set.
 # HTTP 200, 201 or 204 counts as deleted, also when its body was lost (the
 # body is not used). HTTP 202 or another 2xx (Test-StoreAccepted) is never
 # reported as deleted: accepted, completion unconfirmed; it reads that id back
@@ -1912,12 +1941,16 @@ function Resolve-UnconfirmedCommit {
 # unconfirmed, the same read-back by id, and the DELETE is not sent again
 # (Pepper, PR #74 r12).
 function Remove-StoreDraftSubmission {
-  param([Parameter(Mandatory)][string]$ProductId, [Parameter(Mandatory)][string]$SubmissionId)
-  $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId)
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [ValidateRange(1, 3600)][int]$TimeoutSec = 600
+  )
+  $sub = Read-SubmissionSafe -SubmissionJson (Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec)
   if (-not $sub -or $sub.Id -cne $SubmissionId) { throw (Hide-StoreSecret "GET submission $SubmissionId did not return that submission; not deleting") }
   if ($sub.Status -cne 'PendingCommit') { throw (Hide-StoreSecret "submission $SubmissionId is '$($sub.Status)', not an uncommitted PendingCommit draft; not deleting") }
   $note = ''
-  try { Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" | Out-Null }
+  try { Invoke-StoreApi -Method DELETE -Path "applications/$ProductId/submissions/$SubmissionId" -TimeoutSec $TimeoutSec | Out-Null }
   catch {
     $status = Get-StoreErrorStatus $_
     if (Test-StoreAccepted $status) {
@@ -2406,4 +2439,90 @@ function Show-StoreSubmissionDiagnosis {
   finally { $script:ReadOnlyCalls = $was }
 }
 
-Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis
+# The delete-draft mode (msstore-publish.yml mode=delete-draft): deletes one
+# uncommitted draft that this workflow did not create in this run, by its id,
+# and nothing else. While it runs, $script:DeleteOnlyPath makes Invoke-StoreApi
+# and Invoke-StoreHttp refuse any request but a GET to the Store API and one
+# DELETE of exactly applications/<ProductId>/submissions/<SubmissionId>,
+# before it is sent. Steps:
+# 1. GET the app: SubmissionId must be its pending submission and not its last
+#    published one, else it stops and deletes nothing;
+# 2. GET SubmissionId and print its status: it stops and deletes nothing
+#    unless it is an uncommitted PendingCommit draft;
+# 3. Remove-StoreDraftSubmission: GET it once more (still PendingCommit), then
+#    the DELETE; an accepted (HTTP 202 or another 2xx) or unconfirmed answer
+#    stops it, with one read-back by id and nothing sent again;
+# 4. GET SubmissionId again: only HTTP 404 counts as gone; HTTP 200 or a
+#    failed read stops it with "not confirmed";
+# 5. GET the app: it must show no pending submission.
+# Each call waits at most TimeoutSec and none past DeadlineUtc
+# ($script:CallDeadline); the DELETE is not sent unless at least
+# 3 x TimeoutSec are left for it and both checks after it. Prints ids, listed
+# statuses and fixed text only. Creates, changes and commits nothing.
+function Remove-StorePendingDraft {
+  param(
+    [Parameter(Mandatory)][string]$ProductId,
+    [Parameter(Mandatory)][string]$SubmissionId,
+    [Parameter(Mandatory)][datetime]$DeadlineUtc,
+    [ValidateRange(1, 600)][int]$TimeoutSec = 30
+  )
+  Assert-ProductId $ProductId; Assert-SubmissionId $SubmissionId
+  $path = "applications/$ProductId/submissions/$SubmissionId"
+  $get = "GET /v1.0/my/$path"
+  $saved = @($script:DeleteOnlyPath, $script:DeleteOnlySent, $script:CallDeadline)
+  $script:DeleteOnlyPath = $path; $script:DeleteOnlySent = $false
+  $script:CallDeadline = $DeadlineUtc.ToUniversalTime()
+  try {
+    Write-StoreHost ("delete-draft: deletes submission $SubmissionId only, and only while it is the app's pending, uncommitted " +
+      "PendingCommit draft; GET calls and that one DELETE only; nothing is created, changed or committed")
+    $app = ''
+    try { $app = Get-StoreApp $ProductId -TimeoutSec $TimeoutSec } catch { throw (Hide-StoreSecret "$_; cannot read the app; nothing deleted") }
+    $pending = Read-AppPendingSubmissionId -AppJson $app -ProductId $ProductId
+    $published = Read-AppLastPublishedSubmissionId -AppJson $app -ProductId $ProductId
+    $app = $null
+    Write-StoreHost ("app $ProductId before: pending submission $(if ($pending) { $pending } else { '[none]' }), " +
+      "last published submission $(if ($published) { $published } else { '[none]' })")
+    if ($published -ceq $SubmissionId) { throw (Hide-StoreSecret "submission $SubmissionId is the app's last published submission; nothing deleted") }
+    if ($pending -cne $SubmissionId) { throw (Hide-StoreSecret "submission $SubmissionId is not the app's pending submission; nothing deleted") }
+    $json = ''
+    try { $json = Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec } catch { throw (Hide-StoreSecret "$_; nothing deleted") }
+    $safe = Read-SubmissionSafe -SubmissionJson $json
+    $json = $null
+    if (-not $safe) { throw (Hide-StoreSecret "GET submission $SubmissionId returned $script:UnreadSubmission; nothing deleted") }
+    if ($safe.Id -cne $SubmissionId) { throw (Hide-StoreSecret "GET submission $SubmissionId returned another submission; nothing deleted") }
+    Write-StoreHost "submission $SubmissionId before: status $(if ($safe.Status) { $safe.Status } else { '[none]' })"
+    if ($safe.Status -cne 'PendingCommit') { throw (Hide-StoreSecret "submission $SubmissionId is not an uncommitted PendingCommit draft; nothing deleted") }
+    $left = ($script:CallDeadline - (Get-StoreUtcNow)).TotalSeconds
+    if ($left -lt 3 * $TimeoutSec) {
+      throw (Hide-StoreSecret "not enough time left before this step's deadline for the delete and the checks after it; nothing deleted")
+    }
+    Remove-StoreDraftSubmission -ProductId $ProductId -SubmissionId $SubmissionId -TimeoutSec $TimeoutSec
+    $still = $true
+    try { $null = Get-StoreSubmissionJson $ProductId $SubmissionId -TimeoutSec $TimeoutSec }
+    catch {
+      if ((Get-StoreErrorStatus $_) -ne 404) {
+        throw (Hide-StoreSecret ("$_; the delete of submission $SubmissionId is not confirmed; nothing more is sent. A person needs " +
+          "to check $get later: HTTP 404 there means it is gone."))
+      }
+      $still = $false
+    }
+    if ($still) {
+      throw (Hide-StoreSecret ("submission $SubmissionId can still be read after the delete (HTTP 200): the delete is not confirmed; " +
+        "nothing more is sent. A person needs to check $get later: HTTP 404 there means it is gone."))
+    }
+    Write-StoreHost "submission $SubmissionId after: HTTP 404 (gone)"
+    try { $app = Get-StoreApp $ProductId -TimeoutSec $TimeoutSec }
+    catch { throw (Hide-StoreSecret "$_; submission $SubmissionId is gone (HTTP 404), but the app could not be read back") }
+    $pending = Read-AppPendingSubmissionId -AppJson $app -ProductId $ProductId
+    $app = $null
+    Write-StoreHost "app $ProductId after: pending submission $(if ($pending) { $pending } else { '[none]' })"
+    if ($pending -ceq $SubmissionId) { throw (Hide-StoreSecret "the app still shows submission $SubmissionId as pending: the delete is not confirmed") }
+    if ($pending) {
+      throw (Hide-StoreSecret "submission $SubmissionId is gone (HTTP 404), but the app shows another pending submission $pending, which this run did not touch")
+    }
+    Write-StoreHost "delete-draft done: submission $SubmissionId is gone and the app has no pending submission; nothing else was sent"
+  }
+  finally { $script:DeleteOnlyPath = $saved[0]; $script:DeleteOnlySent = $saved[1]; $script:CallDeadline = $saved[2] }
+}
+
+Export-ModuleMember -Function Get-StorePackage, Protect-StoreText, Test-StoreUri, Invoke-StoreHttp, Protect-WorkflowCommand, Get-ListedTarget, Get-StoreErrorText, Connect-StoreApi, Test-NoPendingSubmission, Read-AppPendingSubmissionId, Assert-NoPendingSubmission, New-StoreSubmission, Test-SubmissionPricing, Set-SubmissionPackage, Get-SubmissionComparedFields, Compare-SubmissionFields, Send-StorePackage, Test-DraftReadyToCommit, Invoke-SubmissionCommit, Remove-StoreDraftSubmission, Publish-StoreSubmission, Test-SubmissionHasPackage, Assert-SubmissionHasPackage, Read-AppLastPublishedSubmissionId, Get-SubmissionDiagnosis, Show-StoreSubmissionDiagnosis, Remove-StorePendingDraft

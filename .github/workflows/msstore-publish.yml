@@ -13,6 +13,9 @@ name: msstore-publish
 #   successful `msix` run.
 # - workflow_dispatch, mode=diagnose: give a submission id. Read-only; see
 #   "Diagnose" below. Neither the inspect nor the publish job runs.
+# - workflow_dispatch, mode=delete-draft: give a submission id. Deletes that
+#   one uncommitted draft only; see "Delete-draft" below. Neither the inspect
+#   nor the publish job runs.
 #
 # Package selection: the jobs never build. They find the successful `msix` push
 # run for exactly the released commit and download its jerislink-msix-store
@@ -143,7 +146,7 @@ name: msstore-publish
 #   no redirects, and run with verbose and debug output off (PowerShell 7.6
 #   writes request URLs, headers and bodies to the debug stream).
 # - Secrets reach the API only through step env vars of the steps that sign
-#   in (two in publish, one in diagnose); the token stays in that step's
+#   in (two in publish, one in diagnose, one in delete-draft); the token stays in that step's
 #   PowerShell session. Nothing is written to disk or put in the repo.
 #   msstore-publish-check.yml runs the same flow against a local stand-in for
 #   the API on every change to these files.
@@ -157,6 +160,18 @@ name: msstore-publish
 # and whether the publish run's field check would pass. The module refuses any
 # call but a GET while it runs, before anything is sent, so it creates,
 # changes, commits and deletes nothing.
+#
+# Delete-draft (workflow_dispatch, mode=delete-draft, submission_id=<id>): the
+# `delete-draft` job runs in the `store` environment, so it waits for that
+# approval. It signs in, then (Remove-StorePendingDraft): GETs the app (the id
+# must be its pending submission and not its last published one), GETs that
+# id (it must be an uncommitted PendingCommit draft), DELETEs exactly that id
+# (Remove-StoreDraftSubmission, which GETs it once more first), then checks it
+# is gone: a GET of that id must be HTTP 404 and the app must show no pending
+# submission. Anything else stops it, and an accepted or unconfirmed DELETE is
+# never reported as done or sent again. The module refuses any call but a GET
+# and that one DELETE while it runs, before anything is sent, so it creates,
+# changes and commits nothing, and deletes nothing else.
 
 on:
   release:
@@ -164,19 +179,20 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'publish: upload and commit the package of msix_run_id. diagnose: read submission_id and the last published submission (GET calls only)'
+        description: 'publish: upload and commit the package of msix_run_id. diagnose: read submission_id and the last published submission (GET calls only). delete-draft: delete submission_id, only while it is the pending PendingCommit draft'
         required: true
         default: publish
         type: choice
         options:
           - publish
           - diagnose
+          - delete-draft
       msix_run_id:
         description: 'mode=publish: run id of a successful "msix" push run whose commit is in main (its jerislink-msix-store artifact is uploaded)'
         required: false
         type: string
       submission_id:
-        description: 'mode=diagnose: the submission id to read (digits only)'
+        description: 'mode=diagnose: the submission id to read; mode=delete-draft: the draft to delete (digits only)'
         required: false
         type: string
 
@@ -496,3 +512,42 @@ jobs:
           Import-Module ./.github/scripts/MsStoreRunner.psm1
           Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
           Show-StoreSubmissionDiagnosis -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID
+
+  # mode=delete-draft (see "Delete-draft" above): GET calls and one DELETE of
+  # that submission id only. In the store environment, so it waits for the
+  # same approval as a publish. It never runs on a release.
+  delete-draft:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.mode == 'delete-draft'
+    runs-on: windows-latest
+    environment: store
+    # checkout 5 + delete 5 min (sign-in, then calls of up to 30 s each, none
+    # past the step's deadline).
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Delete that one uncommitted draft by id (only while it is the app's pending PendingCommit draft), then check it is gone
+        id: delete-draft
+        timeout-minutes: 5
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          PC_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
+          PC_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
+          PC_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
+        run: |
+          # No call waits past this deadline, 1 min before timeout-minutes (5)
+          # above. The id is checked before the sign-in. While it runs,
+          # Remove-StorePendingDraft refuses any call but a GET to the Store
+          # API and one DELETE of that submission, before it is sent.
+          $deadline = [DateTime]::UtcNow.AddMinutes(4)
+          if ($env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission_id must be a number' }
+          Import-Module ./.github/scripts/MsStoreRunner.psm1
+          Connect-StoreApi -TenantId $env:PC_TENANT_ID -ClientId $env:PC_CLIENT_ID -ClientSecret $env:PC_CLIENT_SECRET
+          Remove-StorePendingDraft -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -DeadlineUtc $deadline

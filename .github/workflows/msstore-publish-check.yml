@@ -13,8 +13,12 @@ name: msstore-publish-check
 #   timeout and they add up to at most the job's; that the diagnose job runs
 #   only on a manual run from main with mode=diagnose, in the store
 #   environment, checks submission_id before the sign-in and then runs only
-#   Show-StoreSubmissionDiagnosis; and that inspect (so publish) does not run
-#   for mode=diagnose.
+#   Show-StoreSubmissionDiagnosis; that the delete-draft job runs only on a
+#   manual run from main with mode=delete-draft, in the store environment,
+#   sets its deadline at least 1 min before its timeout, checks submission_id
+#   before the sign-in and then runs only Remove-StorePendingDraft with that
+#   deadline; and that inspect (so publish) does not run for mode=diagnose or
+#   mode=delete-draft.
 # - runs that flow with the real package over real HTTP against a stand-in for
 #   the Store API and the blob upload on 127.0.0.1 (tests/FakeStoreApi.psm1,
 #   allowed only through Connect-StoreApi -LoopbackTestServer): the calls and
@@ -36,7 +40,10 @@ name: msstore-publish-check
 #   look-by-id only, no delete or re-run advice and none of that body
 #   printed; without -LoopbackTestServer nothing is sent to the stand-in;
 #   mode=diagnose (Show-StoreSubmissionDiagnosis) sends only GET requests
-#   after the sign-in, changes nothing and prints field paths, not values.
+#   after the sign-in, changes nothing and prints field paths, not values;
+#   mode=delete-draft (Remove-StorePendingDraft) sends GET requests and one
+#   DELETE of exactly the given draft, then reads it back as gone (HTTP 404)
+#   and the app with no pending submission.
 # - checks sign-in and the pending check fail closed on a dead port (127.0.0.1:9).
 # The stand-in only models what the module relies on; the real service's JSON
 # shapes, status changes and upload are not verified here.
@@ -199,7 +206,37 @@ jobs:
           $jobMin = [regex]::Match($diag, '(?m)^    timeout-minutes: (\d+)\s*$')
           $mins = @([regex]::Matches($diag, '(?m)^        timeout-minutes: (\d+)\s*$') | ForEach-Object { [int]$_.Groups[1].Value })
           if (-not $jobMin.Success -or $mins.Count -ne 2 -or ($mins | Measure-Object -Sum).Sum -gt [int]$jobMin.Groups[1].Value) { throw "the diagnose job and its steps need timeouts that add up to at most the job's" }
-          Write-Host "msstore-publish.yml: publish job order, package gate and time budget OK; diagnose job gated, in the store environment, GET-only call OK"
+          # The delete-draft job: only on a manual run from main with
+          # mode=delete-draft, in the store environment, a checkout and one
+          # step whose code is exactly: set the deadline, check the id, sign
+          # in, delete that draft (GET calls and one DELETE of that id; the
+          # module refuses anything else before it is sent).
+          $del = [regex]::Match($code, '(?ms)^  delete-draft:\s*\n(?:(?!^  \S).)*').Value
+          if (-not $del) { throw "msstore-publish.yml has no delete-draft job" }
+          if ($del -notmatch "(?m)^    if: github\.event_name == 'workflow_dispatch' && github\.ref == 'refs/heads/main' && inputs\.mode == 'delete-draft'\s*$") { throw "the delete-draft job must run only on a manual run from main with mode=delete-draft" }
+          if ($del -notmatch '(?m)^    environment: store\s*$') { throw "the delete-draft job must run in the store environment" }
+          if ($del -notmatch '(?m)^          SUBMISSION_ID: \$\{\{ inputs\.submission_id \}\}\s*$') { throw "the delete-draft job must take the id from inputs.submission_id through env" }
+          if (([regex]::Matches($del, '\$\{\{\s*inputs\.')).Count -ne 1) { throw "the delete-draft job may use an input only as SUBMISSION_ID" }
+          $uses = @([regex]::Matches($del, '(?m)^\s+(?:- )?uses: (\S+)\s*$') | ForEach-Object { $_.Groups[1].Value })
+          if (($uses -join ',') -cne 'actions/checkout@v4' -or ([regex]::Matches($del, '(?m)^      - ')).Count -ne 2) { throw "the delete-draft job must be a checkout and one step" }
+          $run = [regex]::Match($del, '(?ms)^        run: \|\s*\n(.*)').Groups[1].Value
+          $lines = @($run -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          $dl = [regex]::Match($lines[0], '^\$deadline = \[DateTime\]::UtcNow\.AddMinutes\((\d+)\)$')
+          $want = @(
+            $lines[0],
+            "if (`$env:SUBMISSION_ID -cnotmatch '^[0-9]{1,20}\z') { throw 'submission_id must be a number' }",
+            'Import-Module ./.github/scripts/MsStoreRunner.psm1',
+            $connect,
+            'Remove-StorePendingDraft -ProductId $env:STORE_PRODUCT_ID -SubmissionId $env:SUBMISSION_ID -DeadlineUtc $deadline'
+          )
+          if (-not $dl.Success -or ($lines -join "`n") -cne ($want -join "`n")) { throw "the delete-draft step must set its deadline, check the id, sign in and run Remove-StorePendingDraft, and nothing else" }
+          $stepMin = [regex]::Match($del, '(?m)^        timeout-minutes: (\d+)\s*$(?![\s\S]*^        timeout-minutes:)')
+          if ([int]$dl.Groups[1].Value -gt [int]$stepMin.Groups[1].Value - 1) { throw "the delete-draft step's deadline must be at least 1 min before its timeout" }
+          $jobMin = [regex]::Match($del, '(?m)^    timeout-minutes: (\d+)\s*$')
+          $mins = @([regex]::Matches($del, '(?m)^        timeout-minutes: (\d+)\s*$') | ForEach-Object { [int]$_.Groups[1].Value })
+          if (-not $jobMin.Success -or $mins.Count -ne 2 -or ($mins | Measure-Object -Sum).Sum -gt [int]$jobMin.Groups[1].Value) { throw "the delete-draft job and its steps need timeouts that add up to at most the job's" }
+          if (([regex]::Matches($code, 'Remove-StorePendingDraft |Remove-StoreDraftSubmission ')).Count -ne 1) { throw "msstore-publish.yml may delete only in the delete-draft job, once" }
+          Write-Host "msstore-publish.yml: publish job order, package gate and time budget OK; diagnose job gated, in the store environment, GET-only call OK; delete-draft job gated, in the store environment, one call with its deadline OK"
 
       - name: Find the msix run
         id: src
@@ -575,5 +612,28 @@ jobs:
             if ($r.Text -cmatch 'Tier\d|Launch sale|Submission [12]|NoFreeTrial') { throw "diagnose printed a field value" }
             Assert-NoLeak $r.Text $s
             Write-Host "diagnose: GET requests only after the sign-in, paths only"
+          } finally { Stop-FakeStoreServer -Store $s }
+
+          # 12. mode=delete-draft on the pending PendingCommit draft: after the
+          # sign-in, GET requests and one DELETE of exactly that id; then it
+          # is gone (HTTP 404) and the app shows no pending submission.
+          $s = New-FakeStore -AppId $app -PendingId '1152921505000000007'
+          $url = Start-FakeStoreServer -Store $s
+          try {
+            Invoke-Shown { Connect-StoreApi -TenantId 'tenant-dry-run' -ClientId 'client-dry-run' -ClientSecret $secret -AuthorityHost $url -ApiBase $url -LoopbackTestServer } | Out-Null
+            $r = Invoke-Shown { Remove-StorePendingDraft -ProductId $app -SubmissionId '1152921505000000007' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(4)) }
+            if ($r.Err) { throw "delete-draft failed against the stand-in" }
+            $got = @($s.Log)
+            Write-Host "calls:`n  $($got -join "`n  ")"
+            $want = @("POST /tenant-dry-run/oauth2/v2.0/token", "GET $base", "GET $base/submissions/1152921505000000007", "GET $base/submissions/1152921505000000007",
+                      "DELETE $base/submissions/1152921505000000007", "GET $base/submissions/1152921505000000007", "GET $base")
+            if (($got -join "`n") -cne ($want -join "`n")) { throw "delete-draft sent other requests than the sign-in, the GETs and one DELETE of that id" }
+            if (@($s.Seen | Where-Object { $_.Line -cnotmatch '^(GET /v1\.0/|DELETE /v1\.0/my/applications/[^/]+/submissions/1152921505000000007$|POST /tenant-dry-run/oauth2/v2\.0/token$)' }).Count) { throw "a request other than a GET or that DELETE reached the stand-in" }
+            if ($s.PendingId -or $s.Sub -or $s.Blob) { throw "delete-draft left a pending submission or created something" }
+            if ($r.Text -notmatch '(?m)^submission 1152921505000000007 before: status PendingCommit$' -or $r.Text -notmatch '(?m)^submission 1152921505000000007 after: HTTP 404 \(gone\)$' -or
+                $r.Text -notmatch '(?m)^app \S+ after: pending submission \[none\]$') { throw "delete-draft did not print the status before and that it is gone after" }
+            if ($r.Text -cmatch 'Tier\d|Launch sale|Submission [12]|NoFreeTrial') { throw "delete-draft printed a field value" }
+            Assert-NoLeak $r.Text $s
+            Write-Host "delete-draft: GET requests and one DELETE of that id after the sign-in; gone afterwards"
           } finally { Stop-FakeStoreServer -Store $s }
           Write-Host "dry run: all assertions passed"

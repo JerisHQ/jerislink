@@ -122,7 +122,8 @@ function Edit-FakeFieldsOnPut([System.Text.Json.Nodes.JsonObject]$Fields, [strin
 # Options: PendingId (a pending submission that exists before the run; a GET
 # of it by id shows it with status PendingStatus, default PendingCommit, and
 # the fields of a draft an earlier run updated: Edit-FakeFieldsOnPut with
-# DriftOnPut), HidePending (GET app does not show it, as if it appeared after the check),
+# DriftOnPut; a DELETE of it by id is refused with 409 unless it is
+# PendingCommit, else answered 204 and it is gone), HidePending (GET app does not show it, as if it appeared after the check),
 # OtherDraftAfterCheck (someone else creates a pending submission with this id
 # right after the first GET app, i.e. after the run's pending check; a create
 # that lands afterwards gets 409),
@@ -521,6 +522,15 @@ function Invoke-FakeApiRoute($Store, [string]$Method, [string]$Path, [string]$Te
       if ($Store.PresetPendingId -and $id -eq $Store.PresetPendingId -and $Store.PendingId -eq $id) {
         return New-FakeResponse 200 (Get-FakeOtherSubmission $Store $id $Store.PendingStatus $Store.PendingFields)
       }
+    }
+    # A DELETE by id of the pending submission from before the run, while it
+    # is still pending: refused (409) unless it is PendingCommit; else it is
+    # gone (a GET of it by id is 404, GET app shows none pending).
+    if ((-not $Store.Sub -or $Store.Sub.id -ne $id) -and -not $commit -and $Method -eq 'DELETE' -and
+      $Store.PresetPendingId -and $id -eq $Store.PresetPendingId -and $Store.PendingId -eq $id) {
+      if ($Store.PendingStatus -ne 'PendingCommit') { return New-FakeResponse 409 @{ code = 'InvalidState'; message = 'not PendingCommit' } }
+      $Store.PendingId = ''
+      return New-FakeResponse 204 $null
     }
     if (-not $Store.Sub -or $Store.Sub.id -ne $id) { return New-FakeResponse 404 @{ code = 'NotFound'; message = "submission $id not found" } }
     if ($commit -and $Method -eq 'POST') {
