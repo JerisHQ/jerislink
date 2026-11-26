@@ -230,7 +230,7 @@ jobs:
       version: ${{ steps.pkg.outputs.version }}
       sha256: ${{ steps.pkg.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
@@ -411,7 +411,7 @@ jobs:
     env:
       EXPECTED_VERSION: ${{ needs.inspect.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         timeout-minutes: 5
         with:
           persist-credentials: false
@@ -490,7 +490,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         timeout-minutes: 5
         with:
           persist-credentials: false
@@ -527,7 +527,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         timeout-minutes: 5
         with:
           persist-credentials: false

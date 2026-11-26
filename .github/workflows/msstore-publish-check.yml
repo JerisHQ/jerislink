@@ -94,7 +94,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           sparse-checkout: |
@@ -124,7 +124,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           sparse-checkout: .github
@@ -193,8 +193,8 @@ jobs:
           if ($diag -notmatch '(?m)^    environment: store\s*$') { throw "the diagnose job must run in the store environment" }
           if ($diag -notmatch '(?m)^          SUBMISSION_ID: \$\{\{ inputs\.submission_id \}\}\s*$') { throw "the diagnose job must take the id from inputs.submission_id through env" }
           if ($diag -match '\$\{\{\s*inputs\.' -and ([regex]::Matches($diag, '\$\{\{\s*inputs\.')).Count -ne 1) { throw "the diagnose job may use an input only as SUBMISSION_ID" }
-          $uses = @([regex]::Matches($diag, '(?m)^\s+(?:- )?uses: (\S+)\s*$') | ForEach-Object { $_.Groups[1].Value })
-          if (($uses -join ',') -cne 'actions/checkout@v4' -or ([regex]::Matches($diag, '(?m)^      - ')).Count -ne 2) { throw "the diagnose job must be a checkout and one step" }
+          $uses = @([regex]::Matches($diag, '(?m)^\s+(?:- )?uses: (\S+)(?:[ \t]+#[^\n]*)?\s*$') | ForEach-Object { $_.Groups[1].Value })
+          if (($uses -join ',') -cne 'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' -or ([regex]::Matches($diag, '(?m)^      - ')).Count -ne 2) { throw "the diagnose job must be a checkout and one step" }
           $run = [regex]::Match($diag, '(?ms)^        run: \|\s*\n(.*)').Groups[1].Value
           $lines = @($run -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
           $want = @(
@@ -218,8 +218,8 @@ jobs:
           if ($del -notmatch '(?m)^    environment: store\s*$') { throw "the delete-draft job must run in the store environment" }
           if ($del -notmatch '(?m)^          SUBMISSION_ID: \$\{\{ inputs\.submission_id \}\}\s*$') { throw "the delete-draft job must take the id from inputs.submission_id through env" }
           if (([regex]::Matches($del, '\$\{\{\s*inputs\.')).Count -ne 1) { throw "the delete-draft job may use an input only as SUBMISSION_ID" }
-          $uses = @([regex]::Matches($del, '(?m)^\s+(?:- )?uses: (\S+)\s*$') | ForEach-Object { $_.Groups[1].Value })
-          if (($uses -join ',') -cne 'actions/checkout@v4' -or ([regex]::Matches($del, '(?m)^      - ')).Count -ne 2) { throw "the delete-draft job must be a checkout and one step" }
+          $uses = @([regex]::Matches($del, '(?m)^\s+(?:- )?uses: (\S+)(?:[ \t]+#[^\n]*)?\s*$') | ForEach-Object { $_.Groups[1].Value })
+          if (($uses -join ',') -cne 'actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' -or ([regex]::Matches($del, '(?m)^      - ')).Count -ne 2) { throw "the delete-draft job must be a checkout and one step" }
           $run = [regex]::Match($del, '(?ms)^        run: \|\s*\n(.*)').Groups[1].Value
           $lines = @($run -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
           $dl = [regex]::Match($lines[0], '^\$deadline = \[DateTime\]::UtcNow\.AddMinutes\((\d+)\)$')
