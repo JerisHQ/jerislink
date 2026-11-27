@@ -62,6 +62,8 @@ constexpr int kActiveGraceMs = 10'000;    // viewer counts as present this long 
 // silence, then one a second; Windows gives up after 10 unanswered probes.
 constexpr ULONG kKeepAliveIdleMs = 3'000;
 constexpr ULONG kKeepAliveIntervalMs = 1'000;
+// How often InputClaims rule 2 (10 s of quiet) is checked.
+constexpr int kQuietCheckMs = 250;
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
 constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
@@ -203,9 +205,8 @@ struct State {
     // H2 input. One injector for every connection: one viewer IP may connect,
     // but over more than one control connection at a time (a reconnect, or
     // a second viewer), so each connection gets its own owner number for
-    // what it holds down.
+    // what it holds down (InputInjector::open).
     jlh::InputInjector input;
-    std::atomic<uint64_t> nextInputOwner{1};
     // MRM1 pointer order. A UDP move and a POINTER_SYNC (control thread) both
     // take this, then the injector's own lock, in that order.
     std::mutex pointerMutex;
@@ -325,18 +326,17 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
         logf("control.closed peer=%s reason=rcvtimeo err=%d", peer.c_str(), WSAGetLastError());
         return;
     }
-    // Pepper's review of f97ad11, item 1: a close lets go of this
-    // connection's own claims only, so a connection whose viewer is gone
-    // must be seen to close. The host never writes to an idle control
-    // connection, so without keep-alive a dropped network would keep it
-    // open, and what it holds held, until the next host start. With it, a
-    // dead connection ends about 3 s after it went quiet when the viewer's
-    // side answers the first probe with a reset (its socket is gone, as
-    // after the viewer reconnected), or about 13 s after when 10 probes go
-    // unanswered. r6 (Pepper's review of c397898): no up on a newer
-    // connection ends an old connection's claims any more, so this close
-    // is what lets go of a key the old connection still held after a
-    // reconnect, and the idle time sets how soon (it was 15 s).
+    // TCP keep-alive. The host never writes to an idle control connection,
+    // so without it a dropped network would keep the connection, and its
+    // slot, open until the next host start. With it, a dead connection is
+    // closed about 3 s after it went quiet when the viewer's side answers
+    // the first probe with a reset (its socket is gone, as after the viewer
+    // reconnected), or about 13 s after when 10 probes go unanswered.
+    // r7 (Pepper's review of 6a581c4, item 1): what the connection holds no
+    // longer waits for that close. A newer connection's first input replaces
+    // it at once, and 10 s with nothing from it ends its claims anyway
+    // (InputClaims), so the limit holds when its socket still answers the
+    // probes and when this call fails.
     tcp_keepalive ka{1, kKeepAliveIdleMs, kKeepAliveIntervalMs};
     DWORD kaBytes = 0;
     if (WSAIoctl(c, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &kaBytes, nullptr, nullptr) != 0)
@@ -346,10 +346,12 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     touch(st);
     const char* role = "control";
     bool first = true;
-    bool hostInfoLogged = false, inputSeen = false;
-    const jlh::HeldInput::Owner owner = st.nextInputOwner++;
+    bool hostInfoLogged = false, inputSeen = false, droppedLogged = false;
+    const jlh::HeldInput::Owner owner = st.input.open(msSinceStart());
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
     while (st.running && readFrame(hdr, -1)) {
+        // r7: any frame shows this connection is alive (InputClaims).
+        st.input.heard(owner, msSinceStart());
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
             else if (hdr.type == jlh::kMsgPing) role = "ping";
@@ -410,6 +412,21 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
                 inputSeen = true;
                 logf("input.open peer=%s channel=%s", peer.c_str(), role);
             }
+            // r7 (InputClaims rule 1): this connection's first input first
+            // replaces the older connections that went quiet when it opened,
+            // so nothing they held touches it; a replaced connection's input
+            // is dropped.
+            const auto admit = st.input.admitInput(owner);
+            if (admit.replaced)
+                logf("input.takeover peer=%s channel=%s replaced=%zu released=%zu still_held=%s", peer.c_str(), role,
+                     admit.replaced, admit.released, st.input.anyHeld() ? "yes" : "no");
+            if (!admit.ok) {
+                if (!droppedLogged) {
+                    droppedLogged = true;
+                    logf("input.dropped peer=%s channel=%s reason=replaced", peer.c_str(), role);
+                }
+                break;
+            }
             // What was typed is never logged; only counts, in the stats line.
             const bool ok = jlh::stepInput(
                 pendingSync, *e,
@@ -432,7 +449,7 @@ done:
         // PC, unless another connection holds it too (Pepper's H2 review,
         // item 2). It lets go of its own claims only (review of f97ad11,
         // item 1). An up Windows refused earlier is tried again.
-        const size_t n = st.input.releaseOwned(owner);
+        const size_t n = st.input.close(owner);
         if (inputSeen || n)
             logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,
                  st.input.anyHeld() ? "yes" : "no");
@@ -505,6 +522,9 @@ void mrm1Listener(State& st, SOCKET u) {
             logf("mrm1.session peer=%s:%u", ipString(from.sin_addr).c_str(), unsigned(ntohs(from.sin_port)));
         }
         if (m->type == jlh::kMrm1Pointer) {
+            // r7: a drag's moves keep the newest input connection's claims
+            // (InputClaims rule 2), late ones too: the viewer is there.
+            st.input.heardPointer(msSinceStart());
             // Only the newest move counts; a late datagram, or one older than
             // the last POINTER_SYNC, is dropped.
             std::lock_guard<std::mutex> g(st.pointerMutex);
@@ -528,6 +548,20 @@ void mrm1Listener(State& st, SOCKET u) {
         }
         // 0x41 NACK, 0x42 receiver report, 0x45 audio: not yet, dropped by
         // parseMrm1.
+    }
+}
+
+// r7 (Pepper's review of 6a581c4, item 1; InputClaims rule 2): a control
+// connection that has sent nothing for 10 s lets go of what it holds, open
+// or not, keep-alive or not. Checked every kQuietCheckMs, so it lets go at
+// most 10.25 s after its last frame.
+void inputQuietLoop(State& st) {
+    while (st.running) {
+        Sleep(kQuietCheckMs);
+        const auto q = st.input.releaseQuiet(msSinceStart());
+        if (q.connections)
+            logf("input.quiet_released connections=%zu released=%zu still_held=%s", q.connections, q.released,
+                 st.input.anyHeld() ? "yes" : "no");
     }
 }
 
@@ -873,6 +907,7 @@ void videoLoop(State& st) {
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
                  "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu input_up_held=%llu "
+                 "input_takeover=%llu input_replaced_drop=%llu input_quiet_release=%llu "
                  "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
                  "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
@@ -882,7 +917,8 @@ void videoLoop(State& st) {
                  sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
                  (unsigned long long)st.input.ignored(), (unsigned long long)st.input.upsHeld(),
-                 (unsigned long long)st.inputMalformed.load(),
+                 (unsigned long long)st.input.replacedConnections(), (unsigned long long)st.input.replacedDropped(),
+                 (unsigned long long)st.input.quietReleases(), (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
                  (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerSyncs.load(),
                  (unsigned long long)st.cursorSent.load(),
@@ -962,6 +998,7 @@ int main(int argc, char** argv) {
     std::thread(controlListener, std::ref(st), ctl).detach();
     std::thread(mrm1Listener, std::ref(st), mrm1).detach();
     std::thread(cursorLoop, std::ref(st)).detach();
+    std::thread(inputQuietLoop, std::ref(st)).detach();
     videoLoop(st);
     st.running = false;
     closesocket(ctl);

@@ -413,7 +413,7 @@ inline bool isExtendedVk(uint16_t v) {
 // More than one control connection can be open at a time: a reconnect
 // opens the new one before the old one is seen closed, and two viewers can
 // be connected at once. Each connection is an owner here, numbered in the
-// order the connections opened (State::nextInputOwner).
+// order the connections opened (InputClaims::open).
 //
 // Who lets go of what (Pepper's H2 reviews: item 2 of a784cd7 and of
 // 8f8a33b, item 1 of f97ad11, the one item of 04622f0, item 1 of c397898):
@@ -428,11 +428,9 @@ inline bool isExtendedVk(uint16_t v) {
 //   takeOwedLocked), and look the same as a plain up. The host does not
 //   tell them apart: such an up ends the new connection's own claim, if it
 //   has one, and nothing else. The old connection's claims end when the
-//   host sees that connection close.
+//   new connection's first input replaces it, when it has been quiet for
+//   10 s, or when it closes, whichever comes first (InputClaims, r7).
 // Windows gets the up only when no connection holds it any more.
-// A connection that went away without a close the host saw (the viewer's
-// network dropped) keeps its claims until TCP keep-alive ends it
-// (host_main.cpp, serveControl) and its close lets go.
 //
 // Every up goes to Windows only through upKey(vk) / upButton(b), which
 // return true when Windows took it. One that Windows did not take keeps its
@@ -462,6 +460,13 @@ public:
     bool buttonHeld(uint8_t b) const { return find(buttons_, b) != nullptr; }
     bool keyOwnedBy(uint16_t v, Owner o) const { return owns(find(keys_, v), o); }
     bool buttonOwnedBy(uint8_t b, Owner o) const { return owns(find(buttons_, b), o); }
+    bool ownsAny(Owner o) const {
+        for (const auto& e : keys_)
+            if (owns(&e, o)) return true;
+        for (const auto& e : buttons_)
+            if (owns(&e, o)) return true;
+        return false;
+    }
 
     // Connection o went away: it lets go of its own claims only (the rule
     // above). Keys (newest press first), then buttons, that no connection
@@ -531,6 +536,143 @@ private:
     }
     std::vector<Entry> keys_;     // in press order
     std::vector<Entry> buttons_;  // 0 left, 1 right, 2 middle; in press order
+};
+
+// r7 (Pepper's review of 6a581c4, item 1): a time limit on what a stale or
+// dead control connection holds, that does not hang on TCP keep-alive. The
+// host sees no close from a viewer whose network dropped or whose machine
+// slept, an old socket can still answer keep-alive after the viewer moved
+// to a new connection, and setting keep-alive can fail. Two rules, on what
+// the host itself hears, with no new message on the wire:
+//
+// 1. Takeover, at once. Before the first input frame of a connection goes
+//    in, every older connection that has sent input and has sent nothing at
+//    all since this one opened is replaced: its claims end (their ups go to
+//    Windows first) and any input it sends later is dropped. The viewer
+//    sends input on one connection at a time and opens a new one only once
+//    it has given up the old one (control_channel.hpp, the reconnect
+//    worker), so the first action after a reconnect never meets a key or
+//    button the old connection held. An older connection that sent anything
+//    after this one opened is live and keeps its claims; a newer one is
+//    never touched, and neither is one that never sent input (clipboard).
+// 2. Quiet, 10 s. A connection that has sent nothing for kQuietMs lets go
+//    of its claims; it stays open and may press again. A held key keeps its
+//    connection talking (the viewer forwards auto-repeat). A drag sends its
+//    moves over MRM1, not on the connection, so a valid MRM1 move counts for
+//    the newest connection that has sent input and was not replaced: the
+//    one the viewer is using.
+//
+// Keep-alive still closes a dead connection (host_main.cpp, serveControl),
+// which ends its claims sooner; neither rule depends on it. Not thread-safe:
+// the host keeps one, with its HeldInput, under InputInjector's lock.
+class InputClaims {
+public:
+    using Owner = HeldInput::Owner;
+    static constexpr int64_t kQuietMs = 10'000;
+
+    // A control connection past its handshake, at nowMs. Owners are numbered
+    // from 1 in the order the connections opened.
+    Owner open(int64_t nowMs) {
+        const Owner o = next_++;
+        const uint64_t s = ++seq_;
+        conns_.push_back(Conn{o, s, s, nowMs});
+        return o;
+    }
+    // Any frame from o (input or not), before it is acted on.
+    void heard(Owner o, int64_t nowMs) {
+        if (Conn* c = find(o)) {
+            c->lastSeq = ++seq_;
+            c->lastMs = nowMs;
+        }
+    }
+    // A valid MRM1 pointer move from the viewer (rule 2). It is not a frame
+    // on any connection, so it does not count for rule 1.
+    void heardPointer(int64_t nowMs) {
+        for (size_t i = conns_.size(); i-- > 0;)
+            if (conns_[i].input && !conns_[i].replaced) {
+                conns_[i].lastMs = nowMs;
+                return;
+            }
+    }
+
+    struct Admit {
+        bool ok = true;         // false: o was replaced, its frame is dropped
+        size_t replaced = 0;    // connections this frame replaced (rule 1)
+        size_t released = 0;    // ups Windows took for them
+    };
+    // An input frame from o, after heard() and before it goes in.
+    template <class UpKey, class UpButton>
+    Admit admitInput(Owner o, UpKey&& upKey, UpButton&& upButton) {
+        Admit r;
+        Conn* c = find(o);
+        if (!c || c->replaced) {
+            r.ok = false;
+            return r;
+        }
+        if (c->input) return r;
+        c->input = true;
+        const uint64_t opened = c->openSeq;
+        for (auto& old : conns_) {
+            if (old.owner >= o) break;  // in owner order
+            if (!old.input || old.replaced || old.lastSeq > opened) continue;
+            old.replaced = true;
+            ++r.replaced;
+            r.released += held_.releaseOwned(old.owner, upKey, upButton);
+        }
+        return r;
+    }
+    // Connection o closed: its claims end (HeldInput::releaseOwned) and it
+    // is forgotten. Returns how many ups Windows took.
+    template <class UpKey, class UpButton>
+    size_t close(Owner o, UpKey&& upKey, UpButton&& upButton) {
+        conns_.erase(std::remove_if(conns_.begin(), conns_.end(), [&](const Conn& c) { return c.owner == o; }),
+                     conns_.end());
+        return held_.releaseOwned(o, upKey, upButton);
+    }
+
+    struct Quiet {
+        size_t connections = 0;  // connections that let go (rule 2)
+        size_t released = 0;     // ups Windows took
+    };
+    // Rule 2, run every so often: a connection quiet for kQuietMs that still
+    // holds something lets go of it.
+    template <class UpKey, class UpButton>
+    Quiet releaseQuiet(int64_t nowMs, UpKey&& upKey, UpButton&& upButton) {
+        Quiet r;
+        for (const auto& c : conns_) {
+            if (nowMs - c.lastMs < kQuietMs || !held_.ownsAny(c.owner)) continue;
+            ++r.connections;
+            r.released += held_.releaseOwned(c.owner, upKey, upButton);
+        }
+        return r;
+    }
+
+    bool replaced(Owner o) const {
+        for (const auto& c : conns_)
+            if (c.owner == o) return c.replaced;
+        return false;
+    }
+    HeldInput& held() { return held_; }
+    const HeldInput& held() const { return held_; }
+
+private:
+    struct Conn {
+        Owner owner = 0;
+        uint64_t openSeq = 0;  // seq_ when it opened
+        uint64_t lastSeq = 0;  // seq_ of its newest frame
+        int64_t lastMs = 0;    // its newest frame, or MRM1 move counted for it
+        bool input = false;    // it has sent an input frame
+        bool replaced = false;
+    };
+    Conn* find(Owner o) {
+        for (auto& c : conns_)
+            if (c.owner == o) return &c;
+        return nullptr;
+    }
+    std::vector<Conn> conns_;  // in owner order
+    uint64_t seq_ = 0;         // one count for opens and frames: what came first
+    Owner next_ = 1;
+    HeldInput held_;
 };
 
 // The captured monitor in virtual-desktop pixels.

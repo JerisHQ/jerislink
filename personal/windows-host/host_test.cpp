@@ -21,6 +21,7 @@
 #include <objbase.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -940,6 +941,374 @@ static void testPointerSyncOrdering() {
     }
 }
 
+// r7 (Pepper's review of 6a581c4, item 1): what a stale or dead control
+// connection holds has a limit that does not hang on TCP keep-alive
+// (InputClaims). StaleHost drives InputClaims as host_main.cpp does: each
+// frame a connection reads is heard first; an input frame is decoded,
+// admitted (rule 1), then applied as InputInjector applies it, through the
+// same HeldInput. Windows is a log. No connection closes unless a test
+// closes it: a socket that still answers keep-alive, or one whose
+// keep-alive could not be set, never closes by itself.
+namespace {
+struct StaleHost {
+    using Owner = jlh::HeldInput::Owner;
+    jlh::InputClaims claims;
+    int64_t now = 0;
+    std::vector<std::string> win;  // what Windows got, in order: "Kd162" key down, "Ku162", "Bd0", "Bu0", "M" a move
+    std::vector<uint16_t> keysDown;
+    std::vector<uint8_t> buttonsDown;
+    std::vector<std::optional<jlh::InputEvent>> pending;  // serveControl's pendingSync, per connection
+    jlh::InputClaims::Admit last;                         // the newest input frame's admission
+    size_t replacedTotal = 0;                             // connections replaced, all frames
+    size_t dropped = 0;                                   // input frames dropped: their connection was replaced
+
+    Owner open() { return claims.open(now); }
+    bool sendKey(uint16_t v, bool down) {
+        win.push_back(std::string(down ? "Kd" : "Ku") + std::to_string(v));
+        const auto it = std::find(keysDown.begin(), keysDown.end(), v);
+        if (down && it == keysDown.end()) keysDown.push_back(v);
+        if (!down && it != keysDown.end()) keysDown.erase(it);
+        return true;
+    }
+    bool sendButton(uint8_t b, bool down) {
+        win.push_back(std::string(down ? "Bd" : "Bu") + std::to_string(b));
+        const auto it = std::find(buttonsDown.begin(), buttonsDown.end(), b);
+        if (down && it == buttonsDown.end()) buttonsDown.push_back(b);
+        if (!down && it != buttonsDown.end()) buttonsDown.erase(it);
+        return true;
+    }
+    bool keyDown(uint16_t v) const { return std::find(keysDown.begin(), keysDown.end(), v) != keysDown.end(); }
+    bool buttonDown(uint8_t b) const {
+        return std::find(buttonsDown.begin(), buttonsDown.end(), b) != buttonsDown.end();
+    }
+    bool got(std::initializer_list<const char*> want) const {
+        if (win.size() != want.size()) return false;
+        size_t i = 0;
+        for (const char* w : want)
+            if (win[i++] != w) return false;
+        return true;
+    }
+    // InputInjector::key / button: a down goes to Windows and is claimed; an
+    // up goes through HeldInput.
+    bool apply(const jlh::InputEvent& e, Owner o) {
+        auto upKey = [this](uint16_t v) { return sendKey(v, false); };
+        auto upButton = [this](uint8_t b) { return sendButton(b, false); };
+        if (e.kind == jlh::InputEvent::Kind::Key) {
+            const uint16_t v = jlh::semanticToVk(e.semantic);
+            if (!v) return false;
+            if (!e.down) return claims.held().releaseKey(v, o, upKey) != jlh::HeldInput::Up::Failed;
+            sendKey(v, true);
+            claims.held().pressKey(v, o);
+            return true;
+        }
+        if (e.kind == jlh::InputEvent::Kind::Button) {
+            if (!e.down) return claims.held().releaseButton(e.button, o, upButton) != jlh::HeldInput::Up::Failed;
+            sendButton(e.button, true);
+            claims.held().pressButton(e.button, o);
+            return true;
+        }
+        win.push_back("M");
+        return true;
+    }
+    // One TCP write the host reads on connection o: any number of MRC1
+    // frames, taken as serveControl takes them.
+    void tcp(Owner o, const std::vector<uint8_t>& bytes) {
+        size_t off = 0;
+        while (off + jlh::kMrc1HeaderBytes <= bytes.size()) {
+            const auto h = jlh::parseMrc1Header(bytes.data() + off);
+            CHECK(h.has_value());
+            if (!h) return;
+            const uint8_t* p = bytes.data() + off + jlh::kMrc1HeaderBytes;
+            off += jlh::kMrc1HeaderBytes + h->length;
+            claims.heard(o, now);
+            const auto e = jlh::decodeInput(*h, p);
+            if (!e) continue;  // ping, VIDEO_CONFIG, clipboard: heard, nothing more
+            last = claims.admitInput(
+                o, [this](uint16_t v) { return sendKey(v, false); }, [this](uint8_t b) { return sendButton(b, false); });
+            replacedTotal += last.replaced;
+            if (!last.ok) {
+                ++dropped;
+                continue;
+            }
+            if (pending.size() <= o) pending.resize(o + 1);
+            jlh::stepInput(
+                pending[o], *e,
+                [&](const jlh::InputEvent&, const jlh::InputEvent* b) {
+                    win.push_back("M");
+                    return b ? apply(*b, o) : true;
+                },
+                [&](const jlh::InputEvent& ev) { return apply(ev, o); });
+        }
+        CHECK(off == bytes.size());
+    }
+    // A valid MRM1 0x24 move from the viewer (mrm1Listener).
+    void pointer() { claims.heardPointer(now); }
+    size_t close(Owner o) {
+        return claims.close(o, [this](uint16_t v) { return sendKey(v, false); },
+                            [this](uint8_t b) { return sendButton(b, false); });
+    }
+    // inputQuietLoop, ms later.
+    jlh::InputClaims::Quiet tick(int64_t ms) {
+        now += ms;
+        return claims.releaseQuiet(now, [this](uint16_t v) { return sendKey(v, false); },
+                                   [this](uint8_t b) { return sendButton(b, false); });
+    }
+};
+// Wire semantics (keymap.hpp): 1 Control, 2 Alt, 4 Shift; letters are their own code.
+std::vector<uint8_t> keyFrame(uint16_t semantic, bool down) {
+    return jlh::mrc1Frame(jlh::kMsgKey, {uint8_t(down ? 1 : 0), uint8_t(semantic >> 8), uint8_t(semantic)});
+}
+std::vector<uint8_t> pingFrame() { return jlh::mrc1Frame(jlh::kMsgPing, std::vector<uint8_t>(jlh::kPingPayloadBytes, 7)); }
+std::vector<uint8_t> clipboardHelloFrame() { return jlh::mrc1Frame(jlh::kMsgClipboardHello, std::vector<uint8_t>{}); }
+}  // namespace
+
+// (a) A reconnect while the old connection is still open on the host, sends
+// nothing and still answers keep-alive: the new connection's first action is
+// not touched by the old connection's Ctrl or button.
+static void testStaleReconnect() {
+    using jlh::vk::LControl;
+    {
+        // A holds Ctrl and the left button (a Ctrl+drag) when its network goes.
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true));
+        CHECK(h.keyDown(LControl) && h.buttonDown(0));
+        // 2 s later the viewer is on a new connection B. A stays open and
+        // quiet. B opening, and a frame on it that is not input, change
+        // nothing.
+        h.now += 2'000;
+        const auto B = h.open();
+        h.tcp(B, pingFrame());
+        CHECK(h.keyDown(LControl) && h.buttonDown(0) && !h.claims.replaced(A));
+        // B's first action, C: Ctrl and the button go up first, so Windows
+        // gets a plain C.
+        h.now += 30;
+        h.win.clear();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.last.ok && h.last.replaced == 1 && h.last.released == 2);
+        CHECK(h.got({"Ku162", "Bu0", "Kd67"}));
+        CHECK(h.claims.replaced(A) && !h.claims.held().ownsAny(A) && h.claims.held().keyOwnedBy('C', B));
+        // A's late frames are dropped: a Ctrl repeat claims nothing, and its
+        // button up ends nothing (nobody holds the button anyway).
+        h.win.clear();
+        h.tcp(A, keyFrame(1, true));
+        h.tcp(A, syncedButton(1200, 1200, 2, 0, false));
+        CHECK(h.dropped == 3 && h.win.empty() && !h.keyDown(LControl) && !h.claims.held().ownsAny(A));
+        // A's close, whenever it comes, has nothing left to release; B's own
+        // up ends B's C.
+        CHECK(h.close(A) == 0 && h.win.empty());
+        h.tcp(B, keyFrame('C', false));
+        CHECK(h.got({"Ku67"}) && !h.claims.held().anyHeld());
+        // The quiet rule has nothing left to do either.
+        CHECK(h.tick(60'000).connections == 0);
+    }
+    {
+        // The first action is a click elsewhere (POINTER_SYNC, then the
+        // button): A's Ctrl and right button go up before the pointer moves.
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 1, true));
+        h.now += 5'000;
+        const auto B = h.open();
+        h.win.clear();
+        h.tcp(B, syncedButton(2000, 2000, 1, 0, true));
+        CHECK(h.got({"Ku162", "Bu1", "M", "Bd0"}));
+        CHECK(!h.keyDown(LControl) && !h.buttonDown(1) && h.buttonDown(0));
+    }
+    {
+        // The viewer sends the up it owes for Ctrl first on the new
+        // connection: the takeover has already sent Ctrl's up, and the owed
+        // up goes to Windows as it is (nobody holds Ctrl); then V is plain.
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        h.now += 1'000;
+        const auto B = h.open();
+        h.win.clear();
+        auto both = keyFrame(1, false);
+        const auto v = keyFrame('V', true);
+        both.insert(both.end(), v.begin(), v.end());
+        h.tcp(B, both);
+        CHECK(h.got({"Ku162", "Ku162", "Kd86"}) && !h.keyDown(LControl));
+    }
+    {
+        // Two old connections (both opened, then each pressed, so neither
+        // replaced the other), both quiet since the new one opened: its first
+        // input replaces both.
+        StaleHost h;
+        const auto A1 = h.open();
+        const auto A2 = h.open();
+        h.tcp(A1, keyFrame(4, true));
+        h.tcp(A2, keyFrame(2, true));
+        CHECK(h.replacedTotal == 0);
+        h.now += 1'000;
+        const auto B = h.open();
+        h.win.clear();
+        h.tcp(B, keyFrame('Z', true));
+        CHECK(h.last.replaced == 2 && h.last.released == 2 && h.got({"Ku160", "Ku164", "Kd90"}));
+        CHECK(h.claims.replaced(A1) && h.claims.replaced(A2));
+    }
+}
+
+// (b) Keep-alive could not be set (or the old socket still answers it): the
+// connection never closes, and what it holds still goes up 10 s after the
+// last thing the host heard on it.
+static void testStaleQuiet() {
+    using jlh::vk::LShift;
+    {
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(4, true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true));
+        h.win.clear();
+        auto q = h.tick(jlh::InputClaims::kQuietMs - 1);
+        CHECK(q.connections == 0 && h.win.empty() && h.keyDown(LShift) && h.buttonDown(0));
+        q = h.tick(1);
+        CHECK(q.connections == 1 && q.released == 2 && h.got({"Ku160", "Bu0"}));
+        CHECK(!h.claims.held().anyHeld() && !h.claims.replaced(A));
+        CHECK(h.tick(60'000).connections == 0);
+        // A is still open. If it talks again, it presses again, under the
+        // same limit.
+        h.win.clear();
+        h.tcp(A, keyFrame('X', true));
+        CHECK(h.tick(jlh::InputClaims::kQuietMs - 1).connections == 0 && h.keyDown('X'));
+        CHECK(h.tick(1).connections == 1 && h.got({"Kd88", "Ku88"}));
+        // Its late up for X goes to Windows as it is.
+        h.win.clear();
+        h.tcp(A, keyFrame('X', false));
+        CHECK(h.got({"Ku88"}));
+    }
+    {
+        // A held key keeps its connection talking (auto-repeat): kept for 30 s.
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(4, true));
+        for (int i = 0; i < 30; ++i) {
+            CHECK(h.tick(1'000).connections == 0);
+            h.tcp(A, keyFrame(4, true));
+        }
+        CHECK(h.keyDown(LShift) && h.claims.held().keyOwnedBy(LShift, A));
+        // The viewer is gone: up 10 s after the last repeat.
+        CHECK(h.tick(jlh::InputClaims::kQuietMs - 1).connections == 0 && h.keyDown(LShift));
+        CHECK(h.tick(1).connections == 1 && !h.keyDown(LShift));
+    }
+    {
+        // A drag: the button goes down on the connection, the moves come over
+        // MRM1. They keep the newest input connection's button for 30 s; when
+        // they stop, the button goes up 10 s after the last one.
+        StaleHost h;
+        const auto D = h.open();
+        h.tcp(D, syncedButton(1000, 1000, 1, 0, true));
+        for (int i = 0; i < 300; ++i) {
+            CHECK(h.tick(100).connections == 0);
+            h.pointer();
+        }
+        CHECK(h.buttonDown(0) && h.claims.held().buttonOwnedBy(0, D));
+        CHECK(h.tick(jlh::InputClaims::kQuietMs - 1).connections == 0 && h.buttonDown(0));
+        CHECK(h.tick(1).connections == 1 && !h.buttonDown(0));
+    }
+    {
+        // MRM1 moves count for the newest input connection only. An older one
+        // that spoke after B opened (so B did not replace it) and then went
+        // quiet lets go 10 s after its last frame, while B's drag goes on.
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        const auto B = h.open();
+        h.tcp(A, keyFrame(1, true));  // a repeat that arrived after B opened
+        h.tcp(B, syncedButton(1000, 1000, 1, 0, true));
+        CHECK(h.replacedTotal == 0 && !h.claims.replaced(A) && h.keyDown(jlh::vk::LControl));
+        for (int i = 0; i < 99; ++i) {
+            CHECK(h.tick(100).connections == 0);
+            h.pointer();
+        }
+        const auto q = h.tick(100);
+        CHECK(q.connections == 1 && !h.keyDown(jlh::vk::LControl) && h.buttonDown(0));
+        CHECK(!h.claims.held().ownsAny(A) && h.claims.held().buttonOwnedBy(0, B));
+    }
+}
+
+// (c) A connection that is still live keeps its own keys and buttons: a
+// newer connection's first input replaces only connections that went quiet
+// when it opened, and never a newer one or one that never sent input.
+static void testLiveConnectionKept() {
+    using jlh::vk::LShift;
+    using jlh::vk::LMenu;
+    using jlh::vk::LControl;
+    {
+        // A holds Shift and is still sending (a repeat after B opened).
+        StaleHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(4, true));
+        h.now += 500;
+        const auto B = h.open();
+        h.now += 100;
+        h.tcp(A, keyFrame(4, true));
+        h.win.clear();
+        h.tcp(B, keyFrame('K', true));
+        CHECK(h.last.ok && h.last.replaced == 0 && h.got({"Kd75"}) && h.keyDown(LShift));
+        CHECK(!h.claims.replaced(A) && h.claims.held().keyOwnedBy(LShift, A));
+        // A's input still goes in, and its own up ends its own Shift.
+        h.win.clear();
+        h.tcp(A, keyFrame(4, false));
+        CHECK(h.got({"Ku160"}) && h.keyDown('K') && h.claims.held().keyOwnedBy('K', B));
+    }
+    {
+        // Four connections. A (Ctrl), L (Alt) and S (middle button) open,
+        // then each presses: each spoke after the others opened, so none
+        // replaces another. E opens; L and S speak after that, A does not.
+        // E's first input replaces A only.
+        StaleHost h;
+        const auto A = h.open();
+        const auto L = h.open();
+        const auto S = h.open();
+        h.tcp(A, keyFrame(1, true));
+        h.tcp(L, keyFrame(2, true));
+        h.tcp(S, syncedButton(500, 500, 1, 2, true));
+        CHECK(h.replacedTotal == 0 && h.keyDown(LControl) && h.keyDown(LMenu) && h.buttonDown(2));
+        h.now += 1'000;
+        const auto E = h.open();
+        h.tcp(L, keyFrame(2, true));
+        h.tcp(S, pingFrame());
+        h.win.clear();
+        h.tcp(E, keyFrame('E', true));
+        CHECK(h.last.replaced == 1 && h.got({"Ku162", "Kd69"}));
+        CHECK(h.claims.replaced(A) && !h.claims.replaced(L) && !h.claims.replaced(S));
+        CHECK(h.keyDown(LMenu) && h.buttonDown(2) && !h.keyDown(LControl));
+        // The quiet rule: L and E keep talking and keep Alt and E; S has
+        // been quiet since its ping and lets go of its button 10 s after it.
+        for (int i = 0; i < 9; ++i) {
+            CHECK(h.tick(1'000).connections == 0);
+            h.tcp(L, keyFrame(2, true));
+            h.tcp(E, keyFrame('E', true));
+        }
+        const auto q = h.tick(1'000);
+        CHECK(q.connections == 1 && !h.buttonDown(2) && h.keyDown(LMenu) && h.keyDown('E'));
+        CHECK(!h.claims.held().ownsAny(S) && h.claims.held().keyOwnedBy(LMenu, L));
+    }
+    {
+        // An older connection's first input that comes late touches no newer
+        // connection; a clipboard connection (never input) is never replaced
+        // and holds nothing.
+        StaleHost h;
+        const auto C = h.open();
+        h.tcp(C, clipboardHelloFrame());
+        const auto P = h.open();  // a control connection that has not sent input yet
+        const auto D = h.open();
+        h.tcp(D, keyFrame('Q', true));
+        CHECK(h.last.replaced == 0 && !h.claims.replaced(C) && !h.claims.replaced(P));
+        h.win.clear();
+        h.tcp(P, keyFrame('Z', true));
+        CHECK(h.last.ok && h.last.replaced == 0 && h.got({"Kd90"}) && h.keyDown('Q'));
+        CHECK(!h.claims.replaced(D) && h.claims.held().keyOwnedBy('Q', D));
+        // A connection closes: only its own claims end.
+        h.win.clear();
+        CHECK(h.close(P) == 1 && h.got({"Ku90"}) && h.keyDown('Q'));
+    }
+}
+
 static void testAnnexB() {
     const std::vector<uint8_t> header{0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce};
     std::vector<uint8_t> idr{0, 0, 0, 1, 0x65, 0x88, 0x84};
@@ -1063,6 +1432,9 @@ int main() {
     testPointerMapping();
     testMrm1SessionAndCursor();
     testPointerSyncOrdering();
+    testStaleReconnect();
+    testStaleQuiet();
+    testLiveConnectionKept();
     testAnnexB();
     testColor();
 #ifdef _WIN32

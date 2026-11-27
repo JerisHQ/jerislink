@@ -5,7 +5,8 @@
 // layout turns them into characters, as a local keyboard would. The pointer
 // is placed on the captured monitor with absolute virtual-desktop
 // coordinates. Everything a control connection pressed is released when
-// that connection goes away, unless another connection still holds it.
+// that connection goes away, is replaced by a newer one, or has been quiet
+// for 10 s, unless another connection still holds it (InputClaims).
 //
 // SendInput reaches only the desktop this process runs on, and Windows
 // (UIPI) drops input aimed at a window of a higher integrity level, such as
@@ -35,11 +36,24 @@ public:
     bool apply(const InputEvent& e, HeldInput::Owner owner);
     // MRM1 0x24.
     bool moveNormalized(int nx, int ny);
-    // Connection `owner` went away: it lets go of its own claims only
+    // r7, InputClaims. A control connection past its handshake: its owner
+    // number, unique to it.
+    HeldInput::Owner open(int64_t nowMs);
+    // Any frame from `owner`, before it is acted on.
+    void heard(HeldInput::Owner owner, int64_t nowMs);
+    // A valid MRM1 pointer move from the viewer.
+    void heardPointer(int64_t nowMs);
+    // An input frame from `owner`, before it goes in: its first one
+    // replaces the older connections that went quiet when it opened (rule
+    // 1); not ok when `owner` itself was replaced, and the frame is dropped.
+    InputClaims::Admit admitInput(HeldInput::Owner owner);
+    // Connection `owner` closed: it lets go of its own claims only
     // (HeldInput's rule); releases what no connection holds any more (and
     // anything an earlier release could not); returns how many ups Windows
     // took.
-    size_t releaseOwned(HeldInput::Owner owner);
+    size_t close(HeldInput::Owner owner);
+    // Rule 2: connections quiet for InputClaims::kQuietMs let go.
+    InputClaims::Quiet releaseQuiet(int64_t nowMs);
     bool anyHeld() const;
 
     uint64_t injected() const { return injected_.load(); }
@@ -48,6 +62,12 @@ public:
     // Up frames not sent to Windows because another connection still holds
     // that key or button (HeldInput's rule).
     uint64_t upsHeld() const { return upsHeld_.load(); }
+    // r7: connections replaced by a newer one's first input (rule 1), their
+    // input frames dropped after that, and connections that let go after
+    // kQuietMs of quiet (rule 2).
+    uint64_t replacedConnections() const { return replaced_.load(); }
+    uint64_t replacedDropped() const { return replacedDropped_.load(); }
+    uint64_t quietReleases() const { return quietReleases_.load(); }
     // The GetLastError of the most recent SendInput that took nothing.
     unsigned long lastError() const { return lastError_.load(); }
 
@@ -63,11 +83,12 @@ private:
     bool countUp(HeldInput::Up r);
     DesktopRect desktopLocked() const;
 
-    mutable std::mutex m_;  // held state and the desktop rect; SendInput itself is thread-safe
+    mutable std::mutex m_;  // claims and the desktop rect; SendInput itself is thread-safe
     DesktopRect desktop_{};
     bool haveDesktop_ = false;
-    HeldInput held_;
+    InputClaims claims_;  // its HeldInput: what is down, and who holds it
     std::atomic<uint64_t> injected_{0}, failed_{0}, ignored_{0}, upsHeld_{0};
+    std::atomic<uint64_t> replaced_{0}, replacedDropped_{0}, quietReleases_{0};
     std::atomic<unsigned long> lastError_{0};
 };
 

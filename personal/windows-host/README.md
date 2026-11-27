@@ -93,19 +93,37 @@ Builds are unsigned (design doc D14).
   the same key, one letting go leaves it down until the other does
   (`input_up_held` in `stats`). After a reconnect the viewer sends the
   ups it owes for the old connection's presses on the new connection;
-  they end none of the old connection's claims, which end when the old
-  connection is seen to close. Control connections use TCP keep-alive
-  (3 s idle, then 10 probes 1 s apart), so one whose viewer vanished
-  closes about 3 s after it went quiet when the viewer's side answers
-  with a reset (as after a reconnect), at most about 13 s when nothing
-  answers, and lets go.
+  they end none of the old connection's claims. Those end at the first
+  of: the old connection closes, takeover, or quiet.
+- Takeover (0 s): just before a connection's first input frame goes in,
+  every older connection that has sent input and has sent nothing at all
+  since this one opened is replaced. What it holds is released first,
+  and later input from it is dropped (`input.takeover`,
+  `input.dropped reason=replaced`, `input_takeover` and
+  `input_replaced_drop` in `stats`). An older connection that spoke
+  after the new one opened is live and keeps its claims; a connection
+  that never sent input (clipboard, ping) is never replaced. So the
+  first key or click after a reconnect never meets a stray Ctrl, Shift
+  or button from the old connection.
+- Quiet (10 s): a connection that has sent nothing for 10 s lets go of
+  what it holds; it stays open and may press again. Held keys keep it
+  talking through the viewer's auto-repeat, and MRM1 moves count for
+  the newest input connection, so a drag stays down. Checked every
+  250 ms, so a claim ends at most about 10.25 s after the last frame
+  (`input.quiet_released`, `input_quiet_release` in `stats`).
+- Control connections use TCP keep-alive (3 s idle, then 10 probes 1 s
+  apart). It only closes dead connections and frees their slots; neither
+  limit above depends on it, or on it being set up at all.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.
 
 Known limits: AltGr characters on European layouts (right Alt arrives as
 Alt), Win+L (Windows ignores it from SendInput), Ctrl+Alt+Del and anything
-on the secure desktop.
+on the secure desktop. Because of the 10 s quiet limit, a mouse button
+held perfectly still with no moves or keys for 10 s (a long press, holding
+a scroll bar arrow) and the Win key held alone for 10 s (the viewer sends
+it once, with no repeats) are released on the PC.
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),
