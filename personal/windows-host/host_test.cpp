@@ -210,7 +210,8 @@ static void testHostInfo() {
     CHECK(jlh::kHostCapKeyboard == jl::hostinfo::kCapKeyboard && jlh::kHostCapPointer == jl::hostinfo::kCapPointer &&
           jlh::kHostCapCursorShape == jl::hostinfo::kCapCursorShape &&
           jlh::kHostCapTaskManager == jl::hostinfo::kCapTaskManager &&
-          jlh::kHostCapPointerSync == jl::hostinfo::kCapPointerSync);
+          jlh::kHostCapPointerSync == jl::hostinfo::kCapPointerSync &&
+          jlh::kHostCapViewerId == jl::hostinfo::kCapViewerId);
     CHECK(jlh::kMsgHostInfo == jl::hostinfo::kType);
     // The frame the host puts behind the ACK is one the viewer recognises.
     auto frame = jlh::mrc1Frame(jlh::kMsgHostInfo, p);
@@ -328,6 +329,22 @@ static void testDecodeInput() {
     // Not input: the host's other frames and unknown types.
     for (uint8_t t : {uint8_t(0x01), uint8_t(0x30), uint8_t(0x40), uint8_t(0x26), uint8_t(0x61)})
         CHECK(!jlh::decodeInput(hdr(t, 3), key));
+    // r5: VIEWER_ID [token BE64], 8 bytes, nonzero, and no other size. It is
+    // not input (decodeInput leaves it alone); the viewer's frame decodes.
+    const uint8_t vid[9] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0};
+    auto t = jlh::decodeViewerId(hdr(0x28, 8), vid);
+    CHECK(t && *t == 0x0123456789ABCDEFull);
+    CHECK(!jlh::decodeViewerId(hdr(0x28, 7), vid) && !jlh::decodeViewerId(hdr(0x28, 9), vid) &&
+          !jlh::decodeViewerId(hdr(0x27, 8), vid));
+    const uint8_t zero[8] = {};
+    CHECK(!jlh::decodeViewerId(hdr(0x28, 8), zero));
+    CHECK(!jlh::decodeInput(hdr(0x28, 8), vid));
+    CHECK(jlh::kMsgViewerId == jl::hostinfo::kViewerIdType && jlh::kViewerIdBytes == jl::hostinfo::kViewerIdBytes);
+    const auto wire = jl::hostinfo::viewerIdFrame(0x0123456789ABCDEFull);
+    const auto ph = jlh::parseMrc1Header(wire.data());
+    CHECK(wire.size() == jlh::kMrc1HeaderBytes + 8 && ph && ph->type == 0x28 && ph->length == 8);
+    t = jlh::decodeViewerId(*ph, wire.data() + jlh::kMrc1HeaderBytes);
+    CHECK(t && *t == 0x0123456789ABCDEFull);
 }
 
 static void testKeysAgainstViewer() {
@@ -418,7 +435,11 @@ static void testHeldInput() {
     // rule. Old connection A pressed the left button and W, the viewer
     // moved to B and pressed them again there; A's late ups arrive after
     // that. Nothing goes up on Windows: B still holds both.
+    const uint64_t V = 0x1111, W = 0x2222;  // two viewers' tokens (MRC1 0x28)
     jlh::HeldInput u;
+    u.setViewer(A, V);
+    u.setViewer(B, V);
+    u.setViewer(C, V);
     ups.clear();
     buttonUps.clear();
     u.pressButton(0, A);
@@ -432,13 +453,6 @@ static void testHeldInput() {
     // B's own ups do.
     CHECK(u.releaseButton(0, B, upButton) == Up::Sent && u.releaseKey('W', B, upKey) == Up::Sent);
     CHECK(same(buttonUps, {uint8_t(0)}) && same(ups, {uint16_t('W')}) && !u.anyHeld());
-    // The newest connection's up ends a press only an older one holds (the
-    // viewer sends the up on the connection it has now).
-    ups.clear();
-    u.pressKey(jlh::vk::LShift, A);
-    CHECK(u.releaseKey(jlh::vk::LShift, B, upKey) == Up::Sent && same(ups, {jlh::vk::LShift}) && !u.anyHeld());
-    CHECK(u.handovers() == 1);
-    CHECK(u.releaseOwned(A, noKey, noButton) == 0);
     // A newer holder outlives an older connection's up, whatever the order
     // they pressed in: C pressed first, then B; B's up is older than C.
     buttonUps.clear();
@@ -446,6 +460,17 @@ static void testHeldInput() {
     u.pressButton(2, B);
     CHECK(u.releaseButton(2, B, noButton) == Up::Held && u.buttonOwnedBy(2, C));
     CHECK(u.releaseButton(2, C, upButton) == Up::Sent && same(buttonUps, {uint8_t(2)}) && !u.anyHeld());
+    // The newest connection's up ends a press only an older connection of
+    // the same viewer holds (the viewer sends the up on the connection it
+    // has now).
+    jlh::HeldInput n2;
+    n2.setViewer(A, V);
+    n2.setViewer(B, V);
+    ups.clear();
+    n2.pressKey(jlh::vk::LShift, A);
+    CHECK(n2.releaseKey(jlh::vk::LShift, B, upKey) == Up::Sent && same(ups, {jlh::vk::LShift}) && !n2.anyHeld());
+    CHECK(n2.handovers() == 1);
+    CHECK(n2.releaseOwned(A, noKey, noButton) == 0);
 
     // Pepper's review of f97ad11, item 1. A and B both hold Shift and the
     // left button; B, the newer connection, closes. A is still open and
@@ -489,12 +514,15 @@ static void testHeldInput() {
     // control_channel.hpp, takeOwedLocked). Such an up stands for A's
     // press: it ends A's claim (a handover) and Windows gets it, before
     // the host sees A closed.
+    // A and B are the same viewer (one VIEWER_ID token).
     jlh::HeldInput o;
+    o.setViewer(A, V);
+    o.setViewer(B, V);
     ups.clear();
     buttonUps.clear();
     o.pressKey('E', A);
     CHECK(o.releaseKey('E', B, upKey) == Up::Sent && same(ups, {uint16_t('E')}) && !o.anyHeld());
-    CHECK(o.handovers() == 1 && o.releaseOwned(A, noKey, noButton) == 0);
+    CHECK(o.handovers() == 1);
     // B pressed it again after the reconnect (auto-repeat): B's up ends both
     // claims, one handover.
     o.pressButton(1, A);
@@ -503,6 +531,86 @@ static void testHeldInput() {
     // An up that ends only its own claim is no handover.
     o.pressKey('R', B);
     CHECK(o.releaseKey('R', B, upKey) == Up::Sent && o.handovers() == 2 && !o.anyHeld());
+    // A is seen closed only now: nothing of it is left to release.
+    CHECK(o.releaseOwned(A, noKey, noButton) == 0);
+
+    // Pepper's review of 04622f0 (r5). Viewers A and B (different tokens)
+    // are both connected and both hold Shift and the left button. B lets go
+    // normally: A still holds them and Windows gets no up. A lets go: one
+    // up each. Whichever connection is newer.
+    for (const bool bNewer : {true, false}) {
+        const jlh::HeldInput::Owner a = bNewer ? A : B, b = bNewer ? B : A;
+        jlh::HeldInput two;
+        two.setViewer(a, V);
+        two.setViewer(b, W);
+        ups.clear();
+        buttonUps.clear();
+        two.pressKey(jlh::vk::LShift, a);
+        two.pressButton(0, a);
+        two.pressKey(jlh::vk::LShift, b);
+        two.pressButton(0, b);
+        CHECK(two.releaseKey(jlh::vk::LShift, b, noKey) == Up::Held);
+        CHECK(two.releaseButton(0, b, noButton) == Up::Held);
+        CHECK(two.keyOwnedBy(jlh::vk::LShift, a) && two.buttonOwnedBy(0, a));
+        CHECK(!two.keyOwnedBy(jlh::vk::LShift, b) && !two.buttonOwnedBy(0, b));
+        CHECK(ups.empty() && buttonUps.empty() && two.handovers() == 0);
+        CHECK(two.releaseKey(jlh::vk::LShift, a, upKey) == Up::Sent);
+        CHECK(two.releaseButton(0, a, upButton) == Up::Sent);
+        CHECK(same(ups, {jlh::vk::LShift}) && same(buttonUps, {uint8_t(0)}) && !two.anyHeld());
+        CHECK(two.handovers() == 0);
+        // Their closes find nothing left.
+        CHECK(two.releaseOwned(b, noKey, noButton) == 0 && two.releaseOwned(a, noKey, noButton) == 0);
+    }
+
+    // r5: a reconnect's owed up ends only the old connection's claim.
+    // Viewer V held Q on connection A; viewer W holds Q on B; V reconnects
+    // as C and sends the up it owes for A's press. A's claim ends (a
+    // handover), B's stays: no up on Windows. B lets go: one up.
+    jlh::HeldInput rc;
+    rc.setViewer(A, V);
+    rc.setViewer(B, W);
+    rc.setViewer(C, V);
+    ups.clear();
+    rc.pressKey('Q', A);
+    rc.pressKey('Q', B);
+    CHECK(rc.releaseKey('Q', C, noKey) == Up::Held);
+    CHECK(!rc.keyOwnedBy('Q', A) && rc.keyOwnedBy('Q', B) && rc.handovers() == 1 && ups.empty());
+    CHECK(rc.releaseOwned(A, noKey, noButton) == 0);  // A seen closed later: nothing
+    CHECK(rc.releaseKey('Q', B, upKey) == Up::Sent && same(ups, {uint16_t('Q')}) && !rc.anyHeld());
+    // The other viewer's newer connection is not "older" for V either: W's
+    // up on B never ends V's claim on A, older or not.
+    jlh::HeldInput rc2;
+    rc2.setViewer(A, V);
+    rc2.setViewer(B, W);
+    rc2.pressKey('Q', A);
+    CHECK(rc2.releaseKey('Q', B, noKey) == Up::Held && rc2.keyOwnedBy('Q', A) && rc2.handovers() == 0);
+    // V's own reconnect up (C) does, and Windows gets it.
+    ups.clear();
+    rc2.setViewer(C, V);
+    CHECK(rc2.releaseKey('Q', C, upKey) == Up::Sent && same(ups, {uint16_t('Q')}) && rc2.handovers() == 1);
+
+    // r5: no token (a viewer from before r5, no VIEWER_ID). Each connection
+    // is a viewer of its own: a newer connection's up ends its own claim
+    // only, and the old claim waits for the old connection's close.
+    jlh::HeldInput nt;
+    ups.clear();
+    nt.pressKey('T', A);
+    CHECK(nt.releaseKey('T', B, noKey) == Up::Held && nt.keyOwnedBy('T', A) && nt.handovers() == 0);
+    CHECK(nt.releaseOwned(A, upKey, noButton) == 1 && same(ups, {uint16_t('T')}) && !nt.anyHeld());
+    // A token on one side only is no match either.
+    nt.setViewer(B, V);
+    nt.pressKey('T', A);
+    CHECK(nt.releaseKey('T', B, noKey) == Up::Held && nt.keyOwnedBy('T', A));
+
+    // r5: the first token counts; 0 is none; a close forgets it.
+    jlh::HeldInput tk;
+    tk.setViewer(A, 0);
+    CHECK(tk.viewerOf(A) == 0);
+    tk.setViewer(A, V);
+    tk.setViewer(A, W);
+    CHECK(tk.viewerOf(A) == V);
+    tk.releaseOwned(A, noKey, noButton);
+    CHECK(tk.viewerOf(A) == 0);
 
     // An up Windows did not take: the entry stays, and the next release
     // (any connection's close or up) tries it again.

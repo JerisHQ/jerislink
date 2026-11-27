@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 // MRC1 0x06 HOST_INFO (design D10, Windows host H2): what kind of host this
 // is. Pure, so the host's unit test decodes what the host encodes
@@ -32,6 +33,14 @@ inline constexpr uint32_t kCapKeyboard = 0x01, kCapPointer = 0x02, kCapCursorSha
 // [nx BE16, ny BE16, MRM1 seq BE32, MRM1 UDP source port BE16].
 inline constexpr uint32_t kCapPointerSync = 0x20;
 inline constexpr uint16_t kPointerSyncBytes = 10;
+// r5 (Pepper's review of 04622f0): the host takes MRC1 0x28 VIEWER_ID,
+// [token BE64, nonzero], first on each control connection. The token says
+// which connections are the same viewer, so an up the viewer sends on a
+// new connection for a press it made on an older one ends that press, and
+// never another viewer's (the host's HeldInput).
+inline constexpr uint32_t kCapViewerId = 0x40;
+inline constexpr uint8_t kViewerIdType = 0x28;
+inline constexpr uint16_t kViewerIdBytes = 8;
 // VIDEO_CONFIG caps bit: "this viewer reads HOST_INFO". ACK payload [10]
 // bit kAckExtHostInfo: one HOST_INFO frame follows the ACK.
 inline constexpr uint8_t kViewerCapHostInfo = 0x08;
@@ -65,6 +74,19 @@ inline std::optional<Info> decode(const uint8_t* p, size_t n) {
 // Buttons carry POINTER_SYNC only to a Windows host that said it takes it.
 inline bool pointerSyncFor(const std::optional<Info>& i) {
     return i && i->windows() && (i->caps & kCapPointerSync) != 0;
+}
+
+// Connections start with VIEWER_ID only to a Windows host that said it
+// takes it.
+inline bool viewerIdFor(const std::optional<Info>& i) {
+    return i && i->windows() && (i->caps & kCapViewerId) != 0;
+}
+
+// The whole MRC1 0x28 frame for `token` (nonzero).
+inline std::vector<uint8_t> viewerIdFrame(uint64_t token) {
+    std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, kViewerIdType, 0, uint8_t(kViewerIdBytes)};
+    for (int shift = 56; shift >= 0; shift -= 8) b.push_back(uint8_t(token >> shift));
+    return b;
 }
 
 // The first n bytes waiting on the socket could be a HOST_INFO frame: the

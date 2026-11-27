@@ -126,8 +126,8 @@ bool InputInjector::sendButton(uint8_t b, bool down) {
 }
 
 // An up frame, by HeldInput's rule (Pepper's reviews of 8f8a33b, item 2,
-// and of f97ad11, item 1): sent to Windows only when no newer connection
-// still holds it.
+// of f97ad11, item 1, and of 04622f0): sent to Windows only when no other
+// connection still holds it.
 bool InputInjector::countUp(HeldInput::Up r) {
     switch (r) {
     case HeldInput::Up::Sent: ++injected_; return true;
@@ -196,6 +196,11 @@ bool InputInjector::taskManager() {
     if (!ok) { ++failed_; return false; }
     ++injected_;
     return true;
+}
+
+void InputInjector::setViewer(HeldInput::Owner owner, uint64_t token) {
+    std::lock_guard<std::mutex> g(m_);
+    held_.setViewer(owner, token);
 }
 
 size_t InputInjector::releaseOwned(HeldInput::Owner owner) {

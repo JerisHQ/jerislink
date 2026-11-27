@@ -69,7 +69,7 @@ constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer send
 constexpr int kCursorPollMs = 16;           // cursor shape check
 constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
 constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
-                               jlh::kHostCapTaskManager | jlh::kHostCapPointerSync;
+                               jlh::kHostCapTaskManager | jlh::kHostCapPointerSync | jlh::kHostCapViewerId;
 
 struct Options {
     bool devNoPassword = false;
@@ -201,8 +201,10 @@ struct State {
     // counters, read by the stats line
     std::atomic<uint64_t> keyframeRequests{0}, pings{0}, rejected{0};
     // H2 input. One injector for every connection: one viewer IP may connect,
-    // but over more than one control connection at a time (a reconnect), so
-    // each connection gets its own owner number for what it holds down.
+    // but over more than one control connection at a time (a reconnect, or
+    // a second viewer), so each connection gets its own owner number for
+    // what it holds down, and says with MRC1 0x28 which viewer it belongs
+    // to (r5).
     jlh::InputInjector input;
     std::atomic<uint64_t> nextInputOwner{1};
     // MRM1 pointer order. A UDP move and a POINTER_SYNC (control thread) both
@@ -340,7 +342,7 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     touch(st);
     const char* role = "control";
     bool first = true;
-    bool hostInfoLogged = false, inputSeen = false;
+    bool hostInfoLogged = false, inputSeen = false, viewerSeen = false;
     const jlh::HeldInput::Owner owner = st.nextInputOwner++;
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
     while (st.running && readFrame(hdr, -1)) {
@@ -416,6 +418,23 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
                      ok ? 0ul : st.input.lastError());
             break;
         }
+        case jlh::kMsgViewerId: {
+            // H2 r5 (Pepper's review of 04622f0): which viewer this
+            // connection belongs to, sent first on it. The token is never
+            // logged.
+            const auto t = jlh::decodeViewerId(hdr, payload.data());
+            if (!t) {
+                ++st.inputMalformed;
+                break;
+            }
+            touch(st);
+            st.input.setViewer(owner, *t);
+            if (!viewerSeen) {
+                viewerSeen = true;
+                logf("input.viewer peer=%s channel=%s viewer_id=yes", peer.c_str(), role);
+            }
+            break;
+        }
         default:
             break;  // clipboard data etc.: not yet
         }
@@ -423,9 +442,9 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
 done:
     {
         // This connection went away: nothing it pressed stays down on this
-        // PC, unless another connection of the viewer holds it too (Pepper's
-        // H2 review, item 2). It lets go of its own claims only (review of
-        // f97ad11, item 1). An up Windows refused earlier is tried again.
+        // PC, unless another connection holds it too (Pepper's H2 review,
+        // item 2). It lets go of its own claims only (review of f97ad11,
+        // item 1). An up Windows refused earlier is tried again.
         const size_t n = st.input.releaseOwned(owner);
         if (inputSeen || n)
             logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,

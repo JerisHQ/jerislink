@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -107,6 +108,8 @@ public:
             a->s = s_;
             s_ = INVALID_SOCKET;
             a->pointerSync = pointerSync_.load(std::memory_order_relaxed);
+            a->viewerIdOn = viewerIdOn_.load(std::memory_order_relaxed);
+            a->viewerId = viewerId_;
             a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
             async_ = std::move(a);
         } else {
@@ -115,6 +118,7 @@ public:
             std::lock_guard<std::mutex> g(a->m);
             closeSocket(a->s);
             pointerSync_.store(a->pointerSync, std::memory_order_relaxed);
+            viewerIdOn_.store(a->viewerIdOn, std::memory_order_relaxed);
         }
     }
 
@@ -139,6 +143,7 @@ public:
         uint64_t noticeReads = 0;        // r5: failed live connections handed to the worker for the notice
         uint64_t renegotiations = 0;     // r5: background VIDEO_CONFIG exchanges that got an ACK
         uint64_t renegotiateFailures = 0;  // r5: those without one (connection closed, tried again)
+        uint64_t viewerIdFailures = 0;   // H2 r5: VIEWER_ID not sent on a new connection (closed, tried again)
         bool pausedNow = false;    // r6: paused right now
         bool live = false;         // r14: a connection is up right now
         bool connecting = false;
@@ -311,6 +316,24 @@ public:
         std::lock_guard<std::mutex> g(async_->m);
         return async_->pointerSync;
     }
+    // H2 r5 (Pepper's review of 04622f0): the host takes MRC1 0x28
+    // VIEWER_ID (HOST_INFO cap 0x40, a Windows host). Every control
+    // connection this channel makes then starts with it, before any input:
+    // right after the start-up ACK (negotiateVideo), first on each
+    // connection a reconnect makes (ensureConnected, the worker). The token
+    // (viewerId) is made at random once per channel, so the host can tell
+    // this viewer's connections from another viewer's: an up this channel
+    // sends on a new connection for a key or button it pressed on an older
+    // one (the ups owed after a reconnect, or a plain up of a key still
+    // down) ends that press and no other viewer's. Set, like POINTER_SYNC,
+    // from every ACK the channel reads. Off (a macOS host, or a Windows host
+    // without the cap): nothing is sent.
+    bool viewerIdOn() const {
+        if (!async_) return viewerIdOn_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(async_->m);
+        return async_->viewerIdOn;
+    }
+    uint64_t viewerId() const { return viewerId_; }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
         std::lock_guard<std::mutex> g(async_->m);
@@ -532,8 +555,15 @@ public:
         if (x == VideoExchange::Replaced) {
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
-        if (x != VideoExchange::Ok) close();
-        else setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
+        if (x != VideoExchange::Ok) {
+            close();
+            return result;
+        }
+        setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
+        // H2 r5: VIEWER_ID next on this connection, before any input, once.
+        const bool viewerIdNow = jl::hostinfo::viewerIdFor(result.hostInfo);
+        viewerIdOn_.store(viewerIdNow, std::memory_order_relaxed);
+        if (viewerIdNow && !viewerIdSent_ && !sendViewerIdOn(s_)) close();
         return result;
     }
 
@@ -699,7 +729,25 @@ private:
     bool ensureConnected() {
         if (s_ != INVALID_SOCKET) return true;
         s_ = openSocket(localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
-        return s_ != INVALID_SOCKET;
+        viewerIdSent_ = false;
+        if (s_ == INVALID_SOCKET) return false;
+        // H2 r5: a new connection to a host that takes VIEWER_ID starts with it.
+        if (viewerIdOn_.load(std::memory_order_relaxed) && !sendViewerIdOn(s_)) {
+            closeSocket(s_);
+            return false;
+        }
+        return true;
+    }
+    bool sendViewerIdOn(SOCKET s) {
+        viewerIdSent_ = sendAllOn(s, jl::hostinfo::viewerIdFrame(viewerId_));
+        return viewerIdSent_;
+    }
+    // Random, nonzero, one per channel (H2 r5, viewerIdOn).
+    static uint64_t newViewerId() {
+        std::random_device rd;
+        uint64_t t = 0;
+        while (t == 0) t = (uint64_t(rd()) << 32) ^ uint64_t(rd());
+        return t;
     }
 
     // TCP connect, then the connection password (v0.4.0) before the first
@@ -849,6 +897,11 @@ private:
         // H2 (Pepper's review of 8f8a33b, item 5b): buttons go out behind a
         // 0x27 POINTER_SYNC, as the newest ACK said (HOST_INFO cap 0x20).
         bool pointerSync = false;
+        // H2 r5 (Pepper's review of 04622f0): each new connection starts
+        // with MRC1 0x28 VIEWER_ID (this channel's token), as the newest ACK
+        // said (HOST_INFO cap 0x40).
+        bool viewerIdOn = false;
+        uint64_t viewerId = 0;
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
@@ -1364,6 +1417,29 @@ private:
                 a->renegotiated = vc;
                 // Item 5b: the queue below goes out as this ACK says.
                 a->pointerSync = jl::hostinfo::pointerSyncFor(vc.hostInfo);
+                a->viewerIdOn = jl::hostinfo::viewerIdFor(vc.hostInfo);
+            }
+            if (a->viewerIdOn) {
+                // H2 r5 (Pepper's review of 04622f0): VIEWER_ID first, before
+                // the owed ups and the queue, so the host reads the ups below
+                // as this viewer's, ending its presses on older connections
+                // and no other viewer's. Not sent: this connection is not
+                // used, as with a failed renegotiation.
+                const std::vector<uint8_t> id = jl::hostinfo::viewerIdFrame(a->viewerId);
+                a->pending = s;
+                lk.unlock();
+                const bool sent = sendAllOn(s, id);
+                lk.lock();
+                a->pending = INVALID_SOCKET;
+                if (a->stopping) { closeSocket(s); break; }
+                if (!sent) {
+                    closeSocket(s);
+                    ++a->stats.viewerIdFailures;
+                    a->connecting = false;
+                    a->nextTry = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryGapMs);
+                    if (!jl::auth::mayConnect()) dropQueueLocked(*a);
+                    continue;
+                }
             }
             bool alive = setNonBlocking(s, true);
             // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
@@ -1593,6 +1669,9 @@ private:
     std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
     std::atomic<uint64_t> lastPointerUdp_{0};  // H2: MRM1 port << 32 | seq of that position (0: TCP)
     std::atomic<bool> pointerSync_{false};     // H2: POINTER_SYNC before buttons (Async::pointerSync once async)
+    std::atomic<bool> viewerIdOn_{false};      // H2 r5: VIEWER_ID first on each connection (Async::viewerIdOn once async)
+    const uint64_t viewerId_ = newViewerId();  // H2 r5: this channel's token
+    bool viewerIdSent_ = false;                // H2 r5: on s_ (the start-up connection)
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

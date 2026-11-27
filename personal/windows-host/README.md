@@ -64,7 +64,7 @@ Builds are unsigned (design doc D14).
   and the HOST_INFO goes right behind it in the same write, on each
   VIDEO_CONFIG of the connection. Platform 2 (Windows), capability bits
   (keyboard 0x01, pointer 0x02, cursor shape 0x04, Task Manager 0x08,
-  POINTER_SYNC 0x20), monitor count, version. A viewer that knows it sends
+  POINTER_SYNC 0x20, VIEWER_ID 0x40), monitor count, version. A viewer that knows it sends
   Windows keys as they are (no Mac shortcut rewrites). A 0.4.x viewer does
   not ask and gets the 10-byte ACK alone: nothing stays unread on its
   socket, so its read-only view still sees the host close the connection.
@@ -81,6 +81,10 @@ Builds are unsigned (design doc D14).
   seq arriving later are dropped as stale. Each viewer UDP socket keeps its
   own seq order (a new socket starts at 1); one not heard from for 10 s
   starts over.
+- VIEWER_ID (MRC1 0x28, 8 bytes: a random nonzero token BE64): a viewer
+  that saw cap 0x40 sends it first on every control connection, before any
+  input, with one token for all its connections. The host learns from it
+  which connections are the same viewer (below). The token is never logged.
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
@@ -89,11 +93,14 @@ Builds are unsigned (design doc D14).
   connection holds stays down, older or newer, so a late close of an old
   connection does not lift what a new one just pressed, and a new one's
   close does not lift what an old one still holds. A key-up or button-up
-  also ends the claims of older connections on that key or button: after a
-  reconnect the viewer sends the ups it owes on the new connection
-  (`input_up_handover` in `stats`). Control connections use TCP
-  keep-alive (15 s idle, then 10 probes 1 s apart), so one whose viewer
-  vanished closes after about 25 s and lets go.
+  ends the sender's own claim, and the claims of older connections of the
+  same viewer (same VIEWER_ID token): after a reconnect the viewer sends
+  the ups it owes on the new connection (`input_up_handover` in `stats`).
+  It never ends another viewer's claim, so when two viewers hold the same
+  key, one letting go leaves it down until the other does (`input_up_held`).
+  A connection without a token is a viewer of its own. Control connections
+  use TCP keep-alive (15 s idle, then 10 probes 1 s apart), so one whose
+  viewer vanished closes after about 25 s and lets go.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.
