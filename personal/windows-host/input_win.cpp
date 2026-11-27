@@ -181,18 +181,11 @@ bool InputInjector::key(uint16_t semantic, bool down, HeldInput::Owner owner, He
 }
 
 bool InputInjector::taskManager(HeldInput& held) {
-    // MRC1 0x60, the viewer's Force Quit button: on Windows, Ctrl+Shift+Esc.
-    // Held keys are released first so the chord is clean. Buttons stay as
-    // they are (Pepper's H2 review, item 3): no up goes to Windows for them,
-    // so their records stay too, and a later up or close releases them. A
-    // key whose up Windows did not take stays recorded as well (and
-    // InputClaims::retry tries it again).
-    held.releaseKeys([this](uint16_t v) { return sendKeyVk(v, false); });
-    const uint16_t seq[] = {vk::LControl, vk::LShift, vk::Escape};
-    bool ok = true;
-    for (uint16_t v : seq) ok = sendKeyVk(v, true) && ok;
-    for (int i = 2; i >= 0; --i) ok = sendKeyVk(seq[i], false) && ok;
-    if (!ok) { ++failed_; return false; }
+    // The chord and its rules: host_protocol.hpp, taskManagerChord.
+    if (!taskManagerChord(held, [this](uint16_t v, bool down) { return sendKeyVk(v, down); })) {
+        ++failed_;
+        return false;
+    }
     ++injected_;
     return true;
 }

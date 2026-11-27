@@ -39,6 +39,11 @@
 // close and comes back (a784cd7's unasked HOST_INFO stopped that). An
 // interactive view whose start-up exchange failed renegotiates on the next
 // control session; with POINTER_SYNC each button goes behind an MRC1 0x27.
+// H2 r9 (Pepper's review of 0d74abe, items 1 and 2): to a Windows host the
+// channel sends liveness pings (the existing MRC1 ping: two ahead of a new
+// connection's input, then one a second from the UI thread) and drops their
+// pongs; it names the MRM1 socket (0x27 then 0x24) once per connection and
+// port. A macOS host gets neither.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -2733,6 +2738,23 @@ Bytes syncPayload(uint16_t nx, uint16_t ny, uint32_t seq, uint16_t port = kUdpPo
                        uint8_t(port)});
     return p;
 }
+// H2 r9: control frames without the liveness pings (0x01) a Windows host
+// gets; `pings` counts the ones skipped.
+std::vector<std::pair<uint8_t, Bytes>> readInput(SOCKET s, size_t n, int ms, int* pings = nullptr) {
+    std::vector<std::pair<uint8_t, Bytes>> out;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(ms);
+    while (out.size() < n) {
+        uint8_t type = 0;
+        Bytes p;
+        if (recvFrame(s, deadline, type, p) != Io::Ok) break;
+        if (type == 0x01) {
+            if (pings) ++*pings;
+            continue;
+        }
+        out.emplace_back(type, std::move(p));
+    }
+    return out;
+}
 template <typename F> bool waitFor(F f, int ms) {
     const auto t0 = Clock::now();
     while (!f()) {
@@ -2936,6 +2958,7 @@ void h2InteractiveTest() {
     control.notePointer(1000, 2000, 41, kUdpPort);
     std::atomic<int> step{0};
     std::vector<std::pair<uint8_t, Bytes>> f0, f1, f2, f3, f4, f5, f6, f7;
+    int pings[4] = {};
     bool auth0 = false, auth1 = false;
     std::thread host([&] {
         SOCKET s = l.accept(8000);
@@ -2943,20 +2966,20 @@ void h2InteractiveTest() {
         auth0 = hostAuth(s, sec, Answer::Ok, 50);
         f0 = readFrames(s, 1, 3000);
         if (f0.size() == 1 && f0[0].first == 0x40) sendAllBytes(s, winReply(f0[0].second));
-        f1 = readFrames(s, 2, 3000);
-        f2 = readFrames(s, 2, 5000);
+        f1 = readInput(s, 2, 3000, &pings[0]);  // H2 r9: two pings go first
+        f2 = readInput(s, 2, 5000, &pings[1]);
         closesocket(s);
         step = 1;
         s = l.accept(8000);
         if (s == INVALID_SOCKET) return;
         auth1 = hostAuth(s, sec, Answer::Ok, 50);
-        f3 = readFrames(s, 2, 5000);
+        f3 = readInput(s, 2, 5000, &pings[2]);
         step = 2;
-        f4 = readFrames(s, 1, 3000);
+        f4 = readInput(s, 1, 3000, &pings[3]);
         step = 3;
-        f5 = readFrames(s, 3, 3000);
+        f5 = readInput(s, 3, 3000, &pings[3]);
         step = 4;
-        f6 = readFrames(s, 1, 500);
+        f6 = readInput(s, 1, 500, &pings[3]);
         step = 5;
         closesocket(s);
     });
@@ -3006,6 +3029,8 @@ void h2InteractiveTest() {
                isFrame(f5[2], 0x25, up) && f6.empty(),
            "h2 interactive: released on focus loss; the later up and its 0x27 are not sent (" +
                std::to_string(f6.size()) + " stray frames)");
+    expect(pings[0] == 2 && pings[1] == 0 && pings[2] == 2 && pings[3] == 0,
+           "h2 interactive: H2 r9: two liveness pings ahead of each new connection's input, none else here (no UI tick)");
     expect(ui.maxMs < kUiBudgetMs, "h2 interactive: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
     control.stop();
     setCurrent(nullptr);
@@ -3099,6 +3124,254 @@ void h2ReviewR2Test() {
     clearKnownModesForTest();
 }
 
+// H2 r9 (Pepper's review of 0d74abe, item 1): to a Windows host the
+// channel sends liveness pings, the existing MRC1 ping (0x01): two on a new
+// connection before its input (the host does not count a connection's
+// first frame), then one a second from the UI thread (livenessTick), never
+// sooner, and none once liveness is off. The host's pongs are read and
+// dropped without closing anything, and a "replaced" notice behind a pong
+// is still seen and halts the attempt.
+void h2R9LivenessTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    const Bytes live{'L', 'I', 'V', 'E'};
+    const Bytes pong = frame(0x02, live.data(), live.size());
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    std::atomic<int> step{0};
+    std::vector<std::pair<uint8_t, Bytes>> first, ticked, off;
+    double tickGapMs = 0.0;
+    bool auth0 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); step = 9; return; }
+        sendAllBytes(s, winReply(req[0].second));
+        first = readFrames(s, 3, 3000);  // the worker's two pings, then the key
+        Bytes two = pong;
+        two.insert(two.end(), pong.begin(), pong.end());
+        sendAllBytes(s, two);
+        step = 1;
+        const auto deadline = Clock::now() + std::chrono::milliseconds(4000);
+        Clock::time_point at[2];
+        while (ticked.size() < 2) {
+            uint8_t type = 0;
+            Bytes p;
+            if (recvFrame(s, deadline, type, p) != Io::Ok) break;
+            at[ticked.size()] = Clock::now();
+            ticked.emplace_back(type, std::move(p));
+        }
+        if (ticked.size() == 2) tickGapMs = std::chrono::duration<double, std::milli>(at[1] - at[0]).count();
+        step = 2;
+        off = readFrames(s, 1, 1500);  // liveness off: nothing
+        Bytes tail = pong;
+        tail.insert(tail.end(), notice, notice + sizeof(notice));
+        sendAllBytes(s, tail);  // a pong, then the notice, in one write
+        shutdown(s, SD_SEND);
+        step = 3;
+        Sleep(1000);
+        closesocket(s);
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendKey(true, 0x0041); });  // queued: starts the reconnect
+    uint64_t pongsAtTwo = 0;
+    bool liveAtTwo = false, livenessOn = false;
+    const auto t0 = Clock::now();
+    while (terminals == 0 && step != 9 && msSince(t0) < 12000) {
+        ui.call([&] {
+            control.pollHostNotice();
+            control.takeRenegotiated();
+            control.livenessTick(std::chrono::steady_clock::now());
+            return true;
+        });
+        if (step == 2 && control.liveness()) {
+            livenessOn = true;
+            const auto rs = control.reconnectStats();
+            pongsAtTwo = rs.pongs;
+            liveAtTwo = rs.live;
+            control.setLiveness(false);
+        }
+        Sleep(10);
+    }
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && first.size() == 3 && isFrame(first[0], 0x01, live) && isFrame(first[1], 0x01, live) &&
+               isFrame(first[2], 0x10, Bytes{1, 0, 0x41}),
+           "h2 r9 liveness: a Windows ACK: two pings on the new connection, then the queued key");
+    expect(ticked.size() == 2 && isFrame(ticked[0], 0x01, live) && isFrame(ticked[1], 0x01, live) &&
+               tickGapMs >= 950.0 && tickGapMs < 1600.0,
+           "h2 r9 liveness: then one ping a second from the UI thread (gap " + std::to_string(int(tickGapMs)) +
+               " ms)");
+    expect(livenessOn && pongsAtTwo == 2 && liveAtTwo,
+           "h2 r9 liveness: the two pongs are read and dropped, the connection stays live (" +
+               std::to_string(pongsAtTwo) + " pongs)");
+    expect(off.empty(), "h2 r9 liveness: off: no ping in 1.5 s");
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect() && rs.pongs == 3,
+           "h2 r9 liveness: a notice behind a pong is still seen and halts the attempt (" +
+               std::to_string(rs.pongs) + " pongs)");
+    expect(rs.livenessPings == 4, "h2 r9 liveness: four pings in all (" + std::to_string(rs.livenessPings) + ")");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r9 liveness: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes MRM1
+// moves only from the UDP socket its owner named in a POINTER_SYNC. The
+// channel names it once per connection and port, at the first move sent
+// by UDP: 0x27 (that move's position, seq and port) then 0x24 there. A
+// second move on the same connection and port sends nothing; a new port
+// is named again. The host closes the connection: the next move asks for
+// a reconnect, and the first move on the new connection names it again.
+void h2R9PointerBindTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);  // a Windows host before
+    const uint16_t port2 = kUdpPort + 1;
+    std::atomic<int> step{0};
+    std::vector<std::pair<uint8_t, Bytes>> c1, c2, c2after;
+    int pings1 = 0, pings2 = 0;
+    bool auth0 = false, auth1 = false, renegotiated2 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); step = 9; return; }
+        sendAllBytes(s, winReply(req[0].second));
+        c1 = readInput(s, 4, 5000, &pings1);
+        closesocket(s);  // the host goes away
+        step = 1;
+        s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth1 = hostAuth(s, sec, Answer::Ok, 50);
+        c2 = readInput(s, 2, 5000, &pings2);
+        renegotiated2 = !c2.empty() && c2[0].first == 0x40;
+        step = 2;
+        c2after = readInput(s, 1, 700);
+        closesocket(s);
+        step = 3;
+    });
+    UiClock ui;
+    auto waitLive = [&] {
+        return waitFor([&] {
+            ui.call([&] { control.pollHostNotice(); control.takeRenegotiated(); return true; });
+            const auto rs = control.reconnectStats();
+            return rs.live && !rs.connecting;
+        }, 8000);
+    };
+    // No connection yet: the move asks for one.
+    ui.call([&] { return control.notePointerUdp(1000, 2000, 5, kUdpPort); });
+    const bool live1 = waitLive();
+    control.clearRenegotiateOnReconnect();
+    const bool liveness1 = control.liveness();
+    bool b1 = false, b2 = false, b3 = false, b4 = false, b5 = false;
+    ui.call([&] { return b1 = control.notePointerUdp(1100, 2100, 6, kUdpPort); });
+    ui.call([&] { return b2 = control.notePointerUdp(1200, 2200, 7, kUdpPort); });   // named already
+    ui.call([&] { return b3 = control.notePointerUdp(1300, 2300, 8, port2); });      // a new UDP socket
+    waitFor([&] { return step >= 1; }, 8000);
+    Sleep(150);  // the close has arrived
+    ui.call([&] { control.pollHostNotice(); return true; });
+    ui.call([&] { return control.notePointerUdp(1400, 2400, 9, port2); });  // no connection: asks for one
+    const bool live2 = waitLive();
+    ui.call([&] { return b4 = control.notePointerUdp(1500, 2500, 10, port2); });
+    waitFor([&] { return step >= 2; }, 8000);
+    ui.call([&] { return b5 = control.notePointerUdp(1600, 2600, 11, port2); });
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && live1 && liveness1 && pings1 == 2 && b1 && !b2 && b3 && c1.size() == 4 &&
+               isFrame(c1[0], 0x27, syncPayload(1100, 2100, 6)) && isFrame(c1[1], 0x24, be16x2(1100, 2100)) &&
+               isFrame(c1[2], 0x27, syncPayload(1300, 2300, 8, port2)) && isFrame(c1[3], 0x24, be16x2(1300, 2300)),
+           "h2 r9 pointer bind: named at the first move (0x27, 0x24), not at the next, again for a new UDP port");
+    expect(auth1 && live2 && !renegotiated2 && pings2 == 2 && b4 && c2.size() == 2 &&
+               isFrame(c2[0], 0x27, syncPayload(1500, 2500, 10, port2)) && isFrame(c2[1], 0x24, be16x2(1500, 2500)),
+           "h2 r9 pointer bind: the host closed it; a move asked for a reconnect, and the new connection is named "
+           "afresh");
+    expect(!b5 && c2after.empty() && rs.pointerBinds == 3,
+           "h2 r9 pointer bind: once per connection and port (" + std::to_string(rs.pointerBinds) + " binds)");
+    expect(ui.maxMs < kUiBudgetMs,
+           "h2 r9 pointer bind: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r9: a macOS host (its 10-byte ACK, no HOST_INFO) gets none of it. With
+// liveness and POINTER_SYNC on from a Windows host before, the Mac's ACK
+// turns both off before the queue goes out: no ping on the new connection
+// or from the UI thread, and no 0x27 for a UDP move. Its control
+// connection carries the key alone, as before r9.
+void h2R9MacUnchangedTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);  // a Windows host before
+    control.setLiveness(true);
+    const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+    std::atomic<bool> done{false};
+    std::vector<std::pair<uint8_t, Bytes>> got;
+    bool auth0 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() == 1 && req[0].first == 0x40) sendAllBytes(s, frame(0x41, macAck.data(), macAck.size()));
+        got = readFrames(s, 2, 2500);
+        closesocket(s);
+        done = true;
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendKey(true, 0x0041); });
+    const auto t0 = Clock::now();
+    uint16_t x = 0;
+    while (!done && msSince(t0) < 10000) {
+        ui.call([&] {
+            control.pollHostNotice();
+            control.takeRenegotiated();
+            control.livenessTick(std::chrono::steady_clock::now());
+            control.notePointerUdp(x, x, x, kUdpPort);
+            return true;
+        });
+        ++x;
+        Sleep(10);
+    }
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && got.size() == 1 && isFrame(got[0], 0x10, Bytes{1, 0, 0x41}) && !control.liveness() &&
+               !control.pointerSync() && rs.livenessPings == 0 && rs.pointerBinds == 0,
+           "h2 r9 mac: the Mac's ACK turns liveness and POINTER_SYNC off: the key alone, no ping, no 0x27 (" +
+               std::to_string(got.size()) + " frames)");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r9 mac: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -3123,6 +3396,9 @@ int main() {
     h2HostInfoTest();
     h2InteractiveTest();
     h2ReviewR2Test();
+    h2R9LivenessTest();
+    h2R9PointerBindTest();
+    h2R9MacUnchangedTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

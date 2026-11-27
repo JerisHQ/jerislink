@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -952,26 +953,39 @@ static void testPointerSyncOrdering() {
 // InputInjector does it, on the HeldInput it passes. Windows is a log and
 // can be made to refuse ups. No connection closes unless a test closes it:
 // a socket that still answers keep-alive never closes by itself.
+// r9: the host's clock (now, ms) drives ping() and expire(); MRM1 moves go
+// through InputClaims::udpMove; a frame the host would close the
+// connection at (silenced) ends that write.
 namespace {
 struct OwnerHost {
     using Owner = jlh::HeldInput::Owner;
     jlh::InputClaims claims;
     // What Windows got, in order: "Kd162" key down, "Ku162", "Bd0", "Bu0",
-    // "M" a move from a POINTER_SYNC; an up Windows refused ends in "!".
+    // "M" a move from a POINTER_SYNC; an up Windows refused ends in "!",
+    // and so does a down (refuseDowns).
     std::vector<std::string> win;
     std::vector<uint16_t> keysDown;
     std::vector<uint8_t> buttonsDown;
     bool refuseUps = false;                               // SendInput takes no up
-    size_t udpMoves = 0;                                  // MRM1 0x24 moves: the pointer only
+    std::set<uint16_t> refuseDowns;                       // SendInput takes no down for these keys
+    size_t udpMoves = 0;                                  // MRM1 0x24 moves that went in
+    size_t udpRefused = 0;                                // r9: MRM1 0x24 moves udpMove dropped
     std::vector<std::optional<jlh::InputEvent>> pending;  // serveControl's pendingSync, per connection
     jlh::InputClaims::Frame last;  // the last write, over its input frames: all admitted, any takeover, sums
     size_t replacedTotal = 0;                             // takeovers from an owner still open
     size_t dropped = 0;                                   // input frames dropped: not the owner
+    size_t blocked = 0;                                   // r9: input frames dropped: an up still owed
+    size_t closedSilenced = 0;                            // r9: frames the host closes a silenced owner at
+    int64_t now = 0;                                      // r9: the host's clock, ms
 
     Owner open() { return claims.open(); }
     bool sendKey(uint16_t v, bool down) {
         if (!down && refuseUps) {
             win.push_back("Ku" + std::to_string(v) + "!");
+            return false;
+        }
+        if (down && refuseDowns.count(v)) {
+            win.push_back("Kd" + std::to_string(v) + "!");
             return false;
         }
         win.push_back(std::string(down ? "Kd" : "Ku") + std::to_string(v));
@@ -1021,6 +1035,8 @@ struct OwnerHost {
             held.pressButton(e.button, o);
             return true;
         }
+        if (e.kind == jlh::InputEvent::Kind::TaskManager)
+            return jlh::taskManagerChord(held, [this](uint16_t v, bool down) { return sendKey(v, down); });
         win.push_back("M");
         return true;
     }
@@ -1040,7 +1056,7 @@ struct OwnerHost {
             if (!e) continue;  // ping, VIDEO_CONFIG, clipboard: no part in input
             if (pending.size() <= o) pending.resize(o + 1);
             const auto f = claims.frame(
-                o,
+                o, kViewerIp, *e,
                 [&](jlh::HeldInput& held) {
                     return jlh::stepInput(
                         pending[o], *e,
@@ -1057,15 +1073,39 @@ struct OwnerHost {
             last.replaced += f.replaced;
             last.released += f.released;
             last.injected = f.injected;
+            last.blocked = last.blocked || f.blocked;
+            last.silenced = last.silenced || f.silenced;
             replacedTotal += f.replaced;
+            if (f.silenced) {  // serveControl closes the connection here
+                ++closedSilenced;
+                last.admitted = false;
+                return;
+            }
             if (!f.admitted) ++dropped;
+            if (f.blocked) {
+                ++blocked;
+                pending[o].reset();
+            }
         }
         last.admitted = any && all;
         CHECK(off == bytes.size());
     }
-    // A valid MRM1 0x24 move from the viewer (mrm1Listener): it moves the
-    // pointer; InputClaims never sees it.
-    void pointer() { ++udpMoves; }
+    // r9: a ping on connection o that was not its first frame
+    // (serveControl). True: o was silenced, and the host closes it.
+    bool ping(Owner o) { return claims.ping(o, now); }
+    // r9: one liveness check of inputRetryLoop at now.
+    jlh::InputClaims::Expired expire() {
+        return claims.expire(now, jlh::kLivenessTimeoutMs, [this](uint16_t v) { return sendKey(v, false); },
+                             [this](uint8_t b) { return sendButton(b, false); });
+    }
+    // A valid MRM1 0x24 move from the viewer's UDP socket at port
+    // (mrm1Listener). r9: it goes in only through InputClaims::udpMove.
+    jlh::InputClaims::Udp pointer(uint16_t port = kViewerPort) {
+        const auto r = claims.udpMove(kViewerIp, port, [] { return true; });
+        if (r == jlh::InputClaims::Udp::Moved) ++udpMoves;
+        else ++udpRefused;
+        return r;
+    }
     size_t close(Owner o) {
         return claims.close(o, [this](uint16_t v) { return sendKey(v, false); },
                             [this](uint8_t b) { return sendButton(b, false); });
@@ -1331,13 +1371,17 @@ static void testAdmitInjectOrder() {
         };
         const auto A = claims.open();
         const auto B = claims.open();
-        CHECK(claims.frame(A, [](jlh::HeldInput&) { return true; }, upKey, upButton).tookOver);  // A owns input
+        jlh::InputEvent press;  // a down: no up is owed here, so nothing blocks it
+        press.kind = jlh::InputEvent::Kind::Key;
+        press.down = true;
+        CHECK(claims.frame(A, kViewerIp, press, [](jlh::HeldInput&) { return true; }, upKey, upButton)
+                  .tookOver);  // A owns input
         std::atomic<bool> aInside{false}, bCalling{false}, bDone{false};
         bool bDoneDuringA = true;
         jlh::InputClaims::Frame fa, fb;
         std::thread ta([&] {
             fa = claims.frame(
-                A,
+                A, kViewerIp, press,
                 [&](jlh::HeldInput& held) {
                     aInside = true;
                     while (!bCalling) std::this_thread::yield();
@@ -1358,7 +1402,7 @@ static void testAdmitInjectOrder() {
         std::thread tb([&] {
             bCalling = true;
             fb = claims.frame(
-                B,
+                B, kViewerIp, press,
                 [&](jlh::HeldInput& held) {
                     log("Kd67");
                     held.pressKey('C', B);
@@ -1380,7 +1424,7 @@ static void testAdmitInjectOrder() {
         // A's next frame: dropped before inject.
         bool called = false;
         const auto late = claims.frame(
-            A,
+            A, kViewerIp, press,
             [&](jlh::HeldInput&) {
                 called = true;
                 return true;
@@ -1413,8 +1457,11 @@ static void testRetryFailedUp() {
         CHECK(h.retry() == 0 && h.got({"Bu0"}));  // nothing left to send
     }
     {
-        // A takeover whose ups Windows refuses: B's key still goes in; the
-        // next round sends A's Ctrl and right button up and leaves B's key.
+        // r9 (Pepper's review of 0d74abe, item 3): a takeover whose ups
+        // Windows refuses. B is the owner, but its C does not go in while
+        // A's Ctrl may still be down on Windows (r8 put it in: Ctrl+C), nor
+        // does anything else of B's but an up. The rounds send A's Ctrl and
+        // right button up until Windows takes them; then B's next C goes in.
         OwnerHost h;
         const auto A = h.open();
         h.tcp(A, keyFrame(1, true));
@@ -1423,12 +1470,24 @@ static void testRetryFailedUp() {
         h.refuseUps = true;
         h.win.clear();
         h.tcp(B, keyFrame('C', true));
-        CHECK(h.last.tookOver && h.last.replaced == 1 && h.last.released == 0);
-        CHECK(h.got({"Ku162!", "Bu1!", "Kd67"}) && h.keyDown(LControl) && h.buttonDown(1));
+        CHECK(h.last.tookOver && h.last.replaced == 1 && h.last.released == 0 && h.last.blocked &&
+              !h.last.injected);
+        CHECK(h.got({"Ku162!", "Bu1!"}) && h.keyDown(LControl) && h.buttonDown(1) && !h.keyDown('C'));
+        CHECK(h.claims.owner() == B && !h.claims.held().keyHeld('C'));
+        // Still refused: a repeat of C, a click and a move are dropped too.
+        h.win.clear();
+        CHECK(h.retry() == 0 && h.got({"Ku162!", "Bu1!"}));
+        h.win.clear();
+        h.tcp(B, keyFrame('C', true));
+        h.tcp(B, syncedButton(2000, 2000, 1, 0, true));
+        CHECK(h.win.empty() && h.blocked == 4 && !h.keyDown('C') && !h.buttonDown(0));
         h.refuseUps = false;
         h.win.clear();
         CHECK(h.retry() == 2 && h.got({"Ku162", "Bu1"}) && !h.keyDown(LControl) && !h.buttonDown(1));
-        CHECK(h.keyDown('C') && h.claims.held().keyOwnedBy('C', B));
+        CHECK(!h.claims.anyHeld());
+        h.win.clear();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.last.injected && !h.last.blocked && h.got({"Kd67"}) && h.claims.held().keyOwnedBy('C', B));
     }
     {
         // The owner's own up, refused: the next round sends it.
@@ -1441,15 +1500,309 @@ static void testRetryFailedUp() {
         h.refuseUps = false;
         h.win.clear();
         CHECK(h.retry() == 1 && h.got({"Ku88"}) && !h.claims.anyHeld());
-        // The same key pressed again before the round: it is the owner's
-        // again, and the round leaves it down.
+        // r9: the same key pressed again before the round is dropped (an up
+        // is owed); the round sends the up; the next press goes in.
         h.refuseUps = true;
         h.tcp(A, keyFrame('Y', true));
         h.tcp(A, keyFrame('Y', false));
         h.refuseUps = false;
-        h.tcp(A, keyFrame('Y', true));
         h.win.clear();
-        CHECK(h.retry() == 0 && h.win.empty() && h.keyDown('Y') && h.claims.held().keyOwnedBy('Y', A));
+        h.tcp(A, keyFrame('Y', true));
+        CHECK(h.last.blocked && h.win.empty() && h.keyDown('Y') && !h.claims.held().keyOwnedBy('Y', A));
+        CHECK(h.retry() == 1 && h.got({"Ku89"}) && !h.keyDown('Y') && !h.claims.anyHeld());
+        h.win.clear();
+        h.tcp(A, keyFrame('Y', true));
+        CHECK(h.got({"Kd89"}) && h.claims.held().keyOwnedBy('Y', A));
+    }
+}
+
+// r9 (Pepper's review of 0d74abe, item 1): a hung viewer app. Its OS still
+// answers keep-alive, so TCP keeps the connection; its UI thread's pings
+// stop. An armed owner (one that has sent a ping after its first frame)
+// that goes kLivenessTimeoutMs without one loses ownership and what it
+// holds; one that keeps pinging while it holds still keeps it; one that
+// never pinged (an older viewer) keeps the r8 rules.
+static void testLiveness() {
+    using jlh::vk::LControl;
+    using jlh::vk::LShift;
+    const int64_t T = jlh::kLivenessTimeoutMs;
+    {
+        // A holds Ctrl and the left button (a Ctrl+drag), pinging once a
+        // second; at t = 2 s its UI hangs. Nothing goes while 5 s have not
+        // passed since the last ping; the first check after that lets go.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());  // the startup ping: the first frame, not counted (no h.ping)
+        h.tcp(A, keyFrame(1, true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true));
+        for (h.now = 0; h.now <= 2000; h.now += 1000) CHECK(!h.ping(A));
+        h.win.clear();
+        for (h.now = 2250; h.now <= 2000 + T; h.now += 250) CHECK(h.expire().owner == 0);
+        CHECK(h.win.empty() && h.keyDown(LControl) && h.buttonDown(0) && h.claims.owner() == A);
+        h.now = 2000 + T + 250;
+        const auto x = h.expire();
+        CHECK(x.owner == A && x.silentMs == T + 250 && x.released == 2);
+        CHECK(h.got({"Ku162", "Bu0"}) && !h.keyDown(LControl) && !h.buttonDown(0) && !h.claims.anyHeld());
+        CHECK(h.claims.owner() == 0 && h.expire().owner == 0);
+        // Its UDP drag no longer moves the pointer.
+        CHECK(h.pointer() == jlh::InputClaims::Udp::NotOwner && h.udpMoves == 0);
+        // The app comes back: its next frame, input or ping, closes it.
+        h.win.clear();
+        h.tcp(A, keyFrame('C', true));
+        CHECK(h.last.silenced && h.closedSilenced == 1 && h.win.empty() && !h.claims.anyHeld());
+        CHECK(h.ping(A));
+        // It reconnects: the new connection's first input makes it the
+        // owner, with nothing to replace. The old one closes with nothing.
+        const auto B = h.open();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.last.tookOver && h.last.replaced == 0 && h.got({"Kd67"}) && h.claims.owner() == B);
+        CHECK(h.close(A) == 0 && h.claims.owner() == B && h.got({"Kd67"}));
+        // B never pinged: never expires.
+        h.now += 60'000;
+        CHECK(h.expire().owner == 0 && h.claims.owner() == B && h.keyDown('C'));
+    }
+    {
+        // Still for 60 s, holding Shift and the left button, pinging once a
+        // second: nothing is let go (checks every 250 ms).
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true));
+        h.tcp(A, keyFrame(4, true));
+        h.win.clear();
+        for (h.now = 0; h.now <= 60'000; h.now += 250) {
+            if (h.now % 1000 == 0) CHECK(!h.ping(A));
+            CHECK(h.expire().owner == 0);
+            h.retry();
+        }
+        CHECK(h.win.empty() && h.buttonDown(0) && h.keyDown(LShift) && h.claims.owner() == A);
+        CHECK(h.claims.held().buttonOwnedBy(0, A) && h.claims.held().keyOwnedBy(LShift, A));
+        // Pings 4.9 s apart (lost and late ones): still kept.
+        CHECK(!h.ping(A));
+        for (int i = 0; i < 5; ++i) {
+            h.now += T - 100;
+            CHECK(h.expire().owner == 0);
+            CHECK(!h.ping(A));
+        }
+        CHECK(h.win.empty() && h.claims.owner() == A);
+        h.tcp(A, syncedButton(1000, 1000, 2, 0, false));
+        h.tcp(A, keyFrame(4, false));
+        CHECK(h.got({"M", "Bu0", "Ku160"}) && !h.claims.anyHeld());
+    }
+    {
+        // An older viewer: one ping, its startup ping, as the first frame,
+        // and none after. Holding Ctrl for 60 s with no frame at all: kept
+        // (the r8 rule). A ping-only connection that pings and stops (the
+        // launch screen) changes nothing for the owner either.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());  // first frame: not counted
+        h.tcp(A, keyFrame(1, true));
+        const auto P = h.open();
+        h.tcp(P, pingFrame());
+        CHECK(!h.ping(P));  // P's second ping arms P, which is never the owner
+        h.win.clear();
+        for (h.now = 0; h.now <= 60'000; h.now += 250) CHECK(h.expire().owner == 0);
+        CHECK(h.win.empty() && h.keyDown(LControl) && h.claims.owner() == A);
+        CHECK(!h.ping(P) && h.claims.owner() == A);
+        h.tcp(A, keyFrame(1, false));
+        CHECK(h.got({"Ku162"}) && !h.claims.anyHeld());
+    }
+    {
+        // An armed owner whose ups Windows refuses on expiry: they are
+        // retried like any other, and nothing new goes in meanwhile.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        CHECK(!h.ping(A));
+        h.refuseUps = true;
+        h.now = T + 1;
+        h.win.clear();
+        CHECK(h.expire().released == 0 && h.got({"Ku162!"}) && h.keyDown(LControl));
+        const auto B = h.open();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.last.tookOver && h.last.blocked && h.got({"Ku162!"}) && !h.keyDown('C'));
+        h.refuseUps = false;
+        CHECK(h.retry() == 1 && !h.keyDown(LControl));
+        h.win.clear();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.got({"Kd67"}));
+    }
+}
+
+// r9 (Pepper's review of 0d74abe, item 2): MRM1 moves go in only from the
+// input owner's own UDP socket, the one its POINTER_SYNC named. A replaced
+// viewer's late datagrams do not move the pointer; the new owner's drag
+// does.
+static void testPointerOwner() {
+    using Udp = jlh::InputClaims::Udp;
+    constexpr uint16_t kA = 50000, kB = 50001;
+    {
+        OwnerHost h;
+        const auto A = h.open();
+        // No owner yet, or an owner that named no socket: no UDP move.
+        CHECK(h.pointer(kA) == Udp::NotOwner);
+        h.tcp(A, keyFrame('Q', true));
+        CHECK(h.claims.owner() == A && h.pointer(kA) == Udp::NotOwner);
+        h.tcp(A, keyFrame('Q', false));
+        // A's click names its socket: A drags over MRM1.
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true, kA));
+        CHECK(h.pointer(kA) == Udp::Moved && h.pointer(kA) == Udp::Moved && h.udpMoves == 2);
+        CHECK(h.pointer(kB) == Udp::NotOwner);  // another socket: B, not the owner yet
+        // B (another viewer, its own socket) takes over with a pointer move:
+        // the registration the viewer sends, POINTER_SYNC then the move, on
+        // its control connection.
+        const auto B = h.open();
+        auto reg = syncedButton(3000, 3000, 7, 0, true, kB);
+        reg.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);
+        const auto mv = jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {uint8_t(3000 >> 8), uint8_t(3000 & 0xff),
+                                                               uint8_t(3000 >> 8), uint8_t(3000 & 0xff)});
+        reg.insert(reg.end(), mv.begin(), mv.end());
+        h.win.clear();
+        h.tcp(B, reg);
+        CHECK(h.last.tookOver && h.last.replaced == 1 && h.got({"Bu0", "M", "M"}) && h.claims.owner() == B);
+        // A's datagrams, late or still coming: dropped. B's drag goes in.
+        h.udpMoves = h.udpRefused = 0;
+        for (int i = 0; i < 20; ++i) {
+            CHECK(h.pointer(kA) == Udp::NotOwner);
+            CHECK(h.pointer(kB) == Udp::Moved);
+        }
+        CHECK(h.udpMoves == 20 && h.udpRefused == 20);
+        h.tcp(B, syncedButton(3100, 3100, 30, 0, true, kB));
+        CHECK(h.pointer(kB) == Udp::Moved && h.pointer(kA) == Udp::NotOwner && h.buttonDown(0));
+        h.tcp(B, syncedButton(3500, 3500, 31, 0, false, kB));
+        // A's frames on its connection are dropped as in r8, and its own
+        // POINTER_SYNC does not name its socket again.
+        h.tcp(A, syncedButton(1200, 1200, 2, 0, true, kA));
+        CHECK(!h.last.admitted && h.pointer(kA) == Udp::NotOwner && h.pointer(kB) == Udp::Moved);
+        // B closes: no owner, no UDP move from anyone.
+        h.close(B);
+        CHECK(h.pointer(kB) == Udp::NotOwner && h.pointer(kA) == Udp::NotOwner);
+    }
+    {
+        // The same viewer reconnects its control connection and keeps its
+        // UDP socket: the new connection names it again (its registration)
+        // before UDP moves go in; until then they are dropped.
+        OwnerHost h;
+        const auto A1 = h.open();
+        h.tcp(A1, syncedButton(1000, 1000, 1, 0, true, kA));
+        h.tcp(A1, syncedButton(1000, 1000, 1, 0, false, kA));
+        CHECK(h.pointer(kA) == Udp::Moved);
+        const auto A2 = h.open();
+        h.tcp(A2, keyFrame('Z', true));  // takes over; names nothing
+        CHECK(h.claims.owner() == A2 && h.pointer(kA) == Udp::NotOwner);
+        auto reg = syncedButton(1500, 1500, 9, 0, true, kA);
+        reg.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);
+        const auto mv = jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {5, 220, 5, 220});
+        reg.insert(reg.end(), mv.begin(), mv.end());
+        h.tcp(A2, reg);
+        CHECK(h.pointer(kA) == Udp::Moved);
+        // Port 0 (a position that went by TCP) names nothing new: the named
+        // socket stays.
+        h.tcp(A2, syncedButton(1600, 1600, 0, 1, true, 0));
+        CHECK(h.pointer(kA) == Udp::Moved && h.pointer(kB) == Udp::NotOwner);
+    }
+    {
+        // While an up is owed, the owner's own UDP moves are dropped too.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true, kA));
+        h.refuseUps = true;
+        h.tcp(A, syncedButton(1000, 1000, 2, 0, false, kA));
+        CHECK(h.pointer(kA) == Udp::UpPending && h.udpMoves == 0);
+        h.refuseUps = false;
+        CHECK(h.retry() == 1 && h.pointer(kA) == Udp::Moved);
+    }
+}
+
+// r9 (Pepper's review of 0d74abe, item 3): while an up Windows did not take
+// is owed, only key and button ups go in; every other frame is dropped (not
+// kept for later), and Task Manager's chord does not go.
+static void testUpPending() {
+    using jlh::vk::LShift;
+    {
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame('X', true));
+        h.tcp(A, keyFrame(4, true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 1, true));
+        h.refuseUps = true;
+        h.tcp(A, keyFrame('X', false));  // refused: X's up is owed
+        h.refuseUps = false;
+        CHECK(h.keyDown('X') && h.claims.held().keyHeld('X') && !h.claims.held().keyOwnedBy('X', A));
+        h.win.clear();
+        h.tcp(A, keyFrame('Z', true));                                                  // a down
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {1, 0, 1, 0}));                 // a move
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgMouseMoveRel, {0, 5, 0, 5}));                  // a relative move
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgMouseScroll, {0, 0, 0, 120}));                 // a wheel
+        h.tcp(A, syncedButton(2000, 2000, 2, 0, true));                                 // a click (2 frames)
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgForceQuitOpen, std::vector<uint8_t>{}));       // Task Manager
+        CHECK(h.win.empty() && h.blocked == 7 && h.dropped == 0 && !h.pending[A]);
+        // Ups go in: they can only let go.
+        h.tcp(A, keyFrame(4, false));
+        h.tcp(A, syncedButton(1000, 1000, 3, 1, false));
+        CHECK(h.got({"Ku160", "Bu1"}) && !h.keyDown(LShift) && !h.buttonDown(1) && h.blocked == 8);
+        // (the click up's POINTER_SYNC was dropped: the up goes in where
+        // the pointer is)
+        h.win.clear();
+        CHECK(h.retry() == 1 && h.got({"Ku88"}) && !h.claims.anyHeld());
+        h.win.clear();
+        h.tcp(A, keyFrame('Z', true));
+        CHECK(h.got({"Kd90"}) && h.claims.held().keyOwnedBy('Z', A));
+    }
+}
+
+// r9 (Pepper's review of 0d74abe, item 3): Task Manager's Ctrl+Shift+Esc.
+static void testTaskManagerChord() {
+    using jlh::vk::Escape;
+    using jlh::vk::LControl;
+    using jlh::vk::LShift;
+    {
+        // Clean: the chord down and up, in order.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgForceQuitOpen, std::vector<uint8_t>{}));
+        CHECK(h.last.injected && h.got({"Kd162", "Kd160", "Kd27", "Ku27", "Ku160", "Ku162"}) && !h.claims.anyHeld());
+    }
+    {
+        // A held key whose up Windows refuses: no chord at all (it would be
+        // a different chord); the up is retried.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame('C', true));
+        h.refuseUps = true;
+        h.win.clear();
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgForceQuitOpen, std::vector<uint8_t>{}));
+        CHECK(!h.last.injected && h.got({"Ku67!"}) && h.keyDown('C'));
+        h.refuseUps = false;
+        CHECK(h.retry() == 1 && !h.claims.anyHeld());
+    }
+    {
+        // Shift's down refused: Ctrl comes back up and Esc never goes
+        // (never Ctrl+Esc).
+        OwnerHost h;
+        const auto A = h.open();
+        h.refuseDowns = {LShift};
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgForceQuitOpen, std::vector<uint8_t>{}));
+        CHECK(!h.last.injected && h.got({"Kd162", "Kd160!", "Ku162"}) && !h.keyDown(LControl) && !h.claims.anyHeld());
+    }
+    {
+        // The chord's ups refused: they are owed and retried, and nothing
+        // new goes in until they are taken.
+        OwnerHost h;
+        const auto A = h.open();
+        h.refuseUps = true;
+        h.tcp(A, jlh::mrc1Frame(jlh::kMsgForceQuitOpen, std::vector<uint8_t>{}));
+        CHECK(!h.last.injected && h.got({"Kd162", "Kd160", "Kd27", "Ku27!", "Ku160!", "Ku162!"}));
+        const auto held = h.claims.held();
+        CHECK(held.keyHeld(Escape) && held.keyHeld(LShift) && held.keyHeld(LControl) && !held.ownsAny(A));
+        h.refuseUps = false;
+        h.win.clear();
+        h.tcp(A, keyFrame('C', true));
+        CHECK(h.last.blocked && h.win.empty());
+        CHECK(h.retry() == 3 && h.keysDown.empty() && !h.claims.anyHeld());
+        h.win.clear();
+        h.tcp(A, keyFrame('C', true));
+        CHECK(h.got({"Kd67"}));
     }
 }
 
@@ -1580,6 +1933,10 @@ int main() {
     testHoldStill();
     testAdmitInjectOrder();
     testRetryFailedUp();
+    testLiveness();
+    testPointerOwner();
+    testUpPending();
+    testTaskManagerChord();
     testAnnexB();
     testColor();
 #ifdef _WIN32

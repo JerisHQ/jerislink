@@ -107,6 +107,7 @@ public:
             a->s = s_;
             s_ = INVALID_SOCKET;
             a->pointerSync = pointerSync_.load(std::memory_order_relaxed);
+            a->liveness = liveness_.load(std::memory_order_relaxed);
             a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
             async_ = std::move(a);
         } else {
@@ -115,6 +116,7 @@ public:
             std::lock_guard<std::mutex> g(a->m);
             closeSocket(a->s);
             pointerSync_.store(a->pointerSync, std::memory_order_relaxed);
+            liveness_.store(a->liveness, std::memory_order_relaxed);
         }
     }
 
@@ -139,6 +141,9 @@ public:
         uint64_t noticeReads = 0;        // r5: failed live connections handed to the worker for the notice
         uint64_t renegotiations = 0;     // r5: background VIDEO_CONFIG exchanges that got an ACK
         uint64_t renegotiateFailures = 0;  // r5: those without one (connection closed, tried again)
+        uint64_t livenessPings = 0;      // H2 r9: liveness pings sent (UI thread, and two per new connection)
+        uint64_t pongs = 0;              // H2 r9: their pongs, read and dropped
+        uint64_t pointerBinds = 0;       // H2 r9: MRM1 sockets named to the host (0x27 then 0x24)
         bool pausedNow = false;    // r6: paused right now
         bool live = false;         // r14: a connection is up right now
         bool connecting = false;
@@ -310,6 +315,121 @@ public:
         if (!async_) return pointerSync_.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> g(async_->m);
         return async_->pointerSync;
+    }
+    // H2 r9 (Pepper's review of 0d74abe, item 1): liveness pings, on for a
+    // Windows host (jl::hostinfo::livenessFor). Set like POINTER_SYNC, from
+    // every ACK the channel reads; setLiveness: tests.
+    void setLiveness(bool on) {
+        if (!async_) {
+            liveness_.store(on, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->liveness = on;
+    }
+    bool liveness() const {
+        if (!async_) return liveness_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(async_->m);
+        return async_->liveness;
+    }
+
+    // H2 r9 (Pepper's review of 0d74abe, item 1): a hung viewer app keeps
+    // its TCP connection up (its OS answers keep-alive), so a Windows host
+    // cannot tell it from a live one by TCP and would keep its keys down.
+    // So the viewer's UI thread, the one that sends input, calls this from
+    // its loop (viewer.cpp sendKeepAlives, which the modal-loop tick runs
+    // too), and it sends the existing MRC1 ping (0x01) on the live control
+    // connection every kLivenessPingMs. The host lets go of what this
+    // viewer holds once they stop (host_protocol.hpp kLivenessTimeoutMs,
+    // 5 s: five missed pings). Never from another thread: a ping says the
+    // input thread runs. Only with liveness on (a Windows host; a macOS
+    // host gets none). Nothing while a reconnect runs or input waits for
+    // one (the worker pings a new connection itself before its input), and
+    // never queued. Its pong is read and dropped by pollHostNotice. True
+    // when one went out.
+    static constexpr int kLivenessPingMs = 1000;
+    bool livenessTick(std::chrono::steady_clock::time_point now) {
+        std::shared_ptr<Async> a = async_;
+        if (!a) return false;
+        SOCKET live = INVALID_SOCKET;
+        bool failNow = false;  // tests
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (!a->liveness || a->stopping || a->connecting || !a->queue.empty() || a->s == INVALID_SOCKET)
+                return false;
+            if (now - a->lastLivenessPing < std::chrono::milliseconds(kLivenessPingMs)) return false;
+            live = a->s;
+            a->lastLivenessPing = now;
+            if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
+        }
+        if (!failNow && sendAllOn(live, livenessPings(1))) {
+            std::lock_guard<std::mutex> g(a->m);
+            ++a->stats.livenessPings;
+            return true;
+        }
+        // As a failed input send: the worker reads a notice still arriving
+        // and closes it; the next input reconnects.
+        std::lock_guard<std::mutex> g(a->m);
+        handOverForNoticeLocked(*a, live);
+        return false;
+    }
+
+    // H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes MRM1
+    // pointer moves only from its input owner's own UDP socket, the one a
+    // POINTER_SYNC (0x27) on the owner's control connection named; until
+    // then it drops them. viewer.cpp calls this for each move it sent by
+    // UDP (seq: that datagram's MRM1 seq, port: the UDP socket's local
+    // port). It notes the position (notePointer) and, with POINTER_SYNC on,
+    // names the socket on the live connection once, when the connection or
+    // the port is new: 0x27 with this move (position, seq, port), then 0x24
+    // at the same position, since a 0x27 waits on the host for the next
+    // input frame. It is input like a key: the host makes this connection
+    // the owner (the newer connection wins). Not while a reconnect runs or
+    // input waits for one, nor while ups are owed: a later move does it,
+    // and a click carries its 0x27 anyway. No live connection and none
+    // being made: a reconnect is asked for (keepSession), since without
+    // one the host moves nothing. True when the 0x27 went out.
+    bool notePointerUdp(uint16_t nx, uint16_t ny, uint32_t seq, uint16_t port) {
+        notePointer(nx, ny, seq, port);
+        std::shared_ptr<Async> a = async_;
+        if (!a || !port) return false;
+        enum class Need { None, Bind, Connect };
+        const auto need = [&] {
+            if (!a->pointerSync || a->stopping || a->connecting || !a->queue.empty()) return Need::None;
+            if (a->s == INVALID_SOCKET) return Need::Connect;
+            if (hasOwedLocked(*a) || (a->boundGen == a->liveGen && a->boundPort == port)) return Need::None;
+            return Need::Bind;
+        };
+        Need n;
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            n = need();
+        }
+        if (n == Need::Connect) keepSession();
+        if (n != Need::Bind) return false;
+        pollHostNotice();  // as sendQueued: a "replaced" notice ends the attempt first
+        SOCKET live = INVALID_SOCKET;
+        bool failNow = false;  // tests
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (need() != Need::Bind) return false;
+            live = a->s;
+            a->boundGen = a->liveGen;
+            a->boundPort = port;
+            if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
+        }
+        const std::vector<uint8_t> pos =
+            packet(0x24, {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)});
+        std::vector<uint8_t> wire = withPointerSync(pos, (uint64_t(port) << 32) | seq);
+        wire.insert(wire.end(), pos.begin(), pos.end());
+        if (!failNow && sendAllOn(live, wire)) {
+            std::lock_guard<std::mutex> g(a->m);
+            ++a->stats.pointerBinds;
+            return true;
+        }
+        std::lock_guard<std::mutex> g(a->m);
+        handOverForNoticeLocked(*a, live);  // the next connection is named afresh (liveGen)
+        return false;
     }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
@@ -532,8 +652,12 @@ public:
         if (x == VideoExchange::Replaced) {
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
-        if (x != VideoExchange::Ok) close();
-        else setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
+        if (x != VideoExchange::Ok) {
+            close();
+        } else {
+            setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
+            setLiveness(jl::hostinfo::livenessFor(result.hostInfo));        // H2 r9, item 1
+        }
         return result;
     }
 
@@ -614,22 +738,62 @@ public:
             s = a->s;
         }
         if (s == INVALID_SOCKET) return false;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(s, &rd);
-        timeval tv{0, 0};
-        if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-        uint8_t b[kHostNoticeBytes]{};
-        const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-        const bool replaced = isReplacedNotice(b, n);
+        // H2 r9: the pongs to the liveness pings go first.
+        uint8_t b[kPongBytes]{};
+        const Peek p = peekPastPongs(s, b);
+        if (p.pongs) {
+            std::lock_guard<std::mutex> g(a->m);
+            a->stats.pongs += p.pongs;
+        }
+        if (!p.readable) return false;
+        const int n = p.n;
+        const bool replaced = isReplacedNotice(b, std::min(n, kHostNoticeBytes));
         if (n > 0 && !replaced) return false;  // partial or other bytes: not ours to read
         if (replaced) {
-            recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+            recv(s, reinterpret_cast<char*>(b), kHostNoticeBytes, 0);
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
         std::lock_guard<std::mutex> g(a->m);
         if (a->s == s) closeSocket(a->s);
         return replaced;
+    }
+
+    // H2 r9: a Windows host answers each liveness ping with a pong (MRC1
+    // 0x02 with the ping's 4 bytes). The whole pongs at the front of what
+    // waits on s are read and dropped, so a "replaced" notice or the close
+    // behind them is still seen; then up to kPongBytes of what is left are
+    // peeked into b (n: recv's result; readable false: nothing waits).
+    static constexpr int kPongBytes = 12;
+    struct Peek {
+        int pongs = 0;
+        bool readable = false;
+        int n = 0;
+    };
+    static bool isPong(const uint8_t* b, int n) {
+        return n >= kPongBytes && b[0] == 'M' && b[1] == 'R' && b[2] == 'C' && b[3] == '1' && b[4] == 1 &&
+               b[5] == 0x02 && b[6] == 0 && b[7] == 4;
+    }
+    static bool isPongPrefix(const uint8_t* b, int n) {
+        static const uint8_t want[8] = {'M', 'R', 'C', '1', 1, 0x02, 0, 4};
+        if (n <= 0 || n >= kPongBytes) return false;
+        for (int i = 0; i < n && i < 8; ++i) if (b[i] != want[i]) return false;
+        return true;
+    }
+    static Peek peekPastPongs(SOCKET s, uint8_t (&b)[kPongBytes]) {
+        Peek p;
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return p;
+            p.n = recv(s, reinterpret_cast<char*>(b), kPongBytes, MSG_PEEK);
+            p.readable = true;
+            if (!isPong(b, p.n)) return p;
+            recv(s, reinterpret_cast<char*>(b), kPongBytes, 0);
+            ++p.pongs;
+            p.readable = false;
+        }
     }
 
     static constexpr int kHostNoticeBytes = 9;
@@ -656,19 +820,17 @@ public:
     // r5: run by the worker; `cancel` (stop()) ends the wait.
     static bool readNoticeBeforeClose(SOCKET s, const std::atomic<bool>* cancel = nullptr) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kNoticeWaitMs);
-        uint8_t b[kHostNoticeBytes]{};
+        uint8_t b[kPongBytes]{};
         for (;;) {
-            fd_set rd;
-            FD_ZERO(&rd);
-            FD_SET(s, &rd);
-            timeval tv{0, 0};
-            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-            const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-            if (isReplacedNotice(b, n)) {
-                recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+            // H2 r9: pongs in front of the notice are read and dropped.
+            const Peek p = peekPastPongs(s, b);
+            if (!p.readable) return false;
+            const int n = p.n;
+            if (isReplacedNotice(b, std::min(n, kHostNoticeBytes))) {
+                recv(s, reinterpret_cast<char*>(b), kHostNoticeBytes, 0);
                 return true;
             }
-            if (!isNoticePrefix(b, n)) return false;
+            if (!isNoticePrefix(b, n) && !isPongPrefix(b, n)) return false;
             if (std::chrono::steady_clock::now() >= deadline) return false;
             if (cancel && cancel->load()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -849,6 +1011,16 @@ private:
         // H2 (Pepper's review of 8f8a33b, item 5b): buttons go out behind a
         // 0x27 POINTER_SYNC, as the newest ACK said (HOST_INFO cap 0x20).
         bool pointerSync = false;
+        // H2 r9 (Pepper's review of 0d74abe, items 1 and 2): a Windows host
+        // (the newest ACK said so, as for pointerSync) gets liveness pings,
+        // the last one at lastLivenessPing. liveGen moves on with each
+        // connection that goes live; boundGen and boundPort: the connection
+        // and the MRM1 port last named to the host (notePointerUdp).
+        bool liveness = false;
+        std::chrono::steady_clock::time_point lastLivenessPing{};
+        uint64_t liveGen = 1;
+        uint64_t boundGen = 0;
+        uint16_t boundPort = 0;
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
@@ -856,6 +1028,16 @@ private:
     static std::vector<uint8_t> frameBytes(uint8_t type, std::initializer_list<uint8_t> payload) {
         std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, 0, uint8_t(payload.size())};
         b.insert(b.end(), payload.begin(), payload.end());
+        return b;
+    }
+    // H2 r9: n liveness pings, MRC1 0x01 with 4 bytes ("LIVE"; the host
+    // echoes them in its pong and reads nothing else in them).
+    static std::vector<uint8_t> livenessPings(int n) {
+        std::vector<uint8_t> b;
+        for (int i = 0; i < n; ++i) {
+            const auto p = frameBytes(0x01, {'L', 'I', 'V', 'E'});
+            b.insert(b.end(), p.begin(), p.end());
+        }
         return b;
     }
 
@@ -1364,8 +1546,26 @@ private:
                 a->renegotiated = vc;
                 // Item 5b: the queue below goes out as this ACK says.
                 a->pointerSync = jl::hostinfo::pointerSyncFor(vc.hostInfo);
+                a->liveness = jl::hostinfo::livenessFor(vc.hostInfo);  // H2 r9
             }
-            bool alive = setNonBlocking(s, true);
+            bool alive = true;
+            if (a->liveness) {
+                // H2 r9 (Pepper's review of 0d74abe, item 1): two pings
+                // before anything else on a new connection. The host counts
+                // no ping that is a connection's first frame (every viewer's
+                // start-up ping is one), so the second one at least starts
+                // its liveness timer, before the input flushed below; then
+                // the UI thread keeps them coming (livenessTick).
+                lk.unlock();
+                alive = sendAllOn(s, livenessPings(2));
+                lk.lock();
+                if (a->stopping) { closeSocket(s); break; }
+                if (alive) {
+                    a->stats.livenessPings += 2;
+                    a->lastLivenessPing = std::chrono::steady_clock::now();
+                }
+            }
+            if (alive) alive = setNonBlocking(s, true);
             // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
             // out, (2) sends the releases owed (including those that aging
             // just made owed), (3) only then sends the next input, or hands
@@ -1416,6 +1616,7 @@ private:
             }
             closeSocket(a->s);
             a->s = s;
+            ++a->liveGen;  // H2 r9: its MRM1 socket is not named yet (notePointerUdp)
             ++a->stats.reconnects;
         }
     }
@@ -1593,6 +1794,7 @@ private:
     std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
     std::atomic<uint64_t> lastPointerUdp_{0};  // H2: MRM1 port << 32 | seq of that position (0: TCP)
     std::atomic<bool> pointerSync_{false};     // H2: POINTER_SYNC before buttons (Async::pointerSync once async)
+    std::atomic<bool> liveness_{false};        // H2 r9: liveness pings (Async::liveness once async)
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

@@ -81,6 +81,18 @@ Builds are unsigned (design doc D14).
   seq arriving later are dropped as stale. Each viewer UDP socket keeps its
   own seq order (a new socket starts at 1); one not heard from for 10 s
   starts over.
+- MRM1 moves are taken only from the input owner's own UDP socket: the
+  owner's viewer address and the port its last POINTER_SYNC named. Until
+  the owner names one, and from any other socket (an old owner's late
+  datagrams after a takeover included), moves are dropped
+  (`pointer_udp_not_owner` in `stats`). The naming is cleared when the
+  owner changes, closes or goes quiet (below). This viewer names its socket
+  on each new control connection with its first move (a 0x27, then a 0x24
+  at the same position), so hover works without a click. An H2 viewer
+  before r9 names it only with a click: until its first click on a
+  connection its moves do not move the host pointer. A 0.4.x viewer never
+  sends 0x27, so its moves never do; for both, a click still lands where it
+  was made (the 0x27 or 0x24 in front of it moves the pointer).
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
@@ -107,26 +119,50 @@ Builds are unsigned (design doc D14).
   the takeover has already released them, so they change nothing.
 - If Windows refuses an up (SendInput fails), the key or button stays on
   record with no owner and the up is retried every 250 ms until it goes
-  in (`input.up_retried`, `input_up_retry` in `stats`).
+  in (`input.up_retried`, `input_up_retry` in `stats`). Until every such
+  up went in, only key and button ups are injected; every other input
+  frame (and every MRM1 move) is dropped, not kept for later
+  (`input.dropped reason=up_pending`, `input_up_pending` and
+  `pointer_udp_up_pending` in `stats`). So a new owner's C never goes in
+  under an old owner's Ctrl. Dropped rather than kept: Windows refuses
+  input while the secure desktop, a UAC prompt or a higher-integrity window
+  has it, and a replay seconds later would land wherever the user is by
+  then. The Task Manager chord stops at the first down Windows refuses and
+  owes the ups of what it pressed.
+- Liveness (a hung viewer app): this viewer sends the existing MRC1 ping
+  (0x01) on its control connection once a second from its input thread
+  (to a Windows host only; no new message or capability bit). A ping that
+  is not the connection's first frame arms the connection
+  (`input.liveness`). An armed owner that sends no ping for more than 5 s
+  loses ownership and what it holds goes up (checked every 250 ms:
+  `input.owner_silent`, `input_silenced` in `stats`); its connection is
+  closed at its next frame, unanswered (`control.silenced_closed`), and
+  the viewer reconnects. Worst case 5.25 s plus the last ping's one-way
+  time after the hang; at least about 4 s (the last ping went out up to a
+  second before). 1 s pings: a lost segment's retransmission or a short UI
+  stall (a modal loop, a slow frame) stays well inside 5 s. A viewer that
+  never pings (an older viewer, a viewer of the macOS host) is never
+  timed out: TCP alone, as before.
 - Control connections use TCP keep-alive (3 s idle, then 10 probes 1 s
   apart) and TCP_MAXRT 13 s (data the host sent that is not
   acknowledged for 13 s closes the connection). If either cannot be set,
   the connection is closed at the handshake (`control.closed
   reason=keepalive` or `reason=maxrt`) and can never own input. So what
   an owner holds is released 0 s after the viewer reconnects and sends
-  input, or about 13 s after the viewer's machine or the network goes
-  away.
+  input, about 5 s after this viewer's app hangs, or about 13 s after the
+  viewer's machine or the network goes away.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.
 
 Known limits: AltGr characters on European layouts (right Alt arrives as
 Alt), Win+L (Windows ignores it from SendInput), Ctrl+Alt+Del and anything
-on the secure desktop. If the viewer app hangs while its machine stays
-up (the OS still answers keep-alive), what it holds stays down until it
-reconnects or exits; bounding that needs an app-level heartbeat, which
-the protocol does not have yet. A replaced viewer that is still online
-can still move the pointer over MRM1 (UDP), but cannot press anything.
+on the secure desktop. An older viewer (no liveness pings) that hangs
+while its machine stays up (the OS still answers keep-alive) keeps what
+it holds down until it reconnects or exits. Input sent right after a hang
+of more than 5 s, before the viewer reconnects, is dropped (the host
+closes that connection at its next frame). A replaced viewer that is
+still online can neither move the pointer nor press anything.
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),

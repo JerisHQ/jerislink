@@ -13,8 +13,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -470,6 +472,21 @@ public:
             if (owns(&e, o)) return true;
         return false;
     }
+    // r9: an up Windows did not take is still owed (an entry no connection
+    // holds any more, which retryUnowned tries again).
+    bool anyUnowned() const {
+        for (const auto& e : keys_)
+            if (e.owners.empty()) return true;
+        for (const auto& e : buttons_)
+            if (e.owners.empty()) return true;
+        return false;
+    }
+    // r9: key v's up, sent outside any claim (the Task Manager chord), was
+    // not taken by Windows: recorded with no owner, so retryUnowned sends it
+    // again and no new input goes in until it does (InputClaims).
+    void oweKey(uint16_t v) {
+        if (!find(keys_, v)) keys_.push_back(Entry{v, {}});
+    }
 
     // Connection o went away: it lets go of its own claims only (the rule
     // above). Keys (newest press first), then buttons, that no connection
@@ -548,6 +565,49 @@ private:
     std::vector<Entry> buttons_;  // 0 left, 1 right, 2 middle; in press order
 };
 
+// MRC1 0x60, the viewer's Force Quit button: on Windows, Ctrl+Shift+Esc
+// (InputInjector::taskManager; sendKey(vk, down) is SendInput). Held keys
+// are released first so the chord is clean. Buttons stay as they are
+// (Pepper's H2 review, item 3): no up goes to Windows for them, so their
+// records stay too, and a later up or close releases them. A key whose up
+// Windows did not take stays recorded as well (InputClaims::retry tries it
+// again).
+// r9 (Pepper's review of 0d74abe, item 3): with an up still owed the chord
+// does not go at all (it would be a different chord). It goes down in
+// order and stops at the first down Windows does not take, so no part of
+// it goes in on its own (Ctrl+Esc without Shift); the keys that went down
+// come up, and an up Windows does not take is recorded (oweKey) and tried
+// again like any other. Returns true when the whole chord went in.
+template <class SendKey>
+bool taskManagerChord(HeldInput& held, SendKey&& sendKey) {
+    held.releaseKeys([&](uint16_t v) { return sendKey(v, false); });
+    if (held.anyUnowned()) return false;
+    const uint16_t chord[] = {vk::LControl, vk::LShift, vk::Escape};
+    size_t down = 0;
+    while (down < 3 && sendKey(chord[down], true)) ++down;
+    bool ok = down == 3;
+    for (size_t i = down; i-- > 0;) {
+        if (!sendKey(chord[i], false)) {
+            held.oweKey(chord[i]);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// r9 (Pepper's review of 0d74abe, item 1): a viewer that pings on its
+// control connection (once a second, from its UI thread: the viewer's
+// control_channel.hpp, kLivenessPingMs) and then sends none for more than
+// this loses input ownership, and what it holds is let go. Five missed
+// pings: a lost segment's TCP retransmission or a short UI stall (a modal
+// resize, a GPU hitch) does not end a press, and a UI frozen for longer
+// could not let go of anything anyway. From the moment the viewer's UI
+// hangs to the ups on Windows: at most 5 s + one check (host_main.cpp,
+// kUpRetryMs, 250 ms) + the last ping's one-way time; at least about 4 s
+// (the last ping went out up to a second before the hang). A dead network
+// is still TCP's (about 13 s).
+constexpr int64_t kLivenessTimeoutMs = 5'000;
+
 // r8 (Pepper's review of 6175b5e, items 1 to 4; Morris's PR-C takeover
 // rule of 2026-11-22, the newer connection wins): one input owner. Keys,
 // buttons and moves go in from one control connection at a time, the
@@ -568,21 +628,55 @@ private:
 //   owner is dropped too: an old connection never takes input back.
 // - A connection that never sends input (clipboard, ping) is never the
 //   owner and never replaced.
-// - Nothing is let go for being quiet: a key or button stays down for as
-//   long as the owner holds it, still or not.
-// - The owner's claims end with its own ups, its close, or a newer owner.
-//   TCP closes a dead owner about 13 s after the last thing the host got
-//   from it (host_main.cpp, serveControl; a connection whose keep-alive or
-//   retransmission limit cannot be set is closed before it can send).
+// - Nothing is let go for being still: a key or button stays down for as
+//   long as the owner holds it, still or not (r9: an owner that pings
+//   keeps pinging while it holds still).
+// - The owner's claims end with its own ups, its close, or a newer owner
+//   (r9: or its pings stopping, below). TCP closes a dead owner about 13 s
+//   after the last thing the host got from it (host_main.cpp,
+//   serveControl; a connection whose keep-alive or retransmission limit
+//   cannot be set is closed before it can send).
 // - An up Windows did not take stays recorded with no owner, and retry(),
 //   every 250 ms, sends it again until Windows takes it.
 //
+// r9 (Pepper's review of 0d74abe, items 1 to 3; no new message on the
+// wire either):
+// - A hung viewer app (item 1). TCP cannot tell it from a live one: the
+//   viewer's OS still answers keep-alive. A viewer that knows this host is
+//   Windows sends the existing MRC1 ping (0x01) on its control connection
+//   from its UI thread, once a second (kLivenessTimeoutMs, above, says
+//   why those numbers), so a hung app stops sending them. Only a ping
+//   after the connection's first frame counts (every viewer, old or new,
+//   sends one ping as the first frame at startup). The first such ping
+//   arms the connection (ping()). An armed owner that goes timeoutMs
+//   without a ping loses ownership (expire(), every 250 ms): its claims
+//   end (their ups go to Windows), it is silenced, so its frames are
+//   dropped and the host closes it at the next one, and a newer connection
+//   becomes the owner with its first input as before. A connection with
+//   no such ping (an older viewer, or a viewer of the macOS host) is never
+//   armed and keeps the r8 rules.
+// - MRM1 moves come from the owner only (item 2). A UDP move goes in only
+//   from the owner's own MRM1 socket: its address and the port its newest
+//   POINTER_SYNC (0x27) named (udpMove()). Until the owner names one, and
+//   from a takeover, close or expire on, no UDP move goes in, so a
+//   replaced viewer's late datagram never moves the pointer.
+// - An up before anything new (item 3). While an up Windows did not take
+//   is owed (an entry with no owner), only key and button ups go in, since
+//   they can only let go. Every other frame (a down, a move, a wheel, a
+//   POINTER_SYNC, Task Manager) and every UDP move is dropped, not kept
+//   for later: Windows refuses input while something blocks it (the secure
+//   desktop, a UAC prompt, a window of higher integrity), for as long as
+//   that lasts, and a down replayed late would land wherever the user is
+//   by then. So a new owner's C never goes in while the old owner's Ctrl
+//   may still be down: never Ctrl+C.
+//
 // Admission (with the takeover it may make) and the injection of the frame
-// are one step under this object's lock (frame()), and so are close() and
-// retry(): a frame admitted for the old owner is in, claim and all, before
-// a takeover can start, so the takeover's release covers it, and a frame
-// that comes after the takeover is dropped. Lock order: this lock, then
-// host_main.cpp's pointer lock, then InputInjector's.
+// are one step under this object's lock (frame()), and so are close(),
+// retry(), expire() and udpMove(): a frame admitted for the old owner is
+// in, claim and all, before a takeover can start, so the takeover's
+// release covers it, and a frame that comes after the takeover is dropped.
+// Lock order: this lock, then host_main.cpp's pointer lock, then
+// InputInjector's.
 class InputClaims {
 public:
     using Owner = HeldInput::Owner;
@@ -599,15 +693,21 @@ public:
         bool tookOver = false;  // o became the owner with this frame
         size_t replaced = 0;    // 1 when it took over from an owner still open
         size_t released = 0;    // ups Windows took then
+        bool blocked = false;   // r9: o is the owner, but an up is still owed: dropped (only ups go in)
+        bool silenced = false;  // r9: o lost ownership for going quiet (expire()): close it
         bool injected = false;  // what inject returned
     };
-    // One input frame from o. When o is the owner, or becomes it now,
-    // inject(HeldInput&) puts the frame in, still under the lock; otherwise
-    // inject is not called.
+    // One input frame e from o, whose peer address is ip. When o is the
+    // owner, or becomes it now, and the frame may go in, inject(HeldInput&)
+    // puts it in, still under the lock; otherwise inject is not called.
     template <class Inject, class UpKey, class UpButton>
-    Frame frame(Owner o, Inject&& inject, UpKey&& upKey, UpButton&& upButton) {
+    Frame frame(Owner o, uint32_t ip, const InputEvent& e, Inject&& inject, UpKey&& upKey, UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         Frame r;
+        if (silenced_.count(o)) {
+            r.silenced = true;
+            return r;
+        }
         if (o != owner_) {
             if (o <= newest_) return r;  // replaced, or older than the newest owner
             if (owner_) {
@@ -615,9 +715,17 @@ public:
                 r.released = held_.releaseOwned(owner_, upKey, upButton);
             }
             owner_ = newest_ = o;
+            udp_ = Endpoint{};
             r.tookOver = true;
         }
         r.admitted = true;
+        // r9: the owner's MRM1 socket, from its own POINTER_SYNC (port 0:
+        // that position went by TCP; nothing to name).
+        if (e.kind == InputEvent::Kind::PointerSync && e.port) udp_ = Endpoint{true, ip, e.port};
+        if (held_.anyUnowned() && !isUp(e)) {
+            r.blocked = true;
+            return r;
+        }
         r.injected = inject(held_);
         return r;
     }
@@ -627,7 +735,12 @@ public:
     template <class UpKey, class UpButton>
     size_t close(Owner o, UpKey&& upKey, UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
-        if (owner_ == o) owner_ = 0;
+        if (owner_ == o) {
+            owner_ = 0;
+            udp_ = Endpoint{};
+        }
+        lastPing_.erase(o);
+        silenced_.erase(o);
         return held_.releaseOwned(o, upKey, upButton);
     }
     // Ups Windows did not take, tried again (HeldInput::retryUnowned).
@@ -636,6 +749,57 @@ public:
     size_t retry(UpKey&& upKey, UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         return held_.retryUnowned(upKey, upButton);
+    }
+
+    // r9: a liveness ping from o at nowMs (one that was not o's first
+    // frame). Returns true when o was silenced: the host closes it.
+    bool ping(Owner o, int64_t nowMs) {
+        std::lock_guard<std::mutex> g(m_);
+        if (silenced_.count(o)) return true;
+        lastPing_[o] = nowMs;
+        return false;
+    }
+    struct Expired {
+        Owner owner = 0;       // the owner that went quiet; 0: none did
+        int64_t silentMs = 0;  // since its last ping
+        size_t released = 0;   // ups Windows took
+    };
+    // r9: the owner, if armed (it has pinged) and quiet for more than
+    // timeoutMs at nowMs, loses ownership: its claims end, it is silenced,
+    // and no connection is the owner until a newer one sends input
+    // (newest_ stays, so no older connection takes input back).
+    template <class UpKey, class UpButton>
+    Expired expire(int64_t nowMs, int64_t timeoutMs, UpKey&& upKey, UpButton&& upButton) {
+        std::lock_guard<std::mutex> g(m_);
+        Expired x;
+        if (!owner_) return x;
+        const auto it = lastPing_.find(owner_);
+        if (it == lastPing_.end() || nowMs - it->second <= timeoutMs) return x;
+        x.owner = owner_;
+        x.silentMs = nowMs - it->second;
+        silenced_.insert(owner_);
+        x.released = held_.releaseOwned(owner_, upKey, upButton);
+        owner_ = 0;
+        udp_ = Endpoint{};
+        return x;
+    }
+
+    // r9: what became of an MRM1 pointer move from (ip, port).
+    enum class Udp {
+        Moved,      // move() went in
+        Stale,      // move() returned false (an older seq)
+        NotOwner,   // not the owner's MRM1 socket, or no owner: dropped
+        UpPending,  // an up is still owed: dropped
+    };
+    // r9: an MRM1 pointer move from (ip, port). move() (the host takes its
+    // pointer lock in it) runs only for the owner's own socket and only
+    // while no up is owed, under this lock.
+    template <class Move>
+    Udp udpMove(uint32_t ip, uint16_t port, Move&& move) {
+        std::lock_guard<std::mutex> g(m_);
+        if (!owner_ || !udp_.named || udp_.ip != ip || udp_.port != port) return Udp::NotOwner;
+        if (held_.anyUnowned()) return Udp::UpPending;
+        return move() ? Udp::Moved : Udp::Stale;
     }
 
     // The input owner; 0 when there is none.
@@ -654,10 +818,21 @@ public:
     }
 
 private:
+    static bool isUp(const InputEvent& e) {
+        return (e.kind == InputEvent::Kind::Key || e.kind == InputEvent::Kind::Button) && !e.down;
+    }
+    struct Endpoint {
+        bool named = false;
+        uint32_t ip = 0;
+        uint16_t port = 0;
+    };
     mutable std::mutex m_;
     Owner next_ = 1;
     Owner owner_ = 0;   // the input owner, 0 none
     Owner newest_ = 0;  // the newest connection that has been the owner
+    Endpoint udp_;      // r9: the owner's MRM1 socket, once its POINTER_SYNC named it
+    std::map<Owner, int64_t> lastPing_;  // r9: armed connections, and their last liveness ping
+    std::set<Owner> silenced_;           // r9: owners that went quiet and are not closed yet
     HeldInput held_;
 };
 

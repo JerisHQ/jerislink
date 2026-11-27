@@ -67,6 +67,12 @@ inline bool pointerSyncFor(const std::optional<Info>& i) {
     return i && i->windows() && (i->caps & kCapPointerSync) != 0;
 }
 
+// H2 r9 (Pepper's review of 0d74abe, item 1): a Windows host gets the
+// liveness pings (control_channel.hpp livenessTick): the existing MRC1 ping,
+// no cap bit. One that does not time out only answers them. A macOS host
+// gets none, so its control connection carries what it did before.
+inline bool livenessFor(const std::optional<Info>& i) { return i && i->windows(); }
+
 // The first n bytes waiting on the socket could be a HOST_INFO frame: the
 // header so far matches MRC1 v1 type 0x06 and, once the length is there, it
 // is one HOST_INFO can have.

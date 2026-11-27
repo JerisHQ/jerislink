@@ -766,9 +766,12 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
     // A click that waits for a control reconnect is queued with this. H2:
     // with the seq of its datagram, for the POINTER_SYNC of a Windows host.
+    // H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes these
+    // moves only from the UDP socket its input owner named, so the channel
+    // names it once per control connection (notePointerUdp).
     if (udpInput) {
         const bool ok = gMouseMoveUdp->sendNormalized(qx, qy);
-        if (gControl) gControl->notePointer(qx, qy, gMouseMoveUdp->lastPointerSeq(), gMouseMoveUdp->localPort());
+        if (gControl) gControl->notePointerUdp(qx, qy, gMouseMoveUdp->lastPointerSeq(), gMouseMoveUdp->localPort());
         return ok;
     }
     gControl->notePointer(qx, qy);
@@ -821,7 +824,8 @@ static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
             " format=" + std::to_string(info.format) + " caps=" + caps +
             " monitors=" + std::to_string(info.monitors) + " version=" + info.version +
             " keymap=" + (gKeys.passthrough() ? "passthrough" : jl::keymap::presetName(gKeys.preset())) +
-            " pointer_sync=" + (sync ? "on" : "off"));
+            " pointer_sync=" + (sync ? "on" : "off") +
+            " liveness=" + (gControl && gControl->liveness() ? "on" : "off"));
     if (changed && gOverlayTip) {
         TTTOOLINFOW ti{};
         ti.cbSize = sizeof(ti);
@@ -6758,6 +6762,12 @@ static int appMain(int argc, char** argv) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
             }
+            // H2 r9 (Pepper's review of 0d74abe, item 1): to a Windows host,
+            // a liveness ping on the control connection every second, from
+            // this (the input) thread: a hung viewer stops sending them and
+            // the host lets go of its keys and buttons. Not a read-only view
+            // (no gControl: it never holds anything).
+            if (gControl) gControl->livenessTick(now);
             if (audio && now - lastAudioRequest >= std::chrono::seconds(1)) {
                 // Keep-alive: the host stops capturing 3 s after the last request.
                 mouseMoveUdp->sendAudioRequest(true, audio->port());
@@ -7283,6 +7293,9 @@ static int appMain(int argc, char** argv) {
                 << " control_cancelled_in_flight=" << (control ? control->reconnectStats().cancelledInFlight : 0)
                 << " control_owed_before_input=" << (control ? control->reconnectStats().owedBeforeInput : 0)
                 << " control_paused_drops=" << (control ? control->reconnectStats().pausedDrops : 0)
+                << " control_liveness_pings=" << (control ? control->reconnectStats().livenessPings : 0)
+                << " control_pongs=" << (control ? control->reconnectStats().pongs : 0)
+                << " control_pointer_binds=" << (control ? control->reconnectStats().pointerBinds : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
                 << " mouse_udp_input_blocked=" << (mouseMoveUdp ? mouseMoveUdp->inputBlocked() : 0)
