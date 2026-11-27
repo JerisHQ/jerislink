@@ -20,6 +20,8 @@ JerisLink is a low-latency remote desktop for your [Tailscale](https://tailscale
 
 Each release's `SHA256SUMS.txt` covers the files the release workflow builds: the Mac zip, `setup.exe` and the portable zip. A `-store-signed.msix` attached to a release later is not in it; its SHA-256 is the `sha256:` digest shown next to the file on the release page. Details: [Code signing](#code-signing).
 
+The [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N) version of the Windows viewer is submitted by the [`msstore-publish`](.github/workflows/msstore-publish.yml) workflow through the Microsoft Store submission API, using the in-repo [`MsStoreRunner.psm1`](.github/scripts/MsStoreRunner.psm1). The same submission flow has been extracted into a reusable GitHub Action, [JerisHQ/msstore-submission-action](https://github.com/JerisHQ/msstore-submission-action) ([GitHub Marketplace](https://github.com/marketplace/actions/microsoft-store-submission-by-submission-id)).
+
 ## Quick start
 
 You need a Mac with Apple silicon on macOS 14 or later, a Windows 10 or 11 x64 PC (Windows 10 version 1809 or later for the Microsoft Store version), and Tailscale signed in to the same tailnet on both. Note each machine's Tailscale IPv4 address (`100.x.y.z`, shown in the Tailscale menu or by `tailscale ip -4`).
