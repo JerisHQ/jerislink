@@ -25,6 +25,19 @@ std::string hr(const char* what, HRESULT h) {
     return b;
 }
 
+HRESULT makeStaging(ID3D11Device* device, UINT w, UINT h, ID3D11Texture2D** out) {
+    D3D11_TEXTURE2D_DESC sd{};
+    sd.Width = w;
+    sd.Height = h;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    return device->CreateTexture2D(&sd, nullptr, out);
+}
+
 std::string narrow(const wchar_t* w) {
     std::string s;
     for (; *w; ++w) s.push_back(*w < 128 ? char(*w) : '?');
@@ -82,7 +95,8 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
     close();
     impl_ = new Impl;
     std::string ddaError;
-    if (mode != CaptureMode::Gdi) {
+    if (mode == CaptureMode::Auto && !ddaUnusable_.empty()) ddaError = "dda.disabled " + ddaUnusable_;
+    else if (mode != CaptureMode::Gdi) {
         IDXGIFactory1* factory = nullptr;
         HRESULT h = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
         if (FAILED(h)) ddaError = hr("dda.factory", h);
@@ -121,8 +135,14 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
                 ddaError = "dda.rotated rotation=" + std::to_string(int(dd.Rotation));
                 release(impl_->dup);
             }
+            // Staging is made here so a device that cannot make one sends Auto
+            // to GDI; acquire() remakes it if a frame comes back another size.
+            if (impl_->dup && FAILED(h = makeStaging(impl_->device, dd.ModeDesc.Width, dd.ModeDesc.Height,
+                                                     &impl_->staging))) {
+                ddaError = hr("dda.staging", h);
+                release(impl_->dup);
+            }
             if (impl_->dup) {
-                // The staging texture is sized from the first acquired frame.
                 impl_->w = int(dd.ModeDesc.Width);
                 impl_->h = int(dd.ModeDesc.Height);
                 impl_->backend = CaptureMode::Dda;
@@ -209,25 +229,18 @@ int ScreenCapture::acquire(int timeoutMs, CapturedFrame& out, std::string& error
     // the frame DDA actually returned, not from the mode description.
     D3D11_TEXTURE2D_DESC td{};
     tex->GetDesc(&td);
+    // These two would fail the same way after a reopen: mark DDA unusable
+    // so Auto moves to GDI instead of reopening DDA forever.
     if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
-        error = "dda.format " + std::to_string(int(td.Format));
+        error = ddaUnusable_ = "dda.format " + std::to_string(int(td.Format));
         release(tex);
         return -1;
     }
-    if (!m.staging || int(td.Width) != m.w || int(td.Height) != m.h) {
+    if (int(td.Width) != m.w || int(td.Height) != m.h) {
         release(m.staging);
-        D3D11_TEXTURE2D_DESC sd{};
-        sd.Width = td.Width;
-        sd.Height = td.Height;
-        sd.MipLevels = 1;
-        sd.ArraySize = 1;
-        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        sd.SampleDesc.Count = 1;
-        sd.Usage = D3D11_USAGE_STAGING;
-        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        h = m.device->CreateTexture2D(&sd, nullptr, &m.staging);
+        h = makeStaging(m.device, td.Width, td.Height, &m.staging);
         if (FAILED(h)) {
-            error = hr("dda.staging", h);
+            error = ddaUnusable_ = hr("dda.staging", h);
             release(tex);
             return -1;
         }

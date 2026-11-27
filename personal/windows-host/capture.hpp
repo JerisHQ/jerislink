@@ -39,6 +39,10 @@ public:
 private:
     struct Impl;
     Impl* impl_ = nullptr;
+    // Set when DDA opens but cannot hand back frames we can use (staging
+    // texture, pixel format). Reopening would hit it again, so Auto then
+    // uses GDI for the rest of the process.
+    std::string ddaUnusable_;
 };
 
 }  // namespace jlh

@@ -62,6 +62,18 @@ std::vector<uint8_t> sequenceHeader(IMFTransform* t) {
     return out;
 }
 
+// How ProcessOutput wants its sample: who allocates it and how big. Read
+// after every output type change, since a new type can change both.
+HRESULT readOutputStreamInfo(IMFTransform* t, int width, int height, bool& providesSamples, DWORD& bufferBytes) {
+    MFT_OUTPUT_STREAM_INFO info{};
+    const HRESULT h = t->GetOutputStreamInfo(0, &info);
+    if (FAILED(h)) return h;
+    providesSamples =
+        (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+    bufferBytes = info.cbSize ? info.cbSize : DWORD(width) * DWORD(height) * 2;
+    return S_OK;
+}
+
 }  // namespace
 
 constexpr int kMaxStreamChanges = 2;
@@ -149,11 +161,8 @@ bool MfH264Encoder::open(const EncoderConfig& cfg, std::string& error) {
     setU32(api, CODECAPI_AVEncMPVGOPSize, ULONG(cfg.gopFrames));
     setBool(api, CODECAPI_AVLowLatencyMode, true);
 
-    MFT_OUTPUT_STREAM_INFO info{};
-    impl_->mft->GetOutputStreamInfo(0, &info);
-    impl_->providesSamples = (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
-                                              MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
-    impl_->outputBufferBytes = info.cbSize ? info.cbSize : DWORD(cfg.width) * DWORD(cfg.height) * 2;
+    h = readOutputStreamInfo(impl_->mft, cfg.width, cfg.height, impl_->providesSamples, impl_->outputBufferBytes);
+    if (FAILED(h)) { error = hr("encoder.output_info", h); close(); return false; }
     impl_->header = sequenceHeader(impl_->mft);
 
     impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -224,6 +233,9 @@ bool MfH264Encoder::encode(const uint8_t* nv12, int64_t ts, bool forceKeyframe, 
                 t->Release();
             }
             if (FAILED(h)) { error = hr("encoder.stream_change", h); return false; }
+            h = readOutputStreamInfo(impl_->mft, cfg_.width, cfg_.height, impl_->providesSamples,
+                                     impl_->outputBufferBytes);
+            if (FAILED(h)) { error = hr("encoder.stream_change_info", h); return false; }
             impl_->header = sequenceHeader(impl_->mft);
             continue;
         }

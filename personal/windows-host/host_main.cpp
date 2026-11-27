@@ -198,14 +198,16 @@ std::string ipString(const in_addr& a) {
 
 // deadlineMs < 0: no deadline (the socket blocks). Otherwise every recv
 // gets only the time left, so a peer trickling bytes cannot hold the
-// handshake open past the deadline.
+// handshake open past the deadline. If the timeout cannot be set, the read
+// fails rather than block without one.
 bool recvExact(SOCKET s, uint8_t* p, size_t n, int64_t deadlineMs = -1) {
     while (n) {
         if (deadlineMs >= 0) {
             const int64_t left = deadlineMs - msSinceStart();
             if (left <= 0) return false;
             const DWORD t = DWORD(left);
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+            if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t)) != 0)
+                return false;
         }
         const int r = recv(s, reinterpret_cast<char*>(p), int(n), 0);
         if (r <= 0) return false;
@@ -261,7 +263,10 @@ void serveControl(State& st, SOCKET c, std::string peer) {
     const uint8_t open = jlh::kAuthOpenIpOnly;
     if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1))) return;
     const DWORD noTimeout = 0;  // the viewer keeps idle channels open
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout));
+    if (setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout)) != 0) {
+        logf("control.closed peer=%s reason=rcvtimeo err=%d", peer.c_str(), WSAGetLastError());
+        return;
+    }
     ++st.controlConnections;
     guard.established = true;
     touch(st);
