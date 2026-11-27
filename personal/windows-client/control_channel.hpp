@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "conn_auth.hpp"
+#include "host_info.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,6 +32,9 @@ struct VideoConfigResult {
     uint16_t bitrateMbps = 25;
     uint16_t remoteWidth = 0;
     uint16_t remoteHeight = 0;
+    // H2 (design D10): the MRC1 0x06 HOST_INFO a Windows host sent behind
+    // this ACK. None (a macOS host): the host is a Mac.
+    std::optional<jl::hostinfo::Info> hostInfo;
 };
 
 class ControlChannel {
@@ -428,6 +432,7 @@ public:
               (reply.size()==6 || reply.size()==10) && reply[0]==1)) {
             return VideoExchange::Failed;
         }
+        readHostInfoAfterAck(s, result.hostInfo, cancel);
 
         const uint8_t status = reply[1];
         const uint8_t selected = reply[2];
@@ -452,6 +457,37 @@ public:
             result.remoteHeight = uint16_t((uint16_t(reply[8]) << 8) | reply[9]);
         }
         return VideoExchange::Ok;
+    }
+
+    // H2 (design D10): a Windows host sends one MRC1 0x06 HOST_INFO right
+    // behind the first 0x41 ACK of a connection, in the same send(). It is
+    // read here when it is already waiting, or its start is (then up to
+    // kHostInfoWaitMs for the rest), so it never sits in front of a later
+    // notice. Nothing waiting (a macOS host sends none): no wait at all.
+    // Other bytes are left alone. One that arrives later is read by
+    // pollHostNotice.
+    static constexpr int kHostInfoWaitMs = 50;
+    static void readHostInfoAfterAck(SOCKET s, std::optional<jl::hostinfo::Info>& out,
+                                     const std::atomic<bool>* cancel) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHostInfoWaitMs);
+        uint8_t b[jl::hostinfo::kMaxFrameBytes];
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return;
+            const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
+            if (n <= 0 || !jl::hostinfo::isFramePrefix(b, size_t(n))) return;
+            if (const size_t total = jl::hostinfo::completeFrameBytes(b, size_t(n))) {
+                if (recvExactOn(s, b, total))
+                    out = jl::hostinfo::decode(b + jl::hostinfo::kHeaderBytes, total - jl::hostinfo::kHeaderBytes);
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return;
+            if (cancel && cancel->load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
     }
 
     VideoConfigResult negotiateVideo(
@@ -496,6 +532,13 @@ public:
         std::lock_guard<std::mutex> g(async_->m);
         return std::exchange(async_->renegotiated, std::nullopt);
     }
+    // UI thread: a HOST_INFO pollHostNotice read on the live socket (its
+    // bytes came after the ACK had been read), once.
+    std::optional<jl::hostinfo::Info> takeHostInfo() {
+        if (!async_) return std::nullopt;
+        std::lock_guard<std::mutex> g(async_->m);
+        return std::exchange(async_->hostInfo, std::nullopt);
+    }
     // Tests (r5): runs on the worker before each renegotiation exchange,
     // without the lock.
     void setBeforeRenegotiateForTest(std::function<void()> fn) {
@@ -524,6 +567,9 @@ public:
     // launch screen says why. The Mac closed without it: the socket is
     // closed here and the next input reconnects as before. Bytes that are
     // not that notice are left alone. One zero-timeout select when idle.
+    // H2: a whole MRC1 0x06 HOST_INFO in front (a Windows host's, split from
+    // its ACK) is read and kept for takeHostInfo(), then the notice check
+    // runs on what follows; part of one: left for the next poll.
     bool pollHostNotice() {
         std::shared_ptr<Async> a = async_;
         if (!a) return false;
@@ -534,13 +580,25 @@ public:
             s = a->s;
         }
         if (s == INVALID_SOCKET) return false;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(s, &rd);
-        timeval tv{0, 0};
-        if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-        uint8_t b[kHostNoticeBytes]{};
-        const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
+        uint8_t b[jl::hostinfo::kMaxFrameBytes]{};
+        int n = 0;
+        for (int round = 0;; ++round) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
+            n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
+            if (round > 0 || n <= 0 || !jl::hostinfo::isFramePrefix(b, size_t(n))) break;
+            const size_t total = jl::hostinfo::completeFrameBytes(b, size_t(n));
+            if (!total) return false;  // the rest of it is on its way
+            if (recv(s, reinterpret_cast<char*>(b), int(total), 0) != int(total)) return false;
+            if (auto info = jl::hostinfo::decode(b + jl::hostinfo::kHeaderBytes, total - jl::hostinfo::kHeaderBytes)) {
+                std::lock_guard<std::mutex> g(a->m);
+                a->hostInfo = std::move(info);
+            }
+        }
+        n = std::min(n, kHostNoticeBytes);
         const bool replaced = isReplacedNotice(b, n);
         if (n > 0 && !replaced) return false;  // partial or other bytes: not ours to read
         if (replaced) {
@@ -762,6 +820,7 @@ private:
         std::vector<uint8_t> renegotiate;
         bool renegotiateHevc = false;
         std::optional<VideoConfigResult> renegotiated;
+        std::optional<jl::hostinfo::Info> hostInfo;  // H2: read by pollHostNotice, for takeHostInfo()
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };

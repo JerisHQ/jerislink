@@ -420,6 +420,12 @@ static constexpr UINT WM_MR_AUTH_PREFLIGHT = WM_APP + 0x60;  // launch screen, w
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
+// H2 (design D10): the host of this session sent HOST_INFO platform 2. Keys
+// then go through as the Windows keys they are (keymap.hpp pass-through) and
+// the words say Windows PC. Reset at each session start: no HOST_INFO is a
+// Mac.
+static bool gHostWindows = false;
+static const wchar_t* hostNoun() { return gHostWindows ? L"Windows PC" : L"Mac"; }
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -579,6 +585,9 @@ static HCURSOR cursorForRemoteShape(uint8_t shape) {
     case 9:  id = IDC_HAND; break;
     case 10: id = IDC_NO; break;
     case 11: id = IDC_IBEAM; break;
+    case 12: id = IDC_WAIT; break;         // H2, Windows host: busy
+    case 13: id = IDC_APPSTARTING; break;  // H2: working in background
+    case 14: id = IDC_SIZEALL; break;      // H2: move
     default: id = IDC_ARROW; break;
     }
     return LoadCursorW(nullptr, id);
@@ -754,6 +763,35 @@ static void releaseRemoteModifiers() {
     gPasteGate.modifiersReleased();
     if (!gControl) return;
     for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
+}
+
+static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
+// H2: what the host said it is (MRC1 0x06 HOST_INFO), from the start-up
+// ACK, a read-only renegotiation or a later poll. Windows: the keymap goes
+// to pass-through (the saved preset stays and still applies to Mac hosts).
+// A switch mid-session releases remote modifiers first. Logs the platform,
+// capabilities and version only.
+static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
+    const bool win = info.windows();
+    const bool changed = win != gHostWindows;
+    if (changed && via != std::string("startup")) releaseRemoteModifiers();
+    gHostWindows = win;
+    if (changed) gKeys.setPassthrough(win);
+    char caps[16];
+    std::snprintf(caps, sizeof(caps), "0x%02x", unsigned(info.caps));
+    logLine(std::string("host.info via=") + via +
+            " platform=" + (win ? "windows" : info.platform == jl::hostinfo::kPlatformMac ? "macos" : "unknown") +
+            " format=" + std::to_string(info.format) + " caps=" + caps +
+            " monitors=" + std::to_string(info.monitors) + " version=" + info.version +
+            " keymap=" + (gKeys.passthrough() ? "passthrough" : jl::keymap::presetName(gKeys.preset())));
+    if (changed && gOverlayTip) {
+        TTTOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.hwnd = GetParent(gOverlayTip);
+        ti.uId = 1;
+        ti.lpszText = const_cast<wchar_t*>(jl::overlay::tooltipFor(jl::overlay::Item::ForceQuit, gHostWindows));
+        SendMessageW(gOverlayTip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
 }
 
 static void sendRemoteButtonUp(uint8_t button) {
@@ -2122,7 +2160,6 @@ static void runSessionModalTick() {
 namespace ov = jl::overlay;
 
 static HWND gOverlay = nullptr;
-static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
 static bool gOverlayKeyboard = false;  // opened with Ctrl+Alt+O: focus ring, keys
 static ov::Item gOverlayFocus = ov::Item::Mute;
 static ov::Item gOverlayHot = ov::Item::None;
@@ -2275,6 +2312,8 @@ static void filePanelToggle(const char* source);  // F4, below
 // Accessibility instead. Every remote modifier is released first and the
 // local shortcut state is reset like on focus loss, so nothing stays held on
 // either side. A host without 0x60 logs it as unknown and does nothing.
+// H2: a Windows host answers the same 0x60 by pressing Ctrl+Shift+Esc there
+// (Task Manager); the button says so (gHostWindows).
 // overlay.action item=force_quit records that the button was used.
 static void forceQuitMac() {
     gKeys.reset();
@@ -2313,7 +2352,7 @@ static void overlayActivate(ov::Item item, const char* source) {
         filePanelToggle(source);
         break;
     case ov::Item::ForceQuit:
-        overlayHide("action");  // so the Mac's Force Quit window is in view
+        overlayHide("action");  // so the Force Quit window (Task Manager) is in view
         forceQuitMac();
         break;
     case ov::Item::Disconnect:
@@ -2516,7 +2555,7 @@ static void paintOverlay(HWND hwnd) {
     overlayText(dc, L"Connected", RECT{st.left + dot + s(8), st.top, st.right, mid}, t.label,
                 c::kText, DT_LEFT | DT_VCENTER);
     const std::wstring host = gSessionHostLabel.empty()
-        ? std::wstring(L"Mac") : L"Mac " + wideFromAscii(gSessionHostLabel);
+        ? std::wstring(hostNoun()) : std::wstring(hostNoun()) + L" " + wideFromAscii(gSessionHostLabel);
     overlayText(dc, host, RECT{st.left, mid, st.right, st.bottom}, t.smallText, c::kMuted,
                 DT_LEFT | DT_VCENTER);
 
@@ -2559,7 +2598,8 @@ static void paintOverlay(HWND hwnd) {
     overlayButton(dc, toRECT(l.info), L"Info", ov::Item::Info, c::kText, dpi);
     overlayButton(dc, toRECT(l.settings), L"Settings", ov::Item::Settings, c::kText, dpi);
     overlayButton(dc, toRECT(l.files), L"Files", ov::Item::Files, c::kText, dpi);
-    overlayButton(dc, toRECT(l.forceQuit), L"Force Quit", ov::Item::ForceQuit, c::kText, dpi);
+    overlayButton(dc, toRECT(l.forceQuit), gHostWindows ? L"Task Manager" : L"Force Quit", ov::Item::ForceQuit,
+                  c::kText, dpi);
     overlayButton(dc, toRECT(l.disconnect), L"Disconnect", ov::Item::Disconnect, c::kError, dpi);
 
     if (gOverlayKeyboard) {
@@ -2580,13 +2620,14 @@ static void paintOverlay(HWND hwnd) {
     jl::ui::fillRect(dc, RECT{l.hint.left, l.bar.bottom - 1, l.hint.right, l.bar.bottom},
                      c::kBorder);
     // The hovered (or keyboard-focused) item's tooltip replaces the hint.
-    const wchar_t* tip = ov::tooltipFor(gOverlayHot);
-    if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus);
+    const wchar_t* tip = ov::tooltipFor(gOverlayHot, gHostWindows);
+    if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus, gHostWindows);
     // Host in transition mode (design §8): the idle hint becomes a yellow
     // warning that anyone on the allowed IP can connect without a password.
     const auto authNow = jl::auth::current();
     if (!tip && authNow && authNow->transition()) {
-        overlayText(dc, L"No connection password set on this Mac (IP check only)",
+        overlayText(dc, gHostWindows ? L"No connection password set on this PC (IP check only)"
+                                     : L"No connection password set on this Mac (IP check only)",
                     toRECT(l.hint), t.smallText, c::kWarning, DT_LEFT | DT_VCENTER);
     } else {
         overlayText(dc,
@@ -2737,7 +2778,7 @@ static void overlayCreate(HWND viewer) {
         ti.uFlags = TTF_SUBCLASS;
         ti.hwnd = gOverlay;
         ti.uId = 1;
-        ti.lpszText = const_cast<wchar_t*>(ov::tooltipFor(ov::Item::ForceQuit));
+        ti.lpszText = const_cast<wchar_t*>(ov::tooltipFor(ov::Item::ForceQuit, gHostWindows));
         SendMessageW(gOverlayTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
     } else {
         logLine("overlay.tooltip_failed error=" + std::to_string(GetLastError()));
@@ -6187,6 +6228,9 @@ static int appMain(int argc, char** argv) {
         {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
             gControl = o.controlEnabled ? control.get() : nullptr;
+            // H2: a Mac until the host says otherwise (HOST_INFO).
+            gHostWindows = false;
+            gKeys.setPassthrough(false);
             if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");
             // Startup negotiation may traverse a degraded Tailscale/DERP path.
             // Give the initial handshake enough headroom, then restore the
@@ -6212,6 +6256,7 @@ static int appMain(int argc, char** argv) {
 
                 const auto videoConfig = control->negotiateVideo(
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
+                if (videoConfig.hostInfo) applyHostInfo(*videoConfig.hostInfo, "startup");
                 if (videoConfig.negotiated) {
                     videoNegotiatedAtStart = true;
                     effectiveCodec = videoConfig.codec;
@@ -6701,6 +6746,7 @@ static int appMain(int argc, char** argv) {
                 // attempt (gAuthHalt, next iteration), no reconnect.
                 if (control) {
                     control->pollHostNotice();
+                    if (const auto hi = control->takeHostInfo()) applyHostInfo(*hi, "poll");
                     // Read-only: no input ever asks for a reconnect, so the
                     // session is brought back here when it dropped.
                     if (!o.controlEnabled) {
@@ -6729,6 +6775,7 @@ static int appMain(int argc, char** argv) {
                         // renegotiated on a new control session; apply what
                         // the Mac offers now. Nothing here waits.
                         if (const auto vc = control->takeRenegotiated()) {
+                            if (vc->hostInfo) applyHostInfo(*vc->hostInfo, "renegotiate");
                             if (vc->negotiated && vc->codec == effectiveCodec) {
                                 hostSupportsAudio = vc->hostSupportsAudio;
                                 // NACK stays as the start set it: the
@@ -6948,8 +6995,8 @@ static int appMain(int argc, char** argv) {
                         // Back to the launch screen with the reason.
                         gRelaunch = true;
                         gRelaunchNote = gotAny
-                            ? L"The connection was lost: no video from the Mac for a while."
-                            : L"The Mac did not answer. Check that the JerisLink host is running.";
+                            ? std::wstring(L"The connection was lost: no video from the ") + hostNoun() + L" for a while."
+                            : std::wstring(L"The ") + hostNoun() + L" did not answer. Check that the JerisLink host is running.";
                         logLine(gotAny ? "session.end reason=idle-timeout"
                                        : "session.end reason=startup-timeout");
                         break;

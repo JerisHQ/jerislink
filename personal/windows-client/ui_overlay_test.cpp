@@ -98,6 +98,14 @@ void focusTests() {
            "Force Quit tooltip names the chord");
     expect(tooltipFor(Item::Disconnect) == nullptr && tooltipFor(Item::Files) == nullptr,
            "other items have no tooltip");
+    // H2: on a Windows host the same button opens Task Manager.
+    expect(tooltipFor(Item::ForceQuit, true) != nullptr &&
+               std::wstring(tooltipFor(Item::ForceQuit, true)) == L"Open Task Manager (Ctrl+Shift+Esc)",
+           "Windows host: the button's tooltip names Task Manager");
+    expect(std::wstring(tooltipFor(Item::ForceQuit, false)) == L"Force Quit Mac apps (Cmd+Option+Esc)",
+           "Mac host: tooltip unchanged");
+    expect(tooltipFor(Item::Disconnect, true) == nullptr && tooltipFor(Item::Files, true) == nullptr,
+           "Windows host: other items still have no tooltip");
 }
 
 void sliderTests() {

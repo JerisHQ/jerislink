@@ -57,6 +57,7 @@ struct ScreenCapture::Impl {
     bool frameHeld = false;
     bool mapped = false;
     int w = 0, h = 0;
+    int left = 0, top = 0;  // DesktopCoordinates of the output (GDI: the primary screen, 0,0)
     // GDI
     HDC screenDc = nullptr, memDc = nullptr;
     HBITMAP bitmap = nullptr;
@@ -73,6 +74,11 @@ const char* ScreenCapture::backend() const {
 }
 
 std::string ScreenCapture::describe() const { return impl_ ? impl_->description : std::string(); }
+
+DesktopRect ScreenCapture::desktopRect() const {
+    if (!impl_ || impl_->backend == CaptureMode::Auto) return DesktopRect{};
+    return DesktopRect{impl_->left, impl_->top, impl_->w, impl_->h};
+}
 
 void ScreenCapture::close() {
     if (!impl_) return;
@@ -116,6 +122,8 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
             DXGI_OUTPUT_DESC od{};
             output->GetDesc(&od);
             impl_->description = "adapter=\"" + narrow(ad.Description) + "\" output=\"" + narrow(od.DeviceName) + "\"";
+            impl_->left = int(od.DesktopCoordinates.left);
+            impl_->top = int(od.DesktopCoordinates.top);
             const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
             h = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
                                   UINT(std::size(levels)), D3D11_SDK_VERSION, &impl_->device, nullptr, &impl_->ctx);
@@ -158,6 +166,8 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
         }
     }
     // GDI fallback: the primary screen.
+    impl_->left = 0;
+    impl_->top = 0;
     impl_->w = GetSystemMetrics(SM_CXSCREEN);
     impl_->h = GetSystemMetrics(SM_CYSCREEN);
     impl_->screenDc = GetDC(nullptr);

@@ -32,6 +32,8 @@
 // PR-C r5: a read-only view renegotiates its video configuration on every
 // new control session, on the worker; a failed send hands the socket to the
 // worker, which reads the "replaced" notice (the UI thread never waits).
+// H2: a Windows host's MRC1 0x06 HOST_INFO behind the ACK is read with it
+// or later by pollHostNotice, and never hides a "replaced" notice.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -2696,6 +2698,106 @@ void prcR14RetryCapTests() {
 }
 }  // namespace
 
+// H2 (design D10): a Windows host sends MRC1 0x06 HOST_INFO right behind
+// the first ACK of a connection. A read-only view renegotiates on every new
+// control session, so each session is one case: ACK and HOST_INFO in one
+// write (read with the ACK), a Mac (none, nothing waits for it), HOST_INFO
+// split from the ACK (reaches the viewer exactly once, with the ACK or by
+// poll), and one arriving on the live socket with the "replaced" notice
+// right behind it (pollHostNotice reads it for takeHostInfo, and the notice
+// still halts the attempt).
+void h2HostInfoTest() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, true);
+    const Bytes info{1, 2, 0, 0, 0, 0x0F, 1, 11, '0', '.', '4', '.', '1', '-', 'h', '2', 'd', 'e', 'v'};
+    const Bytes infoFrame = frame(0x06, info.data(), info.size());
+    const Bytes ack{1, 0, 1, 0x20, 0, 25};
+    const Bytes ackFrame = frame(0x41, ack.data(), ack.size());
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    bool auth[4] = {};
+    std::thread host([&] {
+        for (int i = 0; i < 4; ++i) {
+            SOCKET s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth[i] = hostAuth(s, sec, Answer::Ok, 50);
+            readFrames(s, 1, 3000);
+            Bytes out = ackFrame;
+            if (i == 0) out.insert(out.end(), infoFrame.begin(), infoFrame.end());
+            if (i == 2) out.insert(out.end(), infoFrame.begin(), infoFrame.begin() + 5);
+            sendAllBytes(s, out);
+            if (i == 2) {
+                Sleep(10);
+                sendAllBytes(s, Bytes(infoFrame.begin() + 5, infoFrame.end()));
+            }
+            if (i == 3) {
+                Sleep(300);  // live for a while first
+                Bytes late = infoFrame;
+                late.insert(late.end(), notice, notice + sizeof(notice));
+                sendAllBytes(s, late);
+                shutdown(s, SD_SEND);
+                Sleep(1000);
+            } else {
+                Sleep(400);  // live for a while, then the host goes away
+            }
+            closesocket(s);
+        }
+    });
+    UiClock ui;
+    std::vector<VideoConfigResult> answers;
+    std::vector<std::pair<size_t, jl::hostinfo::Info>> polled;  // answers taken by then, info
+    for (int i = 0; i < 1500 && terminals == 0; ++i) {
+        ui.call([&] {
+            if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+            control.pollHostNotice();
+            if (auto h = control.takeHostInfo()) polled.emplace_back(answers.size(), *h);
+            control.keepSession();
+            return true;
+        });
+        Sleep(10);
+    }
+    host.join();
+    auto isOurs = [](const jl::hostinfo::Info& h) {
+        return h.format == 1 && h.windows() && h.caps == 0x0F && h.monitors == 1 && h.version == "0.4.1-h2dev";
+    };
+    size_t polledIn2 = 0, polledIn3 = 0;
+    bool polledOk = true;
+    for (const auto& p : polled) {
+        if (p.first == 3) ++polledIn2;
+        else if (p.first == 4) ++polledIn3;
+        else polledOk = false;
+        polledOk = polledOk && isOurs(p.second);
+    }
+    expect(auth[0] && auth[1] && auth[2] && auth[3] && answers.size() == 4,
+           "h2 host info: four sessions, each ACK reaches the viewer (" + std::to_string(answers.size()) + ")");
+    expect(answers.size() == 4 && answers[0].negotiated && answers[0].hostInfo && isOurs(*answers[0].hostInfo),
+           "h2 host info: ACK and HOST_INFO in one write: read with the ACK (Windows, caps 0x0f, version)");
+    expect(answers.size() == 4 && answers[1].negotiated && !answers[1].hostInfo,
+           "h2 host info: a Mac (no HOST_INFO): the answer has none");
+    expect(answers.size() == 4 && answers[2].negotiated && (answers[2].hostInfo ? 1u : 0u) + polledIn2 == 1 &&
+               (!answers[2].hostInfo || isOurs(*answers[2].hostInfo)),
+           std::string("h2 host info: split from its ACK, it reaches the viewer once (") +
+               (answers.size() == 4 && answers[2].hostInfo ? "with the ACK" : "by poll") + ")");
+    expect(answers.size() == 4 && !answers[3].hostInfo && polledIn3 == 1 && polledOk,
+           "h2 host info: on the live socket, pollHostNotice reads it and takeHostInfo hands it over once");
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
+           "h2 host info: the replaced notice right behind it still halts the attempt");
+    expect(ui.maxMs < kUiBudgetMs, "h2 host info: the UI thread never waits (max " + std::to_string(ui.maxMs) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -2716,6 +2818,7 @@ int main() {
     prcR9Tests();
     prcR14RetryCapTests();
     prcR15LostOkTest();
+    h2HostInfoTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

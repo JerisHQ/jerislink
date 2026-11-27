@@ -1,9 +1,14 @@
-// JerisLink Windows host, H1 (design doc 2026-11-27, phase H1).
+// JerisLink Windows host, H2 (design doc 2026-11-27, phases H1 and H2).
 //
-// Captures the screen, encodes H.264 with the Media Foundation software
+// H1: captures the screen, encodes H.264 with the Media Foundation software
 // encoder and sends it as MR02 to one viewer, so the existing viewer shows
-// the picture. No input, audio, clipboard, files, NACK or ABR yet; no
-// password: H1 runs only with --dev-no-password and one allowed viewer IP.
+// the picture.
+// H2: the viewer's keyboard and mouse (MRC1 0x10, 0x20-0x25, MRM1 0x24) go
+// in with SendInput, the Force Quit button (MRC1 0x60) opens Task Manager,
+// the cursor shape goes back as MRM1 0x31, and MRC1 0x06 HOST_INFO tells a
+// new viewer it talks to Windows.
+// No audio, clipboard, files, NACK or ABR yet; no password: this dev build
+// runs only with --dev-no-password and one allowed viewer IP.
 //
 //   JerisLinkHost.exe --dev-no-password --bind <host ip> --allow <viewer ip>
 //                     [--fps 30] [--bitrate 25] [--max-size 1920x1080]
@@ -18,6 +23,7 @@
 #include "color_convert.hpp"
 #include "encoder_mf.hpp"
 #include "host_protocol.hpp"
+#include "input_win.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -25,6 +31,7 @@
 #include <mfapi.h>
 #include <objbase.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -53,6 +60,10 @@ constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are me
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
 constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
 constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer sends it ~300 ms after connect
+constexpr int kCursorPollMs = 16;           // cursor shape check
+constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
+constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
+                               jlh::kHostCapTaskManager;
 
 struct Options {
     bool devNoPassword = false;
@@ -129,9 +140,12 @@ bool parseArgs(int argc, char** argv, Options& o, std::string& err) {
     if (o.fps < 1 || o.fps > 240) { err = "--fps must be 1..240"; return false; }
     if (o.bitrateMbps < 4 || o.bitrateMbps > 100) { err = "--bitrate must be 4..100"; return false; }
     if (o.probe) return true;
-    // H1 has no password support: refuse to listen unless told this is a
-    // dev run, and only for one viewer IP on one host address.
-    if (!o.devNoPassword) { err = "H1 runs only with --dev-no-password (no password support yet)"; return false; }
+    // No password support yet: refuse to listen unless told this is a dev
+    // run, and only for one viewer IP on one host address.
+    if (!o.devNoPassword) {
+        err = "this dev build runs only with --dev-no-password (no password support yet)";
+        return false;
+    }
     in_addr a{};
     if (o.bindIp.empty() || !parseIpv4(o.bindIp, a) || a.s_addr == INADDR_ANY) {
         err = "--bind <host IPv4> is required (not 0.0.0.0)";
@@ -180,6 +194,17 @@ struct State {
     std::atomic<int> streamW{0}, streamH{0};
     // counters, read by the stats line
     std::atomic<uint64_t> keyframeRequests{0}, pings{0}, rejected{0};
+    // H2 input. One injector for every connection: one viewer IP may connect.
+    jlh::InputInjector input;
+    std::atomic<uint64_t> inputMalformed{0}, pointerUdp{0}, pointerUdpStale{0};
+    std::atomic<uint64_t> cursorSent{0}, cursorSendFail{0}, cursorChanges{0};
+    // The MRM1 socket and the newest MRM1 session's viewer address: the
+    // cursor shape goes there, from port 38412 (the viewer checks both).
+    SOCKET mrm1Sock = INVALID_SOCKET;
+    std::mutex mrm1PeerMutex;
+    sockaddr_in mrm1Peer{};
+    bool haveMrm1Peer = false;
+    uint32_t mrm1Generation = 0;  // bumped for each new MRM1 session
 };
 State* gState = nullptr;
 
@@ -272,6 +297,7 @@ void serveControl(State& st, SOCKET c, std::string peer) {
     touch(st);
     const char* role = "control";
     bool first = true;
+    bool hostInfoSent = false, inputSeen = false;
     while (st.running && readFrame(hdr, -1)) {
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
@@ -284,7 +310,7 @@ void serveControl(State& st, SOCKET c, std::string peer) {
             break;
         }
         first = false;
-        // Only frames H1 handles count as viewer activity.
+        // Only frames this host handles count as viewer activity.
         switch (hdr.type) {
         case jlh::kMsgPing:
             if (!jlh::isValidPing(hdr)) break;  // like the Mac host: no reply to other sizes
@@ -297,16 +323,61 @@ void serveControl(State& st, SOCKET c, std::string peer) {
             const auto d = jlh::decideVideoConfig(payload.data(), payload.size(), st.bitrateMbps.load(),
                                                   st.streamW.load(), st.streamH.load());
             if (d.accepted && d.bitrateChanged) st.bitrateMbps = d.bitrateMbps;
-            if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgVideoConfigAck, d.ack))) goto done;
+            auto out = jlh::mrc1Frame(jlh::kMsgVideoConfigAck, d.ack);
+            // HOST_INFO rides behind this connection's first ACK, in the same
+            // send (host_protocol.hpp says why there and nowhere else).
+            const int monitors = std::clamp(GetSystemMetrics(SM_CMONITORS), 0, 255);
+            if (!hostInfoSent) {
+                const auto hi = jlh::mrc1Frame(
+                    jlh::kMsgHostInfo,
+                    jlh::hostInfoPayload(jlh::kPlatformWindows, kHostCaps, uint8_t(monitors), JERISLINK_VERSION_STRING));
+                out.insert(out.end(), hi.begin(), hi.end());
+            }
+            if (!sendAll(c, out)) goto done;
             logf("video.config peer=%s status=%u codec=h264 bitrate_mbps=%d flags=0x%02x size=%dx%d", peer.c_str(),
                  unsigned(d.ack[1]), d.bitrateMbps, unsigned(d.ack[3]), st.streamW.load(), st.streamH.load());
+            if (!hostInfoSent) {
+                hostInfoSent = true;
+                logf("host.info peer=%s platform=windows caps=0x%02x monitors=%d version=%s", peer.c_str(),
+                     unsigned(kHostCaps), monitors, JERISLINK_VERSION_STRING);
+            }
+            break;
+        }
+        case jlh::kMsgKey:
+        case jlh::kMsgMouseMoveRel:
+        case jlh::kMsgMouseButton:
+        case jlh::kMsgMouseScroll:
+        case jlh::kMsgMouseMoveAbs:
+        case jlh::kMsgMouseMoveNorm:
+        case jlh::kMsgMouseButtonExt:
+        case jlh::kMsgForceQuitOpen: {
+            const auto e = jlh::decodeInput(hdr, payload.data());
+            if (!e) {
+                ++st.inputMalformed;  // wrong length or button: dropped whole, like the Mac host
+                break;
+            }
+            touch(st);
+            if (!inputSeen) {
+                inputSeen = true;
+                logf("input.open peer=%s channel=%s", peer.c_str(), role);
+            }
+            // What was typed is never logged; only counts, in the stats line.
+            const bool ok = st.input.apply(*e);
+            if (e->kind == jlh::InputEvent::Kind::TaskManager)
+                logf("input.task_manager peer=%s sent=%s err=%lu", peer.c_str(), ok ? "yes" : "no",
+                     ok ? 0ul : st.input.lastError());
             break;
         }
         default:
-            break;  // input, clipboard data etc.: not in H1
+            break;  // clipboard data etc.: not yet
         }
     }
 done:
+    if (inputSeen) {
+        // The viewer went away: nothing it pressed stays down on this PC.
+        const size_t n = st.input.releaseAll();
+        logf("input.released peer=%s held=%zu", peer.c_str(), n);
+    }
     logf("control.closed peer=%s channel=%s", peer.c_str(), role);
 }
 
@@ -345,6 +416,7 @@ void controlListener(State& st, SOCKET ls) {
 void mrm1Listener(State& st, SOCKET u) {
     uint8_t b[2048];
     uint64_t lastLoggedKfr = 0;
+    jlh::Mrm1Session session;
     while (st.running) {
         sockaddr_in from{};
         int len = sizeof(from);
@@ -352,9 +424,28 @@ void mrm1Listener(State& st, SOCKET u) {
         if (n <= 0) continue;
         if (from.sin_addr.s_addr != st.allowAddr.s_addr) { ++st.rejected; continue; }
         const auto m = jlh::parseMrm1(b, size_t(n));
-        if (!m) continue;  // only a valid 0x40 or 0x43 counts as viewer activity
+        if (!m) continue;  // only a valid 0x24, 0x40 or 0x43 counts as viewer activity
         touch(st);
-        if (m->type == jlh::kMrm1KeyframeRequest) {
+        if (session.note(from.sin_addr.s_addr, from.sin_port)) {
+            // A viewer socket not seen before: a new MRM1 session. Pointer
+            // order starts over and the cursor loop sends the shape there.
+            {
+                std::lock_guard<std::mutex> g(st.mrm1PeerMutex);
+                st.mrm1Peer = from;
+                st.haveMrm1Peer = true;
+                ++st.mrm1Generation;
+            }
+            logf("mrm1.session peer=%s:%u", ipString(from.sin_addr).c_str(), unsigned(ntohs(from.sin_port)));
+        }
+        if (m->type == jlh::kMrm1Pointer) {
+            // Only the newest move counts; a late datagram is dropped.
+            if (session.takePointer(m->seq)) {
+                ++st.pointerUdp;
+                st.input.moveNormalized(m->nx, m->ny);
+            } else {
+                ++st.pointerUdpStale;
+            }
+        } else if (m->type == jlh::kMrm1KeyframeRequest) {
             st.keyframeRequested = true;
             const uint64_t k = ++st.keyframeRequests;
             if (k <= 3 || k - lastLoggedKfr >= 50) {
@@ -366,8 +457,62 @@ void mrm1Listener(State& st, SOCKET u) {
             sendto(u, reinterpret_cast<const char*>(pong.data()), int(pong.size()), 0,
                    reinterpret_cast<const sockaddr*>(&from), len);
         }
-        // 0x24 pointer, 0x41 NACK, 0x42 receiver report, 0x45 audio: not in
-        // H1, dropped by parseMrm1.
+        // 0x41 NACK, 0x42 receiver report, 0x45 audio: not yet, dropped by
+        // parseMrm1.
+    }
+}
+
+// ------------------------------------------------------------------- cursor
+
+// Sends the cursor shape (MRM1 0x31) to the newest MRM1 session while a
+// viewer is present: on a change at once, otherwise once a second so a lost
+// datagram is repaired. Each session's seq starts from the tick count, so a
+// viewer that outlives a host restart does not take the new packets for
+// old ones.
+void cursorLoop(State& st) {
+    uint32_t gen = 0, seq = 0;
+    bool haveShape = false;
+    jlh::CursorShape last = jlh::CursorShape::Arrow;
+    auto lastSent = Clock::now();
+    uint64_t changesLogged = 0;
+    while (st.running) {
+        Sleep(kCursorPollMs);
+        const bool active = st.controlConnections.load() > 0 ||
+                            msSinceStart() - st.lastActivityMs.load() < kActiveGraceMs;
+        if (!active) continue;
+        sockaddr_in peer{};
+        uint32_t g = 0;
+        {
+            std::lock_guard<std::mutex> lk(st.mrm1PeerMutex);
+            if (!st.haveMrm1Peer) continue;
+            peer = st.mrm1Peer;
+            g = st.mrm1Generation;
+        }
+        if (g != gen) {
+            gen = g;
+            seq = uint32_t(GetTickCount64());
+            haveShape = false;
+        }
+        const jlh::CursorShape shape = jlh::currentCursorShape();
+        const auto now = Clock::now();
+        const bool changed = !haveShape || shape != last;
+        if (!changed && now - lastSent < std::chrono::milliseconds(kCursorResendMs)) continue;
+        const auto pkt = jlh::mrm1Cursor(seq++, shape);
+        if (sendto(st.mrm1Sock, reinterpret_cast<const char*>(pkt.data()), int(pkt.size()), 0,
+                   reinterpret_cast<const sockaddr*>(&peer), sizeof(peer)) == int(pkt.size()))
+            ++st.cursorSent;
+        else
+            ++st.cursorSendFail;
+        if (changed && haveShape) {
+            ++st.cursorChanges;
+            if (changesLogged < 20) {
+                ++changesLogged;
+                logf("cursor.shape code=%u", unsigned(shape));
+            }
+        }
+        last = shape;
+        haveShape = true;
+        lastSent = now;
     }
 }
 
@@ -406,6 +551,11 @@ int runProbe(const Options& o) {
         return 2;
     }
     logf("probe.capture OK size=%dx%d stride=%zu", f.width, f.height, f.stride);
+    const jlh::DesktopRect dr = cap.desktopRect();
+    logf("probe.desktop rect=%d,%d %dx%d virtual=%d,%d %dx%d monitors=%d cursor_shape=%u", dr.left, dr.top, dr.width,
+         dr.height, GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+         GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN), GetSystemMetrics(SM_CMONITORS),
+         unsigned(jlh::currentCursorShape()));
     if (!o.snapshotPath.empty())
         logf("probe.snapshot %s %s", o.snapshotPath.c_str(), writeBmp(o.snapshotPath, f) ? "written" : "FAILED");
 
@@ -468,7 +618,8 @@ public:
     ~VideoSender() { closesocket(s_); }
     void setBitrate(int mbps) { pacer_.setBitrate(mbps); }
 
-    // Returns packets sent.
+    // Returns packets sent; a datagram the socket refused is counted in
+    // takeFailed() (design §8.4: H1 counted only what went out).
     size_t send(const std::vector<uint8_t>& au, bool key) {
         const auto packets = jlh::packetizeMr02(nextFrameId_++, au.data(), au.size(), key);
         size_t sent = 0;
@@ -481,13 +632,19 @@ public:
             }
             pacer_.spend(now, p.size());
             if (sendto(s_, reinterpret_cast<const char*>(p.data()), int(p.size()), 0,
-                       reinterpret_cast<const sockaddr*>(&to_), sizeof(to_)) == int(p.size()))
+                       reinterpret_cast<const sockaddr*>(&to_), sizeof(to_)) == int(p.size())) {
                 ++sent;
-            bytes_ += p.size();
+                bytes_ += p.size();
+            } else {
+                ++failed_;
+                lastError_ = WSAGetLastError();
+            }
         }
         return sent;
     }
     uint64_t takeBytes() { const uint64_t b = bytes_; bytes_ = 0; return b; }
+    uint64_t takeFailed() { const uint64_t f = failed_; failed_ = 0; return f; }
+    int lastError() const { return lastError_; }
 
 private:
     static int64_t nowUs() {
@@ -504,6 +661,8 @@ private:
     sockaddr_in to_{};
     uint64_t nextFrameId_ = 1;
     uint64_t bytes_ = 0;
+    uint64_t failed_ = 0;
+    int lastError_ = 0;
 };
 
 void videoLoop(State& st) {
@@ -522,7 +681,9 @@ void videoLoop(State& st) {
     auto statsAt = Clock::now() + std::chrono::seconds(1);
     auto streamStart = Clock::now();
     uint64_t frameIndex = 0, nCaptured = 0, nEncoded = 0, nKeys = 0, nPackets = 0;
+    uint64_t sendFailTotal = 0;
     double encMsSum = 0;
+    jlh::DesktopRect desktop{};
 
     while (st.running) {
         if (o.seconds > 0 && msSinceStart() > int64_t(o.seconds) * 1000) break;
@@ -569,6 +730,13 @@ void videoLoop(State& st) {
         }
         if (r == 1) {
             ++nCaptured;
+            const jlh::DesktopRect dr = cap.desktopRect();
+            if (dr.left != desktop.left || dr.top != desktop.top || dr.width != desktop.width ||
+                dr.height != desktop.height) {
+                desktop = dr;
+                st.input.setDesktop(dr);  // the pointer lands on the monitor the viewer sees
+                logf("input.desktop rect=%d,%d %dx%d", dr.left, dr.top, dr.width, dr.height);
+            }
             if (f.width != srcW || f.height != srcH) {
                 srcW = f.width;
                 srcH = f.height;
@@ -631,12 +799,23 @@ void videoLoop(State& st) {
         if (Clock::now() >= statsAt) {
             const double secs = 1.0 + std::chrono::duration<double>(Clock::now() - statsAt).count();
             statsAt = Clock::now() + std::chrono::seconds(1);
+            const uint64_t sendFail = sender.takeFailed();
+            sendFailTotal += sendFail;
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
-                 "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu control_conns=%d pings=%llu backend=%s",
+                 "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
+                 "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu "
+                 "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu cursor_sent=%llu "
+                 "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
                  sender.takeBytes() * 8.0 / 1e6 / secs, (unsigned long long)nKeys,
                  (unsigned long long)st.keyframeRequests.load(), nEncoded ? encMsSum / nEncoded : 0.0,
-                 (unsigned long long)nPackets, st.controlConnections.load(), (unsigned long long)st.pings.load(),
+                 (unsigned long long)nPackets, (unsigned long long)sendFail, (unsigned long long)sendFailTotal,
+                 sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
+                 (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
+                 (unsigned long long)st.input.ignored(), (unsigned long long)st.inputMalformed.load(),
+                 st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
+                 (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.cursorSent.load(),
+                 (unsigned long long)st.cursorSendFail.load(), (unsigned long long)st.cursorChanges.load(),
                  cap.backend());
             nCaptured = nEncoded = nKeys = nPackets = 0;
             encMsSum = 0;
@@ -683,7 +862,8 @@ int main(int argc, char** argv) {
         logf("init FAIL com/mf");
         return 1;
     }
-    logf("JerisLinkHost %s (H1: capture + MF software H.264 + MR02)", JERISLINK_VERSION_STRING);
+    logf("JerisLinkHost %s (H2: capture + MF software H.264 + MR02 + SendInput + cursor shape)",
+         JERISLINK_VERSION_STRING);
     if (o.probe) {
         const int rc = runProbe(o);
         MFShutdown();
@@ -704,11 +884,13 @@ int main(int argc, char** argv) {
     SOCKET ctl = listenOn(st.bindAddr, kControlPort, SOCK_STREAM);
     SOCKET mrm1 = listenOn(st.bindAddr, kMrm1Port, SOCK_DGRAM);
     if (ctl == INVALID_SOCKET || mrm1 == INVALID_SOCKET) return 2;
+    st.mrm1Sock = mrm1;
     logf("listening control=tcp:%s:%u mrm1=udp:%s:%u video_to=%s:%u fps=%d bitrate_mbps=%d max=%dx%d",
          o.bindIp.c_str(), unsigned(kControlPort), o.bindIp.c_str(), unsigned(kMrm1Port), o.allowIp.c_str(),
          unsigned(kVideoPort), o.fps, o.bitrateMbps, o.maxW, o.maxH);
     std::thread(controlListener, std::ref(st), ctl).detach();
     std::thread(mrm1Listener, std::ref(st), mrm1).detach();
+    std::thread(cursorLoop, std::ref(st)).detach();
     videoLoop(st);
     st.running = false;
     closesocket(ctl);

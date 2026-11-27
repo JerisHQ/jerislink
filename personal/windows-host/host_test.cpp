@@ -1,14 +1,17 @@
-// JerisLink Windows host, H1 tests.
+// JerisLink Windows host, H1 and H2 tests.
 //
 // Wire formats against the viewer's own parsers (video_receiver.hpp,
-// h264_nal_summary.hpp), colour conversion values, and on Windows a
-// loopback: synthetic frames -> the real MF software encoder -> MR02 ->
-// jl::VideoReceiver -> an IDR access unit with SPS of the right size.
+// h264_nal_summary.hpp, host_info.hpp) and key codes (keymap.hpp), colour
+// conversion values, and on Windows a loopback: synthetic frames -> the
+// real MF software encoder -> MR02 -> jl::VideoReceiver -> an IDR access
+// unit with SPS of the right size. Nothing here injects input.
 
 #include "color_convert.hpp"
 #include "host_protocol.hpp"
 
 #include "../windows-client/h264_nal_summary.hpp"
+#include "../windows-client/host_info.hpp"
+#include "../windows-client/keymap.hpp"
 #include "../windows-client/video_receiver.hpp"
 
 #ifdef _WIN32
@@ -171,17 +174,222 @@ static void testMrm1() {
     m = jlh::parseMrm1(ping, 18);
     CHECK(m && m->type == 0x43);
     CHECK(!jlh::parseMrm1(ping, 17));
-    // Types H1 does not handle never reach host state, whatever their size.
-    for (uint8_t type : {uint8_t(0x24), uint8_t(0x41), uint8_t(0x42), uint8_t(0x44), uint8_t(0x45), uint8_t(0x99)}) {
+    // Types the host does not handle never reach host state, whatever their size.
+    for (uint8_t type : {uint8_t(0x41), uint8_t(0x42), uint8_t(0x44), uint8_t(0x45), uint8_t(0x99)}) {
         uint8_t other[32] = {'M', 'R', 'M', '1', 1, type, 0, 0, 0, 1};
         for (size_t n : {size_t(10), size_t(18), size_t(32)}) CHECK(!jlh::parseMrm1(other, n));
     }
     uint8_t kfLong[11] = {'M', 'R', 'M', '1', 1, 0x40, 0, 0, 1, 2, 0};
     CHECK(!jlh::parseMrm1(kfLong, 11));
+    // H2: 0x24 pointer, exactly 14 bytes (seq, then nx, ny big-endian).
+    const uint8_t ptr[14] = {'M', 'R', 'M', '1', 1, 0x24, 0x80, 0, 0, 5, 0x12, 0x34, 0xFF, 0xFF};
+    m = jlh::parseMrm1(ptr, 14);
+    CHECK(m && m->type == 0x24 && m->seq == 0x80000005u && m->nx == 0x1234 && m->ny == 0xFFFF);
+    for (size_t n : {size_t(10), size_t(13), size_t(18)}) {
+        uint8_t other[18] = {'M', 'R', 'M', '1', 1, 0x24, 0, 0, 0, 1};
+        CHECK(!jlh::parseMrm1(other, n));
+    }
     const auto pong = jlh::mrm1Pong(ping, 18);
     CHECK(pong.size() == 18 && pong[5] == 0x44);
     for (int i = 0; i < 18; ++i)
         if (i != 5) CHECK(pong[size_t(i)] == ping[i]);
+}
+
+// ------------------------------------------------------------------ H2
+
+static jlh::Mrc1Header hdr(uint8_t type, uint16_t len) { return jlh::Mrc1Header{type, len}; }
+
+static void testHostInfo() {
+    // What the host sends, read by the viewer's own decoder.
+    const auto p = jlh::hostInfoPayload(jlh::kPlatformWindows, 0x0F, 2, "0.4.1-h2dev");
+    CHECK(p.size() == 8 + 11);
+    auto info = jl::hostinfo::decode(p.data(), p.size());
+    CHECK(info && info->format == 1 && info->windows() && info->caps == 0x0F && info->monitors == 2 &&
+          info->version == "0.4.1-h2dev");
+    CHECK(jlh::kHostCapKeyboard == jl::hostinfo::kCapKeyboard && jlh::kHostCapPointer == jl::hostinfo::kCapPointer &&
+          jlh::kHostCapCursorShape == jl::hostinfo::kCapCursorShape &&
+          jlh::kHostCapTaskManager == jl::hostinfo::kCapTaskManager);
+    CHECK(jlh::kMsgHostInfo == jl::hostinfo::kType);
+    // The frame the host puts behind the ACK is one the viewer recognises.
+    auto frame = jlh::mrc1Frame(jlh::kMsgHostInfo, p);
+    CHECK(jl::hostinfo::isFramePrefix(frame.data(), frame.size()));
+    CHECK(jl::hostinfo::completeFrameBytes(frame.data(), frame.size()) == frame.size());
+    for (size_t n = 1; n < frame.size(); ++n) {
+        CHECK(jl::hostinfo::isFramePrefix(frame.data(), n));
+        CHECK(jl::hostinfo::completeFrameBytes(frame.data(), n) == 0);
+    }
+    auto twice = frame;
+    twice.insert(twice.end(), frame.begin(), frame.end());
+    CHECK(jl::hostinfo::completeFrameBytes(twice.data(), twice.size()) == frame.size());
+    // The "replaced" notice (MRC1 0x04) and an ACK are not HOST_INFO.
+    const uint8_t notice[9] = {'M', 'R', 'C', '1', 1, 0x04, 0, 1, 6};
+    CHECK(!jl::hostinfo::isFramePrefix(notice, 9));
+    auto ack = jlh::mrc1Frame(0x41, {1, 0, 1, 0x48, 0, 25});
+    CHECK(!jl::hostinfo::isFramePrefix(ack.data(), ack.size()));
+    // Version: capped at 64, non-printable bytes made '?'.
+    const auto longV = jlh::hostInfoPayload(jlh::kPlatformWindows, 0, 1, std::string(100, 'v') + "\x01");
+    CHECK(longV.size() == 8 + 64 && longV[7] == 64);
+    const auto odd = jlh::hostInfoPayload(jlh::kPlatformWindows, 0, 1, std::string("a\x01\x7f"));
+    info = jl::hostinfo::decode(odd.data(), odd.size());
+    CHECK(info && info->version == "a??");
+    // Malformed: short, format 0, a version longer than the payload.
+    CHECK(!jl::hostinfo::decode(p.data(), 7));
+    auto bad = p;
+    bad[0] = 0;
+    CHECK(!jl::hostinfo::decode(bad.data(), bad.size()));
+    bad = p;
+    bad[7] = 12;
+    CHECK(!jl::hostinfo::decode(bad.data(), bad.size()));
+    // A later format with more fields: the known ones still read.
+    auto later = p;
+    later[0] = 2;
+    later.push_back(0xAA);
+    info = jl::hostinfo::decode(later.data(), later.size());
+    CHECK(info && info->format == 2 && info->windows() && info->version == "0.4.1-h2dev");
+    // Header length outside 8..512: not HOST_INFO, left alone.
+    const uint8_t tiny[8] = {'M', 'R', 'C', '1', 1, 0x06, 0, 7};
+    const uint8_t huge[8] = {'M', 'R', 'C', '1', 1, 0x06, 0x02, 0x01};
+    CHECK(!jl::hostinfo::isFramePrefix(tiny, 8) && !jl::hostinfo::isFramePrefix(huge, 8));
+}
+
+static void testDecodeInput() {
+    const uint8_t key[3] = {1, 0, 'A'};
+    auto e = jlh::decodeInput(hdr(0x10, 3), key);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::Key && e->down && e->semantic == 'A');
+    CHECK(!jlh::decodeInput(hdr(0x10, 2), key) && !jlh::decodeInput(hdr(0x10, 4), key));
+    const uint8_t rel[4] = {0xFF, 0xFE, 0x00, 0x03};
+    e = jlh::decodeInput(hdr(0x20, 4), rel);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::MoveRel && e->x == -2 && e->y == 3);
+    e = jlh::decodeInput(hdr(0x22, 4), rel);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::Scroll && e->x == -2 && e->y == 3);
+    const uint8_t abs[4] = {0xFF, 0xFF, 0x80, 0x00};
+    e = jlh::decodeInput(hdr(0x23, 4), abs);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::MoveAbsPixels && e->x == 65535 && e->y == 32768);
+    e = jlh::decodeInput(hdr(0x24, 4), abs);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::MoveNorm && e->x == 65535 && e->y == 32768);
+    for (uint8_t t : {uint8_t(0x20), uint8_t(0x22), uint8_t(0x23), uint8_t(0x24)})
+        CHECK(!jlh::decodeInput(hdr(t, 3), abs) && !jlh::decodeInput(hdr(t, 5), abs));
+    const uint8_t btn[3] = {1, 1, 2};
+    e = jlh::decodeInput(hdr(0x21, 2), btn);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::Button && e->button == 1 && e->down);
+    e = jlh::decodeInput(hdr(0x25, 3), btn);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::Button && e->button == 1 && e->down);
+    CHECK(!jlh::decodeInput(hdr(0x21, 3), btn) && !jlh::decodeInput(hdr(0x25, 2), btn));
+    const uint8_t btn3[2] = {3, 1};
+    CHECK(!jlh::decodeInput(hdr(0x21, 2), btn3));
+    e = jlh::decodeInput(hdr(0x60, 0), key);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::TaskManager);
+    CHECK(!jlh::decodeInput(hdr(0x60, 1), key));
+    // Not input: the host's other frames and unknown types.
+    for (uint8_t t : {uint8_t(0x01), uint8_t(0x30), uint8_t(0x40), uint8_t(0x26), uint8_t(0x61)})
+        CHECK(!jlh::decodeInput(hdr(t, 3), key));
+}
+
+static void testKeysAgainstViewer() {
+    namespace km = jl::keymap;
+    // Every key the viewer forwards (pass-through to a Windows host sends
+    // the Mac preset's codes) is one this host presses; non-modifiers are
+    // the same VK, modifiers the left-hand key.
+    int forwarded = 0;
+    for (uint32_t key = 0; key < 256; ++key) {
+        const uint16_t sem = km::semanticKey(key, km::Preset::Mac);
+        if (!sem) continue;
+        ++forwarded;
+        const uint16_t v = jlh::semanticToVk(sem);
+        CHECK(v != 0);
+        if (sem > 4) CHECK(v == key);
+    }
+    CHECK(forwarded > 90);
+    CHECK(jlh::semanticToVk(km::kCtrl) == jlh::vk::LControl && jlh::semanticToVk(km::kAlt) == jlh::vk::LMenu &&
+          jlh::semanticToVk(km::kWin) == jlh::vk::LWin && jlh::semanticToVk(km::kShift) == jlh::vk::LShift);
+    // Nothing the viewer never sends is pressed.
+    for (uint32_t s = 5; s < 0x10000; ++s) {
+        if (!jlh::semanticToVk(uint16_t(s))) continue;
+        CHECK(s < 256 && km::semanticKey(s, km::Preset::Mac) == s);
+    }
+    CHECK(jlh::semanticToVk(0) == 0);
+    CHECK(jlh::isExtendedVk(jlh::vk::Left) && jlh::isExtendedVk(jlh::vk::Delete) && jlh::isExtendedVk(jlh::vk::LWin) &&
+          jlh::isExtendedVk(jlh::vk::Divide));
+    CHECK(!jlh::isExtendedVk('A') && !jlh::isExtendedVk(jlh::vk::LControl) && !jlh::isExtendedVk(jlh::vk::Return) &&
+          !jlh::isExtendedVk(jlh::vk::Numpad0));
+}
+
+static void testHeldInput() {
+    jlh::HeldInput h;
+    CHECK(!h.anyHeld());
+    h.key(jlh::vk::LControl, true);
+    h.key('C', true);
+    h.key('C', true);  // auto-repeat: still one
+    h.button(0, true);
+    h.button(3, true);  // not a button: ignored
+    CHECK(h.anyHeld());
+    std::vector<uint16_t> ups;
+    std::vector<uint8_t> buttonUps;
+    size_t n = h.releaseAll([&](uint16_t v) { ups.push_back(v); }, [&](uint8_t b) { buttonUps.push_back(b); });
+    CHECK(n == 3 && ups.size() == 2 && ups[0] == 'C' && ups[1] == jlh::vk::LControl);
+    CHECK(buttonUps.size() == 1 && buttonUps[0] == 0);
+    CHECK(!h.anyHeld());
+    h.key('A', true);
+    h.key('A', false);
+    h.button(1, true);
+    h.button(1, false);
+    CHECK(!h.anyHeld());
+    n = h.releaseAll([&](uint16_t) { CHECK(false); }, [&](uint8_t) { CHECK(false); });
+    CHECK(n == 0);
+}
+
+static void testPointerMapping() {
+    // Primary 1920x1080 at 0,0; a second monitor at -1280,-200.
+    const jlh::DesktopRect primary{0, 0, 1920, 1080};
+    int px = -1, py = -1;
+    jlh::normToDesktop(0, 0, primary, px, py);
+    CHECK(px == 0 && py == 0);
+    jlh::normToDesktop(65535, 65535, primary, px, py);
+    CHECK(px == 1919 && py == 1079);
+    jlh::normToDesktop(32768, 32768, primary, px, py);
+    CHECK(px == 960 && py == 540);
+    jlh::normToDesktop(-5, 70000, primary, px, py);
+    CHECK(px == 0 && py == 1079);
+    const jlh::DesktopRect left{-1280, -200, 1280, 1024};
+    jlh::normToDesktop(0, 0, left, px, py);
+    CHECK(px == -1280 && py == -200);
+    jlh::normToDesktop(65535, 65535, left, px, py);
+    CHECK(px == -1 && py == 823);
+    // Virtual desktop -1280,-200 .. 1920,1080 (3200 x 1280): every pixel a
+    // SendInput absolute value lands on is the pixel asked for.
+    const int vx = -1280, vw = 3200, vy = -200, vh = 1280;
+    for (int x = vx; x < vx + vw; ++x) {
+        const int a = jlh::toAbsolute(x, vx, vw);
+        CHECK(a >= 0 && a <= 65535);
+        CHECK(vx + int((int64_t(a) * vw) / 65536) == x);
+    }
+    for (int y = vy; y < vy + vh; ++y) {
+        const int a = jlh::toAbsolute(y, vy, vh);
+        CHECK(vy + int((int64_t(a) * vh) / 65536) == y);
+    }
+    CHECK(jlh::toAbsolute(-5000, vx, vw) == 0);
+    CHECK(jlh::toAbsolute(5000, vx, vw) == jlh::toAbsolute(vx + vw - 1, vx, vw));
+    CHECK(jlh::toAbsolute(10, 0, 0) == 0);
+}
+
+static void testMrm1SessionAndCursor() {
+    jlh::Mrm1Session s;
+    CHECK(s.note(0x64400010, 50000));   // first datagram: a session
+    CHECK(!s.note(0x64400010, 50000));  // same port: same session
+    CHECK(s.takePointer(10));
+    CHECK(!s.takePointer(10) && !s.takePointer(9));  // repeat or late: dropped
+    CHECK(s.takePointer(11));
+    CHECK(s.takePointer(0x7FFFFFFFu + 11));  // newer: just under half the range ahead
+    CHECK(s.takePointer(5));                 // wrapped round: newer again
+    CHECK(s.note(0x64400010, 50001));        // viewer restarted: new session
+    CHECK(s.takePointer(1));                 // order starts over
+    CHECK(s.note(0x64400011, 50001));        // another address: new session
+    // The cursor packet the viewer reads (viewer.cpp: 11 bytes, seq, shape).
+    const auto c = jlh::mrm1Cursor(0x01020304u, jlh::CursorShape::Wait);
+    CHECK(c.size() == 11 && c[0] == 'M' && c[3] == '1' && c[4] == 1 && c[5] == 0x31);
+    CHECK(c[6] == 1 && c[7] == 2 && c[8] == 3 && c[9] == 4 && c[10] == 12);
+    CHECK(uint8_t(jlh::CursorShape::IBeam) == 1 && uint8_t(jlh::CursorShape::PointingHand) == 2 &&
+          uint8_t(jlh::CursorShape::NotAllowed) == 10 && uint8_t(jlh::CursorShape::Move) == 14);
 }
 
 static void testAnnexB() {
@@ -298,6 +506,12 @@ int main() {
     testConnectionSlots();
     testVideoConfig();
     testMrm1();
+    testHostInfo();
+    testDecodeInput();
+    testKeysAgainstViewer();
+    testHeldInput();
+    testPointerMapping();
+    testMrm1SessionAndCursor();
     testAnnexB();
     testColor();
 #ifdef _WIN32
