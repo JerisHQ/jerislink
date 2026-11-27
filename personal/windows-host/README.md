@@ -84,46 +84,49 @@ Builds are unsigned (design doc D14).
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
-- Held keys and buttons are tracked per control connection. When one
-  closes, only what it pressed is released; a key or button another
-  connection holds stays down, older or newer, so a late close of an old
-  connection does not lift what a new one just pressed, and a new one's
-  close does not lift what an old one still holds. A key-up or button-up
-  ends the sender's own claim and no other, so when two connections hold
-  the same key, one letting go leaves it down until the other does
-  (`input_up_held` in `stats`). After a reconnect the viewer sends the
-  ups it owes for the old connection's presses on the new connection;
-  they end none of the old connection's claims. Those end at the first
-  of: the old connection closes, takeover, or quiet.
-- Takeover (0 s): just before a connection's first input frame goes in,
-  every older connection that has sent input and has sent nothing at all
-  since this one opened is replaced. What it holds is released first,
-  and later input from it is dropped (`input.takeover`,
-  `input.dropped reason=replaced`, `input_takeover` and
-  `input_replaced_drop` in `stats`). An older connection that spoke
-  after the new one opened is live and keeps its claims; a connection
-  that never sent input (clipboard, ping) is never replaced. So the
-  first key or click after a reconnect never meets a stray Ctrl, Shift
-  or button from the old connection.
-- Quiet (10 s): a connection that has sent nothing for 10 s lets go of
-  what it holds; it stays open and may press again. Held keys keep it
-  talking through the viewer's auto-repeat, and MRM1 moves count for
-  the newest input connection, so a drag stays down. Checked every
-  250 ms, so a claim ends at most about 10.25 s after the last frame
-  (`input.quiet_released`, `input_quiet_release` in `stats`).
+- One input owner at a time. When a control connection newer than the
+  current owner sends its first input frame, it becomes the only owner:
+  everything the old owner holds is released on the PC first (key-ups
+  and button-ups go in before the new frame), and from then on every
+  input frame from the old connection is dropped, even if that viewer
+  is still online. To type or click again it has to reconnect. This is
+  the same rule as the viewer's reconnect takeover: the new connection
+  wins and the old one is done at once. An older connection never takes
+  ownership back, even after the owner closes. Connections that never
+  send input (clipboard, ping) are not affected (`input.owner`,
+  `input.dropped reason=not_owner`, `input_takeover` and `input_dropped`
+  in `stats`). Admission, takeover and injection run under one lock, so
+  a frame from the old owner can never slip in after the takeover.
+- Held keys and buttons are tracked per control connection. A key-up or
+  button-up ends the sender's own claim and no other (`input_up_held` in
+  `stats`). The owner's keys and buttons stay down for as long as it
+  holds them: nothing is released for being still, so a long press or a
+  held scroll bar arrow works. They end when the owner sends the up,
+  closes, or is replaced. After a reconnect the viewer sends the ups it
+  owes for the old connection's presses on the new connection; by then
+  the takeover has already released them, so they change nothing.
+- If Windows refuses an up (SendInput fails), the key or button stays on
+  record with no owner and the up is retried every 250 ms until it goes
+  in (`input.up_retried`, `input_up_retry` in `stats`).
 - Control connections use TCP keep-alive (3 s idle, then 10 probes 1 s
-  apart). It only closes dead connections and frees their slots; neither
-  limit above depends on it, or on it being set up at all.
+  apart) and TCP_MAXRT 13 s (data the host sent that is not
+  acknowledged for 13 s closes the connection). If either cannot be set,
+  the connection is closed at the handshake (`control.closed
+  reason=keepalive` or `reason=maxrt`) and can never own input. So what
+  an owner holds is released 0 s after the viewer reconnects and sends
+  input, or about 13 s after the viewer's machine or the network goes
+  away.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.
 
 Known limits: AltGr characters on European layouts (right Alt arrives as
 Alt), Win+L (Windows ignores it from SendInput), Ctrl+Alt+Del and anything
-on the secure desktop. Because of the 10 s quiet limit, a mouse button
-held perfectly still with no moves or keys for 10 s (a long press, holding
-a scroll bar arrow) and the Win key held alone for 10 s (the viewer sends
-it once, with no repeats) are released on the PC.
+on the secure desktop. If the viewer app hangs while its machine stays
+up (the OS still answers keep-alive), what it holds stays down until it
+reconnects or exits; bounding that needs an app-level heartbeat, which
+the protocol does not have yet. A replaced viewer that is still online
+can still move the pointer over MRM1 (UDP), but cannot press anything.
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),

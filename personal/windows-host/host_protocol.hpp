@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -428,14 +429,16 @@ inline bool isExtendedVk(uint16_t v) {
 //   takeOwedLocked), and look the same as a plain up. The host does not
 //   tell them apart: such an up ends the new connection's own claim, if it
 //   has one, and nothing else. The old connection's claims end when the
-//   new connection's first input replaces it, when it has been quiet for
-//   10 s, or when it closes, whichever comes first (InputClaims, r7).
+//   new connection's first input makes it the input owner, or when the old
+//   one closes, whichever comes first (InputClaims, r8). Only the input
+//   owner presses, so one connection at most holds claims.
 // Windows gets the up only when no connection holds it any more.
 //
 // Every up goes to Windows only through upKey(vk) / upButton(b), which
 // return true when Windows took it. One that Windows did not take keeps its
-// entry, with no owner left, and the next release tries it again: nothing
-// is forgotten while it may still be down. An up for a key nobody holds
+// entry, with no owner left, and the next release or retryUnowned (every
+// 250 ms, InputClaims::retry) tries it again: nothing is forgotten while it
+// may still be down. An up for a key nobody holds
 // here goes to Windows as it is (as on the macOS host).
 class HeldInput {
 public:
@@ -476,6 +479,13 @@ public:
     size_t releaseOwned(Owner o, UpKey&& upKey, UpButton&& upButton) {
         for (auto& e : keys_) dropOwner(e, o);
         for (auto& e : buttons_) dropOwner(e, o);
+        return retryUnowned(upKey, upButton);
+    }
+    // Ups Windows did not take before (entries with no owner left), keys
+    // newest first, then buttons: tried again. What a connection still
+    // holds is left alone. Returns how many ups Windows took.
+    template <class UpKey, class UpButton>
+    size_t retryUnowned(UpKey&& upKey, UpButton&& upButton) {
         return releaseUnowned(keys_, upKey) +
                releaseUnowned(buttons_, [&](uint16_t b) { return upButton(uint8_t(b)); });
     }
@@ -538,140 +548,116 @@ private:
     std::vector<Entry> buttons_;  // 0 left, 1 right, 2 middle; in press order
 };
 
-// r7 (Pepper's review of 6a581c4, item 1): a time limit on what a stale or
-// dead control connection holds, that does not hang on TCP keep-alive. The
-// host sees no close from a viewer whose network dropped or whose machine
-// slept, an old socket can still answer keep-alive after the viewer moved
-// to a new connection, and setting keep-alive can fail. Two rules, on what
-// the host itself hears, with no new message on the wire:
+// r8 (Pepper's review of 6175b5e, items 1 to 4; Morris's PR-C takeover
+// rule of 2026-11-22, the newer connection wins): one input owner. Keys,
+// buttons and moves go in from one control connection at a time, the
+// input owner, and only the owner holds anything. The rules use only what
+// the host itself sees, with no new message on the wire:
 //
-// 1. Takeover, at once. Before the first input frame of a connection goes
-//    in, every older connection that has sent input and has sent nothing at
-//    all since this one opened is replaced: its claims end (their ups go to
-//    Windows first) and any input it sends later is dropped. The viewer
-//    sends input on one connection at a time and opens a new one only once
-//    it has given up the old one (control_channel.hpp, the reconnect
-//    worker), so the first action after a reconnect never meets a key or
-//    button the old connection held. An older connection that sent anything
-//    after this one opened is live and keeps its claims; a newer one is
-//    never touched, and neither is one that never sent input (clipboard).
-// 2. Quiet, 10 s. A connection that has sent nothing for kQuietMs lets go
-//    of its claims; it stays open and may press again. A held key keeps its
-//    connection talking (the viewer forwards auto-repeat). A drag sends its
-//    moves over MRM1, not on the connection, so a valid MRM1 move counts for
-//    the newest connection that has sent input and was not replaced: the
-//    one the viewer is using.
+// - A connection becomes the input owner with its first input frame, when
+//   it opened after every connection that was the owner before it. The
+//   owner until then is replaced at once: its claims end (their ups go to
+//   Windows first, before the new owner's frame goes in), and every input
+//   frame it sends later is dropped. Nothing about the old owner is
+//   checked: the newer connection wins even while the old one is still
+//   connected and dragging over MRM1, typing, or just stopped (one
+//   viewer's old connection the host has not seen close, or a second
+//   viewer on the same address). A replaced viewer that wants to type
+//   again reconnects.
+// - An input frame from any other connection opened before the newest
+//   owner is dropped too: an old connection never takes input back.
+// - A connection that never sends input (clipboard, ping) is never the
+//   owner and never replaced.
+// - Nothing is let go for being quiet: a key or button stays down for as
+//   long as the owner holds it, still or not.
+// - The owner's claims end with its own ups, its close, or a newer owner.
+//   TCP closes a dead owner about 13 s after the last thing the host got
+//   from it (host_main.cpp, serveControl; a connection whose keep-alive or
+//   retransmission limit cannot be set is closed before it can send).
+// - An up Windows did not take stays recorded with no owner, and retry(),
+//   every 250 ms, sends it again until Windows takes it.
 //
-// Keep-alive still closes a dead connection (host_main.cpp, serveControl),
-// which ends its claims sooner; neither rule depends on it. Not thread-safe:
-// the host keeps one, with its HeldInput, under InputInjector's lock.
+// Admission (with the takeover it may make) and the injection of the frame
+// are one step under this object's lock (frame()), and so are close() and
+// retry(): a frame admitted for the old owner is in, claim and all, before
+// a takeover can start, so the takeover's release covers it, and a frame
+// that comes after the takeover is dropped. Lock order: this lock, then
+// host_main.cpp's pointer lock, then InputInjector's.
 class InputClaims {
 public:
     using Owner = HeldInput::Owner;
-    static constexpr int64_t kQuietMs = 10'000;
 
-    // A control connection past its handshake, at nowMs. Owners are numbered
-    // from 1 in the order the connections opened.
-    Owner open(int64_t nowMs) {
-        const Owner o = next_++;
-        const uint64_t s = ++seq_;
-        conns_.push_back(Conn{o, s, s, nowMs});
-        return o;
-    }
-    // Any frame from o (input or not), before it is acted on.
-    void heard(Owner o, int64_t nowMs) {
-        if (Conn* c = find(o)) {
-            c->lastSeq = ++seq_;
-            c->lastMs = nowMs;
-        }
-    }
-    // A valid MRM1 pointer move from the viewer (rule 2). It is not a frame
-    // on any connection, so it does not count for rule 1.
-    void heardPointer(int64_t nowMs) {
-        for (size_t i = conns_.size(); i-- > 0;)
-            if (conns_[i].input && !conns_[i].replaced) {
-                conns_[i].lastMs = nowMs;
-                return;
-            }
+    // A control connection past its handshake. Owners are numbered from 1
+    // in the order the connections opened.
+    Owner open() {
+        std::lock_guard<std::mutex> g(m_);
+        return next_++;
     }
 
-    struct Admit {
-        bool ok = true;         // false: o was replaced, its frame is dropped
-        size_t replaced = 0;    // connections this frame replaced (rule 1)
-        size_t released = 0;    // ups Windows took for them
+    struct Frame {
+        bool admitted = false;  // false: o is not the owner and cannot become it; nothing went in
+        bool tookOver = false;  // o became the owner with this frame
+        size_t replaced = 0;    // 1 when it took over from an owner still open
+        size_t released = 0;    // ups Windows took then
+        bool injected = false;  // what inject returned
     };
-    // An input frame from o, after heard() and before it goes in.
-    template <class UpKey, class UpButton>
-    Admit admitInput(Owner o, UpKey&& upKey, UpButton&& upButton) {
-        Admit r;
-        Conn* c = find(o);
-        if (!c || c->replaced) {
-            r.ok = false;
-            return r;
+    // One input frame from o. When o is the owner, or becomes it now,
+    // inject(HeldInput&) puts the frame in, still under the lock; otherwise
+    // inject is not called.
+    template <class Inject, class UpKey, class UpButton>
+    Frame frame(Owner o, Inject&& inject, UpKey&& upKey, UpButton&& upButton) {
+        std::lock_guard<std::mutex> g(m_);
+        Frame r;
+        if (o != owner_) {
+            if (o <= newest_) return r;  // replaced, or older than the newest owner
+            if (owner_) {
+                r.replaced = 1;
+                r.released = held_.releaseOwned(owner_, upKey, upButton);
+            }
+            owner_ = newest_ = o;
+            r.tookOver = true;
         }
-        if (c->input) return r;
-        c->input = true;
-        const uint64_t opened = c->openSeq;
-        for (auto& old : conns_) {
-            if (old.owner >= o) break;  // in owner order
-            if (!old.input || old.replaced || old.lastSeq > opened) continue;
-            old.replaced = true;
-            ++r.replaced;
-            r.released += held_.releaseOwned(old.owner, upKey, upButton);
-        }
+        r.admitted = true;
+        r.injected = inject(held_);
         return r;
     }
-    // Connection o closed: its claims end (HeldInput::releaseOwned) and it
-    // is forgotten. Returns how many ups Windows took.
+    // Connection o closed: its claims end (HeldInput::releaseOwned, which
+    // also tries again any up Windows did not take). Returns how many ups
+    // Windows took.
     template <class UpKey, class UpButton>
     size_t close(Owner o, UpKey&& upKey, UpButton&& upButton) {
-        conns_.erase(std::remove_if(conns_.begin(), conns_.end(), [&](const Conn& c) { return c.owner == o; }),
-                     conns_.end());
+        std::lock_guard<std::mutex> g(m_);
+        if (owner_ == o) owner_ = 0;
         return held_.releaseOwned(o, upKey, upButton);
     }
-
-    struct Quiet {
-        size_t connections = 0;  // connections that let go (rule 2)
-        size_t released = 0;     // ups Windows took
-    };
-    // Rule 2, run every so often: a connection quiet for kQuietMs that still
-    // holds something lets go of it.
+    // Ups Windows did not take, tried again (HeldInput::retryUnowned).
+    // Returns how many Windows took.
     template <class UpKey, class UpButton>
-    Quiet releaseQuiet(int64_t nowMs, UpKey&& upKey, UpButton&& upButton) {
-        Quiet r;
-        for (const auto& c : conns_) {
-            if (nowMs - c.lastMs < kQuietMs || !held_.ownsAny(c.owner)) continue;
-            ++r.connections;
-            r.released += held_.releaseOwned(c.owner, upKey, upButton);
-        }
-        return r;
+    size_t retry(UpKey&& upKey, UpButton&& upButton) {
+        std::lock_guard<std::mutex> g(m_);
+        return held_.retryUnowned(upKey, upButton);
     }
 
-    bool replaced(Owner o) const {
-        for (const auto& c : conns_)
-            if (c.owner == o) return c.replaced;
-        return false;
+    // The input owner; 0 when there is none.
+    Owner owner() const {
+        std::lock_guard<std::mutex> g(m_);
+        return owner_;
     }
-    HeldInput& held() { return held_; }
-    const HeldInput& held() const { return held_; }
+    bool anyHeld() const {
+        std::lock_guard<std::mutex> g(m_);
+        return held_.anyHeld();
+    }
+    // A copy of what is held now, for logs and tests.
+    HeldInput held() const {
+        std::lock_guard<std::mutex> g(m_);
+        return held_;
+    }
 
 private:
-    struct Conn {
-        Owner owner = 0;
-        uint64_t openSeq = 0;  // seq_ when it opened
-        uint64_t lastSeq = 0;  // seq_ of its newest frame
-        int64_t lastMs = 0;    // its newest frame, or MRM1 move counted for it
-        bool input = false;    // it has sent an input frame
-        bool replaced = false;
-    };
-    Conn* find(Owner o) {
-        for (auto& c : conns_)
-            if (c.owner == o) return &c;
-        return nullptr;
-    }
-    std::vector<Conn> conns_;  // in owner order
-    uint64_t seq_ = 0;         // one count for opens and frames: what came first
+    mutable std::mutex m_;
     Owner next_ = 1;
+    Owner owner_ = 0;   // the input owner, 0 none
+    Owner newest_ = 0;  // the newest connection that has been the owner
     HeldInput held_;
 };
 
