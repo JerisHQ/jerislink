@@ -1,0 +1,49 @@
+name: windows-host
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: personal/windows-host
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build host and test (unsigned, dev only)
+        run: cmake --build build --config Release --target JerisLinkHost JerisLinkHostTest
+      - name: Host unit test (MR02 through the viewer's receiver, pacer, MRC1 probe / ping / video config, MRM1, Annex B, BT.709 colour, MF software encoder loopback)
+        run: build\Release\JerisLinkHostTest.exe
+      - name: Host refuses to start without dev mode, a specific bind and an allowed viewer (exit 64)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path build\Release\JerisLinkHost.exe).Path
+          $cases = @(
+            '',
+            '--bind 127.0.0.1 --allow 127.0.0.1',
+            '--dev-no-password --bind 0.0.0.0 --allow 127.0.0.1',
+            '--dev-no-password --bind 127.0.0.1'
+          )
+          foreach ($c in $cases) {
+            $a = @()
+            if ($c) { $a = $c -split ' ' }
+            & $exe @a
+            $code = $LASTEXITCODE
+            Write-Host "args: [$c] exit: $code"
+            if ($code -ne 64) { throw "expected exit 64, got $code for: [$c]" }
+          }
+          Write-Host 'OK: host refuses to start without --dev-no-password, a specific --bind and --allow'
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jerislink-windows-host-h1-unsigned
+          path: personal/windows-host/build/Release/JerisLinkHost.exe
