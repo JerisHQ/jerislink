@@ -55,11 +55,12 @@ DesktopRect InputInjector::desktopLocked() const {
     return DesktopRect{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
 }
 
-bool InputInjector::apply(const InputEvent& e) {
+bool InputInjector::apply(const InputEvent& e, HeldInput::Owner owner) {
     switch (e.kind) {
-    case InputEvent::Kind::Key: return key(e.semantic, e.down);
-    case InputEvent::Kind::Button: return button(e.button, e.down);
-    case InputEvent::Kind::MoveNorm: return moveNormalized(e.x, e.y);
+    case InputEvent::Kind::Key: return key(e.semantic, e.down, owner);
+    case InputEvent::Kind::Button: return button(e.button, e.down, owner);
+    case InputEvent::Kind::MoveNorm:
+    case InputEvent::Kind::PointerSync: return moveNormalized(e.x, e.y);
     case InputEvent::Kind::MoveAbsPixels: {
         DesktopRect r;
         {
@@ -124,14 +125,14 @@ bool InputInjector::sendButton(uint8_t b, bool down) {
     return sendInputs(&in, 1, lastError_);
 }
 
-bool InputInjector::button(uint8_t b, bool down) {
+bool InputInjector::button(uint8_t b, bool down, HeldInput::Owner owner) {
     if (b > 2) { ++ignored_; return false; }
     std::lock_guard<std::mutex> g(m_);
     if (!sendButton(b, down)) {
         ++failed_;
         return false;
     }
-    held_.button(b, down);
+    held_.button(b, down, owner);
     ++injected_;
     return true;
 }
@@ -151,7 +152,7 @@ bool InputInjector::sendKeyVk(uint16_t v, bool down) {
     return sendInputs(&in, 1, lastError_);
 }
 
-bool InputInjector::key(uint16_t semantic, bool down) {
+bool InputInjector::key(uint16_t semantic, bool down, HeldInput::Owner owner) {
     const uint16_t v = semanticToVk(semantic);
     if (!v) { ++ignored_; return false; }
     std::lock_guard<std::mutex> g(m_);
@@ -160,16 +161,19 @@ bool InputInjector::key(uint16_t semantic, bool down) {
         return false;
     }
     // Caps Lock comes as a tap (down, up); it toggles, nothing stays held.
-    held_.key(v, down);
+    held_.key(v, down, owner);
     ++injected_;
     return true;
 }
 
 bool InputInjector::taskManager() {
     // MRC1 0x60, the viewer's Force Quit button: on Windows, Ctrl+Shift+Esc.
-    // Whatever the viewer holds is released first so the chord is clean.
+    // Held keys are released first so the chord is clean. Buttons stay as
+    // they are (Pepper's H2 review, item 3): no up goes to Windows for them,
+    // so their records stay too, and a later up or close releases them. A
+    // key whose up Windows did not take stays recorded as well.
     std::lock_guard<std::mutex> g(m_);
-    held_.releaseAll([this](uint16_t v) { sendKeyVk(v, false); }, [](uint8_t) {});
+    held_.releaseKeys([this](uint16_t v) { return sendKeyVk(v, false); });
     const uint16_t seq[] = {vk::LControl, vk::LShift, vk::Escape};
     bool ok = true;
     for (uint16_t v : seq) ok = sendKeyVk(v, true) && ok;
@@ -179,10 +183,15 @@ bool InputInjector::taskManager() {
     return true;
 }
 
-size_t InputInjector::releaseAll() {
+size_t InputInjector::releaseOwned(HeldInput::Owner owner) {
     std::lock_guard<std::mutex> g(m_);
-    return held_.releaseAll([this](uint16_t v) { sendKeyVk(v, false); },
-                            [this](uint8_t b) { sendButton(b, false); });
+    return held_.releaseOwned(owner, [this](uint16_t v) { return sendKeyVk(v, false); },
+                              [this](uint8_t b) { return sendButton(b, false); });
+}
+
+bool InputInjector::anyHeld() const {
+    std::lock_guard<std::mutex> g(m_);
+    return held_.anyHeld();
 }
 
 CursorShape currentCursorShape() {

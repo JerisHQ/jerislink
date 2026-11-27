@@ -173,11 +173,15 @@ public:
     // but sends no pointer moves.
     void setInputEnabled(bool on) { inputEnabled_ = on; }
     bool inputEnabled() const { return inputEnabled_; }
+    // H2: MRM1 seq of the newest pointer datagram (UI thread), for the
+    // POINTER_SYNC in front of a click (control_channel.hpp notePointer).
+    uint32_t lastPointerSeq() const { return lastPointerSeq_; }
 
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
         if (!inputEnabled_) { ++inputBlocked_; return false; }
         const uint32_t seq = ++sequence_;
+        lastPointerSeq_ = seq;
         uint8_t p[14]{
             'M','R','M','1', 1, 0x24,
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
@@ -364,6 +368,7 @@ private:
     WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
     uint32_t sequence_ = 0;
+    uint32_t lastPointerSeq_ = 0;  // UI thread only
     uint64_t sent_ = 0;
     uint64_t dropped_ = 0;
     std::chrono::steady_clock::time_point lastKeyframeRequest_{};
@@ -426,6 +431,13 @@ static jl::keymap::Translator gKeys;
 // Mac.
 static bool gHostWindows = false;
 static const wchar_t* hostNoun() { return gHostWindows ? L"Windows PC" : L"Mac"; }
+// H2 (Pepper's H2 review, item 4): a VIDEO_CONFIG ACK was read this session,
+// so gHostWindows is what the host is, not the default. Until then keys are
+// held back (holdBackKeys): a shortcut would go out in the wrong layout.
+static bool gHostPlatformKnown = false;
+static uint64_t gKeysHeldBack = 0;
+static std::bitset<256> gHeldBackKeyUp;  // key-ups of keys held back
+static bool gWinHeldBack = false;        // the Windows key's down was held back
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -738,9 +750,14 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const double ny = static_cast<double>(p.y - dy) / std::max(1, dh - 1);
     const uint16_t qx = static_cast<uint16_t>(std::clamp<long>(std::lround(nx * 65535.0), 0, 65535));
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
-    // A click that waits for a control reconnect is queued with this.
-    if (gControl) gControl->notePointer(qx, qy);
-    if (udpInput) return gMouseMoveUdp->sendNormalized(qx, qy);
+    // A click that waits for a control reconnect is queued with this. H2:
+    // with the seq of its datagram, for the POINTER_SYNC of a Windows host.
+    if (udpInput) {
+        const bool ok = gMouseMoveUdp->sendNormalized(qx, qy);
+        if (gControl) gControl->notePointer(qx, qy, gMouseMoveUdp->lastPointerSeq());
+        return ok;
+    }
+    gControl->notePointer(qx, qy);
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
@@ -766,8 +783,9 @@ static void releaseRemoteModifiers() {
 }
 
 static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
-// H2: what the host said it is (MRC1 0x06 HOST_INFO), from the start-up
-// ACK, a read-only renegotiation or a later poll. Windows: the keymap goes
+// H2: what the host said it is (MRC1 0x06 HOST_INFO), read with the
+// VIDEO_CONFIG ACK at start-up or on a renegotiation (a read-only view's, or
+// an interactive view's whose start-up exchange failed). Windows: the keymap goes
 // to pass-through (the saved preset stays and still applies to Mac hosts).
 // A switch mid-session releases remote modifiers first. Logs the platform,
 // capabilities and version only.
@@ -776,14 +794,19 @@ static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
     const bool changed = win != gHostWindows;
     if (changed && via != std::string("startup")) releaseRemoteModifiers();
     gHostWindows = win;
+    gHostPlatformKnown = true;
     if (changed) gKeys.setPassthrough(win);
+    // H2 (Pepper's H2 review, item 5): clicks carry their position.
+    const bool sync = win && (info.caps & jl::hostinfo::kCapPointerSync) != 0;
+    if (gControl) gControl->setPointerSync(sync);
     char caps[16];
     std::snprintf(caps, sizeof(caps), "0x%02x", unsigned(info.caps));
     logLine(std::string("host.info via=") + via +
             " platform=" + (win ? "windows" : info.platform == jl::hostinfo::kPlatformMac ? "macos" : "unknown") +
             " format=" + std::to_string(info.format) + " caps=" + caps +
             " monitors=" + std::to_string(info.monitors) + " version=" + info.version +
-            " keymap=" + (gKeys.passthrough() ? "passthrough" : jl::keymap::presetName(gKeys.preset())));
+            " keymap=" + (gKeys.passthrough() ? "passthrough" : jl::keymap::presetName(gKeys.preset())) +
+            " pointer_sync=" + (sync ? "on" : "off"));
     if (changed && gOverlayTip) {
         TTTOOLINFOW ti{};
         ti.cbSize = sizeof(ti);
@@ -792,6 +815,31 @@ static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
         ti.lpszText = const_cast<wchar_t*>(jl::overlay::tooltipFor(jl::overlay::Item::ForceQuit, gHostWindows));
         SendMessageW(gOverlayTip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
     }
+}
+
+// H2 (Pepper's H2 review, item 4): an ACK (start-up or a renegotiation
+// on a new control session) says what the host is: its HOST_INFO, or none
+// for a Mac. Keys go out from here on.
+static void noteHostPlatform(const std::optional<jl::hostinfo::Info>& info, const char* via) {
+    const bool first = !gHostPlatformKnown;
+    if (info) {
+        applyHostInfo(*info, via);
+    } else if (first) {
+        gHostPlatformKnown = true;
+        logLine(std::string("host.platform via=") + via + " platform=macos reason=no_host_info");
+    }
+    if (first && gKeysHeldBack)
+        logLine("input.keys_released_hold held_back=" + std::to_string(gKeysHeldBack) + " via=" + via);
+}
+
+// H2 (Pepper's H2 review, item 4): no ACK yet (the start-up exchange
+// failed), so the keymap is not known to be the right one: the key is not
+// sent (its up neither) and the session is asked for, which renegotiates.
+static bool holdBackKeys(const char* what) {
+    if (!gControl || gHostPlatformKnown) return false;
+    if (gKeysHeldBack++ == 0) logLine(std::string("input.key_held_back reason=platform_unknown first=") + what);
+    gControl->keepSession();
+    return true;
 }
 
 static void sendRemoteButtonUp(uint8_t button) {
@@ -4115,6 +4163,16 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         // (not auto-repeat, not the pointer) starts a new round.
         if (ControlChannel::isFreshKeyDown(static_cast<uint64_t>(lParam)) && gControl->resumeOnUserKey())
             logLine("control.resume reason=fresh_key");
+        // H2 (item 4): a key held back stays held back until its up, auto-
+        // repeat included, so the host never gets a down without its up.
+        if (wParam < 256 && gHeldBackKeyUp.test(static_cast<size_t>(wParam))) {
+            if (repeat) return 0;
+            gHeldBackKeyUp.reset(static_cast<size_t>(wParam));  // its up went elsewhere
+        }
+        if (holdBackKeys("key")) {
+            if (wParam < 256) gHeldBackKeyUp.set(static_cast<size_t>(wParam));
+            return 0;
+        }
         // Keyboard preset, Win+Space, Win+C, Ctrl compat shortcuts, Ctrl+Y and
         // plain keys: keymap.hpp.
         const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());
@@ -4128,6 +4186,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             gOverlaySwallowUp.reset(static_cast<size_t>(wParam));
             return 0;
         }
+        if (wParam < 256 && gHeldBackKeyUp.test(static_cast<size_t>(wParam))) {
+            gHeldBackKeyUp.reset(static_cast<size_t>(wParam));  // H2: its down was held back
+            return 0;
+        }
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         const auto out = gKeys.keyUp(static_cast<uint32_t>(wParam), heldModifiers());
         if (!out.handled) break;
@@ -4137,12 +4199,20 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     // Posted by the low-level hook, which owns the Windows key and Caps Lock
     // while the viewer is focused.
     case WM_MR_WIN_DOWN:
-        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(gKeys.hookWinDown());
+        if (viewerHasInteractiveFocus(hwnd)) {
+            if (holdBackKeys("win")) gWinHeldBack = true;  // H2 (item 4)
+            else sendKeyOutput(gKeys.hookWinDown());
+        }
         return 0;
     case WM_MR_WIN_UP:
+        if (gWinHeldBack) {
+            gWinHeldBack = false;
+            return 0;
+        }
         sendKeyOutput(gKeys.hookWinUp());
         return 0;
     case WM_MR_WIN_C:
+        if (gWinHeldBack || holdBackKeys("win_c")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinC(gHookFilter.winDown()));
         }
@@ -4150,11 +4220,13 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_MR_WIN_SPACE:
         // Windows+Space becomes native macOS Control+Space for switching
         // input sources (Parsec muscle memory), in both keyboard presets.
+        if (gWinHeldBack || holdBackKeys("win_space")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinSpace(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_CAPS_LOCK:
+        if (holdBackKeys("caps_lock")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookCapsLock());
         return 0;
     case WM_SETCURSOR:
@@ -6228,9 +6300,15 @@ static int appMain(int argc, char** argv) {
         {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
             gControl = o.controlEnabled ? control.get() : nullptr;
-            // H2: a Mac until the host says otherwise (HOST_INFO).
+            // H2: a Mac until the host says otherwise (HOST_INFO); keys wait
+            // until an ACK said which (item 4).
             gHostWindows = false;
+            gHostPlatformKnown = false;
+            gKeysHeldBack = 0;
+            gHeldBackKeyUp.reset();
+            gWinHeldBack = false;
             gKeys.setPassthrough(false);
+            control->setPointerSync(false);
             if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");
             // Startup negotiation may traverse a degraded Tailscale/DERP path.
             // Give the initial handshake enough headroom, then restore the
@@ -6256,7 +6334,7 @@ static int appMain(int argc, char** argv) {
 
                 const auto videoConfig = control->negotiateVideo(
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
-                if (videoConfig.hostInfo) applyHostInfo(*videoConfig.hostInfo, "startup");
+                if (videoConfig.acked) noteHostPlatform(videoConfig.hostInfo, "startup");
                 if (videoConfig.negotiated) {
                     videoNegotiatedAtStart = true;
                     effectiveCodec = videoConfig.codec;
@@ -6402,12 +6480,16 @@ static int appMain(int argc, char** argv) {
         // reconnect worker (never the UI thread). It asks for what the
         // session already runs, so the Mac keeps the stream as it is; the
         // loop below applies what the ACK says now (audio).
-        if (control && !o.controlEnabled) {
+        // H2 (Pepper's H2 review, item 4): so does an interactive view whose
+        // start-up exchange got no ACK, until one says what the host is; the
+        // loop below then turns it off.
+        if (control && (!o.controlEnabled || !gHostPlatformKnown)) {
             const bool hevcNow = effectiveCodec == "hevc";
             const uint16_t bitrateNow = videoNegotiatedAtStart ? effectiveBitrateMbps : o.bitrateMbps;
             control->setRenegotiateOnReconnect(effectiveCodec, h264Supported, hevcNow, bitrateNow, o.audio == "on");
             logLine("video.renegotiate_on_reconnect codec=" + effectiveCodec +
-                    " bitrate_mbps=" + std::to_string(bitrateNow));
+                    " bitrate_mbps=" + std::to_string(bitrateNow) +
+                    (o.controlEnabled ? " reason=host_platform_unknown" : ""));
         }
         // Hand tests only: JERISLINK_TEST_FLUSH_HOLD_MS (1-5000) holds each
         // event the reconnect worker took from the queue for that long
@@ -6746,7 +6828,6 @@ static int appMain(int argc, char** argv) {
                 // attempt (gAuthHalt, next iteration), no reconnect.
                 if (control) {
                     control->pollHostNotice();
-                    if (const auto hi = control->takeHostInfo()) applyHostInfo(*hi, "poll");
                     // Read-only: no input ever asks for a reconnect, so the
                     // session is brought back here when it dropped.
                     if (!o.controlEnabled) {
@@ -6775,7 +6856,7 @@ static int appMain(int argc, char** argv) {
                         // renegotiated on a new control session; apply what
                         // the Mac offers now. Nothing here waits.
                         if (const auto vc = control->takeRenegotiated()) {
-                            if (vc->hostInfo) applyHostInfo(*vc->hostInfo, "renegotiate");
+                            if (vc->acked) noteHostPlatform(vc->hostInfo, "renegotiate");
                             if (vc->negotiated && vc->codec == effectiveCodec) {
                                 hostSupportsAudio = vc->hostSupportsAudio;
                                 // NACK stays as the start set it: the
@@ -6795,6 +6876,20 @@ static int appMain(int argc, char** argv) {
                                 logLine(std::string("video.renegotiate_refused negotiated=") + (vc->negotiated ? "yes" : "no") +
                                         " codec=" + vc->codec + " running=" + effectiveCodec + " audio=unchanged");
                             }
+                        }
+                    } else if (!gHostPlatformKnown) {
+                        // H2 (Pepper's H2 review, item 4): the start-up
+                        // exchange got no ACK. A new control session
+                        // renegotiates (worker) and its ACK says what the
+                        // host is; until then keys wait, so the session is
+                        // brought back here as for a read-only view.
+                        if (const auto vc = control->takeRenegotiated()) {
+                            noteHostPlatform(vc->hostInfo, "renegotiate");
+                            control->clearRenegotiateOnReconnect();
+                            logLine(std::string("video.renegotiate_on_reconnect off reason=host_platform_known negotiated=") +
+                                    (vc->negotiated ? "yes" : "no"));
+                        } else {
+                            control->keepSession();
                         }
                     }
                 }

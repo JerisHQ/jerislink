@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -208,7 +209,8 @@ static void testHostInfo() {
           info->version == "0.4.1-h2dev");
     CHECK(jlh::kHostCapKeyboard == jl::hostinfo::kCapKeyboard && jlh::kHostCapPointer == jl::hostinfo::kCapPointer &&
           jlh::kHostCapCursorShape == jl::hostinfo::kCapCursorShape &&
-          jlh::kHostCapTaskManager == jl::hostinfo::kCapTaskManager);
+          jlh::kHostCapTaskManager == jl::hostinfo::kCapTaskManager &&
+          jlh::kHostCapPointerSync == jl::hostinfo::kCapPointerSync);
     CHECK(jlh::kMsgHostInfo == jl::hostinfo::kType);
     // The frame the host puts behind the ACK is one the viewer recognises.
     auto frame = jlh::mrc1Frame(jlh::kMsgHostInfo, p);
@@ -252,6 +254,40 @@ static void testHostInfo() {
     CHECK(!jl::hostinfo::isFramePrefix(tiny, 8) && !jl::hostinfo::isFramePrefix(huge, 8));
 }
 
+// Pepper's H2 review, item 1: HOST_INFO goes only to a viewer that asks for
+// it in VIDEO_CONFIG (caps 0x08). An older viewer reads exactly the ACK and
+// nothing is left unread on its socket.
+static void testHostInfoOnlyWhenAsked() {
+    const auto hi = jlh::hostInfoPayload(jlh::kPlatformWindows, 0x2F, 1, "0.4.1-h2dev");
+    // 0.4.x viewer: h264 + audio, no 0x08.
+    const uint8_t oldViewer[6] = {1, 0, 0x05, 0, 0, 0};
+    auto d = jlh::decideVideoConfig(oldViewer, 6, 25, 1920, 1080);
+    CHECK(d.accepted && !d.hostInfo && d.ack.size() == 10);
+    auto reply = jlh::videoConfigReply(d, hi);
+    CHECK(reply.size() == 8 + 10);
+    CHECK(reply[5] == jlh::kMsgVideoConfigAck && reply[6] == 0 && reply[7] == 10);
+    // H2 viewer: 0x08 set. ACK of 11 bytes, [10] = 0x01, then HOST_INFO.
+    const uint8_t newViewer[6] = {1, 0, 0x0D, 0, 0, 0};
+    d = jlh::decideVideoConfig(newViewer, 6, 25, 1920, 1080);
+    CHECK(d.accepted && d.hostInfo && d.ack.size() == 11 && d.ack[10] == jlh::kAckExtHostInfo);
+    CHECK(d.ack[1] == 0 && d.ack[2] == 1 && d.ack[3] == 0x08);  // the first ten as before
+    reply = jlh::videoConfigReply(d, hi);
+    CHECK(reply.size() == 8 + 11 + 8 + hi.size());
+    CHECK(reply[5] == jlh::kMsgVideoConfigAck && reply[7] == 11 && reply[8 + 10] == 0x01);
+    const uint8_t* f = reply.data() + 8 + 11;
+    const size_t fn = reply.size() - (8 + 11);
+    CHECK(jl::hostinfo::isFramePrefix(f, fn) && jl::hostinfo::completeFrameBytes(f, fn) == fn);
+    const auto info = jl::hostinfo::decode(f + 8, fn - 8);
+    CHECK(info && info->windows() && info->caps == 0x2F && info->version == "0.4.1-h2dev");
+    // A refusal answers the same way: the viewer asked, so HOST_INFO follows.
+    const uint8_t refused[6] = {1, 3, 0x09, 0, 0, 0};
+    d = jlh::decideVideoConfig(refused, 6, 25, 1920, 1080);
+    CHECK(!d.accepted && d.hostInfo && d.ack.size() == 11);
+    // A malformed request never gets HOST_INFO.
+    d = jlh::decideVideoConfig(newViewer, 5, 25, 1920, 1080);
+    CHECK(!d.accepted && !d.hostInfo && d.ack.size() == 10);
+}
+
 static void testDecodeInput() {
     const uint8_t key[3] = {1, 0, 'A'};
     auto e = jlh::decodeInput(hdr(0x10, 3), key);
@@ -280,6 +316,12 @@ static void testDecodeInput() {
     e = jlh::decodeInput(hdr(0x60, 0), key);
     CHECK(e && e->kind == jlh::InputEvent::Kind::TaskManager);
     CHECK(!jlh::decodeInput(hdr(0x60, 1), key));
+    // POINTER_SYNC: [nx BE16, ny BE16, seq BE32], 8 bytes and no other size.
+    const uint8_t sync[9] = {0x12, 0x34, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x05, 0};
+    e = jlh::decodeInput(hdr(0x27, 8), sync);
+    CHECK(e && e->kind == jlh::InputEvent::Kind::PointerSync && e->x == 0x1234 && e->y == 65535 &&
+          e->seq == 0x80000005u);
+    CHECK(!jlh::decodeInput(hdr(0x27, 7), sync) && !jlh::decodeInput(hdr(0x27, 9), sync));
     // Not input: the host's other frames and unknown types.
     for (uint8_t t : {uint8_t(0x01), uint8_t(0x30), uint8_t(0x40), uint8_t(0x26), uint8_t(0x61)})
         CHECK(!jlh::decodeInput(hdr(t, 3), key));
@@ -314,28 +356,102 @@ static void testKeysAgainstViewer() {
           !jlh::isExtendedVk(jlh::vk::Numpad0));
 }
 
+template <class T>
+static bool same(const std::vector<T>& v, std::initializer_list<T> want) {
+    return v == std::vector<T>(want);
+}
+
 static void testHeldInput() {
-    jlh::HeldInput h;
-    CHECK(!h.anyHeld());
-    h.key(jlh::vk::LControl, true);
-    h.key('C', true);
-    h.key('C', true);  // auto-repeat: still one
-    h.button(0, true);
-    h.button(3, true);  // not a button: ignored
-    CHECK(h.anyHeld());
+    const jlh::HeldInput::Owner A = 1, B = 2, C = 3;
     std::vector<uint16_t> ups;
     std::vector<uint8_t> buttonUps;
-    size_t n = h.releaseAll([&](uint16_t v) { ups.push_back(v); }, [&](uint8_t b) { buttonUps.push_back(b); });
-    CHECK(n == 3 && ups.size() == 2 && ups[0] == 'C' && ups[1] == jlh::vk::LControl);
-    CHECK(buttonUps.size() == 1 && buttonUps[0] == 0);
+    auto upKey = [&](uint16_t v) { ups.push_back(v); return true; };
+    auto upButton = [&](uint8_t b) { buttonUps.push_back(b); return true; };
+    auto noKey = [](uint16_t) { CHECK(false); return true; };
+    auto noButton = [](uint8_t) { CHECK(false); return true; };
+
+    // One connection: what it pressed goes up when it closes, newest key first.
+    jlh::HeldInput h;
     CHECK(!h.anyHeld());
-    h.key('A', true);
-    h.key('A', false);
-    h.button(1, true);
-    h.button(1, false);
+    h.key(jlh::vk::LControl, true, A);
+    h.key('C', true, A);
+    h.key('C', true, A);  // auto-repeat: still one
+    h.button(0, true, A);
+    h.button(3, true, A);  // not a button: ignored
+    CHECK(h.anyHeld() && h.keyOwnedBy('C', A) && h.buttonOwnedBy(0, A));
+    size_t n = h.releaseOwned(A, upKey, upButton);
+    CHECK(n == 3 && same(ups, {uint16_t('C'), jlh::vk::LControl}) && same(buttonUps, {uint8_t(0)}));
     CHECK(!h.anyHeld());
-    n = h.releaseAll([&](uint16_t) { CHECK(false); }, [&](uint8_t) { CHECK(false); });
-    CHECK(n == 0);
+    h.key('A', true, A);
+    h.key('A', false, A);
+    h.button(1, true, A);
+    h.button(1, false, A);
+    CHECK(!h.anyHeld());
+    CHECK(h.releaseOwned(A, noKey, noButton) == 0);
+
+    // Pepper's H2 review, item 2. The viewer reconnected: old connection A
+    // held Shift when it was lost, new connection B presses the left button,
+    // and only then is A seen closed. A's Shift goes up; B's button stays.
+    jlh::HeldInput r;
+    ups.clear();
+    buttonUps.clear();
+    r.key(jlh::vk::LShift, true, A);
+    r.button(0, true, B);
+    n = r.releaseOwned(A, upKey, upButton);
+    CHECK(n == 1 && same(ups, {jlh::vk::LShift}) && buttonUps.empty());
+    CHECK(r.buttonHeld(0) && r.buttonOwnedBy(0, B) && !r.keyHeld(jlh::vk::LShift));
+    // Held by B and C: up only when the last of them closes.
+    ups.clear();
+    r.key('W', true, B);
+    r.key('W', true, C);
+    n = r.releaseOwned(C, noKey, noButton);
+    CHECK(n == 0 && r.keyHeld('W') && r.keyOwnedBy('W', B) && !r.keyOwnedBy('W', C));
+    n = r.releaseOwned(B, upKey, upButton);
+    CHECK(n == 2 && same(ups, {uint16_t('W')}) && same(buttonUps, {uint8_t(0)}) && !r.anyHeld());
+    // An up from either connection ends the press: no second up later.
+    r.button(2, true, A);
+    r.button(2, false, B);
+    CHECK(!r.anyHeld() && r.releaseOwned(A, noKey, noButton) == 0);
+
+    // An up Windows did not take: the entry stays, and the next release
+    // (any connection's close) tries it again.
+    jlh::HeldInput f;
+    ups.clear();
+    buttonUps.clear();
+    f.key('X', true, A);
+    f.button(1, true, A);
+    n = f.releaseOwned(A, [](uint16_t) { return false; }, [](uint8_t) { return false; });
+    CHECK(n == 0 && f.keyHeld('X') && f.buttonHeld(1) && !f.keyOwnedBy('X', A) && !f.buttonOwnedBy(1, A));
+    n = f.releaseOwned(B, upKey, upButton);
+    CHECK(n == 2 && same(ups, {uint16_t('X')}) && same(buttonUps, {uint8_t(1)}) && !f.anyHeld());
+}
+
+// Pepper's H2 review, item 3: Task Manager (MRC1 0x60) releases held keys
+// only. A button stays down on Windows, so its record stays too; a key whose
+// up Windows did not take stays recorded for a later release.
+static void testTaskManagerRelease() {
+    const jlh::HeldInput::Owner A = 1;
+    jlh::HeldInput t;
+    t.key(jlh::vk::LMenu, true, A);
+    t.key('Q', true, A);
+    t.button(0, true, A);
+    std::vector<uint16_t> tried;
+    size_t n = t.releaseKeys([&](uint16_t v) {
+        tried.push_back(v);
+        return v != 'Q';  // Windows refuses Q's up
+    });
+    CHECK(n == 1 && same(tried, {uint16_t('Q'), jlh::vk::LMenu}));
+    CHECK(t.keyHeld('Q') && !t.keyHeld(jlh::vk::LMenu));
+    CHECK(t.buttonHeld(0) && t.buttonOwnedBy(0, A));
+    // A closes later: the button goes up then, and Q is tried again.
+    std::vector<uint16_t> ups;
+    std::vector<uint8_t> buttonUps;
+    n = t.releaseOwned(
+        A, [&](uint16_t v) { ups.push_back(v); return true; },
+        [&](uint8_t b) { buttonUps.push_back(b); return true; });
+    CHECK(n == 2 && same(ups, {uint16_t('Q')}) && same(buttonUps, {uint8_t(0)}) && !t.anyHeld());
+    // Nothing held: nothing sent.
+    CHECK(t.releaseKeys([](uint16_t) { CHECK(false); return true; }) == 0);
 }
 
 static void testPointerMapping() {
@@ -390,6 +506,153 @@ static void testMrm1SessionAndCursor() {
     CHECK(c[6] == 1 && c[7] == 2 && c[8] == 3 && c[9] == 4 && c[10] == 12);
     CHECK(uint8_t(jlh::CursorShape::IBeam) == 1 && uint8_t(jlh::CursorShape::PointingHand) == 2 &&
           uint8_t(jlh::CursorShape::NotAllowed) == 10 && uint8_t(jlh::CursorShape::Move) == 14);
+    // POINTER_SYNC marks a seq as taken; it never moves the mark back.
+    jlh::Mrm1Session p;
+    p.syncPointer(7);  // before any move
+    CHECK(!p.takePointer(7) && !p.takePointer(6) && p.takePointer(8));
+    p.syncPointer(5);  // older than what was taken: no change
+    CHECK(!p.takePointer(8) && p.takePointer(9));
+    p.syncPointer(0xFFFFFFF0u);  // half the range behind 9: older, no change
+    CHECK(p.takePointer(10));
+    p.syncPointer(0x7FFFFFF0u);  // ahead
+    CHECK(!p.takePointer(0x7FFFFFEFu) && p.takePointer(0x7FFFFFF1u));
+}
+
+// Pepper's H2 review, item 5. The host's pointer and buttons as the real
+// steps drive them: UDP moves through Mrm1Session::takePointer, control
+// frames (parsed from the viewer's wire bytes) through stepInput, with
+// POINTER_SYNC applied as in host_main.cpp's applyPointerSync.
+namespace {
+struct Press {
+    uint8_t button;
+    bool down;
+    int x, y;
+};
+struct FakeDesk {
+    jlh::Mrm1Session order;
+    int x = -1, y = -1;
+    std::vector<Press> presses;
+    std::optional<jlh::InputEvent> pending;
+    void udp(uint32_t seq, int nx, int ny) {
+        if (order.takePointer(seq)) {
+            x = nx;
+            y = ny;
+        }
+    }
+    // One TCP write from the viewer: any number of MRC1 frames.
+    void tcp(const std::vector<uint8_t>& bytes) {
+        size_t off = 0;
+        while (off + jlh::kMrc1HeaderBytes <= bytes.size()) {
+            const auto h = jlh::parseMrc1Header(bytes.data() + off);
+            CHECK(h.has_value());
+            if (!h) return;
+            const auto e = jlh::decodeInput(*h, bytes.data() + off + jlh::kMrc1HeaderBytes);
+            CHECK(e.has_value());
+            off += jlh::kMrc1HeaderBytes + h->length;
+            if (!e) continue;
+            jlh::stepInput(
+                pending, *e,
+                [&](const jlh::InputEvent& s, const jlh::InputEvent* b) {
+                    order.syncPointer(s.seq);
+                    x = s.x;
+                    y = s.y;
+                    if (b) presses.push_back({b->button, b->down, x, y});
+                    return true;
+                },
+                [&](const jlh::InputEvent& ev) {
+                    if (ev.kind == jlh::InputEvent::Kind::Button) presses.push_back({ev.button, ev.down, x, y});
+                    if (ev.kind == jlh::InputEvent::Kind::MoveNorm) {
+                        x = ev.x;
+                        y = ev.y;
+                    }
+                    return true;
+                });
+        }
+        CHECK(off == bytes.size());
+    }
+};
+// What the viewer writes for a click with POINTER_SYNC: 0x27 then 0x25.
+std::vector<uint8_t> syncedButton(int nx, int ny, uint32_t seq, uint8_t b, bool down) {
+    auto out = jlh::mrc1Frame(jlh::kMsgPointerSync,
+                              {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny), uint8_t(seq >> 24),
+                               uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)});
+    const auto btn = jlh::mrc1Frame(jlh::kMsgMouseButtonExt, {b, uint8_t(down ? 1 : 0), 1});
+    out.insert(out.end(), btn.begin(), btn.end());
+    return out;
+}
+bool pressedAt(const Press& p, uint8_t b, bool down, int x, int y) {
+    return p.button == b && p.down == down && p.x == x && p.y == y;
+}
+}  // namespace
+
+static void testPointerSyncOrdering() {
+    // The move to the click point (seq 2) is late: it arrives after the
+    // click, together with an older move (seq 1). Down and up land at the
+    // click point, and the late moves are dropped.
+    {
+        FakeDesk d;
+        d.udp(0, 100, 100);
+        d.tcp(syncedButton(500, 600, 2, 0, true));
+        d.udp(1, 300, 300);
+        d.udp(2, 500, 600);
+        d.tcp(syncedButton(500, 600, 2, 0, false));
+        CHECK(d.presses.size() == 2 && pressedAt(d.presses[0], 0, true, 500, 600) &&
+              pressedAt(d.presses[1], 0, false, 500, 600));
+        CHECK(d.x == 500 && d.y == 600);
+    }
+    // The move to the click point is lost: the click still lands there.
+    {
+        FakeDesk d;
+        d.udp(0, 100, 100);
+        d.tcp(syncedButton(700, 800, 1, 1, true));
+        d.tcp(syncedButton(700, 800, 1, 1, false));
+        CHECK(d.presses.size() == 2 && pressedAt(d.presses[0], 1, true, 700, 800) &&
+              pressedAt(d.presses[1], 1, false, 700, 800));
+    }
+    // A drag: down at the start, moves on the way, up at the end even when
+    // the last move comes late; a move from before the up that arrives
+    // after it does not move the pointer off the drop point.
+    {
+        FakeDesk d;
+        d.tcp(syncedButton(1000, 1000, 5, 0, true));
+        d.udp(6, 1500, 1200);
+        d.tcp(syncedButton(2000, 1500, 7, 0, false));
+        d.udp(7, 2000, 1500);
+        d.udp(6, 1500, 1200);
+        CHECK(d.presses.size() == 2 && pressedAt(d.presses[0], 0, true, 1000, 1000) &&
+              pressedAt(d.presses[1], 0, false, 2000, 1500));
+        CHECK(d.x == 2000 && d.y == 1500);
+        d.udp(8, 2100, 1600);  // a move after the drop is taken
+        CHECK(d.x == 2100 && d.y == 1600);
+    }
+    // Without POINTER_SYNC (a viewer that does not send it), the same late
+    // move puts the press at the old point: what Pepper found.
+    {
+        FakeDesk d;
+        d.udp(0, 100, 100);
+        d.tcp(jlh::mrc1Frame(jlh::kMsgMouseButtonExt, {0, 1, 1}));
+        d.udp(1, 500, 600);
+        CHECK(d.presses.size() == 1 && pressedAt(d.presses[0], 0, true, 100, 100));
+    }
+    // A sync followed by something other than a button is applied alone
+    // first, and a sync after a sync applies the first alone.
+    {
+        FakeDesk d;
+        auto two = syncedButton(10, 20, 3, 0, true);
+        two.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);  // the sync only
+        const auto key = jlh::mrc1Frame(jlh::kMsgKey, {1, 0, 'A'});
+        two.insert(two.end(), key.begin(), key.end());
+        d.tcp(two);
+        CHECK(d.x == 10 && d.y == 20 && d.presses.empty() && !d.pending);
+        d.udp(3, 99, 99);  // covered by that sync
+        CHECK(d.x == 10);
+        auto s1 = syncedButton(30, 40, 4, 0, true);
+        s1.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);
+        d.tcp(s1);
+        CHECK(d.pending && d.x == 10);
+        d.tcp(syncedButton(50, 60, 5, 0, true));
+        CHECK(d.presses.size() == 1 && pressedAt(d.presses[0], 0, true, 50, 60));
+    }
 }
 
 static void testAnnexB() {
@@ -509,9 +772,12 @@ int main() {
     testHostInfo();
     testDecodeInput();
     testKeysAgainstViewer();
+    testHostInfoOnlyWhenAsked();
     testHeldInput();
+    testTaskManagerRelease();
     testPointerMapping();
     testMrm1SessionAndCursor();
+    testPointerSyncOrdering();
     testAnnexB();
     testColor();
 #ifdef _WIN32

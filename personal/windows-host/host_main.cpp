@@ -40,6 +40,7 @@
 #include <exception>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,7 +64,7 @@ constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer send
 constexpr int kCursorPollMs = 16;           // cursor shape check
 constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
 constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
-                               jlh::kHostCapTaskManager;
+                               jlh::kHostCapTaskManager | jlh::kHostCapPointerSync;
 
 struct Options {
     bool devNoPassword = false;
@@ -194,9 +195,16 @@ struct State {
     std::atomic<int> streamW{0}, streamH{0};
     // counters, read by the stats line
     std::atomic<uint64_t> keyframeRequests{0}, pings{0}, rejected{0};
-    // H2 input. One injector for every connection: one viewer IP may connect.
+    // H2 input. One injector for every connection: one viewer IP may connect,
+    // but over more than one control connection at a time (a reconnect), so
+    // each connection gets its own owner number for what it holds down.
     jlh::InputInjector input;
-    std::atomic<uint64_t> inputMalformed{0}, pointerUdp{0}, pointerUdpStale{0};
+    std::atomic<uint64_t> nextInputOwner{1};
+    // MRM1 pointer order. A UDP move and a POINTER_SYNC (control thread) both
+    // take this, then the injector's own lock, in that order.
+    std::mutex pointerMutex;
+    jlh::Mrm1Session pointer;  // guarded by pointerMutex
+    std::atomic<uint64_t> inputMalformed{0}, pointerUdp{0}, pointerUdpStale{0}, pointerSyncs{0};
     std::atomic<uint64_t> cursorSent{0}, cursorSendFail{0}, cursorChanges{0};
     // The MRM1 socket and the newest MRM1 session's viewer address: the
     // cursor shape goes there, from port 38412 (the viewer checks both).
@@ -254,6 +262,22 @@ bool sendAll(SOCKET s, const std::vector<uint8_t>& b) {
 
 // ---------------------------------------------------------- control channel
 
+// POINTER_SYNC (Pepper's H2 review, item 5): the viewer's pointer position
+// and MRM1 seq when a button went down or up, sent on the control
+// connection just before that button. Under the pointer lock the pointer is
+// put there, every UDP move up to that seq becomes stale, and the button is
+// injected, with no UDP move in between: the press lands where the viewer
+// clicked whether the move before it came late, never came, or came first.
+// button == nullptr: a sync not followed by a button, applied alone.
+bool applyPointerSync(State& st, const jlh::InputEvent& sync, const jlh::InputEvent* button,
+                      jlh::HeldInput::Owner owner) {
+    std::lock_guard<std::mutex> g(st.pointerMutex);
+    st.pointer.syncPointer(sync.seq);
+    ++st.pointerSyncs;
+    st.input.moveNormalized(sync.x, sync.y);
+    return button ? st.input.apply(*button, owner) : true;
+}
+
 // Runs on its own thread holding one of st.controlSlots, taken by the
 // listener; every return path closes the socket and gives the slot back.
 void serveControl(State& st, SOCKET c, std::string peer) {
@@ -297,7 +321,9 @@ void serveControl(State& st, SOCKET c, std::string peer) {
     touch(st);
     const char* role = "control";
     bool first = true;
-    bool hostInfoSent = false, inputSeen = false;
+    bool hostInfoLogged = false, inputSeen = false;
+    const jlh::HeldInput::Owner owner = st.nextInputOwner++;
+    std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
     while (st.running && readFrame(hdr, -1)) {
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
@@ -323,21 +349,18 @@ void serveControl(State& st, SOCKET c, std::string peer) {
             const auto d = jlh::decideVideoConfig(payload.data(), payload.size(), st.bitrateMbps.load(),
                                                   st.streamW.load(), st.streamH.load());
             if (d.accepted && d.bitrateChanged) st.bitrateMbps = d.bitrateMbps;
-            auto out = jlh::mrc1Frame(jlh::kMsgVideoConfigAck, d.ack);
-            // HOST_INFO rides behind this connection's first ACK, in the same
-            // send (host_protocol.hpp says why there and nowhere else).
+            // HOST_INFO rides behind the ACK, in the same send, only when this
+            // VIDEO_CONFIG said the viewer reads it (host_protocol.hpp says
+            // why): an older viewer gets the ACK alone, as from H1.
             const int monitors = std::clamp(GetSystemMetrics(SM_CMONITORS), 0, 255);
-            if (!hostInfoSent) {
-                const auto hi = jlh::mrc1Frame(
-                    jlh::kMsgHostInfo,
-                    jlh::hostInfoPayload(jlh::kPlatformWindows, kHostCaps, uint8_t(monitors), JERISLINK_VERSION_STRING));
-                out.insert(out.end(), hi.begin(), hi.end());
-            }
+            const auto out = jlh::videoConfigReply(
+                d, jlh::hostInfoPayload(jlh::kPlatformWindows, kHostCaps, uint8_t(monitors), JERISLINK_VERSION_STRING));
             if (!sendAll(c, out)) goto done;
-            logf("video.config peer=%s status=%u codec=h264 bitrate_mbps=%d flags=0x%02x size=%dx%d", peer.c_str(),
-                 unsigned(d.ack[1]), d.bitrateMbps, unsigned(d.ack[3]), st.streamW.load(), st.streamH.load());
-            if (!hostInfoSent) {
-                hostInfoSent = true;
+            logf("video.config peer=%s status=%u codec=h264 bitrate_mbps=%d flags=0x%02x size=%dx%d host_info=%s",
+                 peer.c_str(), unsigned(d.ack[1]), d.bitrateMbps, unsigned(d.ack[3]), st.streamW.load(),
+                 st.streamH.load(), d.hostInfo ? "sent" : "not_asked");
+            if (d.hostInfo && !hostInfoLogged) {
+                hostInfoLogged = true;
                 logf("host.info peer=%s platform=windows caps=0x%02x monitors=%d version=%s", peer.c_str(),
                      unsigned(kHostCaps), monitors, JERISLINK_VERSION_STRING);
             }
@@ -350,6 +373,7 @@ void serveControl(State& st, SOCKET c, std::string peer) {
         case jlh::kMsgMouseMoveAbs:
         case jlh::kMsgMouseMoveNorm:
         case jlh::kMsgMouseButtonExt:
+        case jlh::kMsgPointerSync:
         case jlh::kMsgForceQuitOpen: {
             const auto e = jlh::decodeInput(hdr, payload.data());
             if (!e) {
@@ -362,7 +386,12 @@ void serveControl(State& st, SOCKET c, std::string peer) {
                 logf("input.open peer=%s channel=%s", peer.c_str(), role);
             }
             // What was typed is never logged; only counts, in the stats line.
-            const bool ok = st.input.apply(*e);
+            const bool ok = jlh::stepInput(
+                pendingSync, *e,
+                [&](const jlh::InputEvent& s, const jlh::InputEvent* button) {
+                    return applyPointerSync(st, s, button, owner);
+                },
+                [&](const jlh::InputEvent& ev) { return st.input.apply(ev, owner); });
             if (e->kind == jlh::InputEvent::Kind::TaskManager)
                 logf("input.task_manager peer=%s sent=%s err=%lu", peer.c_str(), ok ? "yes" : "no",
                      ok ? 0ul : st.input.lastError());
@@ -373,10 +402,14 @@ void serveControl(State& st, SOCKET c, std::string peer) {
         }
     }
 done:
-    if (inputSeen) {
-        // The viewer went away: nothing it pressed stays down on this PC.
-        const size_t n = st.input.releaseAll();
-        logf("input.released peer=%s held=%zu", peer.c_str(), n);
+    {
+        // This connection went away: nothing it pressed stays down on this
+        // PC, unless another connection of the viewer holds it too (Pepper's
+        // H2 review, item 2). An up Windows refused earlier is tried again.
+        const size_t n = st.input.releaseOwned(owner);
+        if (inputSeen || n)
+            logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,
+                 st.input.anyHeld() ? "yes" : "no");
     }
     logf("control.closed peer=%s channel=%s", peer.c_str(), role);
 }
@@ -416,7 +449,6 @@ void controlListener(State& st, SOCKET ls) {
 void mrm1Listener(State& st, SOCKET u) {
     uint8_t b[2048];
     uint64_t lastLoggedKfr = 0;
-    jlh::Mrm1Session session;
     while (st.running) {
         sockaddr_in from{};
         int len = sizeof(from);
@@ -426,7 +458,12 @@ void mrm1Listener(State& st, SOCKET u) {
         const auto m = jlh::parseMrm1(b, size_t(n));
         if (!m) continue;  // only a valid 0x24, 0x40 or 0x43 counts as viewer activity
         touch(st);
-        if (session.note(from.sin_addr.s_addr, from.sin_port)) {
+        bool newSession;
+        {
+            std::lock_guard<std::mutex> g(st.pointerMutex);
+            newSession = st.pointer.note(from.sin_addr.s_addr, from.sin_port);
+        }
+        if (newSession) {
             // A viewer socket not seen before: a new MRM1 session. Pointer
             // order starts over and the cursor loop sends the shape there.
             {
@@ -438,8 +475,10 @@ void mrm1Listener(State& st, SOCKET u) {
             logf("mrm1.session peer=%s:%u", ipString(from.sin_addr).c_str(), unsigned(ntohs(from.sin_port)));
         }
         if (m->type == jlh::kMrm1Pointer) {
-            // Only the newest move counts; a late datagram is dropped.
-            if (session.takePointer(m->seq)) {
+            // Only the newest move counts; a late datagram, or one older than
+            // the last POINTER_SYNC, is dropped.
+            std::lock_guard<std::mutex> g(st.pointerMutex);
+            if (st.pointer.takePointer(m->seq)) {
                 ++st.pointerUdp;
                 st.input.moveNormalized(m->nx, m->ny);
             } else {
@@ -804,7 +843,7 @@ void videoLoop(State& st) {
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
                  "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu "
-                 "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu cursor_sent=%llu "
+                 "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
                  "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
                  sender.takeBytes() * 8.0 / 1e6 / secs, (unsigned long long)nKeys,
@@ -814,7 +853,8 @@ void videoLoop(State& st) {
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
                  (unsigned long long)st.input.ignored(), (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
-                 (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.cursorSent.load(),
+                 (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerSyncs.load(),
+                 (unsigned long long)st.cursorSent.load(),
                  (unsigned long long)st.cursorSendFail.load(), (unsigned long long)st.cursorChanges.load(),
                  cap.backend());
             nCaptured = nEncoded = nKeys = nPackets = 0;

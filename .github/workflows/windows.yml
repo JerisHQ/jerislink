@@ -136,8 +136,9 @@ jobs:
         run: build\Release\JerislinkAuthUiTest.exe
       - name: Build control reconnect test
         run: cmake --build build --config Release --target JerislinkControlReconnectTest
-      - name: Control reconnect test (reconnect and connection password off the UI thread, input never waits, queued events in order, Locked from a background reconnect)
-        timeout-minutes: 3
+      - name: Control reconnect test (reconnect and connection password off the UI thread, input never waits, queued events in order, Locked from a background reconnect, H2 HOST_INFO and POINTER_SYNC)
+        # H2: 163 s on a784cd7 before the H2 viewer tests were added.
+        timeout-minutes: 5
         run: build\Release\JerislinkControlReconnectTest.exe
       - name: Send to with no viewer running (Jerislink.exe --send-to, quiet, exit 21, no window)
         shell: pwsh

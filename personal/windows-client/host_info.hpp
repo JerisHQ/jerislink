@@ -9,9 +9,11 @@
 // is. Pure, so the host's unit test decodes what the host encodes
 // (windows-host/host_protocol.hpp hostInfoPayload).
 //
-// A Windows host sends it once per control connection, right behind that
-// connection's first 0x41 VIDEO_CONFIG ACK. The macOS host never sends it:
-// no HOST_INFO means a Mac, and everything stays as it was.
+// A Windows host sends it right behind a 0x41 VIDEO_CONFIG ACK, only when
+// the VIDEO_CONFIG said this viewer reads it (caps kViewerCapHostInfo), and
+// says so in the ACK (an 11th byte, kAckExtHostInfo): the viewer reads it
+// there and then (control_channel.hpp exchangeVideoConfig). The macOS host
+// never sends it: no HOST_INFO means a Mac, and everything stays as it was.
 //   [0] format (1 so far)   [1] platform (1 macOS, 2 Windows)
 //   [2..5] capability bits, big-endian   [6] monitors   [7] version length n
 //   [8..8+n) version, ASCII
@@ -26,6 +28,12 @@ inline constexpr size_t kMaxFrameBytes = kHeaderBytes + kMaxPayload;
 
 inline constexpr uint8_t kPlatformMac = 1, kPlatformWindows = 2;
 inline constexpr uint32_t kCapKeyboard = 0x01, kCapPointer = 0x02, kCapCursorShape = 0x04, kCapTaskManager = 0x08;
+// The host takes MRC1 0x27 POINTER_SYNC in front of a button frame.
+inline constexpr uint32_t kCapPointerSync = 0x20;
+// VIDEO_CONFIG caps bit: "this viewer reads HOST_INFO". ACK payload [10]
+// bit kAckExtHostInfo: one HOST_INFO frame follows the ACK.
+inline constexpr uint8_t kViewerCapHostInfo = 0x08;
+inline constexpr uint8_t kAckExtHostInfo = 0x01;
 
 struct Info {
     uint8_t format = 0;

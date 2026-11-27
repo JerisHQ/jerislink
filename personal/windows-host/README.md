@@ -59,20 +59,32 @@ Builds are unsigned (design doc D14).
 
 ## Input (H2)
 
-- HOST_INFO (MRC1 0x06): sent once per control connection, right behind its
-  first VIDEO_CONFIG ACK in the same write. Platform 2 (Windows), capability
-  bits (keyboard 0x01, pointer 0x02, cursor shape 0x04, Task Manager 0x08),
-  monitor count, version. A viewer that knows it sends Windows keys as they
-  are (no Mac shortcut rewrites); an older viewer never reads it.
+- HOST_INFO (MRC1 0x06): only to a viewer that asks for it (VIDEO_CONFIG
+  caps 0x08). Its ACK is then 11 bytes ([10] = 0x01: one HOST_INFO follows)
+  and the HOST_INFO goes right behind it in the same write, on each
+  VIDEO_CONFIG of the connection. Platform 2 (Windows), capability bits
+  (keyboard 0x01, pointer 0x02, cursor shape 0x04, Task Manager 0x08,
+  POINTER_SYNC 0x20), monitor count, version. A viewer that knows it sends
+  Windows keys as they are (no Mac shortcut rewrites). A 0.4.x viewer does
+  not ask and gets the 10-byte ACK alone: nothing stays unread on its
+  socket, so its read-only view still sees the host close the connection.
 - Keys (MRC1 0x10): the wire semantic is the Windows VK (modifiers 1-4 are
   left Ctrl, Alt, Win, Shift), sent with SendInput as scan codes.
 - Pointer: MRC1 0x20-0x25 and MRM1 0x24 (newest seq only), mapped from the
   picture onto the captured monitor in virtual-desktop coordinates; wheel
   and horizontal wheel as sent; left, right, middle buttons.
+- POINTER_SYNC (MRC1 0x27, [nx, ny BE16, MRM1 seq BE32]): a viewer that saw
+  cap 0x20 sends one right in front of each button. The pointer moves by
+  UDP and the button by TCP, so the button could overtake its move: the
+  host moves to (nx, ny) first, then presses or releases, and MRM1 moves up
+  to that seq arriving later are dropped as stale.
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
-  releases held keys and presses Ctrl+Shift+Esc.
-- Everything this host pressed is released when the control connection
-  that sent it closes.
+  releases held keys (mouse buttons stay as they are) and presses
+  Ctrl+Shift+Esc.
+- Held keys and buttons are tracked per control connection. When one
+  closes, only what it pressed is released; a key or button another
+  connection holds stays down, so a late close of an old connection does
+  not lift what a new one just pressed.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.

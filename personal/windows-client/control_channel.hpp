@@ -32,8 +32,10 @@ struct VideoConfigResult {
     uint16_t bitrateMbps = 25;
     uint16_t remoteWidth = 0;
     uint16_t remoteHeight = 0;
-    // H2 (design D10): the MRC1 0x06 HOST_INFO a Windows host sent behind
-    // this ACK. None (a macOS host): the host is a Mac.
+    // H2 (Pepper's H2 review, items 1 and 4): an ACK was read, so what
+    // kind of host this is is known: hostInfo when the ACK said a HOST_INFO
+    // follows (a Windows host; read right there), none for a macOS host.
+    bool acked = false;
     std::optional<jl::hostinfo::Info> hostInfo;
 };
 
@@ -271,9 +273,21 @@ public:
     // Mac, by UDP or TCP. A click that has to wait for a reconnect is
     // queued right after this position, so it lands where it was made,
     // not wherever the Mac cursor is when the queue is flushed.
-    void notePointer(uint16_t nx, uint16_t ny) {
+    // H2: `seq` is the MRM1 seq of the UDP datagram that carried it (0:
+    // sent by TCP).
+    void notePointer(uint16_t nx, uint16_t ny, uint32_t seq = 0) {
         lastPointer_.store((uint64_t(1) << 32) | (uint64_t(nx) << 16) | uint64_t(ny), std::memory_order_relaxed);
+        lastPointerSeq_.store(seq, std::memory_order_relaxed);
     }
+    // H2 (Pepper's H2 review, item 5): the host takes MRC1 0x27
+    // POINTER_SYNC (HOST_INFO cap 0x20, a Windows host). Each button frame
+    // then goes behind one, in the same write or queue item: the position
+    // the viewer last showed and the seq of its datagram. The host moves
+    // there before the button and drops older moves still in flight by
+    // UDP, so a press and its release land where they were made even when
+    // the moves are late or lost. Off (a macOS host): as before.
+    void setPointerSync(bool on) { pointerSync_.store(on, std::memory_order_relaxed); }
+    bool pointerSync() const { return pointerSync_.load(std::memory_order_relaxed); }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
         std::lock_guard<std::mutex> g(async_->m);
@@ -380,6 +394,9 @@ public:
         // 0x04: this viewer wants audio. Informational for the host log; the
         // audio itself starts with MRM1 0x45 on the video process.
         if (clientAudio) caps |= 0x04;
+        // H2: this viewer reads a HOST_INFO behind the ACK (a Windows host
+        // sends one only when asked; the macOS host ignores the bit).
+        caps |= jl::hostinfo::kViewerCapHostInfo;
         return {1, codec, caps, 0, uint8_t(requestedBitrateMbps >> 8), uint8_t(requestedBitrateMbps)};
     }
 
@@ -418,21 +435,35 @@ public:
         uint16_t len = uint16_t((uint16_t(h[6]) << 8) | h[7]);
         std::vector<uint8_t> reply(len);
         if (len && !recvAck(reply.data(), len)) return VideoExchange::Failed;
-        DWORD normalTimeoutMs = ioTimeoutMs;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
-                   sizeof(normalTimeoutMs));
         if (len == 1) {
             uint8_t frame[kHostNoticeBytes]{};
             std::copy(h, h + 8, frame);
             frame[8] = reply[0];
             if (isReplacedNotice(frame, kHostNoticeBytes)) return VideoExchange::Replaced;
         }
+        // H2: an 11-byte ACK only when this request asked for HOST_INFO.
+        const bool askedHostInfo = payload.size() > 2 && (payload[2] & jl::hostinfo::kViewerCapHostInfo) != 0;
         if (!(h[0]=='M' && h[1]=='R' && h[2]=='C' && h[3]=='1' &&
               h[4]==1 && h[5]==0x41 &&
-              (reply.size()==6 || reply.size()==10) && reply[0]==1)) {
+              (reply.size()==6 || reply.size()==10 || (reply.size()==11 && askedHostInfo)) && reply[0]==1)) {
             return VideoExchange::Failed;
         }
-        readHostInfoAfterAck(s, result.hostInfo, cancel);
+        // H2 (Pepper's H2 review, item 1): the ACK says whether one
+        // HOST_INFO follows (sent in the same write), so it is read here,
+        // whole, and nothing is left on the socket for later reads to trip
+        // over. Not a HOST_INFO frame where one was promised: no ACK.
+        if (reply.size() == 11 && (reply[10] & jl::hostinfo::kAckExtHostInfo)) {
+            uint8_t ih[jl::hostinfo::kHeaderBytes]{};
+            if (!recvAck(ih, sizeof(ih)) || !jl::hostinfo::isFramePrefix(ih, sizeof(ih))) return VideoExchange::Failed;
+            const size_t ilen = (size_t(ih[6]) << 8) | ih[7];
+            std::vector<uint8_t> ip(ilen);
+            if (!recvAck(ip.data(), ilen)) return VideoExchange::Failed;
+            result.hostInfo = jl::hostinfo::decode(ip.data(), ilen);
+        }
+        result.acked = true;
+        DWORD normalTimeoutMs = ioTimeoutMs;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
+                   sizeof(normalTimeoutMs));
 
         const uint8_t status = reply[1];
         const uint8_t selected = reply[2];
@@ -457,37 +488,6 @@ public:
             result.remoteHeight = uint16_t((uint16_t(reply[8]) << 8) | reply[9]);
         }
         return VideoExchange::Ok;
-    }
-
-    // H2 (design D10): a Windows host sends one MRC1 0x06 HOST_INFO right
-    // behind the first 0x41 ACK of a connection, in the same send(). It is
-    // read here when it is already waiting, or its start is (then up to
-    // kHostInfoWaitMs for the rest), so it never sits in front of a later
-    // notice. Nothing waiting (a macOS host sends none): no wait at all.
-    // Other bytes are left alone. One that arrives later is read by
-    // pollHostNotice.
-    static constexpr int kHostInfoWaitMs = 50;
-    static void readHostInfoAfterAck(SOCKET s, std::optional<jl::hostinfo::Info>& out,
-                                     const std::atomic<bool>* cancel) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHostInfoWaitMs);
-        uint8_t b[jl::hostinfo::kMaxFrameBytes];
-        for (;;) {
-            fd_set rd;
-            FD_ZERO(&rd);
-            FD_SET(s, &rd);
-            timeval tv{0, 0};
-            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return;
-            const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-            if (n <= 0 || !jl::hostinfo::isFramePrefix(b, size_t(n))) return;
-            if (const size_t total = jl::hostinfo::completeFrameBytes(b, size_t(n))) {
-                if (recvExactOn(s, b, total))
-                    out = jl::hostinfo::decode(b + jl::hostinfo::kHeaderBytes, total - jl::hostinfo::kHeaderBytes);
-                return;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) return;
-            if (cancel && cancel->load()) return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
     }
 
     VideoConfigResult negotiateVideo(
@@ -532,12 +532,20 @@ public:
         std::lock_guard<std::mutex> g(async_->m);
         return std::exchange(async_->renegotiated, std::nullopt);
     }
-    // UI thread: a HOST_INFO pollHostNotice read on the live socket (its
-    // bytes came after the ACK had been read), once.
-    std::optional<jl::hostinfo::Info> takeHostInfo() {
-        if (!async_) return std::nullopt;
+    // H2 (Pepper's H2 review, item 4): an interactive viewer whose
+    // start-up exchange got no ACK renegotiates on the next connection only
+    // to learn what kind of host it is; once it knows, it stops.
+    void clearRenegotiateOnReconnect() {
+        if (!async_) return;
         std::lock_guard<std::mutex> g(async_->m);
-        return std::exchange(async_->hostInfo, std::nullopt);
+        async_->renegotiate.clear();
+    }
+    // Tests (H2): the VIDEO_CONFIG payload the renegotiation sends as is
+    // (a 0.4.x viewer's, without caps 0x08).
+    void setRenegotiatePayloadForTest(std::vector<uint8_t> payload) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->renegotiate = std::move(payload);
     }
     // Tests (r5): runs on the worker before each renegotiation exchange,
     // without the lock.
@@ -567,9 +575,6 @@ public:
     // launch screen says why. The Mac closed without it: the socket is
     // closed here and the next input reconnects as before. Bytes that are
     // not that notice are left alone. One zero-timeout select when idle.
-    // H2: a whole MRC1 0x06 HOST_INFO in front (a Windows host's, split from
-    // its ACK) is read and kept for takeHostInfo(), then the notice check
-    // runs on what follows; part of one: left for the next poll.
     bool pollHostNotice() {
         std::shared_ptr<Async> a = async_;
         if (!a) return false;
@@ -580,25 +585,13 @@ public:
             s = a->s;
         }
         if (s == INVALID_SOCKET) return false;
-        uint8_t b[jl::hostinfo::kMaxFrameBytes]{};
-        int n = 0;
-        for (int round = 0;; ++round) {
-            fd_set rd;
-            FD_ZERO(&rd);
-            FD_SET(s, &rd);
-            timeval tv{0, 0};
-            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-            n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-            if (round > 0 || n <= 0 || !jl::hostinfo::isFramePrefix(b, size_t(n))) break;
-            const size_t total = jl::hostinfo::completeFrameBytes(b, size_t(n));
-            if (!total) return false;  // the rest of it is on its way
-            if (recv(s, reinterpret_cast<char*>(b), int(total), 0) != int(total)) return false;
-            if (auto info = jl::hostinfo::decode(b + jl::hostinfo::kHeaderBytes, total - jl::hostinfo::kHeaderBytes)) {
-                std::lock_guard<std::mutex> g(a->m);
-                a->hostInfo = std::move(info);
-            }
-        }
-        n = std::min(n, kHostNoticeBytes);
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(s, &rd);
+        timeval tv{0, 0};
+        if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
+        uint8_t b[kHostNoticeBytes]{};
+        const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
         const bool replaced = isReplacedNotice(b, n);
         if (n > 0 && !replaced) return false;  // partial or other bytes: not ours to read
         if (replaced) {
@@ -762,7 +755,8 @@ private:
 
     // Shared by the UI thread and the worker thread.
     // One queue item. A click that waits for a reconnect is one item
-    // holding two frames, its pointer position (0x24) then the button: they
+    // holding two frames, its pointer position (0x24, or H2's 0x27
+    // POINTER_SYNC for a Windows host) then the button: they
     // age out, are pushed out of a full queue, are discarded and are sent
     // together, so a click never lands without its position.
     enum class Kind : uint8_t { Event, Move, PositionedClick, Release };
@@ -820,7 +814,6 @@ private:
         std::vector<uint8_t> renegotiate;
         bool renegotiateHevc = false;
         std::optional<VideoConfigResult> renegotiated;
-        std::optional<jl::hostinfo::Info> hostInfo;  // H2: read by pollHostNotice, for takeHostInfo()
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
@@ -849,6 +842,7 @@ private:
     // the pointer position queued with it (PositionedClick) along, so a
     // click the user made before focus left cannot move the Mac cursor
     // after the reconnect. `positionsSkipped` counts those positions.
+    // H2: a POINTER_SYNC (0x27) in front of a button is left out with it.
     static std::vector<uint8_t> wireBytesLocked(const Async& a, const std::vector<uint8_t>& item,
                                                 uint64_t* positionsSkipped = nullptr) {
         auto skipFrame = [&](uint8_t type, const uint8_t* p, size_t n) {
@@ -862,7 +856,7 @@ private:
         });
         std::vector<uint8_t> out;
         forEachFrame(item, [&](size_t off, size_t len, uint8_t type, const uint8_t* p, size_t n) {
-            if (buttonSkipped && type == 0x24) {
+            if (buttonSkipped && (type == 0x24 || type == 0x27)) {
                 if (positionsSkipped) ++*positionsSkipped;
                 return;
             }
@@ -1385,6 +1379,19 @@ private:
     bool sendQueued(std::vector<uint8_t> b) {
         std::shared_ptr<Async> a = async_;
         pollHostNotice();  // r2: a "replaced" notice ends the attempt before this input goes anywhere
+        const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
+        const bool button = isMouseButton(b);
+        bool synced = false;
+        if (button && (ptr >> 32) && pointerSync()) {
+            // H2: POINTER_SYNC in front of the button, live or queued.
+            const uint32_t seq = lastPointerSeq_.load(std::memory_order_relaxed);
+            std::vector<uint8_t> item = packet(0x27, {uint8_t(ptr >> 24), uint8_t(ptr >> 16), uint8_t(ptr >> 8),
+                                                      uint8_t(ptr), uint8_t(seq >> 24), uint8_t(seq >> 16),
+                                                      uint8_t(seq >> 8), uint8_t(seq)});
+            item.insert(item.end(), b.begin(), b.end());
+            b = std::move(item);
+            synced = true;
+        }
         SOCKET live = INVALID_SOCKET;
         std::vector<uint8_t> wire;
         Owed owed;
@@ -1449,9 +1456,11 @@ private:
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
-        const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
         Kind kind = isMouseMove(b) ? Kind::Move : Kind::Event;
-        if (isMouseButton(b) && (ptr >> 32)) {
+        if (synced) {
+            kind = Kind::PositionedClick;  // H2: its POINTER_SYNC is already in front
+            ++a->stats.positioned;
+        } else if (button && (ptr >> 32)) {
             // The pointer moves by UDP; the click waits here for TCP. Its
             // position goes in the same item, right in front of it.
             std::vector<uint8_t> item = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
@@ -1525,6 +1534,8 @@ private:
     jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
     std::shared_ptr<Async> async_;
     std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
+    std::atomic<uint32_t> lastPointerSeq_{0};  // H2: MRM1 seq of that position (0: TCP)
+    std::atomic<bool> pointerSync_{false};     // H2: send POINTER_SYNC before buttons
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

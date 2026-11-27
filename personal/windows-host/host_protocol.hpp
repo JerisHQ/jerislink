@@ -152,24 +152,38 @@ inline bool isTransitionProbe(const Mrc1Header& h, const uint8_t* payload) {
 
 // VIDEO_CONFIG_SET v1: [1, codec (0 auto, 1 h264, 2 hevc), caps, 0, bitrate BE16].
 // H1 encodes H.264 only. Same refusals as VideoSettingsController.apply.
+//
+// H2 (Pepper's H2 review, item 1): caps 0x08 says "this viewer reads
+// HOST_INFO"; the macOS host ignores caps bits it does not know. Only then
+// does this host send HOST_INFO, right behind the ACK, and say so in the
+// ACK: one payload byte after the usual ten, kAckExtHostInfo, so the viewer
+// reads it at once instead of guessing whether more is coming. A viewer of
+// 0.4.x or older never sets 0x08: it gets exactly the ACK it reads, and
+// nothing stays unread on its socket (its pollHostNotice must see the host
+// close the connection, or a read-only view never reconnects).
+constexpr uint8_t kViewerCapHostInfo = 0x08;
+constexpr uint8_t kAckExtHostInfo = 0x01;  // ACK payload [10]: one MRC1 0x06 HOST_INFO follows
 struct VideoConfigDecision {
-    std::vector<uint8_t> ack;  // the 10-byte 0x41 payload
+    std::vector<uint8_t> ack;  // the 0x41 payload: 10 bytes, 11 when HOST_INFO follows
     bool accepted = false;
+    bool hostInfo = false;     // the viewer asked for HOST_INFO (caps 0x08)
     int bitrateMbps = 25;
     bool bitrateChanged = false;
 };
 inline VideoConfigDecision decideVideoConfig(const uint8_t* p, size_t n, int currentBitrateMbps, int width,
                                              int height) {
     VideoConfigDecision d;
-    auto ack = [&](uint8_t status, uint8_t flags, int bitrate, int w, int h) {
-        d.ack = {1, status, 1, flags, uint8_t(bitrate >> 8), uint8_t(bitrate), uint8_t(w >> 8), uint8_t(w),
-                 uint8_t(h >> 8), uint8_t(h)};
-    };
-    d.bitrateMbps = currentBitrateMbps;
     const bool shapeOk = n == 6 && p[0] == 1;
     const uint8_t codec = shapeOk ? p[1] : 0;
     const uint8_t caps = shapeOk ? p[2] : 0;
     const int bitrate = shapeOk ? int((uint16_t(p[4]) << 8) | p[5]) : 0;
+    d.hostInfo = (caps & kViewerCapHostInfo) != 0;
+    auto ack = [&](uint8_t status, uint8_t flags, int bitrate, int w, int h) {
+        d.ack = {1, status, 1, flags, uint8_t(bitrate >> 8), uint8_t(bitrate), uint8_t(w >> 8), uint8_t(w),
+                 uint8_t(h >> 8), uint8_t(h)};
+        if (d.hostInfo) d.ack.push_back(kAckExtHostInfo);
+    };
+    d.bitrateMbps = currentBitrateMbps;
     if (!shapeOk || !(caps & 0x01) || codec > 2 || (bitrate != 0 && (bitrate < 4 || bitrate > 100))) {
         ack(1, 0, 25, 0, 0);
         return d;
@@ -187,6 +201,17 @@ inline VideoConfigDecision decideVideoConfig(const uint8_t* p, size_t n, int cur
     return d;
 }
 
+// What goes on the socket for one VIDEO_CONFIG: the ACK frame, then the
+// HOST_INFO frame when the viewer asked for it, in one send.
+inline std::vector<uint8_t> videoConfigReply(const VideoConfigDecision& d, const std::vector<uint8_t>& hostInfo) {
+    auto out = mrc1Frame(kMsgVideoConfigAck, d.ack);
+    if (d.hostInfo) {
+        const auto hi = mrc1Frame(kMsgHostInfo, hostInfo);
+        out.insert(out.end(), hi.begin(), hi.end());
+    }
+    return out;
+}
+
 // ------------------------------------------------------------- HOST_INFO (H2)
 
 // MRC1 0x06 HOST_INFO, host -> viewer, design D10. The macOS host never
@@ -195,10 +220,8 @@ inline VideoConfigDecision decideVideoConfig(const uint8_t* p, size_t n, int cur
 //   [2..5] capability bits, BE   [6] monitors   [7] version length n
 //   [8..8+n) version, ASCII
 // Later formats append fields; the viewer reads the ones it knows.
-// Sent once per control connection, right behind its first 0x41 ACK and in
-// the same send: a viewer of 0.4.x or older reads the ACK it waits for and
-// leaves the rest unread (it reads nothing more on that socket), and the
-// launch screen's ping-only check never sees it.
+// Sent behind each 0x41 ACK whose VIDEO_CONFIG asked for it (caps 0x08,
+// decideVideoConfig), in the same send; never to a viewer that did not ask.
 constexpr uint8_t kHostInfoFormat = 1;
 constexpr uint8_t kPlatformMac = 1, kPlatformWindows = 2;
 constexpr uint32_t kHostCapKeyboard = 0x01;     // MRC1 0x10 is injected
@@ -206,6 +229,7 @@ constexpr uint32_t kHostCapPointer = 0x02;      // MRC1 0x20-0x25 and MRM1 0x24 
 constexpr uint32_t kHostCapCursorShape = 0x04;  // MRM1 0x31 cursor state is sent
 constexpr uint32_t kHostCapTaskManager = 0x08;  // MRC1 0x60 opens Task Manager (Ctrl+Shift+Esc)
 // 0x10 is kept for the secure desktop (UAC, lock screen; design D1, not in H2).
+constexpr uint32_t kHostCapPointerSync = 0x20;  // MRC1 0x27 POINTER_SYNC is taken (decodeInput)
 constexpr size_t kHostInfoMaxVersion = 64;
 
 inline std::vector<uint8_t> hostInfoPayload(uint8_t platform, uint32_t caps, uint8_t monitors,
@@ -227,16 +251,47 @@ constexpr uint8_t kMsgKey = 0x10;
 constexpr uint8_t kMsgMouseMoveRel = 0x20, kMsgMouseButton = 0x21, kMsgMouseScroll = 0x22;
 constexpr uint8_t kMsgMouseMoveAbs = 0x23, kMsgMouseMoveNorm = 0x24, kMsgMouseButtonExt = 0x25;
 constexpr uint8_t kMsgForceQuitOpen = 0x60;
+// H2 (Pepper's H2 review, item 5), only from a viewer this host's HOST_INFO
+// told (kHostCapPointerSync): [nx BE16, ny BE16, MRM1 seq BE32], sent right
+// in front of a button frame in the same write. The pointer moves by UDP
+// and the button by TCP, so the button can overtake the move it belongs
+// to. The button is pressed or released at (nx, ny), and MRM1 pointer moves
+// up to seq (the newest the viewer had sent by then) are stale from then
+// on, so a late one cannot move the pointer away from the press.
+constexpr uint8_t kMsgPointerSync = 0x27;
+constexpr uint16_t kPointerSyncBytes = 8;
 
 // One input frame, decoded. Integers on the wire are big-endian.
 struct InputEvent {
-    enum class Kind { Key, MoveRel, Button, Scroll, MoveAbsPixels, MoveNorm, TaskManager };
+    enum class Kind { Key, MoveRel, Button, Scroll, MoveAbsPixels, MoveNorm, TaskManager, PointerSync };
     Kind kind = Kind::Key;
     bool down = false;
     uint16_t semantic = 0;  // Key
     uint8_t button = 0;     // Button: 0 left, 1 right, 2 middle
-    int x = 0, y = 0;       // MoveRel / Scroll: signed deltas; MoveAbsPixels: pixels; MoveNorm: 0..65535
+    int x = 0, y = 0;       // MoveRel / Scroll: signed deltas; MoveAbsPixels: pixels; MoveNorm, PointerSync: 0..65535
+    uint32_t seq = 0;       // PointerSync: the MRM1 seq it covers
 };
+
+// One decoded input frame on a control connection. A POINTER_SYNC is held
+// in `pending` until the next input frame: a button is then applied with it
+// as one step (sync(s, &button): the host does both under its pointer
+// lock), anything else after it on its own (sync(s, nullptr), then
+// apply(e)). Returns what the step returned.
+template <class Sync, class Apply>
+bool stepInput(std::optional<InputEvent>& pending, const InputEvent& e, Sync&& sync, Apply&& apply) {
+    if (e.kind == InputEvent::Kind::PointerSync) {
+        if (pending) sync(*pending, nullptr);  // two in a row: the first alone
+        pending = e;
+        return true;
+    }
+    if (pending) {
+        const InputEvent s = *pending;
+        pending.reset();
+        if (e.kind == InputEvent::Kind::Button) return sync(s, &e);
+        sync(s, nullptr);
+    }
+    return apply(e);
+}
 
 // The frame lengths the macOS host accepts (ControlServer.isLegacyFirstHeader),
 // exactly. Anything else is not input and is dropped whole.
@@ -279,6 +334,13 @@ inline std::optional<InputEvent> decodeInput(const Mrc1Header& h, const uint8_t*
     case kMsgForceQuitOpen:
         if (h.length != 0) return std::nullopt;
         e.kind = InputEvent::Kind::TaskManager;
+        return e;
+    case kMsgPointerSync:
+        if (h.length != kPointerSyncBytes) return std::nullopt;
+        e.kind = InputEvent::Kind::PointerSync;
+        e.x = u16(0);
+        e.y = u16(2);
+        e.seq = (uint32_t(p[4]) << 24) | (uint32_t(p[5]) << 16) | (uint32_t(p[6]) << 8) | p[7];
         return e;
     default:
         return std::nullopt;
@@ -337,37 +399,92 @@ inline bool isExtendedVk(uint16_t v) {
     }
 }
 
-// Keys and buttons this host has pressed and not released, so a viewer
-// that goes away (connection closed, viewer crashed) leaves nothing held.
+// Keys and buttons this host has pressed and not released, and which
+// control connections pressed them, so a viewer that goes away (connection
+// closed, viewer crashed) leaves nothing held.
+//
+// Pepper's H2 review, item 2: one viewer IP can have more than one control
+// connection open at a time (a reconnect opens the new one before the old
+// one is seen closed), and each is an owner here. A down that Windows took
+// adds its owner; an up that Windows took ends the press, whoever sent it.
+// When a connection closes (releaseOwned) only what nobody else still
+// holds is released, so an old connection that closes late never lets go
+// of a key or button the new one has just pressed.
+//
+// Every release sends an up only through upKey(vk) / upButton(b), which
+// return true when Windows took it. One that Windows did not take keeps its
+// entry, with no owner left, and the next release tries it again: nothing
+// is forgotten while it may still be down.
 class HeldInput {
 public:
-    void key(uint16_t v, bool down) { set(keys_, v, down); }
-    void button(uint8_t b, bool down) { if (b < 3) buttons_[b] = down; }
-    bool anyHeld() const {
-        if (!keys_.empty()) return true;
-        for (bool b : buttons_) if (b) return true;
-        return false;
-    }
-    // Calls upKey(vk) / upButton(b) for each one held, then forgets them all.
+    using Owner = uint64_t;
+    void key(uint16_t v, bool down, Owner o) { set(keys_, v, down, o); }
+    void button(uint8_t b, bool down, Owner o) { if (b < 3) set(buttons_, b, down, o); }
+    bool anyHeld() const { return !keys_.empty() || !buttons_.empty(); }
+    bool keyHeld(uint16_t v) const { return find(keys_, v) != nullptr; }
+    bool buttonHeld(uint8_t b) const { return find(buttons_, b) != nullptr; }
+    bool keyOwnedBy(uint16_t v, Owner o) const { return owns(find(keys_, v), o); }
+    bool buttonOwnedBy(uint8_t b, Owner o) const { return owns(find(buttons_, b), o); }
+
+    // Connection o went away: o lets go of everything it held. Keys (newest
+    // press first), then buttons, that no other connection holds are
+    // released. Returns how many ups Windows took.
     template <class UpKey, class UpButton>
-    size_t releaseAll(UpKey&& upKey, UpButton&& upButton) {
-        size_t n = 0;
-        for (auto it = keys_.rbegin(); it != keys_.rend(); ++it, ++n) upKey(*it);
-        for (uint8_t b = 0; b < 3; ++b)
-            if (buttons_[b]) { upButton(b); ++n; }
-        keys_.clear();
-        for (bool& b : buttons_) b = false;
-        return n;
+    size_t releaseOwned(Owner o, UpKey&& upKey, UpButton&& upButton) {
+        for (auto& e : keys_) dropOwner(e, o);
+        for (auto& e : buttons_) dropOwner(e, o);
+        return releaseUnowned(keys_, upKey) +
+               releaseUnowned(buttons_, [&](uint16_t b) { return upButton(uint8_t(b)); });
+    }
+    // Item 3 (Task Manager): every held key is released, whoever pressed
+    // it, so the chord goes in clean. Buttons are left exactly as they are,
+    // on Windows and here. Returns how many ups Windows took.
+    template <class UpKey>
+    size_t releaseKeys(UpKey&& upKey) {
+        for (auto& e : keys_) e.owners.clear();
+        return releaseUnowned(keys_, upKey);
     }
 
 private:
-    static void set(std::vector<uint16_t>& v, uint16_t k, bool down) {
-        auto it = std::find(v.begin(), v.end(), k);
-        if (down && it == v.end()) v.push_back(k);
-        if (!down && it != v.end()) v.erase(it);
+    struct Entry {
+        uint16_t code = 0;
+        std::vector<Owner> owners;
+    };
+    static const Entry* find(const std::vector<Entry>& v, uint16_t code) {
+        for (const auto& e : v)
+            if (e.code == code) return &e;
+        return nullptr;
     }
-    std::vector<uint16_t> keys_;  // in press order
-    bool buttons_[3] = {false, false, false};
+    static bool owns(const Entry* e, Owner o) {
+        return e && std::find(e->owners.begin(), e->owners.end(), o) != e->owners.end();
+    }
+    static void dropOwner(Entry& e, Owner o) {
+        e.owners.erase(std::remove(e.owners.begin(), e.owners.end(), o), e.owners.end());
+    }
+    static void set(std::vector<Entry>& v, uint16_t code, bool down, Owner o) {
+        auto it = std::find_if(v.begin(), v.end(), [&](const Entry& e) { return e.code == code; });
+        if (down) {
+            if (it == v.end()) v.push_back(Entry{code, {o}});
+            else if (!owns(&*it, o)) it->owners.push_back(o);
+        } else if (it != v.end()) {
+            v.erase(it);
+        }
+    }
+    // Newest first; an entry stays when Windows did not take its up.
+    template <class Up>
+    static size_t releaseUnowned(std::vector<Entry>& v, Up&& up) {
+        size_t n = 0;
+        for (size_t i = v.size(); i-- > 0;) {
+            if (!v[i].owners.empty()) continue;
+            if (up(v[i].code)) {
+                v.erase(v.begin() + std::ptrdiff_t(i));
+                ++n;
+            }
+        }
+        return n;
+    }
+    std::vector<Entry> keys_;     // in press order
+    std::vector<Entry> buttons_;  // 0 left, 1 right, 2 middle; in press order
 };
 
 // The captured monitor in virtual-desktop pixels.
@@ -425,7 +542,10 @@ inline std::optional<Mrm1Packet> parseMrm1(const uint8_t* p, size_t n) {
 // MRM1 sessions, as on the macOS host: a viewer port not seen before starts
 // a new session (pointer order and cursor state start over). Within one, a
 // pointer move is taken only when its seq is newer than the newest taken,
-// so a late datagram never moves the pointer back.
+// so a late datagram never moves the pointer back. H2 (Pepper's H2 review,
+// item 5): a POINTER_SYNC on the control connection counts as taking its
+// seq (syncPointer), so a move the viewer sent before a click and that
+// arrives after it is dropped too. The host calls both under one lock.
 class Mrm1Session {
 public:
     // True when this datagram's source starts a new session.
@@ -442,6 +562,12 @@ public:
         havePointer_ = true;
         pointerSeq_ = seq;
         return true;
+    }
+    // Moves up to seq are stale from now on (never moves the mark back).
+    void syncPointer(uint32_t seq) {
+        if (havePointer_ && int32_t(seq - pointerSeq_) <= 0) return;
+        havePointer_ = true;
+        pointerSeq_ = seq;
     }
 
 private:

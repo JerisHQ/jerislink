@@ -4,8 +4,8 @@
 // Keys go in as scan codes (KEYEVENTF_SCANCODE), so the host's own keyboard
 // layout turns them into characters, as a local keyboard would. The pointer
 // is placed on the captured monitor with absolute virtual-desktop
-// coordinates. Everything this host pressed is released when the viewer's
-// control connection goes away.
+// coordinates. Everything a control connection pressed is released when
+// that connection goes away, unless another connection still holds it.
 //
 // SendInput reaches only the desktop this process runs on, and Windows
 // (UIPI) drops input aimed at a window of a higher integrity level, such as
@@ -27,14 +27,19 @@ public:
     // capture, the primary monitor.
     void setDesktop(const DesktopRect& r);
 
-    // One decoded MRC1 input frame. False when Windows took no input (the
-    // event is counted in failed()) or the event was not one to inject
-    // (ignored()).
-    bool apply(const InputEvent& e);
+    // One decoded MRC1 input frame from control connection `owner` (a
+    // number unique to the connection). False when Windows took no input
+    // (the event is counted in failed()) or the event was not one to inject
+    // (ignored()). A POINTER_SYNC only moves the pointer here; its seq is
+    // for the host's Mrm1Session.
+    bool apply(const InputEvent& e, HeldInput::Owner owner);
     // MRM1 0x24.
     bool moveNormalized(int nx, int ny);
-    // Releases every key and button this host pressed; returns how many.
-    size_t releaseAll();
+    // Connection `owner` went away: releases what it pressed and no other
+    // connection still holds (and anything an earlier release could not);
+    // returns how many ups Windows took.
+    size_t releaseOwned(HeldInput::Owner owner);
+    bool anyHeld() const;
 
     uint64_t injected() const { return injected_.load(); }
     uint64_t failed() const { return failed_.load(); }
@@ -43,8 +48,8 @@ public:
     unsigned long lastError() const { return lastError_.load(); }
 
 private:
-    bool key(uint16_t semantic, bool down);
-    bool button(uint8_t b, bool down);
+    bool key(uint16_t semantic, bool down, HeldInput::Owner owner);
+    bool button(uint8_t b, bool down, HeldInput::Owner owner);
     bool movePixel(int x, int y);
     bool moveRelative(int dx, int dy);
     bool scroll(int dx, int dy);
