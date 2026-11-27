@@ -33,9 +33,6 @@ public:
     // (ignored()). A POINTER_SYNC only moves the pointer here; its seq is
     // for the host's Mrm1Session.
     bool apply(const InputEvent& e, HeldInput::Owner owner);
-    // MRC1 0x28 VIEWER_ID on connection `owner`: which viewer it belongs to
-    // (HeldInput::setViewer; the first token counts).
-    void setViewer(HeldInput::Owner owner, uint64_t token);
     // MRM1 0x24.
     bool moveNormalized(int nx, int ny);
     // Connection `owner` went away: it lets go of its own claims only
@@ -51,10 +48,6 @@ public:
     // Up frames not sent to Windows because another connection still holds
     // that key or button (HeldInput's rule).
     uint64_t upsHeld() const { return upsHeld_.load(); }
-    // Up frames that ended the claim of the same viewer's older connection
-    // on that key or button (HeldInput::handovers): after a reconnect, the
-    // ups the viewer owes for presses on the old connection.
-    uint64_t upsHandedOver() const;
     // The GetLastError of the most recent SendInput that took nothing.
     unsigned long lastError() const { return lastError_.load(); }
 

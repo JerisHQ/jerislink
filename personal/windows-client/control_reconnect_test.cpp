@@ -39,9 +39,6 @@
 // close and comes back (a784cd7's unasked HOST_INFO stopped that). An
 // interactive view whose start-up exchange failed renegotiates on the next
 // control session; with POINTER_SYNC each button goes behind an MRC1 0x27.
-// H2 r5 (Pepper's review of 04622f0): a host with HOST_INFO cap 0x40 gets
-// MRC1 0x28 VIEWER_ID first on every control connection, with one token per
-// channel; a host without the cap never gets it.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -2973,7 +2970,6 @@ void h2InteractiveTest() {
     const bool win = vc && vc->acked && vc->hostInfo && isWinInfo(*vc->hostInfo);
     control.clearRenegotiateOnReconnect();
     const bool syncFromAck = control.pointerSync();  // the channel set it from that ACK
-    const bool noViewerId = !control.viewerIdOn();     // caps 0x2F: no 0x40
     waitFor([&] { const auto rs = control.reconnectStats(); return rs.live && !rs.connecting; }, 3000);
     control.notePointer(3000, 4000, 42, kUdpPort);
     ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });  // live
@@ -3010,10 +3006,6 @@ void h2InteractiveTest() {
                isFrame(f5[2], 0x25, up) && f6.empty(),
            "h2 interactive: released on focus loss; the later up and its 0x27 are not sent (" +
                std::to_string(f6.size()) + " stray frames)");
-    bool any28 = false;
-    for (const auto* v : {&f1, &f2, &f3, &f4, &f5, &f6})
-        for (const auto& fr : *v) any28 = any28 || fr.first == 0x28;
-    expect(noViewerId && !any28, "h2 r5: a Windows host without cap 0x40 gets no VIEWER_ID (0x28) on any connection");
     expect(ui.maxMs < kUiBudgetMs, "h2 interactive: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
     control.stop();
     setCurrent(nullptr);
@@ -3107,107 +3099,6 @@ void h2ReviewR2Test() {
     clearKnownModesForTest();
 }
 
-// H2 r5 (Pepper's review of 04622f0). A Windows host whose HOST_INFO has
-// cap 0x40 gets MRC1 0x28 VIEWER_ID first on every control connection:
-// right behind the start-up ACK (negotiateVideo), and first on the
-// reconnect, before the up of a key pressed on the old connection. Both
-// carry the channel's token; another channel has another. The frames the
-// host got, fed to its own HeldInput (host_protocol.hpp): that up ends the
-// old connection's press, and a second viewer holding the same key keeps
-// it down until it lets go.
-void h2ViewerIdTest() {
-    const Secret sec = h2Secret();
-    Listener l;
-    std::atomic<int> terminals{0};
-    std::atomic<int> lastOutcome{-1};
-    auto client = makeClient(terminals, lastOutcome);
-    setCurrent(client);
-    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
-    control.setIoTimeoutMs(4000);  // the start-up exchange, as viewer.cpp does
-    const Bytes info = jlh::hostInfoPayload(jlh::kPlatformWindows, 0x6F, 1, "0.4.1-h2dev");
-    std::atomic<int> step{0};
-    std::vector<std::pair<uint8_t, Bytes>> f0, f1, f2, f3;
-    bool auth0 = false, auth1 = false;
-    std::thread host([&] {
-        SOCKET s = l.accept(8000);
-        if (s == INVALID_SOCKET) return;
-        auth0 = hostAuth(s, sec, Answer::Ok, 50);
-        f0 = readFrames(s, 1, 3000);
-        if (f0.size() == 1 && f0[0].first == 0x40) {
-            const auto d = jlh::decideVideoConfig(f0[0].second.data(), f0[0].second.size(), 25, 1024, 768);
-            sendAllBytes(s, jlh::videoConfigReply(d, info));
-        }
-        f1 = readFrames(s, 2, 5000);  // VIEWER_ID, then the key down
-        closesocket(s);
-        step = 1;
-        s = l.accept(8000);
-        if (s == INVALID_SOCKET) return;
-        auth1 = hostAuth(s, sec, Answer::Ok, 50);
-        f2 = readFrames(s, 2, 5000);  // VIEWER_ID, then the key up
-        f3 = readFrames(s, 1, 500);   // nothing more
-        step = 2;
-        closesocket(s);
-    });
-    const VideoConfigResult vc = control.negotiateVideo("h264", true, false, 25, false);
-    const bool on = vc.acked && jl::hostinfo::viewerIdFor(vc.hostInfo) && control.viewerIdOn();
-    control.setIoTimeoutMs(100);
-    control.setBackgroundReconnect(true);
-    UiClock ui;
-    ui.call([&] { return control.sendKey(true, 'A'); });  // live, on the start-up connection
-    waitFor([&] { return step >= 1; }, 8000);
-    Sleep(150);  // the close has arrived
-    ui.call([&] { return control.sendKey(false, 'A'); });  // sees the close: queued for the reconnect
-    waitFor([&] { return step >= 2; }, 10000);
-    host.join();
-    const uint64_t token = control.viewerId();
-    const Bytes tokenBytes{uint8_t(token >> 56), uint8_t(token >> 48), uint8_t(token >> 40), uint8_t(token >> 32),
-                           uint8_t(token >> 24), uint8_t(token >> 16), uint8_t(token >> 8), uint8_t(token)};
-    ControlChannel other("127.0.0.1", "127.0.0.1", l.port);
-    expect(token != 0 && other.viewerId() != 0 && other.viewerId() != token,
-           "h2 r5: each channel has its own nonzero VIEWER_ID token");
-    expect(auth0 && on && f1.size() == 2 && isFrame(f1[0], 0x28, tokenBytes) && isFrame(f1[1], 0x10, Bytes{1, 0, 'A'}),
-           "h2 r5: cap 0x40 in the start-up HOST_INFO: VIEWER_ID right behind the ACK, before the first key");
-    expect(auth1 && f2.size() == 2 && isFrame(f2[0], 0x28, tokenBytes) && isFrame(f2[1], 0x10, Bytes{0, 0, 'A'}) &&
-               f3.empty(),
-           "h2 r5: the reconnect sends VIEWER_ID (same token) first, then the up of the key pressed before it");
-    // The host's side, from those frames. Connection 1 (start-up) and 2
-    // (the reconnect) are this viewer; connection 3 is another viewer
-    // (other's token) that holds A too.
-    bool hostSide = f1.size() == 2 && f2.size() == 2;
-    if (hostSide) {
-        using Up = jlh::HeldInput::Up;
-        jlh::HeldInput held;
-        auto hdrOf = [](const std::pair<uint8_t, Bytes>& fr) { return jlh::Mrc1Header{fr.first, uint16_t(fr.second.size())}; };
-        const auto t1 = jlh::decodeViewerId(hdrOf(f1[0]), f1[0].second.data());
-        const auto t2 = jlh::decodeViewerId(hdrOf(f2[0]), f2[0].second.data());
-        const auto down = jlh::decodeInput(hdrOf(f1[1]), f1[1].second.data());
-        const auto up = jlh::decodeInput(hdrOf(f2[1]), f2[1].second.data());
-        hostSide = t1 && t2 && *t1 == token && *t2 == token && down && down->down && up && !up->down;
-        if (hostSide) {
-            const uint16_t v = jlh::semanticToVk(down->semantic);
-            int windowsUps = 0;
-            auto upKey = [&](uint16_t) { ++windowsUps; return true; };
-            held.setViewer(1, *t1);
-            held.pressKey(v, 1);
-            held.setViewer(3, other.viewerId());
-            held.pressKey(v, 3);
-            held.setViewer(2, *t2);
-            const Up r2 = held.releaseKey(jlh::semanticToVk(up->semantic), 2, upKey);
-            hostSide = r2 == Up::Held && !held.keyOwnedBy(v, 1) && held.keyOwnedBy(v, 3) && windowsUps == 0 &&
-                       held.handovers() == 1;
-            const Up r3 = held.releaseKey(v, 3, upKey);
-            hostSide = hostSide && r3 == Up::Sent && windowsUps == 1 && !held.anyHeld();
-        }
-    }
-    expect(hostSide,
-           "h2 r5: on the host, that up ends this viewer's start-up press only; the other viewer's A stays down "
-           "until its own up (one up on Windows)");
-    expect(ui.maxMs < kUiBudgetMs, "h2 r5: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
-    control.stop();
-    setCurrent(nullptr);
-    clearKnownModesForTest();
-}
-
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -3232,7 +3123,6 @@ int main() {
     h2HostInfoTest();
     h2InteractiveTest();
     h2ReviewR2Test();
-    h2ViewerIdTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

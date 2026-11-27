@@ -13,7 +13,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -231,7 +230,6 @@ constexpr uint32_t kHostCapCursorShape = 0x04;  // MRM1 0x31 cursor state is sen
 constexpr uint32_t kHostCapTaskManager = 0x08;  // MRC1 0x60 opens Task Manager (Ctrl+Shift+Esc)
 // 0x10 is kept for the secure desktop (UAC, lock screen; design D1, not in H2).
 constexpr uint32_t kHostCapPointerSync = 0x20;  // MRC1 0x27 POINTER_SYNC is taken (decodeInput)
-constexpr uint32_t kHostCapViewerId = 0x40;     // MRC1 0x28 VIEWER_ID is taken (decodeViewerId)
 constexpr size_t kHostInfoMaxVersion = 64;
 
 inline std::vector<uint8_t> hostInfoPayload(uint8_t platform, uint32_t caps, uint8_t monitors,
@@ -267,24 +265,6 @@ constexpr uint8_t kMsgForceQuitOpen = 0x60;
 // position only, no seq mark.
 constexpr uint8_t kMsgPointerSync = 0x27;
 constexpr uint16_t kPointerSyncBytes = 10;
-// H2 r5 (Pepper's review of 04622f0), only from a viewer this host's
-// HOST_INFO told (kHostCapViewerId): [token BE64], nonzero. The viewer makes
-// the token at random once per control channel and sends this first on
-// every control connection it makes, before any input. The host learns
-// from it which connections belong to the same viewer, so an up can end
-// that viewer's claim made on an earlier connection and nobody else's
-// (HeldInput). Not input: it moves nothing and presses nothing.
-constexpr uint8_t kMsgViewerId = 0x28;
-constexpr uint16_t kViewerIdBytes = 8;
-
-// The token of a VIEWER_ID frame; nothing for a wrong length or token 0.
-inline std::optional<uint64_t> decodeViewerId(const Mrc1Header& h, const uint8_t* p) {
-    if (h.type != kMsgViewerId || h.length != kViewerIdBytes) return std::nullopt;
-    uint64_t t = 0;
-    for (int i = 0; i < kViewerIdBytes; ++i) t = (t << 8) | p[i];
-    if (t == 0) return std::nullopt;
-    return t;
-}
 
 // One input frame, decoded. Integers on the wire are big-endian.
 struct InputEvent {
@@ -430,38 +410,29 @@ inline bool isExtendedVk(uint16_t v) {
 // control connections hold them, so a viewer that goes away (connection
 // closed, viewer crashed) leaves nothing held.
 //
-// One viewer IP can have more than one control connection open at a time
-// (a reconnect opens the new one before the old one is seen closed). Each
-// is an owner here, numbered in the order the connections opened
-// (State::nextInputOwner), so a bigger number is a newer connection.
-//
-// Which viewer a connection belongs to: the token of its MRC1 0x28
-// VIEWER_ID (setViewer; the first one counts). A connection that sent none
-// (a viewer from before r5) has no token and is a viewer of its own.
+// More than one control connection can be open at a time: a reconnect
+// opens the new one before the old one is seen closed, and two viewers can
+// be connected at once. Each connection is an owner here, numbered in the
+// order the connections opened (State::nextInputOwner).
 //
 // Who lets go of what (Pepper's H2 reviews: item 2 of a784cd7 and of
-// 8f8a33b, item 1 of f97ad11, the one item of 04622f0):
-// - A connection that closes (releaseOwned) lets go of its own claims and
-//   nothing else. A close says nothing about another connection: one that
-//   is still open, older or newer, keeps what it holds.
-// - An up frame from connection o (releaseKey, releaseButton) ends o's own
-//   claim on that key or button, and the claims of the same viewer's older
-//   connections (same token, opened before o), which end with it (a
-//   handover, counted in handovers()). The viewer sends every up on the
-//   connection it has now; after a reconnect, the ups it owes for presses
-//   made on the old connection go first on the new one (the viewer's
-//   control_channel.hpp, takeOwedLocked), and so does a plain up of a key
-//   still down from before the reconnect. Such an up stands for the old
-//   connection's press. Another viewer's claim is never touched, so when
-//   two viewers hold the same key, one letting go leaves it down for the
-//   other. Nor is a newer connection's claim, so an old connection's late
-//   up never releases what a newer one pressed.
+// 8f8a33b, item 1 of f97ad11, the one item of 04622f0, item 1 of c397898):
+// - A claim belongs to the connection whose down made it, and only that
+//   connection ends it: with an up frame for that key or button
+//   (releaseKey, releaseButton), or by closing (releaseOwned). Another
+//   connection's up or close never ends it, older or newer, the same
+//   viewer or another.
+// - The viewer sends every up on the connection it has now. After a
+//   reconnect, the ups it owes for presses made on the old connection go
+//   first on the new one (the viewer's control_channel.hpp,
+//   takeOwedLocked), and look the same as a plain up. The host does not
+//   tell them apart: such an up ends the new connection's own claim, if it
+//   has one, and nothing else. The old connection's claims end when the
+//   host sees that connection close.
 // Windows gets the up only when no connection holds it any more.
 // A connection that went away without a close the host saw (the viewer's
-// network dropped) keeps its claims until an up of that key or button from
-// a newer connection of the same viewer, or until TCP keep-alive ends it
-// (host_main.cpp, serveControl) and its close lets go. For a viewer with no
-// token, only the close.
+// network dropped) keeps its claims until TCP keep-alive ends it
+// (host_main.cpp, serveControl) and its close lets go.
 //
 // Every up goes to Windows only through upKey(vk) / upButton(b), which
 // return true when Windows took it. One that Windows did not take keeps its
@@ -476,15 +447,6 @@ public:
         Held,    // another connection still holds it: no up sent
         Failed,  // Windows did not take the up
     };
-    // Connection o belongs to the viewer with this token (MRC1 0x28). The
-    // first nonzero token counts; later ones, and 0, change nothing.
-    void setViewer(Owner o, uint64_t token) {
-        if (token != 0) viewers_.emplace(o, token);
-    }
-    uint64_t viewerOf(Owner o) const {
-        const auto it = viewers_.find(o);
-        return it == viewers_.end() ? 0 : it->second;
-    }
     // A down Windows took, from connection o.
     void pressKey(uint16_t v, Owner o) { press(keys_, v, o); }
     void pressButton(uint8_t b, Owner o) { if (b < 3) press(buttons_, b, o); }
@@ -500,20 +462,15 @@ public:
     bool buttonHeld(uint8_t b) const { return find(buttons_, b) != nullptr; }
     bool keyOwnedBy(uint16_t v, Owner o) const { return owns(find(keys_, v), o); }
     bool buttonOwnedBy(uint8_t b, Owner o) const { return owns(find(buttons_, b), o); }
-    // Up frames that ended a claim of the same viewer's older connection
-    // (the rule above).
-    uint64_t handovers() const { return handovers_; }
 
     // Connection o went away: it lets go of its own claims only (the rule
-    // above), and its token is forgotten. Keys (newest press first), then
-    // buttons, that no connection holds any more are released, and so is
-    // anything an earlier up could not release. Returns how many ups
-    // Windows took.
+    // above). Keys (newest press first), then buttons, that no connection
+    // holds any more are released, and so is anything an earlier up could
+    // not release. Returns how many ups Windows took.
     template <class UpKey, class UpButton>
     size_t releaseOwned(Owner o, UpKey&& upKey, UpButton&& upButton) {
         for (auto& e : keys_) dropOwner(e, o);
         for (auto& e : buttons_) dropOwner(e, o);
-        viewers_.erase(o);
         return releaseUnowned(keys_, upKey) +
                releaseUnowned(buttons_, [&](uint16_t b) { return upButton(uint8_t(b)); });
     }
@@ -539,21 +496,9 @@ private:
     static bool owns(const Entry* e, Owner o) {
         return e && std::find(e->owners.begin(), e->owners.end(), o) != e->owners.end();
     }
-    // A close of o: o's own claim ends, no other.
+    // An up or a close from o: o's own claim ends, no other.
     static void dropOwner(Entry& e, Owner o) {
         e.owners.erase(std::remove(e.owners.begin(), e.owners.end(), o), e.owners.end());
-    }
-    // An up from o: o's claim ends, and so do the claims of the same
-    // viewer's connections older than o. A connection with no token is a
-    // viewer of its own. True when it ended one of those older claims.
-    bool upFrom(Entry& e, Owner o) const {
-        const uint64_t t = viewerOf(o);
-        auto sameViewerOlder = [&](Owner x) { return t != 0 && x < o && viewerOf(x) == t; };
-        const bool took = std::any_of(e.owners.begin(), e.owners.end(), sameViewerOlder);
-        e.owners.erase(std::remove_if(e.owners.begin(), e.owners.end(),
-                                      [&](Owner x) { return x == o || sameViewerOlder(x); }),
-                       e.owners.end());
-        return took;
     }
     static void press(std::vector<Entry>& v, uint16_t code, Owner o) {
         auto it = std::find_if(v.begin(), v.end(), [&](const Entry& e) { return e.code == code; });
@@ -564,7 +509,7 @@ private:
     Up release(std::vector<Entry>& v, uint16_t code, Owner o, UpFn&& up) {
         auto it = std::find_if(v.begin(), v.end(), [&](const Entry& e) { return e.code == code; });
         if (it != v.end()) {
-            if (upFrom(*it, o)) ++handovers_;
+            dropOwner(*it, o);
             if (!it->owners.empty()) return Up::Held;
         }
         if (!up(code)) return Up::Failed;  // an entry stays, with no owner, for the next release
@@ -586,8 +531,6 @@ private:
     }
     std::vector<Entry> keys_;     // in press order
     std::vector<Entry> buttons_;  // 0 left, 1 right, 2 middle; in press order
-    std::map<Owner, uint64_t> viewers_;  // connection -> its viewer's token (open connections only)
-    uint64_t handovers_ = 0;
 };
 
 // The captured monitor in virtual-desktop pixels.

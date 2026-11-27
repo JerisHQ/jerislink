@@ -126,7 +126,8 @@ bool InputInjector::sendButton(uint8_t b, bool down) {
 }
 
 // An up frame, by HeldInput's rule (Pepper's reviews of 8f8a33b, item 2,
-// of f97ad11, item 1, and of 04622f0): sent to Windows only when no other
+// of f97ad11, item 1, of 04622f0 and of c397898, item 1): it ends the
+// sender's own claim only, and goes to Windows only when no other
 // connection still holds it.
 bool InputInjector::countUp(HeldInput::Up r) {
     switch (r) {
@@ -198,11 +199,6 @@ bool InputInjector::taskManager() {
     return true;
 }
 
-void InputInjector::setViewer(HeldInput::Owner owner, uint64_t token) {
-    std::lock_guard<std::mutex> g(m_);
-    held_.setViewer(owner, token);
-}
-
 size_t InputInjector::releaseOwned(HeldInput::Owner owner) {
     std::lock_guard<std::mutex> g(m_);
     return held_.releaseOwned(owner, [this](uint16_t v) { return sendKeyVk(v, false); },
@@ -212,11 +208,6 @@ size_t InputInjector::releaseOwned(HeldInput::Owner owner) {
 bool InputInjector::anyHeld() const {
     std::lock_guard<std::mutex> g(m_);
     return held_.anyHeld();
-}
-
-uint64_t InputInjector::upsHandedOver() const {
-    std::lock_guard<std::mutex> g(m_);
-    return held_.handovers();
 }
 
 CursorShape currentCursorShape() {

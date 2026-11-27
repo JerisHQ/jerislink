@@ -60,7 +60,7 @@ constexpr uint16_t kMrm1Port = 38412;
 constexpr int kActiveGraceMs = 10'000;    // viewer counts as present this long after its last packet
 // TCP keep-alive on control connections: first probe after this much
 // silence, then one a second; Windows gives up after 10 unanswered probes.
-constexpr ULONG kKeepAliveIdleMs = 15'000;
+constexpr ULONG kKeepAliveIdleMs = 3'000;
 constexpr ULONG kKeepAliveIntervalMs = 1'000;
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
@@ -69,7 +69,7 @@ constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer send
 constexpr int kCursorPollMs = 16;           // cursor shape check
 constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
 constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
-                               jlh::kHostCapTaskManager | jlh::kHostCapPointerSync | jlh::kHostCapViewerId;
+                               jlh::kHostCapTaskManager | jlh::kHostCapPointerSync;
 
 struct Options {
     bool devNoPassword = false;
@@ -203,8 +203,7 @@ struct State {
     // H2 input. One injector for every connection: one viewer IP may connect,
     // but over more than one control connection at a time (a reconnect, or
     // a second viewer), so each connection gets its own owner number for
-    // what it holds down, and says with MRC1 0x28 which viewer it belongs
-    // to (r5).
+    // what it holds down.
     jlh::InputInjector input;
     std::atomic<uint64_t> nextInputOwner{1};
     // MRM1 pointer order. A UDP move and a POINTER_SYNC (control thread) both
@@ -331,8 +330,13 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     // must be seen to close. The host never writes to an idle control
     // connection, so without keep-alive a dropped network would keep it
     // open, and what it holds held, until the next host start. With it, a
-    // dead connection ends about 25 s after it went quiet: the viewer's
-    // side answers a probe with a reset, or 10 probes go unanswered.
+    // dead connection ends about 3 s after it went quiet when the viewer's
+    // side answers the first probe with a reset (its socket is gone, as
+    // after the viewer reconnected), or about 13 s after when 10 probes go
+    // unanswered. r6 (Pepper's review of c397898): no up on a newer
+    // connection ends an old connection's claims any more, so this close
+    // is what lets go of a key the old connection still held after a
+    // reconnect, and the idle time sets how soon (it was 15 s).
     tcp_keepalive ka{1, kKeepAliveIdleMs, kKeepAliveIntervalMs};
     DWORD kaBytes = 0;
     if (WSAIoctl(c, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &kaBytes, nullptr, nullptr) != 0)
@@ -342,7 +346,7 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     touch(st);
     const char* role = "control";
     bool first = true;
-    bool hostInfoLogged = false, inputSeen = false, viewerSeen = false;
+    bool hostInfoLogged = false, inputSeen = false;
     const jlh::HeldInput::Owner owner = st.nextInputOwner++;
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
     while (st.running && readFrame(hdr, -1)) {
@@ -416,23 +420,6 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
             if (e->kind == jlh::InputEvent::Kind::TaskManager)
                 logf("input.task_manager peer=%s sent=%s err=%lu", peer.c_str(), ok ? "yes" : "no",
                      ok ? 0ul : st.input.lastError());
-            break;
-        }
-        case jlh::kMsgViewerId: {
-            // H2 r5 (Pepper's review of 04622f0): which viewer this
-            // connection belongs to, sent first on it. The token is never
-            // logged.
-            const auto t = jlh::decodeViewerId(hdr, payload.data());
-            if (!t) {
-                ++st.inputMalformed;
-                break;
-            }
-            touch(st);
-            st.input.setViewer(owner, *t);
-            if (!viewerSeen) {
-                viewerSeen = true;
-                logf("input.viewer peer=%s channel=%s viewer_id=yes", peer.c_str(), role);
-            }
             break;
         }
         default:
@@ -886,7 +873,7 @@ void videoLoop(State& st) {
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
                  "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu input_up_held=%llu "
-                 "input_up_handover=%llu input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
+                 "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
                  "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
                  sender.takeBytes() * 8.0 / 1e6 / secs, (unsigned long long)nKeys,
@@ -895,7 +882,7 @@ void videoLoop(State& st) {
                  sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
                  (unsigned long long)st.input.ignored(), (unsigned long long)st.input.upsHeld(),
-                 (unsigned long long)st.input.upsHandedOver(), (unsigned long long)st.inputMalformed.load(),
+                 (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
                  (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerSyncs.load(),
                  (unsigned long long)st.cursorSent.load(),
