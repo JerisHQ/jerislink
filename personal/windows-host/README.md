@@ -73,18 +73,27 @@ Builds are unsigned (design doc D14).
 - Pointer: MRC1 0x20-0x25 and MRM1 0x24 (newest seq only), mapped from the
   picture onto the captured monitor in virtual-desktop coordinates; wheel
   and horizontal wheel as sent; left, right, middle buttons.
-- POINTER_SYNC (MRC1 0x27, [nx, ny BE16, MRM1 seq BE32]): a viewer that saw
-  cap 0x20 sends one right in front of each button. The pointer moves by
-  UDP and the button by TCP, so the button could overtake its move: the
-  host moves to (nx, ny) first, then presses or releases, and MRM1 moves up
-  to that seq arriving later are dropped as stale.
+- POINTER_SYNC (MRC1 0x27, 10 bytes: [nx, ny BE16, MRM1 seq BE32, the
+  viewer's MRM1 UDP port BE16]): a viewer that saw cap 0x20 sends one right
+  in front of each button. The pointer moves by UDP and the button by TCP,
+  so the button could overtake its move: the host moves to (nx, ny) first,
+  then presses or releases, and MRM1 moves from that UDP socket up to that
+  seq arriving later are dropped as stale. Each viewer UDP socket keeps its
+  own seq order (a new socket starts at 1); one not heard from for 10 s
+  starts over.
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
 - Held keys and buttons are tracked per control connection. When one
   closes, only what it pressed is released; a key or button another
-  connection holds stays down, so a late close of an old connection does
-  not lift what a new one just pressed.
+  connection holds stays down, older or newer, so a late close of an old
+  connection does not lift what a new one just pressed, and a new one's
+  close does not lift what an old one still holds. A key-up or button-up
+  also ends the claims of older connections on that key or button: after a
+  reconnect the viewer sends the ups it owes on the new connection
+  (`input_up_handover` in `stats`). Control connections use TCP
+  keep-alive (15 s idle, then 10 probes 1 s apart), so one whose viewer
+  vanished closes after about 25 s and lets go.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
   a second to the viewer's MRM1 address.
 - Typed keys are never logged; the `stats` line has counters only.

@@ -449,6 +449,9 @@ static const wchar_t* hostNoun() { return gHostWindows ? L"Windows PC" : L"Mac";
 // (key_holdback.hpp; Pepper's review of 8f8a33b, item 4a).
 static bool gHostPlatformKnown = false;
 static jl::holdback::KeyHoldBack gHoldBack;
+// The only place the hook's state is reset: the held-back Windows key goes
+// with it (key_holdback.hpp, resetHook; Pepper's review of f97ad11, item 2).
+static void resetKeyboardHookState() { jl::holdback::resetHook(gHookFilter, gHoldBack); }
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -3482,7 +3485,7 @@ static void fileConfirmShow(const char* source) {
     gConfirmKeys.reset();
     gConfirmHot = -1;
     // Nothing goes to the Mac while it is open: lift what is held there now.
-    gHookFilter.reset();
+    resetKeyboardHookState();
     gKeys.reset();
     releaseRemoteButtons("file_confirm");
     releaseRemoteModifiers();
@@ -3761,7 +3764,7 @@ static void filePanelShow(const char* source) {
     gPanelKeys.reset();
     gPanelHot = fp::Button::None;
     // Nothing goes to the Mac while it is open: lift what is held there now.
-    gHookFilter.reset();
+    resetKeyboardHookState();
     gKeys.reset();
     releaseRemoteButtons("file_panel");
     releaseRemoteModifiers();
@@ -4154,8 +4157,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gViewerFocused = false;
         gHaveMouse = false;
         gPasteGate.abandon();  // a held paste never lands after focus left
-        gHookFilter.reset();
-        gHoldBack.focusLost();  // H2: the hook will not send the Windows key's up now
+        resetKeyboardHookState();  // H2: the hook will not send the Windows key's up now
         gKeys.reset();
         discardQueuedInput("focus_kill");
         releaseRemoteButtons("focus_kill");

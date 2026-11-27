@@ -437,6 +437,7 @@ static void testHeldInput() {
     ups.clear();
     u.pressKey(jlh::vk::LShift, A);
     CHECK(u.releaseKey(jlh::vk::LShift, B, upKey) == Up::Sent && same(ups, {jlh::vk::LShift}) && !u.anyHeld());
+    CHECK(u.handovers() == 1);
     CHECK(u.releaseOwned(A, noKey, noButton) == 0);
     // A newer holder outlives an older connection's up, whatever the order
     // they pressed in: C pressed first, then B; B's up is older than C.
@@ -446,21 +447,62 @@ static void testHeldInput() {
     CHECK(u.releaseButton(2, B, noButton) == Up::Held && u.buttonOwnedBy(2, C));
     CHECK(u.releaseButton(2, C, upButton) == Up::Sent && same(buttonUps, {uint8_t(2)}) && !u.anyHeld());
 
-    // A close lets go of what it holds, and older connections let go of
-    // those too; something only an older connection holds stays its own.
+    // Pepper's review of f97ad11, item 1. A and B both hold Shift and the
+    // left button; B, the newer connection, closes. A is still open and
+    // still holds them: Windows gets no up. A's own up, or its close, lets
+    // go.
+    jlh::HeldInput p;
+    ups.clear();
+    buttonUps.clear();
+    p.pressKey(jlh::vk::LShift, A);
+    p.pressButton(0, A);
+    p.pressKey(jlh::vk::LShift, B);
+    p.pressButton(0, B);
+    CHECK(p.releaseOwned(B, noKey, noButton) == 0);
+    CHECK(p.keyOwnedBy(jlh::vk::LShift, A) && p.buttonOwnedBy(0, A) && !p.keyOwnedBy(jlh::vk::LShift, B) &&
+          !p.buttonOwnedBy(0, B));
+    CHECK(p.releaseButton(0, A, upButton) == Up::Sent && same(buttonUps, {uint8_t(0)}));
+    CHECK(p.releaseOwned(A, upKey, upButton) == 1 && same(ups, {jlh::vk::LShift}) && !p.anyHeld());
+    CHECK(p.handovers() == 0);
+
+    // A close lets go of its own claims only, older or newer than the
+    // others: a connection still open keeps what it holds.
     jlh::HeldInput c;
     ups.clear();
     buttonUps.clear();
     c.pressKey('W', B);
     c.pressKey('W', C);
     c.pressKey('Q', A);
-    n = c.releaseOwned(B, noKey, noButton);  // B is older than C: W stays
+    n = c.releaseOwned(B, noKey, noButton);  // B closes: C still holds W
     CHECK(n == 0 && c.keyOwnedBy('W', C) && !c.keyOwnedBy('W', B) && c.keyOwnedBy('Q', A));
-    c.pressKey('W', B);
-    n = c.releaseOwned(C, upKey, upButton);  // C closes: B's claim on W ends with it
-    CHECK(n == 1 && same(ups, {uint16_t('W')}) && c.keyHeld('Q') && c.keyOwnedBy('Q', A) && !c.keyHeld('W'));
+    const jlh::HeldInput::Owner D = 4;
+    c.pressKey('W', D);
+    n = c.releaseOwned(D, noKey, noButton);  // D, the newest, closes: C still holds W
+    CHECK(n == 0 && c.keyOwnedBy('W', C) && !c.keyOwnedBy('W', D));
     n = c.releaseOwned(A, upKey, upButton);
-    CHECK(n == 1 && same(ups, {uint16_t('W'), uint16_t('Q')}) && !c.anyHeld());
+    CHECK(n == 1 && same(ups, {uint16_t('Q')}) && c.keyOwnedBy('W', C));
+    n = c.releaseOwned(C, upKey, upButton);
+    CHECK(n == 1 && same(ups, {uint16_t('Q'), uint16_t('W')}) && !c.anyHeld());
+
+    // After a reconnect the viewer sends the ups it owes for presses made
+    // on the old connection A first on the new connection B (the viewer's
+    // control_channel.hpp, takeOwedLocked). Such an up stands for A's
+    // press: it ends A's claim (a handover) and Windows gets it, before
+    // the host sees A closed.
+    jlh::HeldInput o;
+    ups.clear();
+    buttonUps.clear();
+    o.pressKey('E', A);
+    CHECK(o.releaseKey('E', B, upKey) == Up::Sent && same(ups, {uint16_t('E')}) && !o.anyHeld());
+    CHECK(o.handovers() == 1 && o.releaseOwned(A, noKey, noButton) == 0);
+    // B pressed it again after the reconnect (auto-repeat): B's up ends both
+    // claims, one handover.
+    o.pressButton(1, A);
+    o.pressButton(1, B);
+    CHECK(o.releaseButton(1, B, upButton) == Up::Sent && same(buttonUps, {uint8_t(1)}) && o.handovers() == 2);
+    // An up that ends only its own claim is no handover.
+    o.pressKey('R', B);
+    CHECK(o.releaseKey('R', B, upKey) == Up::Sent && o.handovers() == 2 && !o.anyHeld());
 
     // An up Windows did not take: the entry stays, and the next release
     // (any connection's close or up) tries it again.
@@ -544,16 +586,16 @@ static void testPointerMapping() {
 
 static void testMrm1SessionAndCursor() {
     jlh::Mrm1Session s;
-    CHECK(s.note(0x64400010, 50000));   // first datagram: a session
-    CHECK(!s.note(0x64400010, 50000));  // same port: same session
+    CHECK(s.note(0x64400010, 50000, 0));   // first datagram: a session
+    CHECK(!s.note(0x64400010, 50000, 0));  // same port: same session
     CHECK(s.takePointer(10));
     CHECK(!s.takePointer(10) && !s.takePointer(9));  // repeat or late: dropped
     CHECK(s.takePointer(11));
     CHECK(s.takePointer(0x7FFFFFFFu + 11));  // newer: just under half the range ahead
     CHECK(s.takePointer(5));                 // wrapped round: newer again
-    CHECK(s.note(0x64400010, 50001));        // viewer restarted: new session
-    CHECK(s.takePointer(1));                 // order starts over
-    CHECK(s.note(0x64400011, 50001));        // another address: new session
+    CHECK(s.note(0x64400010, 50001, 0));     // viewer restarted: new session
+    CHECK(s.takePointer(1));                 // its own order, from the start
+    CHECK(s.note(0x64400011, 50001, 0));     // another address: new session
     // The cursor packet the viewer reads (viewer.cpp: 11 bytes, seq, shape).
     const auto c = jlh::mrm1Cursor(0x01020304u, jlh::CursorShape::Wait);
     CHECK(c.size() == 11 && c[0] == 'M' && c[3] == '1' && c[4] == 1 && c[5] == 0x31);
@@ -564,47 +606,84 @@ static void testMrm1SessionAndCursor() {
     // moves the mark back.
     const uint32_t ip = 0x0A000002;
     jlh::Mrm1Session p;
-    CHECK(p.note(ip, 50000));
-    p.syncPointer(ip, 50000, 7);  // before any move
+    CHECK(p.note(ip, 50000, 0));
+    p.syncPointer(ip, 50000, 7, 0);  // before any move
     CHECK(!p.takePointer(7) && !p.takePointer(6) && p.takePointer(8));
-    p.syncPointer(ip, 50000, 5);  // older than what was taken: no change
+    p.syncPointer(ip, 50000, 5, 0);  // older than what was taken: no change
     CHECK(!p.takePointer(8) && p.takePointer(9));
-    p.syncPointer(ip, 50000, 0xFFFFFFF0u);  // half the range behind 9: older, no change
+    p.syncPointer(ip, 50000, 0xFFFFFFF0u, 0);  // half the range behind 9: older, no change
     CHECK(p.takePointer(10));
-    p.syncPointer(ip, 50000, 0x7FFFFFF0u);  // ahead
+    p.syncPointer(ip, 50000, 0x7FFFFFF0u, 0);  // ahead
     CHECK(!p.takePointer(0x7FFFFFEFu) && p.takePointer(0x7FFFFFF1u));
-    p.syncPointer(ip, 0, 0x7FFFFFFFu);  // port 0: position only, no mark
+    p.syncPointer(ip, 0, 0x7FFFFFFFu, 0);  // port 0: position only, no mark
     CHECK(p.takePointer(0x7FFFFFF2u));
 
     // Pepper's review of 8f8a33b, item 5a: the sync is for a viewer socket
     // the host has not heard from yet. Its seq is that socket's (each new
-    // socket starts at 1), not the current session's: kept, and applied
-    // when that socket's first datagram starts its session.
+    // socket starts at 1), not the current session's: kept for that
+    // socket, and in force when its first datagram arrives.
     jlh::Mrm1Session q;
-    CHECK(q.note(ip, 50000) && q.takePointer(5000));
-    q.syncPointer(ip, 50001, 2);  // the new socket's move 2 came before the click
-    CHECK(q.takePointer(5001));   // the current session is not touched
-    CHECK(q.note(ip, 50001));     // the new socket's first datagram, late
+    CHECK(q.note(ip, 50000, 0) && q.takePointer(5000));
+    q.syncPointer(ip, 50001, 2, 0);  // the new socket's move 2 came before the click
+    CHECK(q.takePointer(5001));      // the current session is not touched
+    CHECK(q.note(ip, 50001, 0));     // the new socket's first datagram, late
     CHECK(!q.takePointer(1) && !q.takePointer(2) && q.takePointer(3));
     // No session at all yet: the same.
     jlh::Mrm1Session r;
-    r.syncPointer(ip, 50002, 3);
-    CHECK(r.note(ip, 50002) && !r.takePointer(1) && !r.takePointer(3) && r.takePointer(4));
-    // A pending mark only goes to its own socket: not to another port or
-    // address, and a session from another port in between does not use it.
+    r.syncPointer(ip, 50002, 3, 0);
+    CHECK(r.note(ip, 50002, 0) && !r.takePointer(1) && !r.takePointer(3) && r.takePointer(4));
+    // A mark only goes to its own socket: not to another port or address.
     jlh::Mrm1Session t;
-    t.syncPointer(ip, 50003, 9);
-    t.syncPointer(ip, 50003, 4);   // older: the pending mark stays at 9
-    CHECK(t.note(ip, 50004) && t.takePointer(1));
-    CHECK(t.note(ip + 1, 50003) && t.takePointer(1));
-    CHECK(t.note(ip, 50003) && !t.takePointer(9) && t.takePointer(10));
-    CHECK(t.note(ip, 50004) && t.takePointer(1));  // used once: a session later starts clean
-    // A sync for a newer socket replaces one for an older socket that never sent.
+    t.syncPointer(ip, 50003, 9, 0);
+    t.syncPointer(ip, 50003, 4, 0);  // older: the mark stays at 9
+    CHECK(t.note(ip, 50004, 0) && t.takePointer(1));
+    CHECK(t.note(ip + 1, 50003, 0) && t.takePointer(1));
+    CHECK(t.note(ip, 50003, 0) && !t.takePointer(9) && t.takePointer(10));
+    CHECK(t.note(ip, 50004, 0) && !t.takePointer(1) && t.takePointer(2));  // 50004 kept its own order
+    // Syncs for two sockets that have not sent yet: each keeps its own mark.
     jlh::Mrm1Session u;
-    u.syncPointer(ip, 50005, 9);
-    u.syncPointer(ip, 50006, 2);
-    CHECK(u.note(ip, 50005) && u.takePointer(1));
-    CHECK(u.note(ip, 50006) && !u.takePointer(2) && u.takePointer(3));
+    u.syncPointer(ip, 50005, 9, 0);
+    u.syncPointer(ip, 50006, 2, 0);
+    CHECK(u.note(ip, 50005, 0) && !u.takePointer(9) && u.takePointer(10));
+    CHECK(u.note(ip, 50006, 0) && !u.takePointer(2) && u.takePointer(3));
+
+    // Pepper's review of f97ad11, item 3. B (the new socket) got its mark;
+    // a late datagram from A (the old socket) makes A current for a
+    // moment; when B comes back, its mark is still there, so B's move from
+    // before the click stays dropped. A keeps its own order too.
+    jlh::Mrm1Session v;
+    CHECK(v.note(ip, 50000, 0) && v.takePointer(5000));
+    v.syncPointer(ip, 50001, 3, 10);
+    CHECK(v.note(ip, 50001, 20) && !v.takePointer(1));     // B, from before the click
+    CHECK(v.note(ip, 50000, 30) && v.takePointer(5001));   // A, late
+    CHECK(v.note(ip, 50001, 40) && !v.takePointer(2) && !v.takePointer(3) && v.takePointer(4));
+    CHECK(v.note(ip, 50000, 50) && !v.takePointer(5001) && !v.takePointer(4999));
+
+    // A socket not heard from (no datagram, no sync) for more than kIdleMs
+    // starts over: the viewer sends a keep-alive every second, so that is a
+    // new viewer socket that got the same port.
+    const int64_t idle = jlh::Mrm1Session::kIdleMs;
+    jlh::Mrm1Session w;
+    CHECK(w.note(ip, 50000, 0) && w.takePointer(100));
+    CHECK(!w.note(ip, 50000, idle) && !w.takePointer(1));        // kIdleMs exactly: same order
+    CHECK(!w.note(ip, 50000, 2 * idle + 1) && w.takePointer(1));  // more: starts over
+    w.syncPointer(ip, 50000, 50, 3 * idle);                       // a sync counts as heard from
+    CHECK(!w.note(ip, 50000, 4 * idle) && !w.takePointer(50) && w.takePointer(51));
+    // An idle socket that is not the current one starts over as well.
+    CHECK(w.note(ip, 50001, 4 * idle) && w.takePointer(7));
+    CHECK(w.note(ip, 50000, 5 * idle + 1) && w.takePointer(1));
+
+    // At most kMaxSockets are kept. The one heard from least recently makes
+    // room, never the current one, even when it is the oldest.
+    const size_t cap = jlh::Mrm1Session::kMaxSockets;
+    jlh::Mrm1Session e;
+    CHECK(e.note(ip, 40000, 0) && e.takePointer(7));
+    for (size_t i = 1; i <= cap; ++i) e.syncPointer(ip, uint16_t(40000 + i), 5, int64_t(i));
+    CHECK(e.socketsKept() == cap);
+    CHECK(!e.note(ip, 40000, 100) && !e.takePointer(7) && e.takePointer(8));  // the current one stayed
+    CHECK(e.note(ip, uint16_t(40000 + cap), 101) && !e.takePointer(5) && e.takePointer(6));
+    CHECK(e.note(ip, 40001, 102) && e.takePointer(1));  // made room first: starts over
+    CHECK(e.socketsKept() == cap);
 }
 
 // Pepper's H2 review, item 5. The host's pointer and buttons as the real
@@ -627,7 +706,7 @@ struct FakeDesk {
     // One MRM1 0x24 from the viewer's UDP socket at port, as mrm1Listener
     // takes it.
     void udp(uint32_t seq, int nx, int ny, uint16_t port = kViewerPort) {
-        order.note(kViewerIp, port);
+        order.note(kViewerIp, port, 0);
         if (order.takePointer(seq)) {
             x = nx;
             y = ny;
@@ -647,7 +726,7 @@ struct FakeDesk {
             jlh::stepInput(
                 pending, *e,
                 [&](const jlh::InputEvent& s, const jlh::InputEvent* b) {
-                    order.syncPointer(kViewerIp, s.port, s.seq);
+                    order.syncPointer(kViewerIp, s.port, s.seq, 0);
                     x = s.x;
                     y = s.y;
                     if (b) presses.push_back({b->button, b->down, x, y});
@@ -766,6 +845,28 @@ static void testPointerSyncOrdering() {
         CHECK(d.x == 700 && d.y == 800);
         d.tcp(syncedButton(700, 800, 2, 0, false, 50001));
         CHECK(d.presses.size() == 2 && pressedAt(d.presses[1], 0, false, 700, 800));
+    }
+    // Pepper's review of f97ad11, item 3. As above, and then a late
+    // datagram from the old socket arrives after the click. It is newer in
+    // the old socket's own order, so it moves the pointer (no button goes
+    // down there), and the new socket's move from before the click, seq 2,
+    // arriving after it, is still dropped.
+    {
+        FakeDesk d;
+        d.udp(4999, 100, 100);
+        d.udp(5000, 200, 200);                             // A, the old socket
+        d.tcp(syncedButton(500, 600, 3, 0, true, 50001));  // B's mark: seq 3
+        d.udp(1, 300, 300, 50001);                         // B, from before the click
+        CHECK(d.x == 500 && d.y == 600);
+        d.udp(5001, 250, 250);  // A, late
+        CHECK(d.x == 250 && d.y == 250);
+        d.udp(2, 400, 400, 50001);  // B, from before the click: dropped
+        CHECK(d.x == 250 && d.y == 250);
+        d.udp(4, 700, 800, 50001);  // B, after the click
+        CHECK(d.x == 700 && d.y == 800);
+        d.tcp(syncedButton(700, 800, 4, 0, false, 50001));
+        CHECK(d.presses.size() == 2 && pressedAt(d.presses[0], 0, true, 500, 600) &&
+              pressedAt(d.presses[1], 0, false, 700, 800));
     }
     // Port 0 (no MRM1 socket known): the click lands at the sync point; no
     // seq is marked.

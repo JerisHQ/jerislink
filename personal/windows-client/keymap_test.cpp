@@ -787,8 +787,49 @@ void testChordHoldBack() {
         expect(h.winDown(true, isDown) == Reason::None, "hold-back: Win after the ACK goes out");
         expect(!h.winUp(), "hold-back: ... and its up");
         h.winDown(false, isDown);
-        h.focusLost();
+        h.hookReset();
         expect(h.hookTap(true, isDown) == Reason::None, "hold-back: focus loss forgets the held-back Win (its up will not come)");
+    }
+    {
+        // Pepper's review of f97ad11, item 2. Win goes down before the ACK
+        // and is held back; then the Files panel or the disconnect confirm
+        // opens and resets the hook, so the hook never posts that Win's up.
+        // The reset goes through resetHook, which forgets the held-back Win
+        // too: keys and clicks after it go out.
+        HookFilter hook;
+        KeyHoldBack h;
+        down.clear();
+        expect(hook.onKey(vk::LWin, true, false).post == HookFilter::Post::WinDown, "hook: Win down is posted");
+        expect(h.winDown(false, isDown) == Reason::PlatformUnknown, "hold-back: Win from the hook before the ACK");
+        jl::holdback::resetHook(hook, h);  // the Files panel or the disconnect confirm opens
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::None && !hook.winDown(),
+               "hook reset: the Win up after it is not posted");
+        down = {kV};
+        expect(h.keyDown(kV, false, true, isDown) == Reason::None, "hold-back: after resetHook, V goes out (Win not stuck)");
+        expect(!h.keyUp(kV), "hold-back: ... and its up");
+        down.clear();
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: after resetHook, a click goes out");
+        expect(!h.winUp() && h.heldBack() == 1, "hold-back: nothing else held back");
+    }
+    {
+        // The bug: a hook reset alone leaves the held-back Win, and the hook
+        // will never post its up. The next Win press still starts over.
+        HookFilter hook;
+        KeyHoldBack h;
+        down.clear();
+        hook.onKey(vk::LWin, true, false);
+        h.winDown(false, isDown);
+        hook.reset();
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::None && h.chordOpen(isDown),
+               "hold-back: a hook reset alone leaves the Win held back (what resetHook prevents)");
+        expect(hook.onKey(vk::LWin, true, false).post == HookFilter::Post::WinDown &&
+                   h.winDown(true, isDown) == Reason::None,
+               "hold-back: a fresh Win press after a lost up starts over and goes out");
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::WinUp && !h.winUp(),
+               "hold-back: ... and its up goes out");
+        down = {kV};
+        expect(h.keyDown(kV, false, true, isDown) == Reason::None, "hold-back: and V after it goes out");
+        down.clear();
     }
     {
         KeyHoldBack h;

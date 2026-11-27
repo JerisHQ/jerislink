@@ -35,7 +35,7 @@ public:
     bool apply(const InputEvent& e, HeldInput::Owner owner);
     // MRM1 0x24.
     bool moveNormalized(int nx, int ny);
-    // Connection `owner` went away: it and older connections let go
+    // Connection `owner` went away: it lets go of its own claims only
     // (HeldInput's rule); releases what no connection holds any more (and
     // anything an earlier release could not); returns how many ups Windows
     // took.
@@ -48,6 +48,10 @@ public:
     // Up frames not sent to Windows because a newer connection still holds
     // that key or button (HeldInput's rule).
     uint64_t upsHeld() const { return upsHeld_.load(); }
+    // Up frames that ended an older connection's claim on that key or
+    // button (HeldInput::handovers): after a reconnect, the ups the viewer
+    // owes for presses on the old connection.
+    uint64_t upsHandedOver() const;
     // The GetLastError of the most recent SendInput that took nothing.
     unsigned long lastError() const { return lastError_.load(); }
 

@@ -53,8 +53,12 @@ public:
         return true;
     }
     // The Windows key, from the low-level hook (WM_MR_WIN_DOWN / _UP).
+    // The hook posts a down only for a fresh press, after it posted the
+    // up or was reset, so a Windows key still held back here is one whose
+    // up never came: it starts over, as a fresh key press does.
     template <class IsDown>
     Reason winDown(bool known, IsDown&& isDown) {
+        win_ = false;
         const Reason r = reason(known, isDown);
         if (r != Reason::None) {
             win_ = true;
@@ -90,9 +94,10 @@ public:
             if (keys_.test(k) && isDown(k)) return true;
         return false;
     }
-    // Focus left: the hook forgot the Windows key, so its up will not come.
-    // Keys stay noted, so an up that still comes here is not sent alone.
-    void focusLost() { win_ = false; }
+    // The hook forgot the Windows key (resetHook below), so its up will
+    // not come. Keys stay noted, so an up that still comes here is not sent
+    // alone.
+    void hookReset() { win_ = false; }
     // A new session.
     void reset() {
         keys_.reset();
@@ -111,5 +116,16 @@ private:
     bool win_ = false;       // the Windows key's down was held back
     uint64_t count_ = 0;     // everything held back this session
 };
+
+// Every reset of the viewer's low-level hook state goes through here
+// (Pepper's review of f97ad11, item 2): focus left, the Files panel or the
+// disconnect confirm opened. The reset hook does not post the Windows
+// key's up, so a Windows key held back is forgotten in the same step;
+// otherwise the open chord would hold back every key and click after it.
+template <class Hook>
+void resetHook(Hook& hook, KeyHoldBack& h) {
+    hook.reset();
+    h.hookReset();
+}
 
 }  // namespace jl::holdback

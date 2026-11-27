@@ -27,6 +27,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
 #include <mfapi.h>
 #include <objbase.h>
@@ -57,6 +58,10 @@ constexpr uint16_t kControlPort = 38400;
 constexpr uint16_t kVideoPort = 38402;
 constexpr uint16_t kMrm1Port = 38412;
 constexpr int kActiveGraceMs = 10'000;    // viewer counts as present this long after its last packet
+// TCP keep-alive on control connections: first probe after this much
+// silence, then one a second; Windows gives up after 10 unanswered probes.
+constexpr ULONG kKeepAliveIdleMs = 15'000;
+constexpr ULONG kKeepAliveIntervalMs = 1'000;
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
 constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
@@ -275,7 +280,7 @@ bool sendAll(SOCKET s, const std::vector<uint8_t>& b) {
 bool applyPointerSync(State& st, uint32_t peerAddr, const jlh::InputEvent& sync, const jlh::InputEvent* button,
                       jlh::HeldInput::Owner owner) {
     std::lock_guard<std::mutex> g(st.pointerMutex);
-    st.pointer.syncPointer(peerAddr, sync.port, sync.seq);
+    st.pointer.syncPointer(peerAddr, sync.port, sync.seq, msSinceStart());
     ++st.pointerSyncs;
     st.input.moveNormalized(sync.x, sync.y);
     return button ? st.input.apply(*button, owner) : true;
@@ -319,6 +324,17 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
         logf("control.closed peer=%s reason=rcvtimeo err=%d", peer.c_str(), WSAGetLastError());
         return;
     }
+    // Pepper's review of f97ad11, item 1: a close lets go of this
+    // connection's own claims only, so a connection whose viewer is gone
+    // must be seen to close. The host never writes to an idle control
+    // connection, so without keep-alive a dropped network would keep it
+    // open, and what it holds held, until the next host start. With it, a
+    // dead connection ends about 25 s after it went quiet: the viewer's
+    // side answers a probe with a reset, or 10 probes go unanswered.
+    tcp_keepalive ka{1, kKeepAliveIdleMs, kKeepAliveIntervalMs};
+    DWORD kaBytes = 0;
+    if (WSAIoctl(c, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &kaBytes, nullptr, nullptr) != 0)
+        logf("control.keepalive peer=%s set=no err=%d", peer.c_str(), WSAGetLastError());
     ++st.controlConnections;
     guard.established = true;
     touch(st);
@@ -408,7 +424,8 @@ done:
     {
         // This connection went away: nothing it pressed stays down on this
         // PC, unless another connection of the viewer holds it too (Pepper's
-        // H2 review, item 2). An up Windows refused earlier is tried again.
+        // H2 review, item 2). It lets go of its own claims only (review of
+        // f97ad11, item 1). An up Windows refused earlier is tried again.
         const size_t n = st.input.releaseOwned(owner);
         if (inputSeen || n)
             logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,
@@ -465,11 +482,14 @@ void mrm1Listener(State& st, SOCKET u) {
         bool newSession;
         {
             std::lock_guard<std::mutex> g(st.pointerMutex);
-            newSession = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port));
+            newSession = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port), msSinceStart());
         }
         if (newSession) {
-            // A viewer socket not seen before: a new MRM1 session. Pointer
-            // order starts over and the cursor loop sends the shape there.
+            // Another viewer socket than the current one (a new one, or an
+            // older one whose datagram came late): the cursor loop sends the
+            // shape there. Pointer order is that socket's own and is kept
+            // across the switch (Mrm1Session, Pepper's review of f97ad11,
+            // item 3).
             {
                 std::lock_guard<std::mutex> g(st.mrm1PeerMutex);
                 st.mrm1Peer = from;
@@ -847,7 +867,7 @@ void videoLoop(State& st) {
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
                  "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu input_up_held=%llu "
-                 "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
+                 "input_up_handover=%llu input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
                  "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
                  sender.takeBytes() * 8.0 / 1e6 / secs, (unsigned long long)nKeys,
@@ -856,7 +876,7 @@ void videoLoop(State& st) {
                  sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
                  (unsigned long long)st.input.ignored(), (unsigned long long)st.input.upsHeld(),
-                 (unsigned long long)st.inputMalformed.load(),
+                 (unsigned long long)st.input.upsHandedOver(), (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
                  (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerSyncs.load(),
                  (unsigned long long)st.cursorSent.load(),
