@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -86,6 +87,7 @@ private:
 
 constexpr size_t kMrc1HeaderBytes = 8;
 constexpr uint8_t kMsgPing = 0x01, kMsgPong = 0x02;
+constexpr size_t kPingPayloadBytes = 4;     // ControlChannel::ping(); the Mac host ignores other sizes
 constexpr uint8_t kMsgAuthResponse = 0x03, kMsgAuthResult = 0x04;
 constexpr uint8_t kMsgClipboardHello = 0x30;
 constexpr uint8_t kMsgVideoConfig = 0x40, kMsgVideoConfigAck = 0x41;
@@ -110,6 +112,29 @@ inline std::optional<Mrc1Header> parseMrc1Header(const uint8_t* h) {
     if (h[0] != 'M' || h[1] != 'R' || h[2] != 'C' || h[3] != '1' || h[4] != 1) return std::nullopt;
     return Mrc1Header{h[5], uint16_t((uint16_t(h[6]) << 8) | h[7])};
 }
+
+// A PING the host answers: the 4-byte payload real viewers send.
+inline bool isValidPing(const Mrc1Header& h) { return h.type == kMsgPing && h.length == kPingPayloadBytes; }
+
+// Control connection slots. The listener takes one before it starts a
+// worker, so sockets still in the handshake count against the cap too; the
+// worker gives it back on every exit path.
+class ConnectionSlots {
+public:
+    explicit ConnectionSlots(int max) : max_(max) {}
+    bool tryAcquire() {
+        int n = used_.load();
+        while (n < max_)
+            if (used_.compare_exchange_weak(n, n + 1)) return true;
+        return false;
+    }
+    void release() { --used_; }
+    int inUse() const { return used_.load(); }
+
+private:
+    const int max_;
+    std::atomic<int> used_{0};
+};
 
 // The transition probe a viewer sends to a host that sent no challenge:
 // random nonce, all-zero MAC (conn_auth.hpp, design §9). H1 runs without a
@@ -166,14 +191,17 @@ struct Mrm1Packet {
     uint8_t type = 0;
     uint32_t seq = 0;
 };
+// Only the two types H1 handles, each at its exact length. Anything else
+// (pointer, NACK, receiver report, audio, junk) is dropped before it can
+// touch host state.
 inline std::optional<Mrm1Packet> parseMrm1(const uint8_t* p, size_t n) {
     if (n < 10 || p[0] != 'M' || p[1] != 'R' || p[2] != 'M' || p[3] != '1' || p[4] != 1) return std::nullopt;
     Mrm1Packet m;
     m.type = p[5];
     m.seq = (uint32_t(p[6]) << 24) | (uint32_t(p[7]) << 16) | (uint32_t(p[8]) << 8) | p[9];
-    if (m.type == kMrm1KeyframeRequest && n != 10) return std::nullopt;
-    if (m.type == kMrm1Ping && n != 18) return std::nullopt;
-    return m;
+    if (m.type == kMrm1KeyframeRequest) return n == 10 ? std::optional<Mrm1Packet>(m) : std::nullopt;
+    if (m.type == kMrm1Ping) return n == 18 ? std::optional<Mrm1Packet>(m) : std::nullopt;
+    return std::nullopt;
 }
 // The same 18 bytes back with the type set to 0x44.
 inline std::vector<uint8_t> mrm1Pong(const uint8_t* ping, size_t n) {

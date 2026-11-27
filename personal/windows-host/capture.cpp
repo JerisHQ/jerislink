@@ -47,6 +47,7 @@ struct ScreenCapture::Impl {
     // GDI
     HDC screenDc = nullptr, memDc = nullptr;
     HBITMAP bitmap = nullptr;
+    HGDIOBJ previousBitmap = nullptr;  // memDc's own bitmap, put back before DeleteObject
     void* bits = nullptr;
 };
 
@@ -68,6 +69,7 @@ void ScreenCapture::close() {
     release(impl_->dup);
     release(impl_->ctx);
     release(impl_->device);
+    if (impl_->previousBitmap) SelectObject(impl_->memDc, impl_->previousBitmap);
     if (impl_->bitmap) DeleteObject(impl_->bitmap);
     if (impl_->memDc) DeleteDC(impl_->memDc);
     if (impl_->screenDc) ReleaseDC(nullptr, impl_->screenDc);
@@ -110,28 +112,21 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
             release(out1);
             release(output);
             release(adapter);
+            DXGI_OUTDUPL_DESC dd{};
+            if (impl_->dup) impl_->dup->GetDesc(&dd);
+            // DDA hands back the unrotated scan-out image. H1 does not rotate
+            // it: a rotated screen goes to GDI (Auto) or fails (Dda).
+            if (impl_->dup && dd.Rotation != DXGI_MODE_ROTATION_IDENTITY &&
+                dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+                ddaError = "dda.rotated rotation=" + std::to_string(int(dd.Rotation));
+                release(impl_->dup);
+            }
             if (impl_->dup) {
-                DXGI_OUTDUPL_DESC dd{};
-                impl_->dup->GetDesc(&dd);
+                // The staging texture is sized from the first acquired frame.
                 impl_->w = int(dd.ModeDesc.Width);
                 impl_->h = int(dd.ModeDesc.Height);
-                D3D11_TEXTURE2D_DESC td{};
-                td.Width = dd.ModeDesc.Width;
-                td.Height = dd.ModeDesc.Height;
-                td.MipLevels = 1;
-                td.ArraySize = 1;
-                td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                td.SampleDesc.Count = 1;
-                td.Usage = D3D11_USAGE_STAGING;
-                td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                h = impl_->device->CreateTexture2D(&td, nullptr, &impl_->staging);
-                if (FAILED(h)) {
-                    ddaError = hr("dda.staging", h);
-                    release(impl_->dup);
-                } else {
-                    impl_->backend = CaptureMode::Dda;
-                    return true;
-                }
+                impl_->backend = CaptureMode::Dda;
+                return true;
             }
         }
         release(impl_->ctx);
@@ -161,7 +156,13 @@ bool ScreenCapture::open(CaptureMode mode, std::string& error) {
         close();
         return false;
     }
-    SelectObject(impl_->memDc, impl_->bitmap);
+    impl_->previousBitmap = SelectObject(impl_->memDc, impl_->bitmap);
+    if (!impl_->previousBitmap || impl_->previousBitmap == HGDI_ERROR) {
+        impl_->previousBitmap = nullptr;
+        error = (ddaError.empty() ? std::string() : ddaError + "; ") + "gdi.select failed";
+        close();
+        return false;
+    }
     impl_->description = (ddaError.empty() ? std::string() : "dda_unavailable=\"" + ddaError + "\" ") + "gdi primary";
     impl_->backend = CaptureMode::Gdi;
     return true;
@@ -204,6 +205,35 @@ int ScreenCapture::acquire(int timeoutMs, CapturedFrame& out, std::string& error
     h = res->QueryInterface(IID_PPV_ARGS(&tex));
     release(res);
     if (FAILED(h)) { error = hr("dda.texture", h); return -1; }
+    // CopyResource needs identical shapes: size the staging texture from
+    // the frame DDA actually returned, not from the mode description.
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
+    if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        error = "dda.format " + std::to_string(int(td.Format));
+        release(tex);
+        return -1;
+    }
+    if (!m.staging || int(td.Width) != m.w || int(td.Height) != m.h) {
+        release(m.staging);
+        D3D11_TEXTURE2D_DESC sd{};
+        sd.Width = td.Width;
+        sd.Height = td.Height;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        h = m.device->CreateTexture2D(&sd, nullptr, &m.staging);
+        if (FAILED(h)) {
+            error = hr("dda.staging", h);
+            release(tex);
+            return -1;
+        }
+        m.w = int(td.Width);
+        m.h = int(td.Height);
+    }
     m.ctx->CopyResource(m.staging, tex);
     release(tex);
     D3D11_MAPPED_SUBRESOURCE map{};

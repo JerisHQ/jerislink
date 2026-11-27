@@ -113,6 +113,26 @@ static void testControlFrames() {
     const uint8_t open = jlh::kAuthOpenIpOnly;
     const auto r = jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1);
     CHECK(r.size() == 9 && r[5] == 0x04 && r[7] == 1 && r[8] == 5);
+
+    // PING is answered only at the viewer's 4-byte size.
+    CHECK(jlh::isValidPing(jlh::Mrc1Header{0x01, 4}));
+    CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x01, 0}));
+    CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x01, 5}));
+    CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x01, 0xFFFF}));
+    CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x02, 4}));
+}
+
+static void testConnectionSlots() {
+    jlh::ConnectionSlots slots(8);
+    int taken = 0;
+    for (int i = 0; i < 20; ++i) taken += slots.tryAcquire() ? 1 : 0;
+    CHECK(taken == 8 && slots.inUse() == 8);
+    slots.release();
+    CHECK(slots.inUse() == 7);
+    CHECK(slots.tryAcquire());
+    CHECK(!slots.tryAcquire());
+    for (int i = 0; i < 8; ++i) slots.release();
+    CHECK(slots.inUse() == 0);
 }
 
 static void testVideoConfig() {
@@ -151,6 +171,13 @@ static void testMrm1() {
     m = jlh::parseMrm1(ping, 18);
     CHECK(m && m->type == 0x43);
     CHECK(!jlh::parseMrm1(ping, 17));
+    // Types H1 does not handle never reach host state, whatever their size.
+    for (uint8_t type : {uint8_t(0x24), uint8_t(0x41), uint8_t(0x42), uint8_t(0x44), uint8_t(0x45), uint8_t(0x99)}) {
+        uint8_t other[32] = {'M', 'R', 'M', '1', 1, type, 0, 0, 0, 1};
+        for (size_t n : {size_t(10), size_t(18), size_t(32)}) CHECK(!jlh::parseMrm1(other, n));
+    }
+    uint8_t kfLong[11] = {'M', 'R', 'M', '1', 1, 0x40, 0, 0, 1, 2, 0};
+    CHECK(!jlh::parseMrm1(kfLong, 11));
     const auto pong = jlh::mrm1Pong(ping, 18);
     CHECK(pong.size() == 18 && pong[5] == 0x44);
     for (int i = 0; i < 18; ++i)
@@ -268,6 +295,7 @@ int main() {
     testPacketizeRoundTrip();
     testPacer();
     testControlFrames();
+    testConnectionSlots();
     testVideoConfig();
     testMrm1();
     testAnnexB();

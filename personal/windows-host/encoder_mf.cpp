@@ -64,6 +64,8 @@ std::vector<uint8_t> sequenceHeader(IMFTransform* t) {
 
 }  // namespace
 
+constexpr int kMaxStreamChanges = 2;
+
 struct MfH264Encoder::Impl {
     IMFTransform* mft = nullptr;
     ICodecAPI* api = nullptr;
@@ -110,7 +112,8 @@ bool MfH264Encoder::open(const EncoderConfig& cfg, std::string& error) {
     setU32(api, CODECAPI_AVEncCommonQualityVsSpeed, 0);  // fastest
 
     IMFMediaType* out = nullptr;
-    MFCreateMediaType(&out);
+    h = MFCreateMediaType(&out);
+    if (FAILED(h)) { error = hr("encoder.output_type_create", h); close(); return false; }
     out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     out->SetUINT32(MF_MT_AVG_BITRATE, UINT32(cfg.bitrateMbps) * 1'000'000U);
@@ -128,7 +131,8 @@ bool MfH264Encoder::open(const EncoderConfig& cfg, std::string& error) {
     if (FAILED(h)) { error = hr("encoder.output_type", h); close(); return false; }
 
     IMFMediaType* in = nullptr;
-    MFCreateMediaType(&in);
+    h = MFCreateMediaType(&in);
+    if (FAILED(h)) { error = hr("encoder.input_type_create", h); close(); return false; }
     in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
@@ -169,29 +173,36 @@ bool MfH264Encoder::encode(const uint8_t* nv12, int64_t ts, bool forceKeyframe, 
     HRESULT h = MFCreateMemoryBuffer(frameBytes, &buf);
     if (FAILED(h)) { error = hr("encoder.in_buffer", h); return false; }
     BYTE* p = nullptr;
-    buf->Lock(&p, nullptr, nullptr);
+    h = buf->Lock(&p, nullptr, nullptr);
+    if (FAILED(h)) { buf->Release(); error = hr("encoder.in_lock", h); return false; }
     std::memcpy(p, nv12, frameBytes);
     buf->Unlock();
     buf->SetCurrentLength(frameBytes);
     IMFSample* sample = nullptr;
-    MFCreateSample(&sample);
-    sample->AddBuffer(buf);
+    h = MFCreateSample(&sample);
+    if (SUCCEEDED(h)) h = sample->AddBuffer(buf);
     buf->Release();
+    if (FAILED(h)) { release(sample); error = hr("encoder.in_sample", h); return false; }
     sample->SetSampleTime(ts);
     sample->SetSampleDuration(impl_->frameDuration);
     h = impl_->mft->ProcessInput(0, sample, 0);
     sample->Release();
     if (FAILED(h)) { error = hr("encoder.process_input", h); return false; }
 
+    // Every failure below returns false: the caller closes and reopens the
+    // encoder rather than retrying a transform in an unknown state.
+    int streamChanges = 0;
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER od{};
         IMFSample* outSample = nullptr;
         if (!impl_->providesSamples) {
             IMFMediaBuffer* ob = nullptr;
-            if (FAILED(MFCreateMemoryBuffer(impl_->outputBufferBytes, &ob))) { error = "encoder.out_buffer"; return false; }
-            MFCreateSample(&outSample);
-            outSample->AddBuffer(ob);
+            h = MFCreateMemoryBuffer(impl_->outputBufferBytes, &ob);
+            if (FAILED(h)) { error = hr("encoder.out_buffer", h); return false; }
+            h = MFCreateSample(&outSample);
+            if (SUCCEEDED(h)) h = outSample->AddBuffer(ob);
             ob->Release();
+            if (FAILED(h)) { release(outSample); error = hr("encoder.out_sample", h); return false; }
             od.pSample = outSample;
         }
         DWORD status = 0;
@@ -203,11 +214,16 @@ bool MfH264Encoder::encode(const uint8_t* nv12, int64_t ts, bool forceKeyframe, 
         }
         if (h == MF_E_TRANSFORM_STREAM_CHANGE) {
             if (outSample) outSample->Release();
+            if (od.pSample && od.pSample != outSample) od.pSample->Release();
+            // One renegotiation is normal; a transform that keeps asking is broken.
+            if (++streamChanges > kMaxStreamChanges) { error = "encoder.stream_change_loop"; return false; }
             IMFMediaType* t = nullptr;
-            if (SUCCEEDED(impl_->mft->GetOutputAvailableType(0, 0, &t))) {
-                impl_->mft->SetOutputType(0, t, 0);
+            h = impl_->mft->GetOutputAvailableType(0, 0, &t);
+            if (SUCCEEDED(h)) {
+                h = impl_->mft->SetOutputType(0, t, 0);
                 t->Release();
             }
+            if (FAILED(h)) { error = hr("encoder.stream_change", h); return false; }
             impl_->header = sequenceHeader(impl_->mft);
             continue;
         }
@@ -218,17 +234,21 @@ bool MfH264Encoder::encode(const uint8_t* nv12, int64_t ts, bool forceKeyframe, 
             return false;
         }
         IMFSample* got = od.pSample;
+        if (!got) break;  // success without a sample: nothing more this frame
         IMFMediaBuffer* contiguous = nullptr;
-        if (got && SUCCEEDED(got->ConvertToContiguousBuffer(&contiguous))) {
+        h = got->ConvertToContiguousBuffer(&contiguous);
+        if (SUCCEEDED(h)) {
             BYTE* q = nullptr;
             DWORD len = 0;
-            if (SUCCEEDED(contiguous->Lock(&q, nullptr, &len))) {
+            h = contiguous->Lock(&q, nullptr, &len);
+            if (SUCCEEDED(h)) {
                 outBytes.insert(outBytes.end(), q, q + len);
                 contiguous->Unlock();
             }
             contiguous->Release();
         }
-        if (got) got->Release();
+        got->Release();
+        if (FAILED(h)) { error = hr("encoder.out_read", h); return false; }
     }
     if (outBytes.empty()) return true;
     const auto types = annexBNalTypes(outBytes.data(), outBytes.size());

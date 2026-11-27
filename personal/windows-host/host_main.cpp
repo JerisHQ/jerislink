@@ -30,6 +30,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -50,7 +51,8 @@ constexpr uint16_t kMrm1Port = 38412;
 constexpr int kActiveGraceMs = 10'000;    // viewer counts as present this long after its last packet
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
-constexpr int kMaxControlConnections = 8;
+constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
+constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer sends it ~300 ms after connect
 
 struct Options {
     bool devNoPassword = false;
@@ -171,7 +173,8 @@ struct State {
     in_addr bindAddr{}, allowAddr{};
     std::atomic<bool> running{true};
     std::atomic<int64_t> lastActivityMs{-1'000'000};
-    std::atomic<int> controlConnections{0};
+    std::atomic<int> controlConnections{0};  // past the handshake: these keep the stream active
+    jlh::ConnectionSlots controlSlots{kMaxControlConnections};
     std::atomic<bool> keyframeRequested{false};
     std::atomic<int> bitrateMbps{25};
     std::atomic<int> streamW{0}, streamH{0};
@@ -193,8 +196,17 @@ std::string ipString(const in_addr& a) {
     return b;
 }
 
-bool recvExact(SOCKET s, uint8_t* p, size_t n) {
+// deadlineMs < 0: no deadline (the socket blocks). Otherwise every recv
+// gets only the time left, so a peer trickling bytes cannot hold the
+// handshake open past the deadline.
+bool recvExact(SOCKET s, uint8_t* p, size_t n, int64_t deadlineMs = -1) {
     while (n) {
+        if (deadlineMs >= 0) {
+            const int64_t left = deadlineMs - msSinceStart();
+            if (left <= 0) return false;
+            const DWORD t = DWORD(left);
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+        }
         const int r = recv(s, reinterpret_cast<char*>(p), int(n), 0);
         if (r <= 0) return false;
         p += r;
@@ -215,38 +227,47 @@ bool sendAll(SOCKET s, const std::vector<uint8_t>& b) {
 
 // ---------------------------------------------------------- control channel
 
+// Runs on its own thread holding one of st.controlSlots, taken by the
+// listener; every return path closes the socket and gives the slot back.
 void serveControl(State& st, SOCKET c, std::string peer) {
-    DWORD timeout = 10'000;  // the viewer sends its probe ~300 ms after connect
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    struct Release {
+        State& st;
+        SOCKET c;
+        bool established = false;
+        ~Release() {
+            if (established) --st.controlConnections;
+            closesocket(c);
+            st.controlSlots.release();
+        }
+    } guard{st, c};
     BOOL nodelay = TRUE;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     uint8_t h[jlh::kMrc1HeaderBytes];
     std::vector<uint8_t> payload;
-    auto readFrame = [&](jlh::Mrc1Header& hdr) {
-        if (!recvExact(c, h, sizeof(h))) return false;
+    auto readFrame = [&](jlh::Mrc1Header& hdr, int64_t deadlineMs) {
+        if (!recvExact(c, h, sizeof(h), deadlineMs)) return false;
         auto parsed = jlh::parseMrc1Header(h);
         if (!parsed) return false;
         hdr = *parsed;
         payload.resize(hdr.length);
-        return hdr.length == 0 || recvExact(c, payload.data(), hdr.length);
+        return hdr.length == 0 || recvExact(c, payload.data(), hdr.length, deadlineMs);
     };
 
     jlh::Mrc1Header hdr;
-    if (!readFrame(hdr) || !jlh::isTransitionProbe(hdr, payload.data())) {
+    if (!readFrame(hdr, msSinceStart() + kHandshakeMs) || !jlh::isTransitionProbe(hdr, payload.data())) {
         logf("control.refused peer=%s reason=no_transition_probe", peer.c_str());
-        closesocket(c);
         return;
     }
     const uint8_t open = jlh::kAuthOpenIpOnly;
-    if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1))) { closesocket(c); return; }
-    timeout = 0;  // the viewer keeps idle channels open
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1))) return;
+    const DWORD noTimeout = 0;  // the viewer keeps idle channels open
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout));
     ++st.controlConnections;
+    guard.established = true;
     touch(st);
     const char* role = "control";
     bool first = true;
-    while (st.running && readFrame(hdr)) {
-        touch(st);
+    while (st.running && readFrame(hdr, -1)) {
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
             else if (hdr.type == jlh::kMsgPing) role = "ping";
@@ -258,12 +279,16 @@ void serveControl(State& st, SOCKET c, std::string peer) {
             break;
         }
         first = false;
+        // Only frames H1 handles count as viewer activity.
         switch (hdr.type) {
         case jlh::kMsgPing:
+            if (!jlh::isValidPing(hdr)) break;  // like the Mac host: no reply to other sizes
             ++st.pings;
+            touch(st);
             if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgPong, payload))) goto done;
             break;
         case jlh::kMsgVideoConfig: {
+            touch(st);
             const auto d = jlh::decideVideoConfig(payload.data(), payload.size(), st.bitrateMbps.load(),
                                                   st.streamW.load(), st.streamH.load());
             if (d.accepted && d.bitrateChanged) st.bitrateMbps = d.bitrateMbps;
@@ -277,9 +302,7 @@ void serveControl(State& st, SOCKET c, std::string peer) {
         }
     }
 done:
-    --st.controlConnections;
     logf("control.closed peer=%s channel=%s", peer.c_str(), role);
-    closesocket(c);
 }
 
 void controlListener(State& st, SOCKET ls) {
@@ -297,12 +320,18 @@ void controlListener(State& st, SOCKET ls) {
             closesocket(c);
             continue;
         }
-        if (st.controlConnections.load() >= kMaxControlConnections) {
+        if (!st.controlSlots.tryAcquire()) {
             logf("control.rejected peer=%s reason=too_many", ipString(from.sin_addr).c_str());
             closesocket(c);
             continue;
         }
-        std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr)).detach();
+        try {
+            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr)).detach();
+        } catch (const std::exception&) {
+            logf("control.rejected peer=%s reason=no_thread", ipString(from.sin_addr).c_str());
+            closesocket(c);
+            st.controlSlots.release();
+        }
     }
 }
 
@@ -318,7 +347,7 @@ void mrm1Listener(State& st, SOCKET u) {
         if (n <= 0) continue;
         if (from.sin_addr.s_addr != st.allowAddr.s_addr) { ++st.rejected; continue; }
         const auto m = jlh::parseMrm1(b, size_t(n));
-        if (!m) continue;
+        if (!m) continue;  // only a valid 0x40 or 0x43 counts as viewer activity
         touch(st);
         if (m->type == jlh::kMrm1KeyframeRequest) {
             st.keyframeRequested = true;
@@ -332,7 +361,8 @@ void mrm1Listener(State& st, SOCKET u) {
             sendto(u, reinterpret_cast<const char*>(pong.data()), int(pong.size()), 0,
                    reinterpret_cast<const sockaddr*>(&from), len);
         }
-        // 0x24 pointer, 0x41 NACK, 0x42 receiver report, 0x45 audio: not in H1.
+        // 0x24 pointer, 0x41 NACK, 0x42 receiver report, 0x45 audio: not in
+        // H1, dropped by parseMrm1.
     }
 }
 
@@ -565,6 +595,7 @@ void videoLoop(State& st) {
         if (!enc.encode(nv12.data(), int64_t(frameIndex++) * 10'000'000 / o.fps, forceKey, au, key, err)) {
             logf("encoder.error %s; reopening", err.c_str());
             enc.close();
+            Sleep(100);
             continue;
         }
         encMsSum += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
