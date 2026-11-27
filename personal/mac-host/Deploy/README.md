@@ -33,17 +33,20 @@ You need a Mac with Apple silicon and macOS 14 or later, and Tailscale signed in
    - Login Items, only if the status shows `requiresApproval`.
 
    Then open `JerisLink.app` again. All three services should show `enabled`.
-5. Allow the Windows PC. The host accepts one viewer address, set in `listen.plist` (see "Listen endpoint" below). The app has no field for it yet, so use Terminal and replace `100.x.y.z` with the **Windows PC's** Tailscale IPv4:
+5. Create the settings file `listen.plist` once in Terminal (see "Listen endpoint" below). The app does not create it yet, and its **連線設定…** window has no setting for the listen mode:
 
    ```sh
    mkdir -p ~/Library/Application\ Support/JerisLink
    cd ~/Library/Application\ Support/JerisLink
    /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy \
-     -c 'Add :mode string tailnet' -c 'Add :clientIP string 100.x.y.z' listen.plist
+     -c 'Add :mode string tailnet' listen.plist
    ```
 
-   To change it later: `cd ~/Library/Application\ Support/JerisLink && /usr/bin/lockf -k listen.plist.lock /usr/libexec/PlistBuddy -c 'Set :clientIP 100.a.b.c' listen.plist`. The services pick up the change within a few seconds. Always edit `listen.plist` through `lockf` like this (see "Listen endpoint" below).
-6. On the PC, open JerisLink, type the **Mac's** Tailscale IPv4 on the launch screen, and connect. This PC's address is chosen automatically; both addresses are shown read-only under Connection info.
+   The host does not listen yet: it waits for a password or an allowed address. Always edit `listen.plist` through `lockf` like this.
+6. Set a connection password: open `JerisLink.app`, click **連線設定…** (connection settings), type the password twice and click **設定／更改密碼**. It needs at least 10 characters, with an upper-case letter, a lower-case letter and a symbol. The services pick it up within a few seconds; no restart is needed. From then on, any device in your tailnet that can reach the Mac connects with the password (Tailscale's access controls decide which devices can reach it).
+
+   Optional: to allow only some PCs, put their Tailscale IPv4 addresses in **白名單** (allowed addresses) in the same window and click **儲存白名單**. Blocked addresses (**黑名單**) and the password are changed there too. An older setup with the PC's address in `clientIP` keeps working without a password; saving a whitelist in 連線設定 replaces `clientIP`.
+7. On the PC, open JerisLink, type the **Mac's** Tailscale IPv4 and the password on the launch screen, and connect. This PC's address is chosen automatically; both addresses are shown read-only under Connection info.
 
 The Microsoft Store version of the viewer (v0.4.1 and later) has its own "Send to JerisLink" command in the Explorer right-click menu (Windows 11: in the first menu). If the entry does not appear, drag files onto the viewer window or its Files panel instead.
 
@@ -81,7 +84,13 @@ After installing a build that moves the agents (or back), run `--unregister` the
 Video, mouse UDP and control all use one endpoint, so the screen and the input always listen on the same interface.
 
 - `~/Library/Application Support/JerisLink/listen.plist`, when present, decides it:
-  - `mode` = `tailnet`: bind this Mac's tailnet address (the `utun` IPv4 in 100.64.0.0/10, or `bindIP` if set), allow only `clientIP` (a 100.64.0.0/10 address).
+  - `mode` = `tailnet`: bind this Mac's tailnet address (the `utun` IPv4 in 100.64.0.0/10, or `bindIP` if set). Who may connect:
+    - `passwordSet` true (set by 連線設定; the key derived from the password is in the Keychain): every connection must pass the password check, and only addresses on the whitelist (below) may try. An empty whitelist means any address that reaches the listener.
+    - No password: only the addresses on the whitelist, with no password check, as in v0.3.
+    - The whitelist, with or without a password: `allowedIPs`, as saved by 連線設定 (**白名單**). Exception for older setups: when the file has no `allowedIPs`, or `allowedIPs` is still the copy that migration made (`allowedIPsSource` = `clientIP`), the whitelist is `clientIP` alone, so even with a password only that address may try. A file from before v0.4.0 with `clientIP` gets that copy when the control service starts. Saving a whitelist in 連線設定 removes `clientIP` and `allowedIPsSource`; from then on `allowedIPs` is the whitelist, and an empty one (allowed only with a password) admits any address.
+    - Neither a password nor `allowedIPs` nor `clientIP`: not configured; the services do not listen. A `clientIP`, when set, must be in 100.64.0.0/10.
+    - `blockedIPs` (連線設定's **黑名單**, and addresses blocked after repeated wrong passwords) are refused in every case.
+    - Do not set `passwordSet` by hand: without the Keychain item the host refuses every viewer.
   - `mode` = `loopback`: bind and allow 127.0.0.1 only.
   - Any other mode (for example `lan`) is refused; the services log "not configured" and do not listen.
 - Without listen.plist, `JERISLINK_BIND_IP` and `JERISLINK_CLIENT_IP` from `network.conf` (or the environment) are used as before.
@@ -89,20 +98,23 @@ Video, mouse UDP and control all use one endpoint, so the screen and the input a
 - Editing listen.plist: hold its lock, `/usr/bin/lockf -k listen.plist.lock <command>` in that folder, as in the install steps. The services take the same lock (an flock on `listen.plist.lock`) from read to replace when they write the blacklist or migrate the file, so no edit is lost. An edit made without the lock (a text editor, plain PlistBuddy) can race with a blacklist write and is not supported.
 - A service that cannot take the lock within 0.5 s writes nothing. A new block then stays pending in `auth-state/pending-blocks.plist` and no viewer gets a challenge until it is saved. If that pending file exists but cannot be read, the control service admits no viewer at all until it reads again or is removed; it is never overwritten meanwhile.
 
+After step 5 of the install the file holds only the mode; after a password and a whitelist are saved in 連線設定 it looks like this:
+
 ```xml
 <dict>
   <key>mode</key><string>tailnet</string>
-  <key>clientIP</key><string>100.64.0.20</string>
+  <key>passwordSet</key><true/>
+  <key>allowedIPs</key><array><string>100.64.0.20</string></array>
 </dict>
 ```
 
 ## Ports
 
-- control TCP 38400, bound directly on the endpoint address. Only `clientIP` is accepted; any other peer is logged (`Control reject peer=…`) and closed. No `tailscale serve` forward is used.
+- control TCP 38400, bound directly on the endpoint address. Peers are admitted as described under "Listen endpoint" (blocked addresses, allowed addresses, password); a refused peer is logged (`Control reject peer=…` or `auth.…`) and closed. No `tailscale serve` forward is used.
 - control relay localhost 38411 (`--relay-port`), for the video service's mouse relay only; accepts 127.0.0.1.
 - input helper localhost 38410
-- video UDP 38402
-- mouse/cursor-state UDP side-channel 38412, on the endpoint address, `clientIP` only
+- video UDP to port 38402 on the viewer, sent only to the viewer of the admitted control session
+- mouse/cursor-state UDP side-channel 38412, on the endpoint address, only from the viewer of the admitted control session (with a password, each packet must also carry that session's key tag)
 
 ### Moving from the `tailscale serve` setup
 
@@ -112,7 +124,7 @@ Older builds ran control on 127.0.0.1:38411 behind `tailscale serve --tcp 38400 
 tailscale serve --tcp 38400 off
 ```
 
-Until then the forward still delivers to the 38411 relay, which accepts input but refuses settings changes (unverified peer).
+Until then the forward still delivers to the 38411 relay, which refuses it: the relay accepts only the video service's own mouse relay.
 
 The Windows viewer and the wire protocol are unchanged.
 
@@ -139,7 +151,7 @@ TCC records are tied to the code signature. Rebuilds signed with the same certif
 ## Paths
 
 - App: `~/Applications/JerisLink.app`
-- Support: `~/Library/Application Support/JerisLink/` (`network.conf`, `video-settings.plist`)
+- Support: `~/Library/Application Support/JerisLink/` (`listen.plist`, `network.conf`, `video-settings.plist`)
 - Logs: `/tmp/jerislink-host.{log,err}`, `/tmp/jerislink-control-service.{log,err}`, `/tmp/jerislink-input-helper.{log,err}`
 - Debug mode is off by default. With `JERISLINK_DEBUG=1` the input helper also logs one line per injected mouse button (time, button, down/up, modifier flags, click state; never key codes) to `/tmp/jerislink-input-helper.err`. To turn it on for one session: `launchctl setenv JERISLINK_DEBUG 1` and `launchctl kickstart -k gui/$(id -u)/org.jeris.jerislink.agent.input-helper`. To turn it off: `launchctl unsetenv JERISLINK_DEBUG` and kick the agent again.
 
@@ -182,7 +194,7 @@ Whatever the result, check the Screen Recording, Accessibility and Login Items e
 
 ## Host baseline
 
-- active main display native framebuffer resolution @ 60 fps (auto-detected); `--width` / `--height` remain debug overrides
+- active main display native framebuffer resolution @ 60 fps (auto-detected), scaled down with its aspect ratio kept when larger than 3840×2160 pixels of area (`--max-encode-pixels` changes the cap); `--width` / `--height` remain debug overrides
 - display mode changes restart capture/encoder at the new native size
 - H.264 or HEVC, 4:2:0 Full Range; H.264 / 25 Mbps is the default
 - client-selected codec/bitrate are persisted in `video-settings.plist` and read each time the video agent starts

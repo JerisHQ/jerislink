@@ -1,6 +1,6 @@
 # JerisLink Privacy Policy
 
-Effective date: 2026-11-17
+Effective date: 2026-11-25
 
 This policy covers the JerisLink Windows viewer (including the Microsoft Store
 package) and the JerisLink Mac host in this repository.
@@ -15,9 +15,27 @@ sends goes directly between the two devices you set up.
 ## What is sent, and where
 
 The viewer connects only to the Mac address you enter (or start it with). The
-Mac host accepts only the one viewer address it is configured for. Between
-those two devices JerisLink sends:
+Mac host accepts a viewer only as set in its 連線設定 window: with a
+connection password, the viewer must prove that it knows the password (see
+"Password check" below), and if the Mac has allowed addresses (saved in
+連線設定, or the one viewer address of a setup from before v0.4.0), only those
+addresses may try; without a password, only the allowed addresses are
+accepted. Blocked addresses are always refused. Between those two devices
+JerisLink sends:
 
+- **Password check**, only when a connection password is set, once per
+  connection. The Mac sends a random challenge, the salt and settings for
+  deriving a key from the password (PBKDF2-HMAC-SHA256), and a random ID of
+  that Mac. The viewer answers with its own random value and a code
+  (HMAC-SHA256) computed from these with the derived key. The Mac answers with
+  the result and, when it matches, its own code and a session ID. Neither the
+  password nor the derived key is sent. In a session set up this way, every
+  UDP packet in either direction carries a short code from a key for that
+  session: video, sound, mouse movement (sent over UDP by default), cursor
+  shape, ping and pong, and the viewer's video reports and its requests for
+  lost video and for sound. Keyboard keys, mouse clicks, scrolling,
+  clipboard text and files go over TCP connections that each passed the
+  password check; those messages carry no code of their own.
 - **Screen video** from the Mac to the PC.
 - **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
   Opus at 48 kHz, only while a viewer with audio on is connected. The host
@@ -64,6 +82,11 @@ On the Windows PC:
   the Mac's address, codec and bitrate. This PC's address is chosen
   automatically each time and is not saved; a value saved by an older
   version is deleted when you save settings.
+- Only if you tick **Remember password on this PC**: a key derived from the
+  connection password, protected with Windows DPAPI for your user account, in
+  `%LOCALAPPDATA%\JerisLink\hosts` (Windows may keep the Microsoft Store
+  version's copy in that app's own package data instead). The password itself
+  is never stored.
 - Diagnostic logs in your temporary folder (`%TEMP%`):
   `jerislink-viewer.log` and `jerislink-viewer-history.log` (each capped at
   about 10 MB). They contain connection details such as the two IP addresses,
@@ -73,8 +96,11 @@ On the Windows PC:
 
 On the Mac:
 
-- Settings in `~/Library/Application Support/JerisLink/` (listen address, the
-  allowed viewer address, video settings, and status files).
+- Settings in `~/Library/Application Support/JerisLink/` (listen mode, the
+  allowed and blocked viewer addresses, whether a password is set, video
+  settings, and status files).
+- When a connection password is set: a key derived from it, in the Keychain.
+  The password itself is never stored.
 - Service logs in `/tmp/jerislink-*.log` and `/tmp/jerislink-*.err`, with the
   same kind of content as the Windows logs: addresses, statistics and event
   counts, not clipboard text or typed keys.
