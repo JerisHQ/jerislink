@@ -28,8 +28,10 @@ inline constexpr size_t kMaxFrameBytes = kHeaderBytes + kMaxPayload;
 
 inline constexpr uint8_t kPlatformMac = 1, kPlatformWindows = 2;
 inline constexpr uint32_t kCapKeyboard = 0x01, kCapPointer = 0x02, kCapCursorShape = 0x04, kCapTaskManager = 0x08;
-// The host takes MRC1 0x27 POINTER_SYNC in front of a button frame.
+// The host takes MRC1 0x27 POINTER_SYNC in front of a button frame:
+// [nx BE16, ny BE16, MRM1 seq BE32, MRM1 UDP source port BE16].
 inline constexpr uint32_t kCapPointerSync = 0x20;
+inline constexpr uint16_t kPointerSyncBytes = 10;
 // VIDEO_CONFIG caps bit: "this viewer reads HOST_INFO". ACK payload [10]
 // bit kAckExtHostInfo: one HOST_INFO frame follows the ACK.
 inline constexpr uint8_t kViewerCapHostInfo = 0x08;
@@ -58,6 +60,11 @@ inline std::optional<Info> decode(const uint8_t* p, size_t n) {
         i.version.push_back(c >= 0x20 && c < 0x7F ? char(c) : '?');
     }
     return i;
+}
+
+// Buttons carry POINTER_SYNC only to a Windows host that said it takes it.
+inline bool pointerSyncFor(const std::optional<Info>& i) {
+    return i && i->windows() && (i->caps & kCapPointerSync) != 0;
 }
 
 // The first n bytes waiting on the socket could be a HOST_INFO frame: the

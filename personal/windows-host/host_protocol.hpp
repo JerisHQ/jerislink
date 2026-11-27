@@ -252,14 +252,19 @@ constexpr uint8_t kMsgMouseMoveRel = 0x20, kMsgMouseButton = 0x21, kMsgMouseScro
 constexpr uint8_t kMsgMouseMoveAbs = 0x23, kMsgMouseMoveNorm = 0x24, kMsgMouseButtonExt = 0x25;
 constexpr uint8_t kMsgForceQuitOpen = 0x60;
 // H2 (Pepper's H2 review, item 5), only from a viewer this host's HOST_INFO
-// told (kHostCapPointerSync): [nx BE16, ny BE16, MRM1 seq BE32], sent right
-// in front of a button frame in the same write. The pointer moves by UDP
-// and the button by TCP, so the button can overtake the move it belongs
-// to. The button is pressed or released at (nx, ny), and MRM1 pointer moves
-// up to seq (the newest the viewer had sent by then) are stale from then
-// on, so a late one cannot move the pointer away from the press.
+// told (kHostCapPointerSync): [nx BE16, ny BE16, MRM1 seq BE32, MRM1 port
+// BE16], sent right in front of a button frame in the same write. The
+// pointer moves by UDP and the button by TCP, so the button can overtake
+// the move it belongs to. The button is pressed or released at (nx, ny),
+// and MRM1 pointer moves up to seq (the newest the viewer had sent by then)
+// from the viewer's UDP source port are stale from then on, so a late one
+// cannot move the pointer away from the press. The port names the MRM1
+// session the seq belongs to (Pepper's review of 8f8a33b, item 5a): the
+// viewer's seq starts over on every new UDP socket, and the sync can arrive
+// before that socket's first datagram (Mrm1Session::syncPointer). Port 0:
+// position only, no seq mark.
 constexpr uint8_t kMsgPointerSync = 0x27;
-constexpr uint16_t kPointerSyncBytes = 8;
+constexpr uint16_t kPointerSyncBytes = 10;
 
 // One input frame, decoded. Integers on the wire are big-endian.
 struct InputEvent {
@@ -270,6 +275,7 @@ struct InputEvent {
     uint8_t button = 0;     // Button: 0 left, 1 right, 2 middle
     int x = 0, y = 0;       // MoveRel / Scroll: signed deltas; MoveAbsPixels: pixels; MoveNorm, PointerSync: 0..65535
     uint32_t seq = 0;       // PointerSync: the MRM1 seq it covers
+    uint16_t port = 0;      // PointerSync: the viewer's MRM1 UDP source port that seq belongs to
 };
 
 // One decoded input frame on a control connection. A POINTER_SYNC is held
@@ -341,6 +347,7 @@ inline std::optional<InputEvent> decodeInput(const Mrc1Header& h, const uint8_t*
         e.x = u16(0);
         e.y = u16(2);
         e.seq = (uint32_t(p[4]) << 24) | (uint32_t(p[5]) << 16) | (uint32_t(p[6]) << 8) | p[7];
+        e.port = uint16_t(u16(8));
         return e;
     default:
         return std::nullopt;
@@ -400,39 +407,64 @@ inline bool isExtendedVk(uint16_t v) {
 }
 
 // Keys and buttons this host has pressed and not released, and which
-// control connections pressed them, so a viewer that goes away (connection
+// control connections hold them, so a viewer that goes away (connection
 // closed, viewer crashed) leaves nothing held.
 //
-// Pepper's H2 review, item 2: one viewer IP can have more than one control
-// connection open at a time (a reconnect opens the new one before the old
-// one is seen closed), and each is an owner here. A down that Windows took
-// adds its owner; an up that Windows took ends the press, whoever sent it.
-// When a connection closes (releaseOwned) only what nobody else still
-// holds is released, so an old connection that closes late never lets go
-// of a key or button the new one has just pressed.
+// One viewer IP can have more than one control connection open at a time
+// (a reconnect opens the new one before the old one is seen closed). Each
+// is an owner here, numbered in the order the connections opened
+// (State::nextInputOwner), so a bigger number is a newer connection.
 //
-// Every release sends an up only through upKey(vk) / upButton(b), which
+// One rule for a key-up or button-up frame (releaseKey, releaseButton) and
+// for a connection that closes (releaseOwned), Pepper's H2 reviews (item 2
+// of a784cd7 and of 8f8a33b): connection o lets go of that key or button
+// (an up frame) or of everything it holds (a close), and so does every
+// connection older than o (the viewer sends each up on its newest
+// connection, so an older one's claim on that key is over); Windows gets
+// the up only when no connection holds it any more. So an old
+// connection's late up or late close never releases a key or button a
+// newer one pressed, and the newest connection's up ends a press an older
+// one made.
+//
+// Every up goes to Windows only through upKey(vk) / upButton(b), which
 // return true when Windows took it. One that Windows did not take keeps its
 // entry, with no owner left, and the next release tries it again: nothing
-// is forgotten while it may still be down.
+// is forgotten while it may still be down. An up for a key nobody holds
+// here goes to Windows as it is (as on the macOS host).
 class HeldInput {
 public:
     using Owner = uint64_t;
-    void key(uint16_t v, bool down, Owner o) { set(keys_, v, down, o); }
-    void button(uint8_t b, bool down, Owner o) { if (b < 3) set(buttons_, b, down, o); }
+    enum class Up {
+        Sent,    // Windows took the up
+        Held,    // a newer connection still holds it: no up sent
+        Failed,  // Windows did not take the up
+    };
+    // A down Windows took, from connection o.
+    void pressKey(uint16_t v, Owner o) { press(keys_, v, o); }
+    void pressButton(uint8_t b, Owner o) { if (b < 3) press(buttons_, b, o); }
+    // An up frame from connection o (the rule above).
+    template <class UpKey>
+    Up releaseKey(uint16_t v, Owner o, UpKey&& upKey) { return release(keys_, v, o, upKey); }
+    template <class UpButton>
+    Up releaseButton(uint8_t b, Owner o, UpButton&& upButton) {
+        return release(buttons_, b, o, [&](uint16_t c) { return upButton(uint8_t(c)); });
+    }
     bool anyHeld() const { return !keys_.empty() || !buttons_.empty(); }
     bool keyHeld(uint16_t v) const { return find(keys_, v) != nullptr; }
     bool buttonHeld(uint8_t b) const { return find(buttons_, b) != nullptr; }
     bool keyOwnedBy(uint16_t v, Owner o) const { return owns(find(keys_, v), o); }
     bool buttonOwnedBy(uint8_t b, Owner o) const { return owns(find(buttons_, b), o); }
 
-    // Connection o went away: o lets go of everything it held. Keys (newest
-    // press first), then buttons, that no other connection holds are
-    // released. Returns how many ups Windows took.
+    // Connection o went away: it lets go of everything it held, by the
+    // rule above. Keys (newest press first), then buttons, that no
+    // connection holds any more are released, and so is anything an
+    // earlier up could not release. Returns how many ups Windows took.
     template <class UpKey, class UpButton>
     size_t releaseOwned(Owner o, UpKey&& upKey, UpButton&& upButton) {
-        for (auto& e : keys_) dropOwner(e, o);
-        for (auto& e : buttons_) dropOwner(e, o);
+        for (auto& e : keys_)
+            if (owns(&e, o)) letGo(e, o);
+        for (auto& e : buttons_)
+            if (owns(&e, o)) letGo(e, o);
         return releaseUnowned(keys_, upKey) +
                releaseUnowned(buttons_, [&](uint16_t b) { return upButton(uint8_t(b)); });
     }
@@ -458,21 +490,30 @@ private:
     static bool owns(const Entry* e, Owner o) {
         return e && std::find(e->owners.begin(), e->owners.end(), o) != e->owners.end();
     }
-    static void dropOwner(Entry& e, Owner o) {
-        e.owners.erase(std::remove(e.owners.begin(), e.owners.end(), o), e.owners.end());
+    // o and every connection older than o let go.
+    static void letGo(Entry& e, Owner o) {
+        e.owners.erase(std::remove_if(e.owners.begin(), e.owners.end(), [o](Owner x) { return x <= o; }),
+                       e.owners.end());
     }
-    static void set(std::vector<Entry>& v, uint16_t code, bool down, Owner o) {
+    static void press(std::vector<Entry>& v, uint16_t code, Owner o) {
         auto it = std::find_if(v.begin(), v.end(), [&](const Entry& e) { return e.code == code; });
-        if (down) {
-            if (it == v.end()) v.push_back(Entry{code, {o}});
-            else if (!owns(&*it, o)) it->owners.push_back(o);
-        } else if (it != v.end()) {
-            v.erase(it);
+        if (it == v.end()) v.push_back(Entry{code, {o}});
+        else if (!owns(&*it, o)) it->owners.push_back(o);
+    }
+    template <class UpFn>
+    static Up release(std::vector<Entry>& v, uint16_t code, Owner o, UpFn&& up) {
+        auto it = std::find_if(v.begin(), v.end(), [&](const Entry& e) { return e.code == code; });
+        if (it != v.end()) {
+            letGo(*it, o);
+            if (!it->owners.empty()) return Up::Held;
         }
+        if (!up(code)) return Up::Failed;  // an entry stays, with no owner, for the next release
+        if (it != v.end()) v.erase(it);
+        return Up::Sent;
     }
     // Newest first; an entry stays when Windows did not take its up.
-    template <class Up>
-    static size_t releaseUnowned(std::vector<Entry>& v, Up&& up) {
+    template <class UpFn>
+    static size_t releaseUnowned(std::vector<Entry>& v, UpFn&& up) {
         size_t n = 0;
         for (size_t i = v.size(); i-- > 0;) {
             if (!v[i].owners.empty()) continue;
@@ -545,7 +586,17 @@ inline std::optional<Mrm1Packet> parseMrm1(const uint8_t* p, size_t n) {
 // so a late datagram never moves the pointer back. H2 (Pepper's H2 review,
 // item 5): a POINTER_SYNC on the control connection counts as taking its
 // seq (syncPointer), so a move the viewer sent before a click and that
-// arrives after it is dropped too. The host calls both under one lock.
+// arrives after it is dropped too. The host calls all of these under one
+// lock.
+//
+// A seq belongs to one viewer UDP socket (ip, port), and each new socket
+// starts its seq over (Pepper's review of 8f8a33b, item 5a). A sync for the
+// current session raises its mark. A sync for a socket the host has not
+// heard from yet (the click overtook that socket's first datagram) is kept
+// as a pending mark for that (ip, port) and becomes the session's mark when
+// its first datagram starts the session, so that datagram and any other
+// move up to seq is dropped too. A new session from another port does not
+// take it.
 class Mrm1Session {
 public:
     // True when this datagram's source starts a new session.
@@ -555,6 +606,11 @@ public:
         ip_ = ip;
         port_ = port;
         havePointer_ = false;
+        if (havePending_ && pendingIp_ == ip && pendingPort_ == port) {
+            havePointer_ = true;
+            pointerSeq_ = pendingSeq_;
+            havePending_ = false;
+        }
         return true;
     }
     bool takePointer(uint32_t seq) {
@@ -563,19 +619,35 @@ public:
         pointerSeq_ = seq;
         return true;
     }
-    // Moves up to seq are stale from now on (never moves the mark back).
-    void syncPointer(uint32_t seq) {
-        if (havePointer_ && int32_t(seq - pointerSeq_) <= 0) return;
-        havePointer_ = true;
-        pointerSeq_ = seq;
+    // Moves up to seq from (ip, port) are stale from now on (never moves a
+    // mark back). Port 0 marks nothing.
+    void syncPointer(uint32_t ip, uint16_t port, uint32_t seq) {
+        if (port == 0) return;
+        if (have_ && ip == ip_ && port == port_) {
+            raise(havePointer_, pointerSeq_, seq);
+            return;
+        }
+        if (!(havePending_ && pendingIp_ == ip && pendingPort_ == port)) havePending_ = false;
+        raise(havePending_, pendingSeq_, seq);
+        pendingIp_ = ip;
+        pendingPort_ = port;
     }
 
 private:
+    static void raise(bool& have, uint32_t& mark, uint32_t seq) {
+        if (have && int32_t(seq - mark) <= 0) return;
+        have = true;
+        mark = seq;
+    }
     bool have_ = false;
     uint32_t ip_ = 0;
     uint16_t port_ = 0;
     bool havePointer_ = false;
     uint32_t pointerSeq_ = 0;
+    bool havePending_ = false;  // a sync for a session that has not started yet
+    uint32_t pendingIp_ = 0;
+    uint16_t pendingPort_ = 0;
+    uint32_t pendingSeq_ = 0;
 };
 
 // Cursor shape codes the viewer maps to a local cursor (viewer.cpp

@@ -106,6 +106,7 @@ public:
             auto a = std::make_shared<Async>();
             a->s = s_;
             s_ = INVALID_SOCKET;
+            a->pointerSync = pointerSync_.load(std::memory_order_relaxed);
             a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
             async_ = std::move(a);
         } else {
@@ -113,6 +114,7 @@ public:
             std::shared_ptr<Async> a = std::move(async_);
             std::lock_guard<std::mutex> g(a->m);
             closeSocket(a->s);
+            pointerSync_.store(a->pointerSync, std::memory_order_relaxed);
         }
     }
 
@@ -273,21 +275,42 @@ public:
     // Mac, by UDP or TCP. A click that has to wait for a reconnect is
     // queued right after this position, so it lands where it was made,
     // not wherever the Mac cursor is when the queue is flushed.
-    // H2: `seq` is the MRM1 seq of the UDP datagram that carried it (0:
-    // sent by TCP).
-    void notePointer(uint16_t nx, uint16_t ny, uint32_t seq = 0) {
+    // H2: `seq` is the MRM1 seq of the UDP datagram that carried it and
+    // `port` the local port of the UDP socket that sent it (both 0: sent
+    // by TCP). Each new UDP socket starts its seq over, so the host needs
+    // both to know which moves are older (Pepper's review of 8f8a33b, item
+    // 5a).
+    void notePointer(uint16_t nx, uint16_t ny, uint32_t seq = 0, uint16_t port = 0) {
         lastPointer_.store((uint64_t(1) << 32) | (uint64_t(nx) << 16) | uint64_t(ny), std::memory_order_relaxed);
-        lastPointerSeq_.store(seq, std::memory_order_relaxed);
+        lastPointerUdp_.store((uint64_t(port) << 32) | seq, std::memory_order_relaxed);
     }
     // H2 (Pepper's H2 review, item 5): the host takes MRC1 0x27
     // POINTER_SYNC (HOST_INFO cap 0x20, a Windows host). Each button frame
-    // then goes behind one, in the same write or queue item: the position
-    // the viewer last showed and the seq of its datagram. The host moves
-    // there before the button and drops older moves still in flight by
-    // UDP, so a press and its release land where they were made even when
-    // the moves are late or lost. Off (a macOS host): as before.
-    void setPointerSync(bool on) { pointerSync_.store(on, std::memory_order_relaxed); }
-    bool pointerSync() const { return pointerSync_.load(std::memory_order_relaxed); }
+    // then goes behind one, in the same write: the position the viewer
+    // last showed, the seq of its datagram and that socket's port. The host
+    // moves there before the button and drops older moves of that socket
+    // still in flight by UDP, so a press and its release land where they
+    // were made even when the moves are late or lost. Off (a macOS host):
+    // as before.
+    // The channel sets this itself from every VIDEO_CONFIG ACK it reads,
+    // the start-up one (negotiateVideo) and each renegotiation's on the
+    // worker, before that connection's queue is flushed (Pepper's review of
+    // 8f8a33b, item 5b). A queued click keeps its 0x24 position and gets the
+    // 0x27 only when it goes out (flushOneLocked), from what the ACK of
+    // that connection said. setPointerSync: the session start and tests.
+    void setPointerSync(bool on) {
+        if (!async_) {
+            pointerSync_.store(on, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->pointerSync = on;
+    }
+    bool pointerSync() const {
+        if (!async_) return pointerSync_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(async_->m);
+        return async_->pointerSync;
+    }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
         std::lock_guard<std::mutex> g(async_->m);
@@ -452,6 +475,10 @@ public:
         // HOST_INFO follows (sent in the same write), so it is read here,
         // whole, and nothing is left on the socket for later reads to trip
         // over. Not a HOST_INFO frame where one was promised: no ACK.
+        // Pepper's review of 8f8a33b, item 4b: neither is one whose payload
+        // does not decode (a bad format byte, a version longer than the
+        // payload). The ACK promised to say what the host is; taking it
+        // without that would leave the viewer on the Mac keymap.
         if (reply.size() == 11 && (reply[10] & jl::hostinfo::kAckExtHostInfo)) {
             uint8_t ih[jl::hostinfo::kHeaderBytes]{};
             if (!recvAck(ih, sizeof(ih)) || !jl::hostinfo::isFramePrefix(ih, sizeof(ih))) return VideoExchange::Failed;
@@ -459,6 +486,7 @@ public:
             std::vector<uint8_t> ip(ilen);
             if (!recvAck(ip.data(), ilen)) return VideoExchange::Failed;
             result.hostInfo = jl::hostinfo::decode(ip.data(), ilen);
+            if (!result.hostInfo) return VideoExchange::Failed;
         }
         result.acked = true;
         DWORD normalTimeoutMs = ioTimeoutMs;
@@ -505,6 +533,7 @@ public:
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
         if (x != VideoExchange::Ok) close();
+        else setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
         return result;
     }
 
@@ -755,16 +784,19 @@ private:
 
     // Shared by the UI thread and the worker thread.
     // One queue item. A click that waits for a reconnect is one item
-    // holding two frames, its pointer position (0x24, or H2's 0x27
-    // POINTER_SYNC for a Windows host) then the button: they
+    // holding two frames, its pointer position (0x24) then the button: they
     // age out, are pushed out of a full queue, are discarded and are sent
-    // together, so a click never lands without its position.
+    // together, so a click never lands without its position. H2: when the
+    // connection it goes out on has POINTER_SYNC (Async::pointerSync), the
+    // 0x24 goes out as a 0x27 with the seq and port kept in `udp`
+    // (withPointerSync, at flush time).
     enum class Kind : uint8_t { Event, Move, PositionedClick, Release };
     struct Queued {
         std::vector<uint8_t> bytes;
         std::chrono::steady_clock::time_point at;
         Kind kind = Kind::Event;
         uint64_t generation = 0;  // Async::generation when queued
+        uint64_t udp = 0;         // PositionedClick: MRM1 port << 32 | seq of its position (0: TCP)
     };
     struct Async {
         std::mutex m;
@@ -814,6 +846,9 @@ private:
         std::vector<uint8_t> renegotiate;
         bool renegotiateHevc = false;
         std::optional<VideoConfigResult> renegotiated;
+        // H2 (Pepper's review of 8f8a33b, item 5b): buttons go out behind a
+        // 0x27 POINTER_SYNC, as the newest ACK said (HOST_INFO cap 0x20).
+        bool pointerSync = false;
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
@@ -822,6 +857,21 @@ private:
         std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, 0, uint8_t(payload.size())};
         b.insert(b.end(), payload.begin(), payload.end());
         return b;
+    }
+
+    // H2: a positioned click (0x24 position, then the button) with its
+    // position as MRC1 0x27 POINTER_SYNC instead: [nx BE16, ny BE16, MRM1
+    // seq BE32, MRM1 port BE16] (udp = port << 32 | seq; 0 when the
+    // position went by TCP: the host then only moves there).
+    static std::vector<uint8_t> withPointerSync(const std::vector<uint8_t>& click, uint64_t udp) {
+        if (click.size() < 12 || click[5] != 0x24 || click[6] != 0 || click[7] != 4) return click;
+        const uint32_t seq = uint32_t(udp);
+        const uint16_t port = uint16_t(udp >> 32);
+        std::vector<uint8_t> out{'M', 'R', 'C', '1', 1, 0x27, 0, uint8_t(jl::hostinfo::kPointerSyncBytes),
+                                 click[8], click[9], click[10], click[11], uint8_t(seq >> 24), uint8_t(seq >> 16),
+                                 uint8_t(seq >> 8), uint8_t(seq), uint8_t(port >> 8), uint8_t(port)};
+        out.insert(out.end(), click.begin() + 12, click.end());
+        return out;
     }
 
     // Calls f(offset, size, type, payload, payloadSize) for each MRC1 frame
@@ -1123,8 +1173,15 @@ private:
             // r6: an up for a key released on focus loss is not sent again.
             // r7: positions left out are counted once, when the item goes.
             uint64_t positionsSkipped = 0;
+            // H2 (Pepper's review of 8f8a33b, item 5b): a click's position
+            // frame is made now, as the ACK of this connection said (the
+            // worker set a.pointerSync before the flush), not when the
+            // click was queued.
+            std::vector<uint8_t> synced;
+            if (q.kind == Kind::PositionedClick && a.pointerSync) synced = withPointerSync(q.bytes, q.udp);
+            const std::vector<uint8_t>& item = synced.empty() ? q.bytes : synced;
             const std::vector<uint8_t> wire =
-                q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, q.bytes, &positionsSkipped);
+                q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, item, &positionsSkipped);
             if (wire.empty()) {
                 noteWireLocked(a, q.bytes);
                 a.stats.positionsSkipped += positionsSkipped;
@@ -1182,7 +1239,8 @@ private:
         }
     }
 
-    static void enqueueLocked(Async& a, std::vector<uint8_t> b, Kind kind, std::chrono::steady_clock::time_point now) {
+    static void enqueueLocked(Async& a, std::vector<uint8_t> b, Kind kind, std::chrono::steady_clock::time_point now,
+                              uint64_t udp = 0) {
         dropAgedLocked(a, now);
         // Only the latest absolute pointer position matters (never one that
         // belongs to a click).
@@ -1196,7 +1254,7 @@ private:
             a.queue.pop_front();
             ++a.stats.dropped;
         }
-        a.queue.push_back(Queued{std::move(b), now, kind, a.generation});
+        a.queue.push_back(Queued{std::move(b), now, kind, a.generation, udp});
         ++a.stats.queued;
     }
 
@@ -1304,6 +1362,8 @@ private:
                 }
                 ++a->stats.renegotiations;
                 a->renegotiated = vc;
+                // Item 5b: the queue below goes out as this ACK says.
+                a->pointerSync = jl::hostinfo::pointerSyncFor(vc.hostInfo);
             }
             bool alive = setNonBlocking(s, true);
             // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
@@ -1380,17 +1440,14 @@ private:
         std::shared_ptr<Async> a = async_;
         pollHostNotice();  // r2: a "replaced" notice ends the attempt before this input goes anywhere
         const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
-        const bool button = isMouseButton(b);
-        bool synced = false;
-        if (button && (ptr >> 32) && pointerSync()) {
-            // H2: POINTER_SYNC in front of the button, live or queued.
-            const uint32_t seq = lastPointerSeq_.load(std::memory_order_relaxed);
-            std::vector<uint8_t> item = packet(0x27, {uint8_t(ptr >> 24), uint8_t(ptr >> 16), uint8_t(ptr >> 8),
-                                                      uint8_t(ptr), uint8_t(seq >> 24), uint8_t(seq >> 16),
-                                                      uint8_t(seq >> 8), uint8_t(seq)});
-            item.insert(item.end(), b.begin(), b.end());
-            b = std::move(item);
-            synced = true;
+        const uint64_t udp = lastPointerUdp_.load(std::memory_order_relaxed);
+        // A button with the pointer position it was made at: 0x24 then the
+        // button. Queued as that; live, and at flush time, the 0x24 becomes
+        // a 0x27 POINTER_SYNC when the connection has it (H2).
+        std::vector<uint8_t> click;
+        if (isMouseButton(b) && (ptr >> 32)) {
+            click = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16), uint8_t(ptr >> 8), uint8_t(ptr)});
+            click.insert(click.end(), b.begin(), b.end());
         }
         SOCKET live = INVALID_SOCKET;
         std::vector<uint8_t> wire;
@@ -1402,6 +1459,10 @@ private:
             if (a->stopping) return false;
             if (!a->connecting && a->queue.empty()) live = a->s;
             if (live != INVALID_SOCKET) {
+                // H2: on the live connection a button goes behind a
+                // POINTER_SYNC when it has one, on its own otherwise (the
+                // pointer went by UDP just before).
+                if (!click.empty() && a->pointerSync) b = withPointerSync(click, udp);
                 // Only this thread uses or closes a->s while no reconnect
                 // runs, so what the Mac has down is noted here, before the
                 // send. r6: ups still owed go first.
@@ -1457,20 +1518,16 @@ private:
         }
         const auto now = std::chrono::steady_clock::now();
         Kind kind = isMouseMove(b) ? Kind::Move : Kind::Event;
-        if (synced) {
-            kind = Kind::PositionedClick;  // H2: its POINTER_SYNC is already in front
-            ++a->stats.positioned;
-        } else if (button && (ptr >> 32)) {
+        uint64_t itemUdp = 0;
+        if (!click.empty()) {
             // The pointer moves by UDP; the click waits here for TCP. Its
             // position goes in the same item, right in front of it.
-            std::vector<uint8_t> item = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
-                                                      uint8_t(ptr >> 8), uint8_t(ptr)});
-            item.insert(item.end(), b.begin(), b.end());
-            b = std::move(item);
+            b = std::move(click);
             kind = Kind::PositionedClick;
+            itemUdp = udp;
             ++a->stats.positioned;
         }
-        enqueueLocked(*a, std::move(b), kind, now);
+        enqueueLocked(*a, std::move(b), kind, now, itemUdp);
         if (!a->connecting && now >= a->nextTry) {
             a->connecting = true;
             a->wake = true;
@@ -1534,8 +1591,8 @@ private:
     jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
     std::shared_ptr<Async> async_;
     std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
-    std::atomic<uint32_t> lastPointerSeq_{0};  // H2: MRM1 seq of that position (0: TCP)
-    std::atomic<bool> pointerSync_{false};     // H2: send POINTER_SYNC before buttons
+    std::atomic<uint64_t> lastPointerUdp_{0};  // H2: MRM1 port << 32 | seq of that position (0: TCP)
+    std::atomic<bool> pointerSync_{false};     // H2: POINTER_SYNC before buttons (Async::pointerSync once async)
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

@@ -35,15 +35,19 @@ public:
     bool apply(const InputEvent& e, HeldInput::Owner owner);
     // MRM1 0x24.
     bool moveNormalized(int nx, int ny);
-    // Connection `owner` went away: releases what it pressed and no other
-    // connection still holds (and anything an earlier release could not);
-    // returns how many ups Windows took.
+    // Connection `owner` went away: it and older connections let go
+    // (HeldInput's rule); releases what no connection holds any more (and
+    // anything an earlier release could not); returns how many ups Windows
+    // took.
     size_t releaseOwned(HeldInput::Owner owner);
     bool anyHeld() const;
 
     uint64_t injected() const { return injected_.load(); }
     uint64_t failed() const { return failed_.load(); }
     uint64_t ignored() const { return ignored_.load(); }
+    // Up frames not sent to Windows because a newer connection still holds
+    // that key or button (HeldInput's rule).
+    uint64_t upsHeld() const { return upsHeld_.load(); }
     // The GetLastError of the most recent SendInput that took nothing.
     unsigned long lastError() const { return lastError_.load(); }
 
@@ -56,13 +60,14 @@ private:
     bool taskManager();
     bool sendKeyVk(uint16_t vk, bool down);
     bool sendButton(uint8_t b, bool down);
+    bool countUp(HeldInput::Up r);
     DesktopRect desktopLocked() const;
 
     mutable std::mutex m_;  // held state and the desktop rect; SendInput itself is thread-safe
     DesktopRect desktop_{};
     bool haveDesktop_ = false;
     HeldInput held_;
-    std::atomic<uint64_t> injected_{0}, failed_{0}, ignored_{0};
+    std::atomic<uint64_t> injected_{0}, failed_{0}, ignored_{0}, upsHeld_{0};
     std::atomic<unsigned long> lastError_{0};
 };
 

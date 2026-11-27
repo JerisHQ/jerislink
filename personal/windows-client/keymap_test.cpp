@@ -3,8 +3,10 @@
 // Ctrl+Y redo, Win+C / Win+Space escapes. Windows layout: Ctrl = Command,
 // Win = Control. Both: viewer hotkeys, Alt+Tab left to Windows, focus-loss
 // release, live preset switch. Windows host (H2): pass-through in either
-// preset, no shortcut rewritten.
+// preset, no shortcut rewritten. Key hold-back until the host is known,
+// and no held-back chord crossing the ACK (key_holdback.hpp).
 #include "keymap.hpp"
+#include "key_holdback.hpp"
 
 #include <cstdio>
 #include <set>
@@ -712,6 +714,95 @@ void testWindowsHostPassthrough() {
 
 }  // namespace
 
+// H2, Pepper's review of 8f8a33b item 4a: a chord held back before the
+// ACK stays held back after it, until its keys are up.
+void testChordHoldBack() {
+    using jl::holdback::KeyHoldBack;
+    using jl::holdback::Reason;
+    std::set<uint32_t> down;  // keys down now
+    auto isDown = [&](uint32_t vk) { return down.count(vk) != 0; };
+    const uint32_t kCtrlVk = 0x11, kShiftVk = 0x10, kC = 'C', kV = 'V';
+
+    {
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        expect(h.keyDown(kCtrlVk, false, false, isDown) == Reason::PlatformUnknown,
+               "hold-back: Ctrl before the ACK is held back (platform unknown)");
+        down.insert(kC);
+        expect(h.keyDown(kC, false, true, isDown) == Reason::ChordOpen,
+               "hold-back: C after the ACK with the held-back Ctrl still down is held back (no lone C)");
+        expect(h.keyDown(kC, true, true, isDown) == Reason::ChordOpen, "hold-back: its auto-repeat too");
+        expect(h.buttonDown(isDown) == Reason::ChordOpen, "hold-back: a click inside the open chord is held back");
+        down.erase(kC);
+        expect(h.keyUp(kC), "hold-back: the held-back C's up is not sent");
+        expect(h.keyDown(kV, false, true, isDown) == Reason::ChordOpen,
+               "hold-back: V while the held-back Ctrl is still down is held back");
+        down.erase(kCtrlVk);
+        expect(h.keyUp(kCtrlVk), "hold-back: the held-back Ctrl's up is not sent");
+        down.erase(kV);
+        expect(h.keyUp(kV), "hold-back: the held-back V's up is not sent");
+        expect(!h.chordOpen(isDown), "hold-back: chord closed once its keys are up");
+        down = {kC};
+        expect(h.keyDown(kC, false, true, isDown) == Reason::None, "hold-back: after the chord, C goes out");
+        expect(!h.keyUp(kC), "hold-back: ... and so does its up");
+        down.clear();
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: a click with no chord open goes out");
+        expect(h.heldBack() == 4, "hold-back: count is every down held back (Ctrl, C, click, V; auto-repeat not counted)");
+    }
+    {
+        // Ctrl held back, its up went to another window (focus moved): a key
+        // that is no longer down does not keep the chord open.
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        down.clear();
+        expect(h.keyDown(kC, false, true, isDown) == Reason::None,
+               "hold-back: a held-back key whose up was lost and is up now does not hold back C");
+        down = {kCtrlVk};
+        expect(h.keyDown(kCtrlVk, false, true, isDown) == Reason::None,
+               "hold-back: a fresh press of that key after the ACK starts over and goes out");
+        expect(!h.keyUp(kCtrlVk), "hold-back: ... and its up goes out too");
+    }
+    {
+        // Chord of two modifiers before the ACK, then the letter after it.
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        down.insert(kShiftVk);
+        expect(h.keyDown(kShiftVk, false, false, isDown) == Reason::PlatformUnknown, "hold-back: Ctrl+Shift before the ACK");
+        down.insert(kC);
+        expect(h.keyDown(kC, false, true, isDown) == Reason::ChordOpen, "hold-back: Ctrl+Shift+C does not cross the ACK");
+    }
+    {
+        // The Windows key from the hook.
+        KeyHoldBack h;
+        down.clear();
+        expect(h.winDown(false, isDown) == Reason::PlatformUnknown, "hold-back: Win before the ACK");
+        expect(h.hookTap(true, isDown) == Reason::ChordOpen, "hold-back: hook Win+C after the ACK, Win still held back");
+        expect(h.keyDown(kV, false, true, isDown) == Reason::ChordOpen, "hold-back: V while the held-back Win is down");
+        expect(h.winUp(), "hold-back: the held-back Win's up is not sent");
+        expect(!h.winUp(), "hold-back: a second Win up is sent");
+        expect(h.keyUp(kV), "hold-back: V's up is not sent");
+        expect(h.hookTap(true, isDown) == Reason::None, "hold-back: hook tap with nothing held back goes out");
+        expect(h.winDown(true, isDown) == Reason::None, "hold-back: Win after the ACK goes out");
+        expect(!h.winUp(), "hold-back: ... and its up");
+        h.winDown(false, isDown);
+        h.focusLost();
+        expect(h.hookTap(true, isDown) == Reason::None, "hold-back: focus loss forgets the held-back Win (its up will not come)");
+    }
+    {
+        KeyHoldBack h;
+        expect(h.hookTap(false, isDown) == Reason::PlatformUnknown, "hold-back: Caps Lock before the ACK");
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: a click before the ACK with no chord goes out");
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        h.reset();
+        expect(h.heldBack() == 0 && !h.chordOpen(isDown) && !h.keyUp(kCtrlVk),
+               "hold-back: a new session forgets everything");
+        down.clear();
+    }
+}
+
 int main() {
     testSemantics();
     testCtrlCompat();
@@ -724,6 +815,7 @@ int main() {
     testAltTab();
     testPresetSwitch();
     testWindowsHostPassthrough();
+    testChordHoldBack();
     std::printf("keymap: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

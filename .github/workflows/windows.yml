@@ -94,7 +94,7 @@ jobs:
         run: build\Release\JerislinkNalSummaryTest.exe
       - name: Build keymap golden test
         run: cmake --build build --config Release --target JerislinkKeymapTest
-      - name: Keymap golden test (Mac and Windows presets, Ctrl+A/C/V/X/Z/S/F, Ctrl+Y redo, Win+C / Win+Space, Alt+Tab, viewer hotkeys, focus-loss release, live preset switch)
+      - name: Keymap golden test (Mac and Windows presets, Ctrl+A/C/V/X/Z/S/F, Ctrl+Y redo, Win+C / Win+Space, Alt+Tab, viewer hotkeys, focus-loss release, live preset switch, held-back chord does not cross the host ACK)
         run: build\Release\JerislinkKeymapTest.exe
       - name: Build file wire codec test
         run: cmake --build build --config Release --target JerislinkFileProtoTest

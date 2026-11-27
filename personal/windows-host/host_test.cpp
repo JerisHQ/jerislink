@@ -316,12 +316,15 @@ static void testDecodeInput() {
     e = jlh::decodeInput(hdr(0x60, 0), key);
     CHECK(e && e->kind == jlh::InputEvent::Kind::TaskManager);
     CHECK(!jlh::decodeInput(hdr(0x60, 1), key));
-    // POINTER_SYNC: [nx BE16, ny BE16, seq BE32], 8 bytes and no other size.
-    const uint8_t sync[9] = {0x12, 0x34, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x05, 0};
-    e = jlh::decodeInput(hdr(0x27, 8), sync);
+    // POINTER_SYNC: [nx BE16, ny BE16, seq BE32, port BE16], 10 bytes and
+    // no other size (8f8a33b's 8-byte form is not taken).
+    const uint8_t sync[11] = {0x12, 0x34, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x05, 0xC3, 0x51, 0};
+    e = jlh::decodeInput(hdr(0x27, 10), sync);
     CHECK(e && e->kind == jlh::InputEvent::Kind::PointerSync && e->x == 0x1234 && e->y == 65535 &&
-          e->seq == 0x80000005u);
-    CHECK(!jlh::decodeInput(hdr(0x27, 7), sync) && !jlh::decodeInput(hdr(0x27, 9), sync));
+          e->seq == 0x80000005u && e->port == 50001);
+    CHECK(jlh::kPointerSyncBytes == 10 && jlh::kPointerSyncBytes == jl::hostinfo::kPointerSyncBytes);
+    CHECK(!jlh::decodeInput(hdr(0x27, 8), sync) && !jlh::decodeInput(hdr(0x27, 9), sync) &&
+          !jlh::decodeInput(hdr(0x27, 11), sync));
     // Not input: the host's other frames and unknown types.
     for (uint8_t t : {uint8_t(0x01), uint8_t(0x30), uint8_t(0x40), uint8_t(0x26), uint8_t(0x61)})
         CHECK(!jlh::decodeInput(hdr(t, 3), key));
@@ -362,6 +365,7 @@ static bool same(const std::vector<T>& v, std::initializer_list<T> want) {
 }
 
 static void testHeldInput() {
+    using Up = jlh::HeldInput::Up;
     const jlh::HeldInput::Owner A = 1, B = 2, C = 3;
     std::vector<uint16_t> ups;
     std::vector<uint8_t> buttonUps;
@@ -373,57 +377,107 @@ static void testHeldInput() {
     // One connection: what it pressed goes up when it closes, newest key first.
     jlh::HeldInput h;
     CHECK(!h.anyHeld());
-    h.key(jlh::vk::LControl, true, A);
-    h.key('C', true, A);
-    h.key('C', true, A);  // auto-repeat: still one
-    h.button(0, true, A);
-    h.button(3, true, A);  // not a button: ignored
+    h.pressKey(jlh::vk::LControl, A);
+    h.pressKey('C', A);
+    h.pressKey('C', A);  // auto-repeat: still one
+    h.pressButton(0, A);
+    h.pressButton(3, A);  // not a button: ignored
     CHECK(h.anyHeld() && h.keyOwnedBy('C', A) && h.buttonOwnedBy(0, A));
     size_t n = h.releaseOwned(A, upKey, upButton);
     CHECK(n == 3 && same(ups, {uint16_t('C'), jlh::vk::LControl}) && same(buttonUps, {uint8_t(0)}));
     CHECK(!h.anyHeld());
-    h.key('A', true, A);
-    h.key('A', false, A);
-    h.button(1, true, A);
-    h.button(1, false, A);
-    CHECK(!h.anyHeld());
+    // Its own ups: sent, and nothing left for the close.
+    ups.clear();
+    buttonUps.clear();
+    h.pressKey('A', A);
+    CHECK(h.releaseKey('A', A, upKey) == Up::Sent);
+    h.pressButton(1, A);
+    CHECK(h.releaseButton(1, A, upButton) == Up::Sent);
+    CHECK(!h.anyHeld() && same(ups, {uint16_t('A')}) && same(buttonUps, {uint8_t(1)}));
     CHECK(h.releaseOwned(A, noKey, noButton) == 0);
+    // An up for a key nobody holds here goes to Windows as it is.
+    ups.clear();
+    CHECK(h.releaseKey('Z', B, upKey) == Up::Sent && same(ups, {uint16_t('Z')}) && !h.anyHeld());
 
-    // Pepper's H2 review, item 2. The viewer reconnected: old connection A
-    // held Shift when it was lost, new connection B presses the left button,
-    // and only then is A seen closed. A's Shift goes up; B's button stays.
+    // Pepper's H2 review of a784cd7, item 2. The viewer reconnected: old
+    // connection A held Shift when it was lost, new connection B presses
+    // the left button, and only then is A seen closed. A's Shift goes up;
+    // B's button stays.
     jlh::HeldInput r;
     ups.clear();
     buttonUps.clear();
-    r.key(jlh::vk::LShift, true, A);
-    r.button(0, true, B);
+    r.pressKey(jlh::vk::LShift, A);
+    r.pressButton(0, B);
     n = r.releaseOwned(A, upKey, upButton);
     CHECK(n == 1 && same(ups, {jlh::vk::LShift}) && buttonUps.empty());
     CHECK(r.buttonHeld(0) && r.buttonOwnedBy(0, B) && !r.keyHeld(jlh::vk::LShift));
-    // Held by B and C: up only when the last of them closes.
-    ups.clear();
-    r.key('W', true, B);
-    r.key('W', true, C);
-    n = r.releaseOwned(C, noKey, noButton);
-    CHECK(n == 0 && r.keyHeld('W') && r.keyOwnedBy('W', B) && !r.keyOwnedBy('W', C));
     n = r.releaseOwned(B, upKey, upButton);
-    CHECK(n == 2 && same(ups, {uint16_t('W')}) && same(buttonUps, {uint8_t(0)}) && !r.anyHeld());
-    // An up from either connection ends the press: no second up later.
-    r.button(2, true, A);
-    r.button(2, false, B);
-    CHECK(!r.anyHeld() && r.releaseOwned(A, noKey, noButton) == 0);
+    CHECK(n == 1 && same(buttonUps, {uint8_t(0)}) && !r.anyHeld());
+
+    // Pepper's review of 8f8a33b, item 2: an up frame follows the same
+    // rule. Old connection A pressed the left button and W, the viewer
+    // moved to B and pressed them again there; A's late ups arrive after
+    // that. Nothing goes up on Windows: B still holds both.
+    jlh::HeldInput u;
+    ups.clear();
+    buttonUps.clear();
+    u.pressButton(0, A);
+    u.pressKey('W', A);
+    u.pressButton(0, B);
+    u.pressKey('W', B);
+    CHECK(u.releaseButton(0, A, noButton) == Up::Held && u.releaseKey('W', A, noKey) == Up::Held);
+    CHECK(u.buttonOwnedBy(0, B) && !u.buttonOwnedBy(0, A) && u.keyOwnedBy('W', B) && !u.keyOwnedBy('W', A));
+    // ... and A's late close does not release them either.
+    CHECK(u.releaseOwned(A, noKey, noButton) == 0 && u.buttonHeld(0) && u.keyHeld('W'));
+    // B's own ups do.
+    CHECK(u.releaseButton(0, B, upButton) == Up::Sent && u.releaseKey('W', B, upKey) == Up::Sent);
+    CHECK(same(buttonUps, {uint8_t(0)}) && same(ups, {uint16_t('W')}) && !u.anyHeld());
+    // The newest connection's up ends a press only an older one holds (the
+    // viewer sends the up on the connection it has now).
+    ups.clear();
+    u.pressKey(jlh::vk::LShift, A);
+    CHECK(u.releaseKey(jlh::vk::LShift, B, upKey) == Up::Sent && same(ups, {jlh::vk::LShift}) && !u.anyHeld());
+    CHECK(u.releaseOwned(A, noKey, noButton) == 0);
+    // A newer holder outlives an older connection's up, whatever the order
+    // they pressed in: C pressed first, then B; B's up is older than C.
+    buttonUps.clear();
+    u.pressButton(2, C);
+    u.pressButton(2, B);
+    CHECK(u.releaseButton(2, B, noButton) == Up::Held && u.buttonOwnedBy(2, C));
+    CHECK(u.releaseButton(2, C, upButton) == Up::Sent && same(buttonUps, {uint8_t(2)}) && !u.anyHeld());
+
+    // A close lets go of what it holds, and older connections let go of
+    // those too; something only an older connection holds stays its own.
+    jlh::HeldInput c;
+    ups.clear();
+    buttonUps.clear();
+    c.pressKey('W', B);
+    c.pressKey('W', C);
+    c.pressKey('Q', A);
+    n = c.releaseOwned(B, noKey, noButton);  // B is older than C: W stays
+    CHECK(n == 0 && c.keyOwnedBy('W', C) && !c.keyOwnedBy('W', B) && c.keyOwnedBy('Q', A));
+    c.pressKey('W', B);
+    n = c.releaseOwned(C, upKey, upButton);  // C closes: B's claim on W ends with it
+    CHECK(n == 1 && same(ups, {uint16_t('W')}) && c.keyHeld('Q') && c.keyOwnedBy('Q', A) && !c.keyHeld('W'));
+    n = c.releaseOwned(A, upKey, upButton);
+    CHECK(n == 1 && same(ups, {uint16_t('W'), uint16_t('Q')}) && !c.anyHeld());
 
     // An up Windows did not take: the entry stays, and the next release
-    // (any connection's close) tries it again.
+    // (any connection's close or up) tries it again.
     jlh::HeldInput f;
     ups.clear();
     buttonUps.clear();
-    f.key('X', true, A);
-    f.button(1, true, A);
+    f.pressKey('X', A);
+    f.pressButton(1, A);
     n = f.releaseOwned(A, [](uint16_t) { return false; }, [](uint8_t) { return false; });
     CHECK(n == 0 && f.keyHeld('X') && f.buttonHeld(1) && !f.keyOwnedBy('X', A) && !f.buttonOwnedBy(1, A));
     n = f.releaseOwned(B, upKey, upButton);
     CHECK(n == 2 && same(ups, {uint16_t('X')}) && same(buttonUps, {uint8_t(1)}) && !f.anyHeld());
+    f.pressKey('Y', A);
+    CHECK(f.releaseKey('Y', A, [](uint16_t) { return false; }) == Up::Failed);
+    CHECK(f.keyHeld('Y') && !f.keyOwnedBy('Y', A));
+    ups.clear();
+    CHECK(f.releaseKey('Y', A, upKey) == Up::Sent && same(ups, {uint16_t('Y')}) && !f.anyHeld());
 }
 
 // Pepper's H2 review, item 3: Task Manager (MRC1 0x60) releases held keys
@@ -432,9 +486,9 @@ static void testHeldInput() {
 static void testTaskManagerRelease() {
     const jlh::HeldInput::Owner A = 1;
     jlh::HeldInput t;
-    t.key(jlh::vk::LMenu, true, A);
-    t.key('Q', true, A);
-    t.button(0, true, A);
+    t.pressKey(jlh::vk::LMenu, A);
+    t.pressKey('Q', A);
+    t.pressButton(0, A);
     std::vector<uint16_t> tried;
     size_t n = t.releaseKeys([&](uint16_t v) {
         tried.push_back(v);
@@ -506,16 +560,51 @@ static void testMrm1SessionAndCursor() {
     CHECK(c[6] == 1 && c[7] == 2 && c[8] == 3 && c[9] == 4 && c[10] == 12);
     CHECK(uint8_t(jlh::CursorShape::IBeam) == 1 && uint8_t(jlh::CursorShape::PointingHand) == 2 &&
           uint8_t(jlh::CursorShape::NotAllowed) == 10 && uint8_t(jlh::CursorShape::Move) == 14);
-    // POINTER_SYNC marks a seq as taken; it never moves the mark back.
+    // POINTER_SYNC marks a seq of the current session as taken; it never
+    // moves the mark back.
+    const uint32_t ip = 0x0A000002;
     jlh::Mrm1Session p;
-    p.syncPointer(7);  // before any move
+    CHECK(p.note(ip, 50000));
+    p.syncPointer(ip, 50000, 7);  // before any move
     CHECK(!p.takePointer(7) && !p.takePointer(6) && p.takePointer(8));
-    p.syncPointer(5);  // older than what was taken: no change
+    p.syncPointer(ip, 50000, 5);  // older than what was taken: no change
     CHECK(!p.takePointer(8) && p.takePointer(9));
-    p.syncPointer(0xFFFFFFF0u);  // half the range behind 9: older, no change
+    p.syncPointer(ip, 50000, 0xFFFFFFF0u);  // half the range behind 9: older, no change
     CHECK(p.takePointer(10));
-    p.syncPointer(0x7FFFFFF0u);  // ahead
+    p.syncPointer(ip, 50000, 0x7FFFFFF0u);  // ahead
     CHECK(!p.takePointer(0x7FFFFFEFu) && p.takePointer(0x7FFFFFF1u));
+    p.syncPointer(ip, 0, 0x7FFFFFFFu);  // port 0: position only, no mark
+    CHECK(p.takePointer(0x7FFFFFF2u));
+
+    // Pepper's review of 8f8a33b, item 5a: the sync is for a viewer socket
+    // the host has not heard from yet. Its seq is that socket's (each new
+    // socket starts at 1), not the current session's: kept, and applied
+    // when that socket's first datagram starts its session.
+    jlh::Mrm1Session q;
+    CHECK(q.note(ip, 50000) && q.takePointer(5000));
+    q.syncPointer(ip, 50001, 2);  // the new socket's move 2 came before the click
+    CHECK(q.takePointer(5001));   // the current session is not touched
+    CHECK(q.note(ip, 50001));     // the new socket's first datagram, late
+    CHECK(!q.takePointer(1) && !q.takePointer(2) && q.takePointer(3));
+    // No session at all yet: the same.
+    jlh::Mrm1Session r;
+    r.syncPointer(ip, 50002, 3);
+    CHECK(r.note(ip, 50002) && !r.takePointer(1) && !r.takePointer(3) && r.takePointer(4));
+    // A pending mark only goes to its own socket: not to another port or
+    // address, and a session from another port in between does not use it.
+    jlh::Mrm1Session t;
+    t.syncPointer(ip, 50003, 9);
+    t.syncPointer(ip, 50003, 4);   // older: the pending mark stays at 9
+    CHECK(t.note(ip, 50004) && t.takePointer(1));
+    CHECK(t.note(ip + 1, 50003) && t.takePointer(1));
+    CHECK(t.note(ip, 50003) && !t.takePointer(9) && t.takePointer(10));
+    CHECK(t.note(ip, 50004) && t.takePointer(1));  // used once: a session later starts clean
+    // A sync for a newer socket replaces one for an older socket that never sent.
+    jlh::Mrm1Session u;
+    u.syncPointer(ip, 50005, 9);
+    u.syncPointer(ip, 50006, 2);
+    CHECK(u.note(ip, 50005) && u.takePointer(1));
+    CHECK(u.note(ip, 50006) && !u.takePointer(2) && u.takePointer(3));
 }
 
 // Pepper's H2 review, item 5. The host's pointer and buttons as the real
@@ -528,12 +617,17 @@ struct Press {
     bool down;
     int x, y;
 };
+constexpr uint32_t kViewerIp = 0x0A000002;
+constexpr uint16_t kViewerPort = 50000;
 struct FakeDesk {
     jlh::Mrm1Session order;
     int x = -1, y = -1;
     std::vector<Press> presses;
     std::optional<jlh::InputEvent> pending;
-    void udp(uint32_t seq, int nx, int ny) {
+    // One MRM1 0x24 from the viewer's UDP socket at port, as mrm1Listener
+    // takes it.
+    void udp(uint32_t seq, int nx, int ny, uint16_t port = kViewerPort) {
+        order.note(kViewerIp, port);
         if (order.takePointer(seq)) {
             x = nx;
             y = ny;
@@ -553,7 +647,7 @@ struct FakeDesk {
             jlh::stepInput(
                 pending, *e,
                 [&](const jlh::InputEvent& s, const jlh::InputEvent* b) {
-                    order.syncPointer(s.seq);
+                    order.syncPointer(kViewerIp, s.port, s.seq);
                     x = s.x;
                     y = s.y;
                     if (b) presses.push_back({b->button, b->down, x, y});
@@ -572,10 +666,12 @@ struct FakeDesk {
     }
 };
 // What the viewer writes for a click with POINTER_SYNC: 0x27 then 0x25.
-std::vector<uint8_t> syncedButton(int nx, int ny, uint32_t seq, uint8_t b, bool down) {
+std::vector<uint8_t> syncedButton(int nx, int ny, uint32_t seq, uint8_t b, bool down,
+                                  uint16_t port = kViewerPort) {
     auto out = jlh::mrc1Frame(jlh::kMsgPointerSync,
                               {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny), uint8_t(seq >> 24),
-                               uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)});
+                               uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq), uint8_t(port >> 8),
+                               uint8_t(port)});
     const auto btn = jlh::mrc1Frame(jlh::kMsgMouseButtonExt, {b, uint8_t(down ? 1 : 0), 1});
     out.insert(out.end(), btn.begin(), btn.end());
     return out;
@@ -652,6 +748,34 @@ static void testPointerSyncOrdering() {
         CHECK(d.pending && d.x == 10);
         d.tcp(syncedButton(50, 60, 5, 0, true));
         CHECK(d.presses.size() == 1 && pressedAt(d.presses[0], 0, true, 50, 60));
+    }
+    // Pepper's review of 8f8a33b, item 5a. The viewer reconnected and
+    // opened a new UDP socket (port 50001, seq from 1). The click on the
+    // control connection overtakes that socket's first datagram, the move
+    // to the click point. The late move is dropped, not taken as the start
+    // of a new session, and the press stays where the viewer clicked.
+    {
+        FakeDesk d;
+        d.udp(4999, 100, 100);
+        d.udp(5000, 200, 200);  // the old socket's session, far ahead in seq
+        d.tcp(syncedButton(500, 600, 1, 0, true, 50001));
+        d.udp(1, 300, 300, 50001);  // late, from before the click
+        CHECK(d.presses.size() == 1 && pressedAt(d.presses[0], 0, true, 500, 600));
+        CHECK(d.x == 500 && d.y == 600);
+        d.udp(2, 700, 800, 50001);  // the drag goes on
+        CHECK(d.x == 700 && d.y == 800);
+        d.tcp(syncedButton(700, 800, 2, 0, false, 50001));
+        CHECK(d.presses.size() == 2 && pressedAt(d.presses[1], 0, false, 700, 800));
+    }
+    // Port 0 (no MRM1 socket known): the click lands at the sync point; no
+    // seq is marked.
+    {
+        FakeDesk d;
+        d.udp(1, 100, 100);
+        d.tcp(syncedButton(500, 600, 9, 0, true, 0));
+        CHECK(d.presses.size() == 1 && pressedAt(d.presses[0], 0, true, 500, 600));
+        d.udp(2, 300, 300);
+        CHECK(d.x == 300);
     }
 }
 

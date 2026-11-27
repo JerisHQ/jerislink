@@ -44,6 +44,7 @@
 #include "send_to_win.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
+#include "key_holdback.hpp"
 #include "udp_tag.hpp"
 
 #include <algorithm>
@@ -127,6 +128,11 @@ public:
             closesocket(s_); s_ = INVALID_SOCKET;
             throw std::runtime_error("mouse UDP bind failed");
         }
+        // H2: the port the host sees these datagrams come from; 0 if
+        // unknown (the host then takes a click's position only).
+        sockaddr_in bound{};
+        int boundLen = sizeof(bound);
+        if (getsockname(s_, reinterpret_cast<sockaddr*>(&bound), &boundLen) == 0) localPort_ = ntohs(bound.sin_port);
 
         remote_.sin_family = AF_INET;
         remote_.sin_port = htons(port);
@@ -176,6 +182,10 @@ public:
     // H2: MRM1 seq of the newest pointer datagram (UI thread), for the
     // POINTER_SYNC in front of a click (control_channel.hpp notePointer).
     uint32_t lastPointerSeq() const { return lastPointerSeq_; }
+    // H2 (Pepper's review of 8f8a33b, item 5a): this socket's local port.
+    // Its seq starts at 1, so the host needs the port to know which
+    // session a POINTER_SYNC's seq belongs to.
+    uint16_t localPort() const { return localPort_; }
 
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
@@ -369,6 +379,7 @@ private:
     sockaddr_in remote_{};
     uint32_t sequence_ = 0;
     uint32_t lastPointerSeq_ = 0;  // UI thread only
+    uint16_t localPort_ = 0;
     uint64_t sent_ = 0;
     uint64_t dropped_ = 0;
     std::chrono::steady_clock::time_point lastKeyframeRequest_{};
@@ -433,11 +444,11 @@ static bool gHostWindows = false;
 static const wchar_t* hostNoun() { return gHostWindows ? L"Windows PC" : L"Mac"; }
 // H2 (Pepper's H2 review, item 4): a VIDEO_CONFIG ACK was read this session,
 // so gHostWindows is what the host is, not the default. Until then keys are
-// held back (holdBackKeys): a shortcut would go out in the wrong layout.
+// held back (holdBack*): a shortcut would go out in the wrong layout. A
+// chord held back stays held back after the ACK until its keys are up
+// (key_holdback.hpp; Pepper's review of 8f8a33b, item 4a).
 static bool gHostPlatformKnown = false;
-static uint64_t gKeysHeldBack = 0;
-static std::bitset<256> gHeldBackKeyUp;  // key-ups of keys held back
-static bool gWinHeldBack = false;        // the Windows key's down was held back
+static jl::holdback::KeyHoldBack gHoldBack;
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -754,7 +765,7 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     // with the seq of its datagram, for the POINTER_SYNC of a Windows host.
     if (udpInput) {
         const bool ok = gMouseMoveUdp->sendNormalized(qx, qy);
-        if (gControl) gControl->notePointer(qx, qy, gMouseMoveUdp->lastPointerSeq());
+        if (gControl) gControl->notePointer(qx, qy, gMouseMoveUdp->lastPointerSeq(), gMouseMoveUdp->localPort());
         return ok;
     }
     gControl->notePointer(qx, qy);
@@ -796,9 +807,10 @@ static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
     gHostWindows = win;
     gHostPlatformKnown = true;
     if (changed) gKeys.setPassthrough(win);
-    // H2 (Pepper's H2 review, item 5): clicks carry their position.
-    const bool sync = win && (info.caps & jl::hostinfo::kCapPointerSync) != 0;
-    if (gControl) gControl->setPointerSync(sync);
+    // H2 (Pepper's H2 review, item 5): clicks carry their position. The
+    // control channel set this from the same ACK, before any queued click
+    // went out (Pepper's review of 8f8a33b, item 5b).
+    const bool sync = gControl && gControl->pointerSync();
     char caps[16];
     std::snprintf(caps, sizeof(caps), "0x%02x", unsigned(info.caps));
     logLine(std::string("host.info via=") + via +
@@ -828,18 +840,50 @@ static void noteHostPlatform(const std::optional<jl::hostinfo::Info>& info, cons
         gHostPlatformKnown = true;
         logLine(std::string("host.platform via=") + via + " platform=macos reason=no_host_info");
     }
-    if (first && gKeysHeldBack)
-        logLine("input.keys_released_hold held_back=" + std::to_string(gKeysHeldBack) + " via=" + via);
+    if (first && gHoldBack.heldBack())
+        logLine("input.keys_released_hold held_back=" + std::to_string(gHoldBack.heldBack()) + " via=" + via);
+}
+
+// Is this key down now, whatever window got its messages (a held-back key
+// whose up went elsewhere does not keep a chord open).
+static bool keyDownNow(uint32_t vk) {
+    return (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
 }
 
 // H2 (Pepper's H2 review, item 4): no ACK yet (the start-up exchange
 // failed), so the keymap is not known to be the right one: the key is not
 // sent (its up neither) and the session is asked for, which renegotiates.
-static bool holdBackKeys(const char* what) {
-    if (!gControl || gHostPlatformKnown) return false;
-    if (gKeysHeldBack++ == 0) logLine(std::string("input.key_held_back reason=platform_unknown first=") + what);
-    gControl->keepSession();
+// Item 4a of the review of 8f8a33b: nor is anything pressed while a chord
+// held back is still down. Logs the first of each reason in a session.
+static bool heldBack(jl::holdback::Reason r, const char* what) {
+    using jl::holdback::Reason;
+    if (r == Reason::None) return false;
+    static bool loggedUnknown = false, loggedChord = false;
+    if (gHoldBack.heldBack() <= 1) loggedUnknown = loggedChord = false;  // a new session
+    bool& logged = r == Reason::PlatformUnknown ? loggedUnknown : loggedChord;
+    if (!logged) {
+        logged = true;
+        logLine(std::string("input.key_held_back reason=") +
+                (r == Reason::PlatformUnknown ? "platform_unknown" : "chord_open") + " first=" + what);
+    }
+    if (r == Reason::PlatformUnknown) gControl->keepSession();
     return true;
+}
+static bool holdBackKey(uint32_t vk, bool repeat, const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.keyDown(vk, repeat, gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackWin(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.winDown(gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackHookTap(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.hookTap(gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackButton(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.buttonDown(keyDownNow), what);
 }
 
 static void sendRemoteButtonUp(uint8_t button) {
@@ -4111,6 +4155,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gHaveMouse = false;
         gPasteGate.abandon();  // a held paste never lands after focus left
         gHookFilter.reset();
+        gHoldBack.focusLost();  // H2: the hook will not send the Windows key's up now
         gKeys.reset();
         discardQueuedInput("focus_kill");
         releaseRemoteButtons("focus_kill");
@@ -4164,15 +4209,10 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (ControlChannel::isFreshKeyDown(static_cast<uint64_t>(lParam)) && gControl->resumeOnUserKey())
             logLine("control.resume reason=fresh_key");
         // H2 (item 4): a key held back stays held back until its up, auto-
-        // repeat included, so the host never gets a down without its up.
-        if (wParam < 256 && gHeldBackKeyUp.test(static_cast<size_t>(wParam))) {
-            if (repeat) return 0;
-            gHeldBackKeyUp.reset(static_cast<size_t>(wParam));  // its up went elsewhere
-        }
-        if (holdBackKeys("key")) {
-            if (wParam < 256) gHeldBackKeyUp.set(static_cast<size_t>(wParam));
-            return 0;
-        }
+        // repeat included, so the host never gets a down without its up;
+        // and so does a key pressed while a held-back chord is still down
+        // (item 4a of the review of 8f8a33b).
+        if (holdBackKey(static_cast<uint32_t>(wParam), repeat, "key")) return 0;
         // Keyboard preset, Win+Space, Win+C, Ctrl compat shortcuts, Ctrl+Y and
         // plain keys: keymap.hpp.
         const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());
@@ -4186,10 +4226,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             gOverlaySwallowUp.reset(static_cast<size_t>(wParam));
             return 0;
         }
-        if (wParam < 256 && gHeldBackKeyUp.test(static_cast<size_t>(wParam))) {
-            gHeldBackKeyUp.reset(static_cast<size_t>(wParam));  // H2: its down was held back
-            return 0;
-        }
+        if (gHoldBack.keyUp(static_cast<uint32_t>(wParam))) return 0;  // H2: its down was held back
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         const auto out = gKeys.keyUp(static_cast<uint32_t>(wParam), heldModifiers());
         if (!out.handled) break;
@@ -4200,19 +4237,15 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     // while the viewer is focused.
     case WM_MR_WIN_DOWN:
         if (viewerHasInteractiveFocus(hwnd)) {
-            if (holdBackKeys("win")) gWinHeldBack = true;  // H2 (item 4)
-            else sendKeyOutput(gKeys.hookWinDown());
+            if (!holdBackWin("win")) sendKeyOutput(gKeys.hookWinDown());  // H2 (item 4)
         }
         return 0;
     case WM_MR_WIN_UP:
-        if (gWinHeldBack) {
-            gWinHeldBack = false;
-            return 0;
-        }
+        if (gHoldBack.winUp()) return 0;
         sendKeyOutput(gKeys.hookWinUp());
         return 0;
     case WM_MR_WIN_C:
-        if (gWinHeldBack || holdBackKeys("win_c")) return 0;
+        if (holdBackHookTap("win_c")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinC(gHookFilter.winDown()));
         }
@@ -4220,13 +4253,13 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_MR_WIN_SPACE:
         // Windows+Space becomes native macOS Control+Space for switching
         // input sources (Parsec muscle memory), in both keyboard presets.
-        if (gWinHeldBack || holdBackKeys("win_space")) return 0;
+        if (holdBackHookTap("win_space")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinSpace(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_CAPS_LOCK:
-        if (holdBackKeys("caps_lock")) return 0;
+        if (holdBackHookTap("caps_lock")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookCapsLock());
         return 0;
     case WM_SETCURSOR:
@@ -4257,6 +4290,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
+            if (holdBackButton("button")) return 0;  // H2 (item 4a): its up is not sent either
             gLeftClickCount = msg == WM_LBUTTONDBLCLK ? 2 : 1;
             SetCapture(hwnd);
             gControl->sendMouseButtonExtended(0, true, gLeftClickCount);
@@ -4274,6 +4308,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             const uint8_t button = msg == WM_RBUTTONDOWN ? 1 : 2;
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
+            if (holdBackButton("button")) return 0;  // H2 (item 4a): its up is not sent either
             SetCapture(hwnd);
             gControl->sendMouseButton(button, true);
             gRemoteButtons.down(button);
@@ -6304,9 +6339,7 @@ static int appMain(int argc, char** argv) {
             // until an ACK said which (item 4).
             gHostWindows = false;
             gHostPlatformKnown = false;
-            gKeysHeldBack = 0;
-            gHeldBackKeyUp.reset();
-            gWinHeldBack = false;
+            gHoldBack.reset();
             gKeys.setPassthrough(false);
             control->setPointerSync(false);
             if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");

@@ -125,14 +125,27 @@ bool InputInjector::sendButton(uint8_t b, bool down) {
     return sendInputs(&in, 1, lastError_);
 }
 
+// An up frame, by HeldInput's rule (Pepper's review of 8f8a33b, item 2):
+// sent to Windows only when no newer connection still holds it.
+bool InputInjector::countUp(HeldInput::Up r) {
+    switch (r) {
+    case HeldInput::Up::Sent: ++injected_; return true;
+    case HeldInput::Up::Held: ++upsHeld_; return true;
+    case HeldInput::Up::Failed: break;
+    }
+    ++failed_;
+    return false;
+}
+
 bool InputInjector::button(uint8_t b, bool down, HeldInput::Owner owner) {
     if (b > 2) { ++ignored_; return false; }
     std::lock_guard<std::mutex> g(m_);
-    if (!sendButton(b, down)) {
+    if (!down) return countUp(held_.releaseButton(b, owner, [this](uint8_t x) { return sendButton(x, false); }));
+    if (!sendButton(b, true)) {
         ++failed_;
         return false;
     }
-    held_.button(b, down, owner);
+    held_.pressButton(b, owner);
     ++injected_;
     return true;
 }
@@ -156,12 +169,13 @@ bool InputInjector::key(uint16_t semantic, bool down, HeldInput::Owner owner) {
     const uint16_t v = semanticToVk(semantic);
     if (!v) { ++ignored_; return false; }
     std::lock_guard<std::mutex> g(m_);
-    if (!sendKeyVk(v, down)) {
+    // Caps Lock comes as a tap (down, up); it toggles, nothing stays held.
+    if (!down) return countUp(held_.releaseKey(v, owner, [this](uint16_t x) { return sendKeyVk(x, false); }));
+    if (!sendKeyVk(v, true)) {
         ++failed_;
         return false;
     }
-    // Caps Lock comes as a tap (down, up); it toggles, nothing stays held.
-    held_.key(v, down, owner);
+    held_.pressKey(v, owner);
     ++injected_;
     return true;
 }

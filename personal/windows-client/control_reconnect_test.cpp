@@ -2725,9 +2725,12 @@ bool isFrame(const std::pair<uint8_t, Bytes>& f, uint8_t type, const Bytes& payl
     return f.first == type && f.second == payload;
 }
 Bytes be16x2(uint16_t a, uint16_t b) { return {uint8_t(a >> 8), uint8_t(a), uint8_t(b >> 8), uint8_t(b)}; }
-Bytes syncPayload(uint16_t nx, uint16_t ny, uint32_t seq) {
+// H2: MRC1 0x27 POINTER_SYNC payload, [nx, ny, MRM1 seq, MRM1 UDP port].
+constexpr uint16_t kUdpPort = 50000;
+Bytes syncPayload(uint16_t nx, uint16_t ny, uint32_t seq, uint16_t port = kUdpPort) {
     Bytes p = be16x2(nx, ny);
-    p.insert(p.end(), {uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq)});
+    p.insert(p.end(), {uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq), uint8_t(port >> 8),
+                       uint8_t(port)});
     return p;
 }
 template <typename F> bool waitFor(F f, int ms) {
@@ -2912,11 +2915,13 @@ void h2HostInfoTest() {
 // H2 (Pepper's H2 review, items 4 and 5), interactive. The start-up
 // exchange got no ACK, so (as viewer.cpp does) the next control session
 // renegotiates: the host gets VIDEO_CONFIG before the click that started
-// the reconnect, and the answer says what the host is. Then, as viewer.cpp
-// does, renegotiation is turned off and POINTER_SYNC on (cap 0x20): each
-// button goes behind a 0x27 with the position the viewer last showed and
-// its MRM1 seq, live and queued. Off again: no 0x27. A button up released
-// on focus loss and its later (swallowed) up leave no stray 0x27.
+// the reconnect, and the answer says what the host is. The channel turns
+// POINTER_SYNC on from that ACK (cap 0x20) before the queue goes out
+// (Pepper's review of 8f8a33b, item 5b), so even the click queued before
+// the platform was known goes behind a 0x27. Each button then goes behind
+// a 0x27 with the position the viewer last showed, its MRM1 seq and the
+// UDP socket's port, live and queued. Off again: no 0x27. A button up
+// released on focus loss and its later (swallowed) up leave no stray 0x27.
 void h2InteractiveTest() {
     const Secret sec = h2Secret();
     Listener l;
@@ -2928,7 +2933,7 @@ void h2InteractiveTest() {
     control.setIoTimeoutMs(100);
     control.setBackgroundReconnect(true);
     control.setRenegotiateOnReconnect("h264", true, false, 25, false);
-    control.notePointer(1000, 2000, 41);
+    control.notePointer(1000, 2000, 41, kUdpPort);
     std::atomic<int> step{0};
     std::vector<std::pair<uint8_t, Bytes>> f0, f1, f2, f3, f4, f5, f6, f7;
     bool auth0 = false, auth1 = false;
@@ -2964,13 +2969,13 @@ void h2InteractiveTest() {
     }, 8000);
     const bool win = vc && vc->acked && vc->hostInfo && isWinInfo(*vc->hostInfo);
     control.clearRenegotiateOnReconnect();
-    control.setPointerSync(win && (vc->hostInfo->caps & jl::hostinfo::kCapPointerSync));
+    const bool syncFromAck = control.pointerSync();  // the channel set it from that ACK
     waitFor([&] { const auto rs = control.reconnectStats(); return rs.live && !rs.connecting; }, 3000);
-    control.notePointer(3000, 4000, 42);
+    control.notePointer(3000, 4000, 42, kUdpPort);
     ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });  // live
     waitFor([&] { return step >= 1; }, 8000);
     Sleep(150);  // the close has arrived
-    control.notePointer(5000, 6000, 43);
+    control.notePointer(5000, 6000, 43, kUdpPort);
     ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });  // sees the close: queued
     waitFor([&] { return step >= 2; }, 8000);
     waitFor([&] { const auto rs = control.reconnectStats(); return rs.live && !rs.connecting; }, 3000);
@@ -2978,7 +2983,7 @@ void h2InteractiveTest() {
     ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });
     waitFor([&] { return step >= 3; }, 5000);
     control.setPointerSync(true);
-    control.notePointer(7000, 8000, 44);
+    control.notePointer(7000, 8000, 44, kUdpPort);
     ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });
     ui.call([&] { control.discardQueuedInput(); return true; });  // focus left: the down is released now
     ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });  // the user's up: not sent again
@@ -2987,11 +2992,13 @@ void h2InteractiveTest() {
     expect(auth0 && f0.size() == 1 && f0[0].first == 0x40 && f0[0].second.size() == 6 &&
                (f0[0].second[2] & jl::hostinfo::kViewerCapHostInfo),
            "h2 interactive: no start-up ACK: the reconnect sends VIDEO_CONFIG (caps 0x08) before the queued click");
-    expect(win, "h2 interactive: the renegotiated answer says Windows (HOST_INFO read with the ACK)");
-    expect(f1.size() == 2 && isFrame(f1[0], 0x24, be16x2(1000, 2000)) && isFrame(f1[1], 0x25, down),
-           "h2 interactive: the click queued before the platform was known goes as before (0x24 then 0x25)");
+    expect(win && syncFromAck,
+           "h2 interactive: the renegotiated answer says Windows (HOST_INFO read with the ACK), POINTER_SYNC on from it");
+    expect(f1.size() == 2 && isFrame(f1[0], 0x27, syncPayload(1000, 2000, 41)) && isFrame(f1[1], 0x25, down),
+           "h2 interactive: the click queued before the platform was known gets its 0x27 from that ACK, at the flush "
+           "(item 5b)");
     expect(f2.size() == 2 && isFrame(f2[0], 0x27, syncPayload(3000, 4000, 42)) && isFrame(f2[1], 0x25, up),
-           "h2 interactive: POINTER_SYNC on, live: 0x27 (position, seq 42) right in front of the button");
+           "h2 interactive: POINTER_SYNC on, live: 0x27 (position, seq 42, UDP port) right in front of the button");
     expect(auth1 && f3.size() == 2 && isFrame(f3[0], 0x27, syncPayload(5000, 6000, 43)) && isFrame(f3[1], 0x25, down),
            "h2 interactive: queued for the reconnect: 0x27 then the button, and no VIDEO_CONFIG once the platform is known");
     expect(f4.size() == 1 && isFrame(f4[0], 0x25, up), "h2 interactive: POINTER_SYNC off: the button alone");
@@ -3000,6 +3007,93 @@ void h2InteractiveTest() {
            "h2 interactive: released on focus loss; the later up and its 0x27 are not sent (" +
                std::to_string(f6.size()) + " stray frames)");
     expect(ui.maxMs < kUiBudgetMs, "h2 interactive: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// Pepper's review of 8f8a33b, items 4b and 5b. POINTER_SYNC was on (a
+// Windows host before) and a click waits for the reconnect.
+// Session 1: an 11-byte ACK promising HOST_INFO, then a HOST_INFO frame
+// whose payload does not decode (format 0): no ACK (4b), the connection is
+// closed and the click not sent on it. Session 2: a Mac's 10-byte ACK: the
+// channel turns POINTER_SYNC off from it before the queue goes out, so the
+// click goes as 0x24 then the button, no 0x27 to a Mac (5b).
+void h2ReviewR2Test() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);
+    control.notePointer(1000, 2000, 7, kUdpPort);
+    const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+    const Bytes badInfo{0, jl::hostinfo::kPlatformWindows, 0, 0, 0, 0x2F, 1, 0};  // format 0
+    bool auth0 = false, auth1 = false, asked0 = false, sent0 = false;
+    std::vector<std::pair<uint8_t, Bytes>> r0, r1, after0, f1;
+    std::atomic<bool> done{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        r0 = readFrames(s, 1, 3000);
+        if (r0.size() == 1 && r0[0].first == 0x40) {
+            asked0 = r0[0].second.size() > 2 && (r0[0].second[2] & jl::hostinfo::kViewerCapHostInfo);
+            const Bytes good = winReply(r0[0].second);
+            const size_t ackEnd = 8 + size_t((good[6] << 8) | good[7]);
+            Bytes reply(good.begin(), good.begin() + ackEnd);
+            const Bytes bad = frame(jl::hostinfo::kType, badInfo.data(), badInfo.size());
+            reply.insert(reply.end(), bad.begin(), bad.end());
+            sent0 = ackEnd == 8 + 11 && sendAllBytes(s, reply);
+        }
+        after0 = readFrames(s, 1, 1000);  // the viewer closes it: nothing comes
+        closesocket(s);
+        s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth1 = hostAuth(s, sec, Answer::Ok, 50);
+        r1 = readFrames(s, 1, 3000);
+        if (r1.size() == 1 && r1[0].first == 0x40) sendAllBytes(s, frame(0x41, macAck.data(), macAck.size()));
+        f1 = readFrames(s, 2, 3000);
+        closesocket(s);
+        done = true;
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });  // queued: starts the reconnect
+    std::vector<VideoConfigResult> answers;
+    const auto t0 = Clock::now();
+    while (!done && msSince(t0) < 15000) {
+        ui.call([&] {
+            if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+            control.pollHostNotice();
+            control.keepSession();
+            return true;
+        });
+        Sleep(10);
+    }
+    host.join();
+    ui.call([&] {
+        if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+        return true;
+    });
+    const auto rs = control.reconnectStats();
+    const Bytes down{0, 1, 1};
+    expect(auth0 && asked0 && sent0 && after0.empty() && rs.renegotiateFailures == 1,
+           "h2 r2 item 4b: an 11-byte ACK with a HOST_INFO that does not decode is no ACK: connection closed, "
+           "nothing sent on it (" + std::to_string(rs.renegotiateFailures) + " failed renegotiations)");
+    expect(auth1 && r1.size() == 1 && r1[0].first == 0x40 && answers.size() == 1 && answers[0].acked &&
+               !answers[0].hostInfo,
+           "h2 r2 item 4b: the next session asks again; only the Mac's ACK reaches the viewer (" +
+               std::to_string(answers.size()) + " answers)");
+    expect(f1.size() == 2 && isFrame(f1[0], 0x24, be16x2(1000, 2000)) && isFrame(f1[1], 0x25, down) &&
+               !control.pointerSync(),
+           "h2 r2 item 5b: the Mac's ACK turns POINTER_SYNC off before the flush: the queued click goes as 0x24 then "
+           "0x25");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r2: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
     control.stop();
     setCurrent(nullptr);
     clearKnownModesForTest();
@@ -3028,6 +3122,7 @@ int main() {
     h2OldViewerReconnectTest();
     h2HostInfoTest();
     h2InteractiveTest();
+    h2ReviewR2Test();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

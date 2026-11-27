@@ -268,11 +268,14 @@ bool sendAll(SOCKET s, const std::vector<uint8_t>& b) {
 // put there, every UDP move up to that seq becomes stale, and the button is
 // injected, with no UDP move in between: the press lands where the viewer
 // clicked whether the move before it came late, never came, or came first.
+// The seq belongs to the viewer's MRM1 socket (peerAddr, sync.port), which
+// the host may not have heard from yet (Pepper's review of 8f8a33b, item
+// 5a; Mrm1Session::syncPointer).
 // button == nullptr: a sync not followed by a button, applied alone.
-bool applyPointerSync(State& st, const jlh::InputEvent& sync, const jlh::InputEvent* button,
+bool applyPointerSync(State& st, uint32_t peerAddr, const jlh::InputEvent& sync, const jlh::InputEvent* button,
                       jlh::HeldInput::Owner owner) {
     std::lock_guard<std::mutex> g(st.pointerMutex);
-    st.pointer.syncPointer(sync.seq);
+    st.pointer.syncPointer(peerAddr, sync.port, sync.seq);
     ++st.pointerSyncs;
     st.input.moveNormalized(sync.x, sync.y);
     return button ? st.input.apply(*button, owner) : true;
@@ -280,7 +283,7 @@ bool applyPointerSync(State& st, const jlh::InputEvent& sync, const jlh::InputEv
 
 // Runs on its own thread holding one of st.controlSlots, taken by the
 // listener; every return path closes the socket and gives the slot back.
-void serveControl(State& st, SOCKET c, std::string peer) {
+void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     struct Release {
         State& st;
         SOCKET c;
@@ -389,7 +392,7 @@ void serveControl(State& st, SOCKET c, std::string peer) {
             const bool ok = jlh::stepInput(
                 pendingSync, *e,
                 [&](const jlh::InputEvent& s, const jlh::InputEvent* button) {
-                    return applyPointerSync(st, s, button, owner);
+                    return applyPointerSync(st, peerAddr, s, button, owner);
                 },
                 [&](const jlh::InputEvent& ev) { return st.input.apply(ev, owner); });
             if (e->kind == jlh::InputEvent::Kind::TaskManager)
@@ -435,7 +438,8 @@ void controlListener(State& st, SOCKET ls) {
             continue;
         }
         try {
-            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr)).detach();
+            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr))
+                .detach();
         } catch (const std::exception&) {
             logf("control.rejected peer=%s reason=no_thread", ipString(from.sin_addr).c_str());
             closesocket(c);
@@ -461,7 +465,7 @@ void mrm1Listener(State& st, SOCKET u) {
         bool newSession;
         {
             std::lock_guard<std::mutex> g(st.pointerMutex);
-            newSession = st.pointer.note(from.sin_addr.s_addr, from.sin_port);
+            newSession = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port));
         }
         if (newSession) {
             // A viewer socket not seen before: a new MRM1 session. Pointer
@@ -842,7 +846,7 @@ void videoLoop(State& st) {
             sendFailTotal += sendFail;
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
-                 "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu "
+                 "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu input_up_held=%llu "
                  "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_sync=%llu cursor_sent=%llu "
                  "cursor_fail=%llu cursor_changes=%llu backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
@@ -851,7 +855,8 @@ void videoLoop(State& st) {
                  (unsigned long long)nPackets, (unsigned long long)sendFail, (unsigned long long)sendFailTotal,
                  sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
-                 (unsigned long long)st.input.ignored(), (unsigned long long)st.inputMalformed.load(),
+                 (unsigned long long)st.input.ignored(), (unsigned long long)st.input.upsHeld(),
+                 (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
                  (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerSyncs.load(),
                  (unsigned long long)st.cursorSent.load(),
