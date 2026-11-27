@@ -30,8 +30,12 @@ JerisLink sends:
   (HMAC-SHA256) computed from these with the derived key. The Mac answers with
   the result and, when it matches, its own code and a session ID. Neither the
   password nor the derived key is sent. In a session set up this way, every
-  video, audio and input packet carries a short code from a key for that
-  session.
+  UDP packet in either direction carries a short code from a key for that
+  session: video, sound, mouse movement (sent over UDP by default), cursor
+  shape, ping and pong, and the viewer's video reports and its requests for
+  lost video and for sound. Keyboard keys, mouse clicks, scrolling,
+  clipboard text and files go over TCP connections that each passed the
+  password check; those messages carry no code of their own.
 - **Screen video** from the Mac to the PC.
 - **Sound** from the Mac to the PC: the Mac's system audio mix, encoded with
   Opus at 48 kHz, only while a viewer with audio on is connected. The host
