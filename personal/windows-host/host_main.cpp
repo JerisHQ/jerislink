@@ -383,10 +383,26 @@ int runProbe(const Options& o) {
         return 2;
     }
     logf("probe.capture backend=%s %s", cap.backend(), cap.describe().c_str());
+    // Up to 2 s for a frame. An acquire error reopens capture, as the
+    // stream loop does, so Auto can move to GDI within the same probe
+    // (e.g. after DDA fails to remake its staging texture).
     int r = 0;
-    for (int i = 0; i < 20 && r != 1; ++i) r = cap.acquire(100, f, err);
+    std::string lastErr;
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    while (r != 1 && Clock::now() < deadline) {
+        r = cap.acquire(100, f, err);
+        if (r >= 0) continue;
+        lastErr = err;
+        logf("probe.capture lost %s; reopening", err.c_str());
+        Sleep(100);
+        if (!cap.open(o.capture, err)) {
+            logf("probe.capture FAIL %s", err.c_str());
+            return 2;
+        }
+        logf("probe.capture backend=%s %s", cap.backend(), cap.describe().c_str());
+    }
     if (r != 1) {
-        logf("probe.capture FAIL no frame in 2 s (%s)", r < 0 ? err.c_str() : "timeout");
+        logf("probe.capture FAIL no frame in 2 s (%s)", lastErr.empty() ? "timeout" : lastErr.c_str());
         return 2;
     }
     logf("probe.capture OK size=%dx%d stride=%zu", f.width, f.height, f.stride);
