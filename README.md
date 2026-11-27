@@ -14,6 +14,8 @@ Release builds are published on [GitHub Releases](https://github.com/JerisHQ/jer
 
 The version number lives in one place: the [`VERSION`](VERSION) file. The Windows file metadata (ProductName "JerisLink", ProductVersion) and the installer version are generated from it.
 
+The [Microsoft Store](https://apps.microsoft.com/detail/9NM3VWQ9MD7N) version of the Windows viewer is submitted by the [`msstore-publish`](.github/workflows/msstore-publish.yml) workflow through the Microsoft Store submission API, using the in-repo [`MsStoreRunner.psm1`](.github/scripts/MsStoreRunner.psm1). The same submission flow has been extracted into a reusable GitHub Action, [JerisHQ/msstore-submission-action](https://github.com/JerisHQ/msstore-submission-action) ([GitHub Marketplace](https://github.com/marketplace/actions/microsoft-store-submission-by-submission-id)).
+
 ## Repository layout
 
 | Folder | What it is |
