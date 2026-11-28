@@ -416,6 +416,12 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
                 logf("control.shared_address peer=%s channel=%s controls=%zu legacy_udp=off", peer.c_str(), role,
                      heard.controls);
         }
+        // r13 (Pepper's review of 35d72ff): a second session connection
+        // from this address while the host runs. No 0.4.x UDP move from it
+        // goes in again until the host restarts (README: 0.4.x then runs
+        // with --mouse-move-transport tcp); r9+ viewers name their socket.
+        if (heard.handover)
+            logf("control.handover peer=%s channel=%s legacy_udp=off until=host_restart", peer.c_str(), role);
         if (heard.refuse) {
             // No file transfer in H1: the viewer reads a close as refused.
             logf("control.file_refused peer=%s reason=not_in_h1", peer.c_str());
@@ -632,7 +638,8 @@ void mrm1Listener(State& st, SOCKET u) {
             // newest move counts; a late datagram, or one older than the
             // last POINTER_SYNC, is dropped. r10 (item 2): a 0.4.x owner,
             // which names none, and a 0.4.x viewer hovering before its first
-            // click, by the legacy rule (host_protocol.hpp).
+            // click, by the legacy rule (host_protocol.hpp). r13: never from
+            // an address that had a handover.
             const auto r = st.claims.udpMove(from.sin_addr.s_addr, ntohs(from.sin_port), [&] {
                 std::lock_guard<std::mutex> g(st.pointerMutex);
                 if (!st.pointer.takePointer(m->seq)) return false;
@@ -646,7 +653,8 @@ void mrm1Listener(State& st, SOCKET u) {
             case jlh::InputClaims::Udp::UpPending: ++st.pointerUdpUpPending; break;
             case jlh::InputClaims::Udp::LegacyOff: {
                 // r11 (Pepper's review of 5880264, item 2): not one viewer
-                // alone on its address, or a second socket of it.
+                // alone on its address, or a second socket of it. r13: or
+                // its address had a handover.
                 const uint64_t k = ++st.pointerUdpLegacyOff;
                 if (k <= 3 || k % 500 == 0)
                     logf("mrm1.legacy_off peer=%s:%u total=%llu", ipString(from.sin_addr).c_str(),
