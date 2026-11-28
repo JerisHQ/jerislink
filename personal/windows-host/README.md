@@ -104,28 +104,43 @@ Builds are unsigned (design doc D14).
     never sent a 0x27 takes moves from the first socket on its own TCP peer
     address that moves, and from that one only. With no owner, the socket
     that moved last does (hover before the first click).
-  - The 0.4.x rule only works when that viewer is the only one on its
-    address. The host classifies each control connection by its first
-    frame. CLIPBOARD_HELLO (the clipboard connection) and FILE_HELLO (a
-    file panel, refused) do not count. Any other first frame counts as a
-    control connection from its address until it closes. When an address
-    has two or more control connections (for example two viewers on one
-    PC; the host takes UDP from one address only), the host cannot tell
-    which UDP socket belongs to which viewer. So no move goes in by the
-    0.4.x rule, either for an owner or for hover, and the socket that had
-    the binding stops getting the cursor shape (`control.shared_address
-    ... legacy_udp=off`, `mrm1.legacy_off`, `pointer_udp_legacy_off` in
-    `stats`). Once the 0.4.x owner is alone again, it takes moves from the
-    socket it first moved from. If a different socket from its address
-    moves after that, the 0.4.x rule stays off for this owner until
-    ownership changes (it reconnects, or another connection takes over).
-    A viewer that names its socket with 0x27 is not affected.
+  - The 0.4.x rule only works when the host can tell which connection a
+    UDP socket belongs to (the host takes UDP from one address only, so two
+    viewers on one PC look the same). The host classifies each control
+    connection by its first frame. CLIPBOARD_HELLO (the clipboard
+    connection) and FILE_HELLO (a file panel, refused) do not count. Any
+    other first frame counts as a control connection from its address
+    until it closes, and so does a connection whose first frame has not
+    come yet, from the moment it is accepted. A UDP socket belongs to a
+    connection only if that connection was the only one counted on its
+    address when the host first heard the socket (its first MRM1 datagram
+    of any kind), and only while that connection is open.
+  - So no move goes in by the 0.4.x rule, either for an owner or for hover,
+    and the cursor shape goes nowhere (`control.shared_address ...
+    legacy_udp=off`, `mrm1.legacy_off`, `pointer_udp_legacy_off` in
+    `stats`), when:
+    - its address has a second counted connection: a second viewer on the
+      same PC, or any new connection whose first frame has not come yet.
+      This lasts while that connection is counted; once the 0.4.x viewer
+      is alone again, its own socket moves the pointer again;
+    - the socket was first heard while another connection was counted on
+      its address, or the connection it belongs to has closed. This covers
+      an old connection's datagrams that still arrive after it closed, a
+      handover, and every reconnect of a 0.4.x viewer's control
+      connection: 0.4.x keeps its UDP socket across a reconnect, and the
+      host heard that socket with the old connection;
+    - a second socket from the owner's address moved (a port change).
+    The last two keep the rule off for this owner until ownership changes.
+    In every one of these cases a 0.4.x viewer's clicks go in where the
+    host pointer is, not where it clicked. Its user reconnects it with TCP
+    moves (`--mouse-move-transport tcp`, below). A viewer that names its
+    socket with 0x27 is not affected.
   - When the owner changes (a takeover, its close, going quiet), the socket
     its moves came from is done: it moves nothing and gets no cursor shape,
-    not under the next owner and not with no owner. A replaced viewer's late
-    datagrams never move the pointer, and the new owner's drag and cursor
-    shape are not disturbed. Only once that connection has closed may the
-    same 0.4.x viewer's next connection take the socket again, as above.
+    not under the next owner, not with no owner, and not after that
+    connection has closed. A replaced viewer's late datagrams never move
+    the pointer, and the new owner's drag and cursor shape are not
+    disturbed.
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
@@ -207,19 +222,44 @@ it holds down until it reconnects or exits. After a hang of more than 5 s
 the host closes the connection; a frame the viewer sends just as it does
 is lost, and what follows goes on the reconnect. A replaced viewer that
 is still online can neither move the pointer nor press anything. A 0.4.x
-viewer whose control connection reconnects while the host still holds
-the old one (up to about 13 s) cannot move the pointer until the old one
-closes, but its first click still lands where it clicked. After a 0.4.x
-viewer's connection closes with no owner after it, its hover moves nothing
-until its next click. A 0.4.x viewer taking over from another viewer: its
-first click lands where the pointer was. A 0.4.x viewer that shares its PC
-with another connected viewer, or whose address had a second UDP socket
-move: its UDP moves are dropped, so it cannot move the Windows pointer.
-Its clicks go in where the pointer is (a click queued for a reconnect
-goes in at its own position). It can move the pointer again once it is
-alone on its address (after a second socket: once it reconnects). A
-viewer (any) gets no cursor shape before its moves are taken (a
-read-only view, this viewer before its first move).
+viewer with UDP moves (its default) taking over from another viewer: its
+first click lands where the pointer was. A 0.4.x viewer with UDP moves
+whose socket the host cannot tell is its own (above: a second viewer on
+its PC, a port change, a reconnect of its control connection, an old
+connection's UDP): its UDP moves are dropped, so it cannot move the
+Windows pointer and gets no cursor shape. Its clicks go in where the
+pointer is (a click queued for a reconnect goes in at its own position).
+After a reconnect this lasts until the viewer is restarted. The host
+cannot switch a running 0.4.x viewer to TCP moves; its user restarts it
+with `--mouse-move-transport tcp` (below). One gap is left: a 0.4.x
+viewer whose control connection has closed and that never sent a UDP
+datagram while it was open, moving for the first time while another
+viewer is alone on the same PC, is taken for that viewer (two viewers on
+one PC: run 0.4.x with tcp). A viewer (any) gets no cursor
+shape before its moves are taken (a read-only view, this viewer before
+its first move), and a 0.4.x viewer with TCP moves never gets one.
+
+A 0.4.x viewer whose mouse does not move the Windows pointer (the cases
+above; `mrm1.legacy_off` in the host log): quit it and start it again
+with TCP moves, from a command prompt in its folder on the viewer PC:
+
+```
+Jerislink.exe --source-ip <host tailnet IP> --mouse-move-transport tcp
+```
+
+`--mouse-move-transport tcp|udp` is a command-line option of 0.4.0 and
+0.4.1 (`viewer_options.hpp`; udp is the default and there is no setting
+for it), so it goes on every start, for example in a shortcut. With tcp,
+every move goes on the control connection (MRC1 0x24), in order with the
+clicks: each press and release goes in right behind the move to where it
+was made. Hover, clicks, double clicks and drags then go in where they were
+made, with other viewers on the same PC, after a port change and after a
+reconnect (`testLegacyTcpMoves` in `host_test.cpp`). The cost: with tcp a
+0.4.x viewer opens no MRM1 socket (`udp_plan.hpp`), so it gets no cursor
+shape and sends no keyframe requests (the host sends a keyframe every
+second, so a broken picture heals within about 1 s). NACK, ABR and audio
+are not in H2 either way. A viewer from this
+build does not need the option: it names its socket with 0x27.
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),

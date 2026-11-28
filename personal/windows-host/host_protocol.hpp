@@ -743,6 +743,38 @@ constexpr int64_t kLivenessTimeoutMs = 5'000;
 // - The cursor shape (item 3): with the binding dropped, cursorPeer() names
 //   no socket and no shape is sent.
 //
+// r12 (Pepper's review of 9f803c6, item 2; still no new message on the
+// wire, 0x27 stays the only addition): a UDP socket is taken as a 0.4.x
+// viewer's only when the host can tell whose it is. Otherwise that viewer
+// stays TCP-only (README: run it with --mouse-move-transport tcp).
+// - A connection counts for its address from the moment the host accepts
+//   it (host_main.cpp opens it in controlListener), not from its first
+//   frame: until that frame says what it is, it may be a second viewer.
+//   Its opening drops a binding made by the legacy rule (sharedLocked()),
+//   as a second control connection's first frame did in r11.
+// - Each socket remembers the connections open from its address when the
+//   host first heard it (any valid MRM1 datagram: udpHeard(), udpMove()),
+//   less those whose first frame then said they are not a viewer's
+//   (CLIPBOARD_HELLO, FILE_HELLO). A socket is a connection's only when
+//   that connection is the one in that list (Sock::only()): a 0.4.x viewer
+//   opens its MRM1 socket after its control connection's start-up ping
+//   was answered, so a fresh viewer alone on its PC passes.
+// - A legacy owner takes moves from one socket: the first to move under
+//   this ownership, and only when it is the owner's. A first socket that
+//   is not, or any other socket after it, turns the legacy rule off until
+//   ownership changes. r10's allowance is gone: a socket an ended owner
+//   moved from never becomes a newer connection's, so a 0.4.x viewer whose
+//   control connection reconnected (it keeps its socket) stays TCP-only.
+// - With no owner, a socket hovers only when it is the one control
+//   connection's on its address. When the connection a hover binding was
+//   made for closes, the binding goes (close()), so its socket's late
+//   datagrams get no cursor shape and move nothing.
+// Known limit: a 0.4.x viewer whose control connection is gone and that
+// never sent a datagram while it was open, moving for the first time while
+// another viewer's connection is alone on the address, is taken as that
+// one's. A 0.4.x viewer whose control connection the host closed reconnects
+// at once, and its new connection makes the address shared.
+//
 // Admission (with the takeover it may make) and the injection of the frame
 // are one step under this object's lock (frame()), and so are close(),
 // retry(), expire() and udpMove(): a frame admitted for the old owner is
@@ -754,18 +786,22 @@ class InputClaims {
 public:
     using Owner = HeldInput::Owner;
 
-    // A control connection past its handshake, from ip (network order).
-    // Owners are numbered from 1 in the order the connections opened.
+    // A connection the host accepted from ip (network order). Owners are
+    // numbered from 1 in the order the connections opened. r12: called at
+    // accept, before the handshake; it counts for its address from now on
+    // (the class comment says why).
     Owner open(uint32_t ip) {
         std::lock_guard<std::mutex> g(m_);
         const Owner o = next_++;
         conns_[o] = Conn{ip, false, false};
+        if (controlsLocked(ip) > 1) sharedLocked(ip);
         return o;
     }
 
     struct Heard {
         bool refuse = false;    // a FILE_HELLO first: no file transfer here; close the connection
-        size_t controls = 0;    // r11: o's first frame made it a control connection; this many from its address now
+        size_t controls = 0;    // r11: o's first frame made it a control connection; this many from its address
+                                // now (r12: with those whose first frame has not come)
         bool liveness = false;  // a liveness ping: valid, and not o's first frame
         bool armed = false;     // its first one: o is armed from now on
         bool silenced = false;  // o lost ownership for going quiet: close it, no pong
@@ -781,9 +817,12 @@ public:
         Conn& c = it->second;
         if (!c.framed) {
             c.framed = true;
-            if (h.type == kMsgFileHello) {
-                r.refuse = true;
-            } else if (h.type != kMsgClipboardHello) {
+            if (h.type == kMsgFileHello || h.type == kMsgClipboardHello) {
+                r.refuse = h.type == kMsgFileHello;
+                // r12: not a viewer's control connection: sockets heard
+                // while it was open are not made ambiguous by it.
+                for (auto& s : socks_) s.with.erase(std::remove(s.with.begin(), s.with.end(), o), s.with.end());
+            } else {
                 c.control = true;
                 r.controls = controlsLocked(c.ip);
                 if (r.controls > 1) sharedLocked(c.ip);
@@ -835,7 +874,7 @@ public:
         // ends the legacy rule for this owner.
         if (e.kind == InputEvent::Kind::PointerSync) {
             ownerSynced_ = true;
-            if (e.port) bindLocked(Endpoint{true, ip, e.port});
+            if (e.port) bindLocked(Endpoint{true, ip, e.port}, o);
         }
         if (held_.anyUnowned() && !isUp(e)) {
             r.blocked = true;
@@ -855,8 +894,13 @@ public:
             owner_ = 0;
             newOwnershipLocked();
         }
-        // r10: a socket it was replaced on is no longer spent (the same
-        // 0.4.x viewer's next connection may use it).
+        // r12: a hover binding made for it goes too: its socket's datagrams
+        // may go on after its TCP is gone, and no connection can be shown to
+        // own them.
+        if (boundFor_ == o) bindLocked(Endpoint{});
+        // r10: a socket it was replaced on is no longer spent. r12: no newer
+        // connection takes it (Sock::only()); a move from it under a legacy
+        // owner turns the rule off.
         for (auto& s : socks_)
             if (s.spentBy == o) s.spentBy = 0;
         lastPing_.erase(o);
@@ -939,24 +983,34 @@ public:
             // r10: a legacy owner's socket: its first to move.
             if (ip != ownerIp_ || s.spentBy) return Udp::NotOwner;
             // r11: and only while it is the only control connection from
-            // its address, and that socket stays its only one.
+            // its address, and that socket stays its only one. r12: that
+            // first socket must be the owner's (Sock::only()).
             if (legacyOff_ || !soleControlLocked(owner_)) return Udp::LegacyOff;
-            if (legacyPort_ && port != legacyPort_) {
+            if (legacyPort_ ? port != legacyPort_ : !s.only(owner_)) {
                 legacyOff_ = true;
                 bindLocked(Endpoint{});
                 return Udp::LegacyOff;
             }
             legacyPort_ = port;
-            bindLocked(Endpoint{true, ip, port});
+            bindLocked(Endpoint{true, ip, port}, owner_);
         } else {
             // r10: no owner: the latest socket to move whose owner has not
-            // ended. r11: from an address with one control connection.
+            // ended. r11: from an address with one control connection. r12:
+            // that connection's socket (Sock::only()); one whose first frame
+            // has not come counts (controlsLocked()).
             if (s.spentBy || s.retired) return Udp::NotOwner;
-            if (controlsLocked(ip) != 1) return Udp::LegacyOff;
-            bindLocked(Endpoint{true, ip, port});
+            if (controlsLocked(ip) != 1 || s.with.size() != 1 || !soleControlLocked(s.with[0]))
+                return Udp::LegacyOff;
+            bindLocked(Endpoint{true, ip, port}, s.with[0]);
         }
         if (held_.anyUnowned()) return Udp::UpPending;
         return move() ? Udp::Moved : Udp::Stale;
+    }
+    // r12: any other valid MRM1 datagram from (ip, port) (0x40, 0x43): the
+    // host has heard that socket (Sock::with); nothing else changes.
+    void udpHeard(uint32_t ip, uint16_t port) {
+        std::lock_guard<std::mutex> g(m_);
+        heardLocked(ip, port);
     }
     // r10 (Pepper's review of f919167, item 3): where the cursor shape goes,
     // the socket the host takes moves from now (none: nowhere). gen moves
@@ -1005,6 +1059,12 @@ private:
         uint64_t lastHeard = 0;  // order of the last datagram (heard_)
         Owner spentBy = 0;       // the replaced (or expired) connection, still open, it was bound for
         bool retired = false;    // an owner ended while it was bound: moves nothing with no owner
+        // r12: the connections open from its address (a control connection,
+        // or one whose first frame had not come) when the host first heard
+        // it, less those that turned out not to be a viewer's (heard()).
+        std::vector<Owner> with;
+        // r12: it is o's: o was the one such connection.
+        bool only(Owner o) const { return with.size() == 1 && with[0] == o; }
     };
     // More than one per control connection (kMaxControlConnections, 8, in
     // host_main.cpp), so a spent socket never has to make room.
@@ -1034,13 +1094,17 @@ private:
                 }
                 socks_.erase(victim);
             }
-            socks_.push_back(Sock{ip, port, 0, 0, false});
+            socks_.push_back(Sock{ip, port, 0, 0, false, {}});
             s = &socks_.back();
+            for (const auto& [o, c] : conns_)
+                if (c.ip == ip && (c.control || !c.framed)) s->with.push_back(o);
         }
         s->lastHeard = ++heard_;
         return *s;
     }
-    void bindLocked(const Endpoint& e) {
+    // r12: forConn, the connection the binding is made for (0: none).
+    void bindLocked(const Endpoint& e, Owner forConn = 0) {
+        boundFor_ = e.named ? forConn : 0;
         if (e.named == bound_.named && e.ip == bound_.ip && e.port == bound_.port) return;
         bound_ = e;
         ++boundGen_;
@@ -1055,7 +1119,10 @@ private:
         if (!e.named && owner_ && !ownerSynced_ && legacyPort_) e = Endpoint{true, ownerIp_, legacyPort_};
         if (!e.named) return;
         Sock* s = findLocked(e.ip, e.port);
-        if (!s) s = &heardLocked(e.ip, e.port);
+        if (!s) {
+            s = &heardLocked(e.ip, e.port);
+            s->with.clear();  // r12: not heard now; no one's
+        }
         s->retired = true;
         s->spentBy = openOwner;
     }
@@ -1067,11 +1134,12 @@ private:
         legacyOff_ = false;
         bindLocked(Endpoint{});
     }
-    // r11: control connections from ip now.
+    // r11: control connections from ip now. r12: and those whose first
+    // frame has not come (each may be one).
     size_t controlsLocked(uint32_t ip) const {
         size_t n = 0;
         for (const auto& [o, c] : conns_)
-            if (c.control && c.ip == ip) ++n;
+            if ((c.control || !c.framed) && c.ip == ip) ++n;
         return n;
     }
     // r11: o is a control connection and the only one from its address.
@@ -1079,9 +1147,10 @@ private:
         const auto it = conns_.find(o);
         return it != conns_.end() && it->second.control && controlsLocked(it->second.ip) == 1;
     }
-    // r11: a second control connection from ip: a binding there made by the
-    // legacy rule (a legacy owner's socket, or the hovering one) is dropped.
-    // A synced owner's named socket stays.
+    // r11: a second control connection from ip (r12: or one whose first
+    // frame has not come): a binding there made by the legacy rule (a
+    // legacy owner's socket, or the hovering one) is dropped. A synced
+    // owner's named socket stays.
     void sharedLocked(uint32_t ip) {
         if (bound_.named && bound_.ip == ip && !(owner_ && ownerSynced_)) bindLocked(Endpoint{});
     }
@@ -1104,6 +1173,7 @@ private:
     // the socket bound by the legacy rule; the cursor shape goes there.
     Endpoint bound_;
     uint64_t boundGen_ = 0;
+    Owner boundFor_ = 0;  // r12: the connection bound_ was made for
     std::vector<Sock> socks_;  // r10
     uint64_t heard_ = 0;
     // r11: a legacy owner's first socket to move (0: none yet), and whether

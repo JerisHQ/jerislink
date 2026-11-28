@@ -307,17 +307,27 @@ bool applyPointerSync(State& st, uint32_t peerAddr, const jlh::InputEvent& sync,
 
 // Runs on its own thread holding one of st.controlSlots, taken by the
 // listener; every return path closes the socket and gives the slot back.
-void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
+// r12 (Pepper's review of 9f803c6, item 2): the listener opened owner in
+// InputClaims at accept, so the connection counts for its address from
+// then; every return path closes it there too (done: below, or the guard).
+void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh::HeldInput::Owner owner) {
+    auto upKey = [&st](uint16_t v) { return st.input.upKey(v); };
+    auto upButton = [&st](uint8_t b) { return st.input.upButton(b); };
     struct Release {
         State& st;
         SOCKET c;
+        jlh::HeldInput::Owner owner;
         bool established = false;
+        bool claimsClosed = false;
         ~Release() {
+            if (!claimsClosed)  // before its first frame: it holds nothing
+                st.claims.close(owner, [this](uint16_t v) { return st.input.upKey(v); },
+                                [this](uint8_t b) { return st.input.upButton(b); });
             if (established) --st.controlConnections;
             closesocket(c);
             st.controlSlots.release();
         }
-    } guard{st, c};
+    } guard{st, c, owner};
     BOOL nodelay = TRUE;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     uint8_t h[jlh::kMrc1HeaderBytes];
@@ -378,9 +388,6 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     const char* role = "control";
     bool first = true;
     bool hostInfoLogged = false, inputSeen = false, droppedLogged = false, upPending = false;
-    const jlh::HeldInput::Owner owner = st.claims.open(peerAddr);
-    auto upKey = [&st](uint16_t v) { return st.input.upKey(v); };
-    auto upButton = [&st](uint8_t b) { return st.input.upButton(b); };
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
     // r10 (Pepper's review of f919167, item 1): the connection is read in
     // short slices (control_read.hpp), and reading stops as soon as it
@@ -546,6 +553,7 @@ done:
         // (review of f97ad11, item 1); a replaced connection has none left.
         // An up Windows refused earlier is tried again.
         const size_t n = st.claims.close(owner, upKey, upButton);
+        guard.claimsClosed = true;
         if (inputSeen || n)
             logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,
                  st.claims.anyHeld() ? "yes" : "no");
@@ -573,11 +581,16 @@ void controlListener(State& st, SOCKET ls) {
             closesocket(c);
             continue;
         }
+        // r12 (Pepper's review of 9f803c6, item 2): counted for its address
+        // from now, before its handshake and first frame (InputClaims).
+        const jlh::HeldInput::Owner owner = st.claims.open(uint32_t(from.sin_addr.s_addr));
         try {
-            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr))
+            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr), owner)
                 .detach();
         } catch (const std::exception&) {
             logf("control.rejected peer=%s reason=no_thread", ipString(from.sin_addr).c_str());
+            st.claims.close(owner, [&st](uint16_t v) { return st.input.upKey(v); },
+                            [&st](uint8_t b) { return st.input.upButton(b); });
             closesocket(c);
             st.controlSlots.release();
         }
@@ -642,6 +655,8 @@ void mrm1Listener(State& st, SOCKET u) {
             }
             }
         } else if (m->type == jlh::kMrm1KeyframeRequest) {
+            // r12: InputClaims notes every socket it hears (Sock::with).
+            st.claims.udpHeard(from.sin_addr.s_addr, ntohs(from.sin_port));
             st.keyframeRequested = true;
             const uint64_t k = ++st.keyframeRequests;
             if (k <= 3 || k - lastLoggedKfr >= 50) {
@@ -649,6 +664,7 @@ void mrm1Listener(State& st, SOCKET u) {
                 lastLoggedKfr = k;
             }
         } else if (m->type == jlh::kMrm1Ping) {
+            st.claims.udpHeard(from.sin_addr.s_addr, ntohs(from.sin_port));
             const auto pong = jlh::mrm1Pong(b, size_t(n));
             sendto(u, reinterpret_cast<const char*>(pong.data()), int(pong.size()), 0,
                    reinterpret_cast<const sockaddr*>(&from), len);
