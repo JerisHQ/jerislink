@@ -21,7 +21,7 @@ jobs:
         run: cmake -S . -B build -A x64
       - name: Build host and test (unsigned, dev only)
         run: cmake --build build --config Release --target JerisLinkHost JerisLinkHostTest
-      - name: Host unit test (MR02 through the viewer's receiver, pacer, MRC1 probe / ping / video config, MRM1, Annex B, BT.709 colour, MF software encoder loopback)
+      - name: Host unit test (MR02 through the viewer's receiver, pacer, MRC1 probe / ping / video config, HOST_INFO through the viewer's decoder, input decode / keymap / pointer mapping, MRM1, Annex B, BT.709 colour, MF software encoder loopback)
         run: build\Release\JerisLinkHostTest.exe
       - name: Host refuses to start without dev mode, a specific bind and an allowed viewer (exit 64)
         shell: pwsh
@@ -45,5 +45,5 @@ jobs:
           exit 0
       - uses: actions/upload-artifact@v4
         with:
-          name: jerislink-windows-host-h1-unsigned
+          name: jerislink-windows-host-h2-unsigned
           path: personal/windows-host/build/Release/JerisLinkHost.exe

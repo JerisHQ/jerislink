@@ -80,8 +80,11 @@ constexpr std::array<Item, 7> kFocusOrder{Item::Mute,     Item::Volume, Item::In
 
 // Tooltip for an item: a Win32 tooltip on hover, and the hint row while the
 // item is hot or keyboard-focused. nullptr for items without one.
-inline const wchar_t* tooltipFor(Item item) {
-    return item == Item::ForceQuit ? L"Force Quit Mac apps (Cmd+Option+Esc)" : nullptr;
+// windowsHost (H2, the host sent HOST_INFO platform 2): the same button
+// opens Task Manager on the Windows PC.
+inline const wchar_t* tooltipFor(Item item, bool windowsHost = false) {
+    if (item != Item::ForceQuit) return nullptr;
+    return windowsHost ? L"Open Task Manager (Ctrl+Shift+Esc)" : L"Force Quit Mac apps (Cmd+Option+Esc)";
 }
 
 // Next item in kFocusOrder (dir +1) or previous (dir -1), wrapping. From

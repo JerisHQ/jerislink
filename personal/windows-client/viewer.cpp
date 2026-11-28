@@ -44,6 +44,7 @@
 #include "send_to_win.hpp"
 #include "h264_nal_summary.hpp"
 #include "keymap.hpp"
+#include "key_holdback.hpp"
 #include "udp_tag.hpp"
 
 #include <algorithm>
@@ -127,6 +128,11 @@ public:
             closesocket(s_); s_ = INVALID_SOCKET;
             throw std::runtime_error("mouse UDP bind failed");
         }
+        // H2: the port the host sees these datagrams come from; 0 if
+        // unknown (the host then takes a click's position only).
+        sockaddr_in bound{};
+        int boundLen = sizeof(bound);
+        if (getsockname(s_, reinterpret_cast<sockaddr*>(&bound), &boundLen) == 0) localPort_ = ntohs(bound.sin_port);
 
         remote_.sin_family = AF_INET;
         remote_.sin_port = htons(port);
@@ -173,11 +179,19 @@ public:
     // but sends no pointer moves.
     void setInputEnabled(bool on) { inputEnabled_ = on; }
     bool inputEnabled() const { return inputEnabled_; }
+    // H2: MRM1 seq of the newest pointer datagram (UI thread), for the
+    // POINTER_SYNC in front of a click (control_channel.hpp notePointer).
+    uint32_t lastPointerSeq() const { return lastPointerSeq_; }
+    // H2 (Pepper's review of 8f8a33b, item 5a): this socket's local port.
+    // Its seq starts at 1, so the host needs the port to know which
+    // session a POINTER_SYNC's seq belongs to.
+    uint16_t localPort() const { return localPort_; }
 
     bool sendNormalized(uint16_t nx, uint16_t ny) {
         if (s_ == INVALID_SOCKET) return false;
         if (!inputEnabled_) { ++inputBlocked_; return false; }
         const uint32_t seq = ++sequence_;
+        lastPointerSeq_ = seq;
         uint8_t p[14]{
             'M','R','M','1', 1, 0x24,
             uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq),
@@ -364,6 +378,8 @@ private:
     WSAEVENT event_ = WSA_INVALID_EVENT;
     sockaddr_in remote_{};
     uint32_t sequence_ = 0;
+    uint32_t lastPointerSeq_ = 0;  // UI thread only
+    uint16_t localPort_ = 0;
     uint64_t sent_ = 0;
     uint64_t dropped_ = 0;
     std::chrono::steady_clock::time_point lastKeyframeRequest_{};
@@ -420,6 +436,22 @@ static constexpr UINT WM_MR_AUTH_PREFLIGHT = WM_APP + 0x60;  // launch screen, w
 // Remapped-shortcut state: the key owned until its physical key-up and the
 // remote modifier released for it; keymap.hpp.
 static jl::keymap::Translator gKeys;
+// H2 (design D10): the host of this session sent HOST_INFO platform 2. Keys
+// then go through as the Windows keys they are (keymap.hpp pass-through) and
+// the words say Windows PC. Reset at each session start: no HOST_INFO is a
+// Mac.
+static bool gHostWindows = false;
+static const wchar_t* hostNoun() { return gHostWindows ? L"Windows PC" : L"Mac"; }
+// H2 (Pepper's H2 review, item 4): a VIDEO_CONFIG ACK was read this session,
+// so gHostWindows is what the host is, not the default. Until then keys are
+// held back (holdBack*): a shortcut would go out in the wrong layout. A
+// chord held back stays held back after the ACK until its keys are up
+// (key_holdback.hpp; Pepper's review of 8f8a33b, item 4a).
+static bool gHostPlatformKnown = false;
+static jl::holdback::KeyHoldBack gHoldBack;
+// The only place the hook's state is reset: the held-back Windows key goes
+// with it (key_holdback.hpp, resetHook; Pepper's review of f97ad11, item 2).
+static void resetKeyboardHookState() { jl::holdback::resetHook(gHookFilter, gHoldBack); }
 static uint8_t gLeftClickCount = 1;
 // Buttons sent down to the host and not yet up: every down gets one up.
 static RemoteButtons gRemoteButtons;
@@ -579,6 +611,9 @@ static HCURSOR cursorForRemoteShape(uint8_t shape) {
     case 9:  id = IDC_HAND; break;
     case 10: id = IDC_NO; break;
     case 11: id = IDC_IBEAM; break;
+    case 12: id = IDC_WAIT; break;         // H2, Windows host: busy
+    case 13: id = IDC_APPSTARTING; break;  // H2: working in background
+    case 14: id = IDC_SIZEALL; break;      // H2: move
     default: id = IDC_ARROW; break;
     }
     return LoadCursorW(nullptr, id);
@@ -729,9 +764,17 @@ static bool sendAbsolutePointer(HWND hwnd, POINT p) {
     const double ny = static_cast<double>(p.y - dy) / std::max(1, dh - 1);
     const uint16_t qx = static_cast<uint16_t>(std::clamp<long>(std::lround(nx * 65535.0), 0, 65535));
     const uint16_t qy = static_cast<uint16_t>(std::clamp<long>(std::lround(ny * 65535.0), 0, 65535));
-    // A click that waits for a control reconnect is queued with this.
-    if (gControl) gControl->notePointer(qx, qy);
-    if (udpInput) return gMouseMoveUdp->sendNormalized(qx, qy);
+    // A click that waits for a control reconnect is queued with this. H2:
+    // with the seq of its datagram, for the POINTER_SYNC of a Windows host.
+    // H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes these
+    // moves only from the UDP socket its input owner named, so the channel
+    // names it once per control connection (notePointerUdp).
+    if (udpInput) {
+        const bool ok = gMouseMoveUdp->sendNormalized(qx, qy);
+        if (gControl) gControl->notePointerUdp(qx, qy, gMouseMoveUdp->lastPointerSeq(), gMouseMoveUdp->localPort());
+        return ok;
+    }
+    gControl->notePointer(qx, qy);
     return gControl->sendMouseMoveNormalized(qx, qy);
 }
 
@@ -754,6 +797,100 @@ static void releaseRemoteModifiers() {
     gPasteGate.modifiersReleased();
     if (!gControl) return;
     for (const auto& e : jl::keymap::releaseAllModifiers()) gControl->sendKey(e.down, e.semantic);
+}
+
+static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
+// H2: what the host said it is (MRC1 0x06 HOST_INFO), read with the
+// VIDEO_CONFIG ACK at start-up or on a renegotiation (a read-only view's, or
+// an interactive view's whose start-up exchange failed). Windows: the keymap goes
+// to pass-through (the saved preset stays and still applies to Mac hosts).
+// A switch mid-session releases remote modifiers first. Logs the platform,
+// capabilities and version only.
+static void applyHostInfo(const jl::hostinfo::Info& info, const char* via) {
+    const bool win = info.windows();
+    const bool changed = win != gHostWindows;
+    if (changed && via != std::string("startup")) releaseRemoteModifiers();
+    gHostWindows = win;
+    gHostPlatformKnown = true;
+    if (changed) gKeys.setPassthrough(win);
+    // H2 (Pepper's H2 review, item 5): clicks carry their position. The
+    // control channel set this from the same ACK, before any queued click
+    // went out (Pepper's review of 8f8a33b, item 5b).
+    const bool sync = gControl && gControl->pointerSync();
+    char caps[16];
+    std::snprintf(caps, sizeof(caps), "0x%02x", unsigned(info.caps));
+    logLine(std::string("host.info via=") + via +
+            " platform=" + (win ? "windows" : info.platform == jl::hostinfo::kPlatformMac ? "macos" : "unknown") +
+            " format=" + std::to_string(info.format) + " caps=" + caps +
+            " monitors=" + std::to_string(info.monitors) + " version=" + info.version +
+            " keymap=" + (gKeys.passthrough() ? "passthrough" : jl::keymap::presetName(gKeys.preset())) +
+            " pointer_sync=" + (sync ? "on" : "off") +
+            " liveness=" + (gControl && gControl->liveness() ? "on" : "off"));
+    if (changed && gOverlayTip) {
+        TTTOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.hwnd = GetParent(gOverlayTip);
+        ti.uId = 1;
+        ti.lpszText = const_cast<wchar_t*>(jl::overlay::tooltipFor(jl::overlay::Item::ForceQuit, gHostWindows));
+        SendMessageW(gOverlayTip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
+}
+
+// H2 (Pepper's H2 review, item 4): an ACK (start-up or a renegotiation
+// on a new control session) says what the host is: its HOST_INFO, or none
+// for a Mac. Keys go out from here on.
+static void noteHostPlatform(const std::optional<jl::hostinfo::Info>& info, const char* via) {
+    const bool first = !gHostPlatformKnown;
+    if (info) {
+        applyHostInfo(*info, via);
+    } else if (first) {
+        gHostPlatformKnown = true;
+        logLine(std::string("host.platform via=") + via + " platform=macos reason=no_host_info");
+    }
+    if (first && gHoldBack.heldBack())
+        logLine("input.keys_released_hold held_back=" + std::to_string(gHoldBack.heldBack()) + " via=" + via);
+}
+
+// Is this key down now, whatever window got its messages (a held-back key
+// whose up went elsewhere does not keep a chord open).
+static bool keyDownNow(uint32_t vk) {
+    return (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+}
+
+// H2 (Pepper's H2 review, item 4): no ACK yet (the start-up exchange
+// failed), so the keymap is not known to be the right one: the key is not
+// sent (its up neither) and the session is asked for, which renegotiates.
+// Item 4a of the review of 8f8a33b: nor is anything pressed while a chord
+// held back is still down. Logs the first of each reason in a session.
+static bool heldBack(jl::holdback::Reason r, const char* what) {
+    using jl::holdback::Reason;
+    if (r == Reason::None) return false;
+    static bool loggedUnknown = false, loggedChord = false;
+    if (gHoldBack.heldBack() <= 1) loggedUnknown = loggedChord = false;  // a new session
+    bool& logged = r == Reason::PlatformUnknown ? loggedUnknown : loggedChord;
+    if (!logged) {
+        logged = true;
+        logLine(std::string("input.key_held_back reason=") +
+                (r == Reason::PlatformUnknown ? "platform_unknown" : "chord_open") + " first=" + what);
+    }
+    if (r == Reason::PlatformUnknown) gControl->keepSession();
+    return true;
+}
+static bool holdBackKey(uint32_t vk, bool repeat, const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.keyDown(vk, repeat, gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackWin(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.winDown(gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackHookTap(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.hookTap(gHostPlatformKnown, keyDownNow), what);
+}
+static bool holdBackButton(const char* what) {
+    if (!gControl) return false;
+    return heldBack(gHoldBack.buttonDown(keyDownNow), what);
 }
 
 static void sendRemoteButtonUp(uint8_t button) {
@@ -2122,7 +2259,6 @@ static void runSessionModalTick() {
 namespace ov = jl::overlay;
 
 static HWND gOverlay = nullptr;
-static HWND gOverlayTip = nullptr;  // Win32 tooltip on the Force Quit button
 static bool gOverlayKeyboard = false;  // opened with Ctrl+Alt+O: focus ring, keys
 static ov::Item gOverlayFocus = ov::Item::Mute;
 static ov::Item gOverlayHot = ov::Item::None;
@@ -2275,6 +2411,8 @@ static void filePanelToggle(const char* source);  // F4, below
 // Accessibility instead. Every remote modifier is released first and the
 // local shortcut state is reset like on focus loss, so nothing stays held on
 // either side. A host without 0x60 logs it as unknown and does nothing.
+// H2: a Windows host answers the same 0x60 by pressing Ctrl+Shift+Esc there
+// (Task Manager); the button says so (gHostWindows).
 // overlay.action item=force_quit records that the button was used.
 static void forceQuitMac() {
     gKeys.reset();
@@ -2313,7 +2451,7 @@ static void overlayActivate(ov::Item item, const char* source) {
         filePanelToggle(source);
         break;
     case ov::Item::ForceQuit:
-        overlayHide("action");  // so the Mac's Force Quit window is in view
+        overlayHide("action");  // so the Force Quit window (Task Manager) is in view
         forceQuitMac();
         break;
     case ov::Item::Disconnect:
@@ -2516,7 +2654,7 @@ static void paintOverlay(HWND hwnd) {
     overlayText(dc, L"Connected", RECT{st.left + dot + s(8), st.top, st.right, mid}, t.label,
                 c::kText, DT_LEFT | DT_VCENTER);
     const std::wstring host = gSessionHostLabel.empty()
-        ? std::wstring(L"Mac") : L"Mac " + wideFromAscii(gSessionHostLabel);
+        ? std::wstring(hostNoun()) : std::wstring(hostNoun()) + L" " + wideFromAscii(gSessionHostLabel);
     overlayText(dc, host, RECT{st.left, mid, st.right, st.bottom}, t.smallText, c::kMuted,
                 DT_LEFT | DT_VCENTER);
 
@@ -2559,7 +2697,8 @@ static void paintOverlay(HWND hwnd) {
     overlayButton(dc, toRECT(l.info), L"Info", ov::Item::Info, c::kText, dpi);
     overlayButton(dc, toRECT(l.settings), L"Settings", ov::Item::Settings, c::kText, dpi);
     overlayButton(dc, toRECT(l.files), L"Files", ov::Item::Files, c::kText, dpi);
-    overlayButton(dc, toRECT(l.forceQuit), L"Force Quit", ov::Item::ForceQuit, c::kText, dpi);
+    overlayButton(dc, toRECT(l.forceQuit), gHostWindows ? L"Task Manager" : L"Force Quit", ov::Item::ForceQuit,
+                  c::kText, dpi);
     overlayButton(dc, toRECT(l.disconnect), L"Disconnect", ov::Item::Disconnect, c::kError, dpi);
 
     if (gOverlayKeyboard) {
@@ -2580,13 +2719,14 @@ static void paintOverlay(HWND hwnd) {
     jl::ui::fillRect(dc, RECT{l.hint.left, l.bar.bottom - 1, l.hint.right, l.bar.bottom},
                      c::kBorder);
     // The hovered (or keyboard-focused) item's tooltip replaces the hint.
-    const wchar_t* tip = ov::tooltipFor(gOverlayHot);
-    if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus);
+    const wchar_t* tip = ov::tooltipFor(gOverlayHot, gHostWindows);
+    if (!tip && gOverlayKeyboard) tip = ov::tooltipFor(gOverlayFocus, gHostWindows);
     // Host in transition mode (design §8): the idle hint becomes a yellow
     // warning that anyone on the allowed IP can connect without a password.
     const auto authNow = jl::auth::current();
     if (!tip && authNow && authNow->transition()) {
-        overlayText(dc, L"No connection password set on this Mac (IP check only)",
+        overlayText(dc, gHostWindows ? L"No connection password set on this PC (IP check only)"
+                                     : L"No connection password set on this Mac (IP check only)",
                     toRECT(l.hint), t.smallText, c::kWarning, DT_LEFT | DT_VCENTER);
     } else {
         overlayText(dc,
@@ -2737,7 +2877,7 @@ static void overlayCreate(HWND viewer) {
         ti.uFlags = TTF_SUBCLASS;
         ti.hwnd = gOverlay;
         ti.uId = 1;
-        ti.lpszText = const_cast<wchar_t*>(ov::tooltipFor(ov::Item::ForceQuit));
+        ti.lpszText = const_cast<wchar_t*>(ov::tooltipFor(ov::Item::ForceQuit, gHostWindows));
         SendMessageW(gOverlayTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
     } else {
         logLine("overlay.tooltip_failed error=" + std::to_string(GetLastError()));
@@ -3349,7 +3489,7 @@ static void fileConfirmShow(const char* source) {
     gConfirmKeys.reset();
     gConfirmHot = -1;
     // Nothing goes to the Mac while it is open: lift what is held there now.
-    gHookFilter.reset();
+    resetKeyboardHookState();
     gKeys.reset();
     releaseRemoteButtons("file_confirm");
     releaseRemoteModifiers();
@@ -3628,7 +3768,7 @@ static void filePanelShow(const char* source) {
     gPanelKeys.reset();
     gPanelHot = fp::Button::None;
     // Nothing goes to the Mac while it is open: lift what is held there now.
-    gHookFilter.reset();
+    resetKeyboardHookState();
     gKeys.reset();
     releaseRemoteButtons("file_panel");
     releaseRemoteModifiers();
@@ -4021,7 +4161,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gViewerFocused = false;
         gHaveMouse = false;
         gPasteGate.abandon();  // a held paste never lands after focus left
-        gHookFilter.reset();
+        resetKeyboardHookState();  // H2: the hook will not send the Windows key's up now
         gKeys.reset();
         discardQueuedInput("focus_kill");
         releaseRemoteButtons("focus_kill");
@@ -4074,6 +4214,11 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         // (not auto-repeat, not the pointer) starts a new round.
         if (ControlChannel::isFreshKeyDown(static_cast<uint64_t>(lParam)) && gControl->resumeOnUserKey())
             logLine("control.resume reason=fresh_key");
+        // H2 (item 4): a key held back stays held back until its up, auto-
+        // repeat included, so the host never gets a down without its up;
+        // and so does a key pressed while a held-back chord is still down
+        // (item 4a of the review of 8f8a33b).
+        if (holdBackKey(static_cast<uint32_t>(wParam), repeat, "key")) return 0;
         // Keyboard preset, Win+Space, Win+C, Ctrl compat shortcuts, Ctrl+Y and
         // plain keys: keymap.hpp.
         const auto out = gKeys.keyDown(static_cast<uint32_t>(wParam), repeat, heldModifiers());
@@ -4087,6 +4232,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             gOverlaySwallowUp.reset(static_cast<size_t>(wParam));
             return 0;
         }
+        if (gHoldBack.keyUp(static_cast<uint32_t>(wParam))) return 0;  // H2: its down was held back
         if (!viewerHasInteractiveFocus(hwnd) || !gControl) break;
         const auto out = gKeys.keyUp(static_cast<uint32_t>(wParam), heldModifiers());
         if (!out.handled) break;
@@ -4096,12 +4242,16 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     // Posted by the low-level hook, which owns the Windows key and Caps Lock
     // while the viewer is focused.
     case WM_MR_WIN_DOWN:
-        if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(gKeys.hookWinDown());
+        if (viewerHasInteractiveFocus(hwnd)) {
+            if (!holdBackWin("win")) sendKeyOutput(gKeys.hookWinDown());  // H2 (item 4)
+        }
         return 0;
     case WM_MR_WIN_UP:
+        if (gHoldBack.winUp()) return 0;
         sendKeyOutput(gKeys.hookWinUp());
         return 0;
     case WM_MR_WIN_C:
+        if (holdBackHookTap("win_c")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinC(gHookFilter.winDown()));
         }
@@ -4109,11 +4259,13 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_MR_WIN_SPACE:
         // Windows+Space becomes native macOS Control+Space for switching
         // input sources (Parsec muscle memory), in both keyboard presets.
+        if (holdBackHookTap("win_space")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) {
             sendKeyOutput(gKeys.hookWinSpace(gHookFilter.winDown()));
         }
         return 0;
     case WM_MR_CAPS_LOCK:
+        if (holdBackHookTap("caps_lock")) return 0;
         if (viewerHasInteractiveFocus(hwnd)) sendKeyOutput(jl::keymap::Translator::hookCapsLock());
         return 0;
     case WM_SETCURSOR:
@@ -4144,6 +4296,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (viewerHasInteractiveFocus(hwnd) && gControl) {
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
+            if (holdBackButton("button")) return 0;  // H2 (item 4a): its up is not sent either
             gLeftClickCount = msg == WM_LBUTTONDBLCLK ? 2 : 1;
             SetCapture(hwnd);
             gControl->sendMouseButtonExtended(0, true, gLeftClickCount);
@@ -4161,6 +4314,7 @@ static LRESULT viewerWndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             const uint8_t button = msg == WM_RBUTTONDOWN ? 1 : 2;
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             sendAbsolutePointer(hwnd, p);
+            if (holdBackButton("button")) return 0;  // H2 (item 4a): its up is not sent either
             SetCapture(hwnd);
             gControl->sendMouseButton(button, true);
             gRemoteButtons.down(button);
@@ -6187,6 +6341,13 @@ static int appMain(int argc, char** argv) {
         {
             control = std::make_unique<ControlChannel>(o.bindIp, o.sourceIp, o.controlPort);
             gControl = o.controlEnabled ? control.get() : nullptr;
+            // H2: a Mac until the host says otherwise (HOST_INFO); keys wait
+            // until an ACK said which (item 4).
+            gHostWindows = false;
+            gHostPlatformKnown = false;
+            gHoldBack.reset();
+            gKeys.setPassthrough(false);
+            control->setPointerSync(false);
             if (!o.controlEnabled) logLine("control.read_only input=off clipboard=off file=off session=kept");
             // Startup negotiation may traverse a degraded Tailscale/DERP path.
             // Give the initial handshake enough headroom, then restore the
@@ -6212,6 +6373,7 @@ static int appMain(int argc, char** argv) {
 
                 const auto videoConfig = control->negotiateVideo(
                     o.codec, h264Supported, hevcSupported, o.bitrateMbps, o.audio == "on");
+                if (videoConfig.acked) noteHostPlatform(videoConfig.hostInfo, "startup");
                 if (videoConfig.negotiated) {
                     videoNegotiatedAtStart = true;
                     effectiveCodec = videoConfig.codec;
@@ -6357,12 +6519,16 @@ static int appMain(int argc, char** argv) {
         // reconnect worker (never the UI thread). It asks for what the
         // session already runs, so the Mac keeps the stream as it is; the
         // loop below applies what the ACK says now (audio).
-        if (control && !o.controlEnabled) {
+        // H2 (Pepper's H2 review, item 4): so does an interactive view whose
+        // start-up exchange got no ACK, until one says what the host is; the
+        // loop below then turns it off.
+        if (control && (!o.controlEnabled || !gHostPlatformKnown)) {
             const bool hevcNow = effectiveCodec == "hevc";
             const uint16_t bitrateNow = videoNegotiatedAtStart ? effectiveBitrateMbps : o.bitrateMbps;
             control->setRenegotiateOnReconnect(effectiveCodec, h264Supported, hevcNow, bitrateNow, o.audio == "on");
             logLine("video.renegotiate_on_reconnect codec=" + effectiveCodec +
-                    " bitrate_mbps=" + std::to_string(bitrateNow));
+                    " bitrate_mbps=" + std::to_string(bitrateNow) +
+                    (o.controlEnabled ? " reason=host_platform_unknown" : ""));
         }
         // Hand tests only: JERISLINK_TEST_FLUSH_HOLD_MS (1-5000) holds each
         // event the reconnect worker took from the queue for that long
@@ -6596,6 +6762,12 @@ static int appMain(int argc, char** argv) {
                 mouseMoveUdp->sendPing();
                 lastPing = now;
             }
+            // H2 r9 (Pepper's review of 0d74abe, item 1): to a Windows host,
+            // a liveness ping on the control connection every second, from
+            // this (the input) thread: a hung viewer stops sending them and
+            // the host lets go of its keys and buttons. Not a read-only view
+            // (no gControl: it never holds anything).
+            if (gControl) gControl->livenessTick(now);
             if (audio && now - lastAudioRequest >= std::chrono::seconds(1)) {
                 // Keep-alive: the host stops capturing 3 s after the last request.
                 mouseMoveUdp->sendAudioRequest(true, audio->port());
@@ -6729,6 +6901,7 @@ static int appMain(int argc, char** argv) {
                         // renegotiated on a new control session; apply what
                         // the Mac offers now. Nothing here waits.
                         if (const auto vc = control->takeRenegotiated()) {
+                            if (vc->acked) noteHostPlatform(vc->hostInfo, "renegotiate");
                             if (vc->negotiated && vc->codec == effectiveCodec) {
                                 hostSupportsAudio = vc->hostSupportsAudio;
                                 // NACK stays as the start set it: the
@@ -6748,6 +6921,20 @@ static int appMain(int argc, char** argv) {
                                 logLine(std::string("video.renegotiate_refused negotiated=") + (vc->negotiated ? "yes" : "no") +
                                         " codec=" + vc->codec + " running=" + effectiveCodec + " audio=unchanged");
                             }
+                        }
+                    } else if (!gHostPlatformKnown) {
+                        // H2 (Pepper's H2 review, item 4): the start-up
+                        // exchange got no ACK. A new control session
+                        // renegotiates (worker) and its ACK says what the
+                        // host is; until then keys wait, so the session is
+                        // brought back here as for a read-only view.
+                        if (const auto vc = control->takeRenegotiated()) {
+                            noteHostPlatform(vc->hostInfo, "renegotiate");
+                            control->clearRenegotiateOnReconnect();
+                            logLine(std::string("video.renegotiate_on_reconnect off reason=host_platform_known negotiated=") +
+                                    (vc->negotiated ? "yes" : "no"));
+                        } else {
+                            control->keepSession();
                         }
                     }
                 }
@@ -6948,8 +7135,8 @@ static int appMain(int argc, char** argv) {
                         // Back to the launch screen with the reason.
                         gRelaunch = true;
                         gRelaunchNote = gotAny
-                            ? L"The connection was lost: no video from the Mac for a while."
-                            : L"The Mac did not answer. Check that the JerisLink host is running.";
+                            ? std::wstring(L"The connection was lost: no video from the ") + hostNoun() + L" for a while."
+                            : std::wstring(L"The ") + hostNoun() + L" did not answer. Check that the JerisLink host is running.";
                         logLine(gotAny ? "session.end reason=idle-timeout"
                                        : "session.end reason=startup-timeout");
                         break;
@@ -7106,6 +7293,9 @@ static int appMain(int argc, char** argv) {
                 << " control_cancelled_in_flight=" << (control ? control->reconnectStats().cancelledInFlight : 0)
                 << " control_owed_before_input=" << (control ? control->reconnectStats().owedBeforeInput : 0)
                 << " control_paused_drops=" << (control ? control->reconnectStats().pausedDrops : 0)
+                << " control_liveness_pings=" << (control ? control->reconnectStats().livenessPings : 0)
+                << " control_pongs=" << (control ? control->reconnectStats().pongs : 0)
+                << " control_pointer_binds=" << (control ? control->reconnectStats().pointerBinds : 0)
                 << " mouse_udp_tx=" << (mouseMoveUdp ? mouseMoveUdp->sent() : 0)
                 << " mouse_udp_drops=" << (mouseMoveUdp ? mouseMoveUdp->dropped() : 0)
                 << " mouse_udp_input_blocked=" << (mouseMoveUdp ? mouseMoveUdp->inputBlocked() : 0)

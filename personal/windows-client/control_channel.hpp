@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "conn_auth.hpp"
+#include "host_info.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,6 +32,11 @@ struct VideoConfigResult {
     uint16_t bitrateMbps = 25;
     uint16_t remoteWidth = 0;
     uint16_t remoteHeight = 0;
+    // H2 (Pepper's H2 review, items 1 and 4): an ACK was read, so what
+    // kind of host this is is known: hostInfo when the ACK said a HOST_INFO
+    // follows (a Windows host; read right there), none for a macOS host.
+    bool acked = false;
+    std::optional<jl::hostinfo::Info> hostInfo;
 };
 
 class ControlChannel {
@@ -100,6 +106,24 @@ public:
             auto a = std::make_shared<Async>();
             a->s = s_;
             s_ = INVALID_SOCKET;
+            a->pointerSync = pointerSync_.load(std::memory_order_relaxed);
+            a->liveness = liveness_.load(std::memory_order_relaxed);
+            // H2 r10 (Pepper's review of f919167, item 1): the start-up
+            // connection gets a liveness ping as it is adopted, before the
+            // UI thread can send any input on it (viewer.cpp pumps messages
+            // before its first livenessTick). Its first frame was the
+            // start-up ping, so this one counts. Nothing else uses the
+            // socket yet; a failed send hands it over like any live send.
+            bool lost = false;
+            if (a->liveness && a->s != INVALID_SOCKET) {
+                if (sendAllOn(a->s, livenessPings(1))) {
+                    ++a->stats.livenessPings;
+                    a->lastLivenessPing = std::chrono::steady_clock::now();
+                } else {
+                    lost = true;
+                }
+            }
+            if (lost) handOverForNoticeLocked(*a, a->s);  // no worker yet: nothing else holds a
             a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
             async_ = std::move(a);
         } else {
@@ -107,6 +131,8 @@ public:
             std::shared_ptr<Async> a = std::move(async_);
             std::lock_guard<std::mutex> g(a->m);
             closeSocket(a->s);
+            pointerSync_.store(a->pointerSync, std::memory_order_relaxed);
+            liveness_.store(a->liveness, std::memory_order_relaxed);
         }
     }
 
@@ -131,6 +157,9 @@ public:
         uint64_t noticeReads = 0;        // r5: failed live connections handed to the worker for the notice
         uint64_t renegotiations = 0;     // r5: background VIDEO_CONFIG exchanges that got an ACK
         uint64_t renegotiateFailures = 0;  // r5: those without one (connection closed, tried again)
+        uint64_t livenessPings = 0;      // H2 r9: liveness pings sent (UI thread, and two per new connection)
+        uint64_t pongs = 0;              // H2 r9: their pongs, read and dropped
+        uint64_t pointerBinds = 0;       // H2 r9: MRM1 sockets named to the host (0x27 then 0x24)
         bool pausedNow = false;    // r6: paused right now
         bool live = false;         // r14: a connection is up right now
         bool connecting = false;
@@ -267,8 +296,156 @@ public:
     // Mac, by UDP or TCP. A click that has to wait for a reconnect is
     // queued right after this position, so it lands where it was made,
     // not wherever the Mac cursor is when the queue is flushed.
-    void notePointer(uint16_t nx, uint16_t ny) {
+    // H2: `seq` is the MRM1 seq of the UDP datagram that carried it and
+    // `port` the local port of the UDP socket that sent it (both 0: sent
+    // by TCP). Each new UDP socket starts its seq over, so the host needs
+    // both to know which moves are older (Pepper's review of 8f8a33b, item
+    // 5a).
+    void notePointer(uint16_t nx, uint16_t ny, uint32_t seq = 0, uint16_t port = 0) {
         lastPointer_.store((uint64_t(1) << 32) | (uint64_t(nx) << 16) | uint64_t(ny), std::memory_order_relaxed);
+        lastPointerUdp_.store((uint64_t(port) << 32) | seq, std::memory_order_relaxed);
+    }
+    // H2 (Pepper's H2 review, item 5): the host takes MRC1 0x27
+    // POINTER_SYNC (HOST_INFO cap 0x20, a Windows host). Each button frame
+    // then goes behind one, in the same write: the position the viewer
+    // last showed, the seq of its datagram and that socket's port. The host
+    // moves there before the button and drops older moves of that socket
+    // still in flight by UDP, so a press and its release land where they
+    // were made even when the moves are late or lost. Off (a macOS host):
+    // as before.
+    // The channel sets this itself from every VIDEO_CONFIG ACK it reads,
+    // the start-up one (negotiateVideo) and each renegotiation's on the
+    // worker, before that connection's queue is flushed (Pepper's review of
+    // 8f8a33b, item 5b). A queued click keeps its 0x24 position and gets the
+    // 0x27 only when it goes out (flushOneLocked), from what the ACK of
+    // that connection said. setPointerSync: the session start and tests.
+    void setPointerSync(bool on) {
+        if (!async_) {
+            pointerSync_.store(on, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->pointerSync = on;
+    }
+    bool pointerSync() const {
+        if (!async_) return pointerSync_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(async_->m);
+        return async_->pointerSync;
+    }
+    // H2 r9 (Pepper's review of 0d74abe, item 1): liveness pings, on for a
+    // Windows host (jl::hostinfo::livenessFor). Set like POINTER_SYNC, from
+    // every ACK the channel reads; setLiveness: tests.
+    void setLiveness(bool on) {
+        if (!async_) {
+            liveness_.store(on, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->liveness = on;
+    }
+    bool liveness() const {
+        if (!async_) return liveness_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(async_->m);
+        return async_->liveness;
+    }
+
+    // H2 r9 (Pepper's review of 0d74abe, item 1): a hung viewer app keeps
+    // its TCP connection up (its OS answers keep-alive), so a Windows host
+    // cannot tell it from a live one by TCP and would keep its keys down.
+    // So the viewer's UI thread, the one that sends input, calls this from
+    // its loop (viewer.cpp sendKeepAlives, which the modal-loop tick runs
+    // too), and it sends the existing MRC1 ping (0x01) on the live control
+    // connection every kLivenessPingMs. The host lets go of what this
+    // viewer holds once they stop (host_protocol.hpp kLivenessTimeoutMs,
+    // 5 s: five missed pings). Never from another thread: a ping says the
+    // input thread runs. Only with liveness on (a Windows host; a macOS
+    // host gets none). Nothing while a reconnect runs or input waits for
+    // one (the worker pings a new connection itself before its input), and
+    // never queued. Its pong is read and dropped by pollHostNotice. True
+    // when one went out.
+    static constexpr int kLivenessPingMs = 1000;
+    bool livenessTick(std::chrono::steady_clock::time_point now) {
+        std::shared_ptr<Async> a = async_;
+        if (!a) return false;
+        SOCKET live = INVALID_SOCKET;
+        bool failNow = false;  // tests
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (!a->liveness || a->stopping || a->connecting || !a->queue.empty() || a->s == INVALID_SOCKET)
+                return false;
+            if (now - a->lastLivenessPing < std::chrono::milliseconds(kLivenessPingMs)) return false;
+            live = a->s;
+            a->lastLivenessPing = now;
+            if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
+        }
+        if (!failNow && sendAllOn(live, livenessPings(1))) {
+            std::lock_guard<std::mutex> g(a->m);
+            ++a->stats.livenessPings;
+            return true;
+        }
+        // As a failed input send: the worker reads a notice still arriving
+        // and closes it; the next input reconnects.
+        std::lock_guard<std::mutex> g(a->m);
+        handOverForNoticeLocked(*a, live);
+        return false;
+    }
+
+    // H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes MRM1
+    // pointer moves only from its input owner's own UDP socket, the one a
+    // POINTER_SYNC (0x27) on the owner's control connection named; until
+    // then it drops them. viewer.cpp calls this for each move it sent by
+    // UDP (seq: that datagram's MRM1 seq, port: the UDP socket's local
+    // port). It notes the position (notePointer) and, with POINTER_SYNC on,
+    // names the socket on the live connection once, when the connection or
+    // the port is new: 0x27 with this move (position, seq, port), then 0x24
+    // at the same position, since a 0x27 waits on the host for the next
+    // input frame. It is input like a key: the host makes this connection
+    // the owner (the newer connection wins). Not while a reconnect runs or
+    // input waits for one, nor while ups are owed: a later move does it,
+    // and a click carries its 0x27 anyway. No live connection and none
+    // being made: a reconnect is asked for (keepSession), since without
+    // one the host moves nothing. True when the 0x27 went out.
+    bool notePointerUdp(uint16_t nx, uint16_t ny, uint32_t seq, uint16_t port) {
+        notePointer(nx, ny, seq, port);
+        std::shared_ptr<Async> a = async_;
+        if (!a || !port) return false;
+        enum class Need { None, Bind, Connect };
+        const auto need = [&] {
+            if (!a->pointerSync || a->stopping || a->connecting || !a->queue.empty()) return Need::None;
+            if (a->s == INVALID_SOCKET) return Need::Connect;
+            if (hasOwedLocked(*a) || (a->boundGen == a->liveGen && a->boundPort == port)) return Need::None;
+            return Need::Bind;
+        };
+        Need n;
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            n = need();
+        }
+        if (n == Need::Connect) keepSession();
+        if (n != Need::Bind) return false;
+        pollHostNotice();  // as sendQueued: a "replaced" notice ends the attempt first
+        SOCKET live = INVALID_SOCKET;
+        bool failNow = false;  // tests
+        {
+            std::lock_guard<std::mutex> g(a->m);
+            if (need() != Need::Bind) return false;
+            live = a->s;
+            a->boundGen = a->liveGen;
+            a->boundPort = port;
+            if (a->failLiveSends > 0) { --a->failLiveSends; failNow = true; }
+        }
+        const std::vector<uint8_t> pos =
+            packet(0x24, {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)});
+        std::vector<uint8_t> wire = withPointerSync(pos, (uint64_t(port) << 32) | seq);
+        wire.insert(wire.end(), pos.begin(), pos.end());
+        if (!failNow && sendAllOn(live, wire)) {
+            std::lock_guard<std::mutex> g(a->m);
+            ++a->stats.pointerBinds;
+            return true;
+        }
+        std::lock_guard<std::mutex> g(a->m);
+        handOverForNoticeLocked(*a, live);  // the next connection is named afresh (liveGen)
+        return false;
     }
     ReconnectStats reconnectStats() const {
         if (!async_) return {};
@@ -376,6 +553,9 @@ public:
         // 0x04: this viewer wants audio. Informational for the host log; the
         // audio itself starts with MRM1 0x45 on the video process.
         if (clientAudio) caps |= 0x04;
+        // H2: this viewer reads a HOST_INFO behind the ACK (a Windows host
+        // sends one only when asked; the macOS host ignores the bit).
+        caps |= jl::hostinfo::kViewerCapHostInfo;
         return {1, codec, caps, 0, uint8_t(requestedBitrateMbps >> 8), uint8_t(requestedBitrateMbps)};
     }
 
@@ -414,20 +594,40 @@ public:
         uint16_t len = uint16_t((uint16_t(h[6]) << 8) | h[7]);
         std::vector<uint8_t> reply(len);
         if (len && !recvAck(reply.data(), len)) return VideoExchange::Failed;
-        DWORD normalTimeoutMs = ioTimeoutMs;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
-                   sizeof(normalTimeoutMs));
         if (len == 1) {
             uint8_t frame[kHostNoticeBytes]{};
             std::copy(h, h + 8, frame);
             frame[8] = reply[0];
             if (isReplacedNotice(frame, kHostNoticeBytes)) return VideoExchange::Replaced;
         }
+        // H2: an 11-byte ACK only when this request asked for HOST_INFO.
+        const bool askedHostInfo = payload.size() > 2 && (payload[2] & jl::hostinfo::kViewerCapHostInfo) != 0;
         if (!(h[0]=='M' && h[1]=='R' && h[2]=='C' && h[3]=='1' &&
               h[4]==1 && h[5]==0x41 &&
-              (reply.size()==6 || reply.size()==10) && reply[0]==1)) {
+              (reply.size()==6 || reply.size()==10 || (reply.size()==11 && askedHostInfo)) && reply[0]==1)) {
             return VideoExchange::Failed;
         }
+        // H2 (Pepper's H2 review, item 1): the ACK says whether one
+        // HOST_INFO follows (sent in the same write), so it is read here,
+        // whole, and nothing is left on the socket for later reads to trip
+        // over. Not a HOST_INFO frame where one was promised: no ACK.
+        // Pepper's review of 8f8a33b, item 4b: neither is one whose payload
+        // does not decode (a bad format byte, a version longer than the
+        // payload). The ACK promised to say what the host is; taking it
+        // without that would leave the viewer on the Mac keymap.
+        if (reply.size() == 11 && (reply[10] & jl::hostinfo::kAckExtHostInfo)) {
+            uint8_t ih[jl::hostinfo::kHeaderBytes]{};
+            if (!recvAck(ih, sizeof(ih)) || !jl::hostinfo::isFramePrefix(ih, sizeof(ih))) return VideoExchange::Failed;
+            const size_t ilen = (size_t(ih[6]) << 8) | ih[7];
+            std::vector<uint8_t> ip(ilen);
+            if (!recvAck(ip.data(), ilen)) return VideoExchange::Failed;
+            result.hostInfo = jl::hostinfo::decode(ip.data(), ilen);
+            if (!result.hostInfo) return VideoExchange::Failed;
+        }
+        result.acked = true;
+        DWORD normalTimeoutMs = ioTimeoutMs;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&normalTimeoutMs),
+                   sizeof(normalTimeoutMs));
 
         const uint8_t status = reply[1];
         const uint8_t selected = reply[2];
@@ -468,7 +668,12 @@ public:
         if (x == VideoExchange::Replaced) {
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
-        if (x != VideoExchange::Ok) close();
+        if (x != VideoExchange::Ok) {
+            close();
+        } else {
+            setPointerSync(jl::hostinfo::pointerSyncFor(result.hostInfo));  // item 5b
+            setLiveness(jl::hostinfo::livenessFor(result.hostInfo));        // H2 r9, item 1
+        }
         return result;
     }
 
@@ -495,6 +700,21 @@ public:
         if (!async_) return std::nullopt;
         std::lock_guard<std::mutex> g(async_->m);
         return std::exchange(async_->renegotiated, std::nullopt);
+    }
+    // H2 (Pepper's H2 review, item 4): an interactive viewer whose
+    // start-up exchange got no ACK renegotiates on the next connection only
+    // to learn what kind of host it is; once it knows, it stops.
+    void clearRenegotiateOnReconnect() {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->renegotiate.clear();
+    }
+    // Tests (H2): the VIDEO_CONFIG payload the renegotiation sends as is
+    // (a 0.4.x viewer's, without caps 0x08).
+    void setRenegotiatePayloadForTest(std::vector<uint8_t> payload) {
+        if (!async_) return;
+        std::lock_guard<std::mutex> g(async_->m);
+        async_->renegotiate = std::move(payload);
     }
     // Tests (r5): runs on the worker before each renegotiation exchange,
     // without the lock.
@@ -534,22 +754,62 @@ public:
             s = a->s;
         }
         if (s == INVALID_SOCKET) return false;
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(s, &rd);
-        timeval tv{0, 0};
-        if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-        uint8_t b[kHostNoticeBytes]{};
-        const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-        const bool replaced = isReplacedNotice(b, n);
+        // H2 r9: the pongs to the liveness pings go first.
+        uint8_t b[kPongBytes]{};
+        const Peek p = peekPastPongs(s, b);
+        if (p.pongs) {
+            std::lock_guard<std::mutex> g(a->m);
+            a->stats.pongs += p.pongs;
+        }
+        if (!p.readable) return false;
+        const int n = p.n;
+        const bool replaced = isReplacedNotice(b, std::min(n, kHostNoticeBytes));
         if (n > 0 && !replaced) return false;  // partial or other bytes: not ours to read
         if (replaced) {
-            recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+            recv(s, reinterpret_cast<char*>(b), kHostNoticeBytes, 0);
             if (auto c = jl::auth::current()) c->hostReplaced(authChannel_);
         }
         std::lock_guard<std::mutex> g(a->m);
         if (a->s == s) closeSocket(a->s);
         return replaced;
+    }
+
+    // H2 r9: a Windows host answers each liveness ping with a pong (MRC1
+    // 0x02 with the ping's 4 bytes). The whole pongs at the front of what
+    // waits on s are read and dropped, so a "replaced" notice or the close
+    // behind them is still seen; then up to kPongBytes of what is left are
+    // peeked into b (n: recv's result; readable false: nothing waits).
+    static constexpr int kPongBytes = 12;
+    struct Peek {
+        int pongs = 0;
+        bool readable = false;
+        int n = 0;
+    };
+    static bool isPong(const uint8_t* b, int n) {
+        return n >= kPongBytes && b[0] == 'M' && b[1] == 'R' && b[2] == 'C' && b[3] == '1' && b[4] == 1 &&
+               b[5] == 0x02 && b[6] == 0 && b[7] == 4;
+    }
+    static bool isPongPrefix(const uint8_t* b, int n) {
+        static const uint8_t want[8] = {'M', 'R', 'C', '1', 1, 0x02, 0, 4};
+        if (n <= 0 || n >= kPongBytes) return false;
+        for (int i = 0; i < n && i < 8; ++i) if (b[i] != want[i]) return false;
+        return true;
+    }
+    static Peek peekPastPongs(SOCKET s, uint8_t (&b)[kPongBytes]) {
+        Peek p;
+        for (;;) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(s, &rd);
+            timeval tv{0, 0};
+            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return p;
+            p.n = recv(s, reinterpret_cast<char*>(b), kPongBytes, MSG_PEEK);
+            p.readable = true;
+            if (!isPong(b, p.n)) return p;
+            recv(s, reinterpret_cast<char*>(b), kPongBytes, 0);
+            ++p.pongs;
+            p.readable = false;
+        }
     }
 
     static constexpr int kHostNoticeBytes = 9;
@@ -576,19 +836,17 @@ public:
     // r5: run by the worker; `cancel` (stop()) ends the wait.
     static bool readNoticeBeforeClose(SOCKET s, const std::atomic<bool>* cancel = nullptr) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kNoticeWaitMs);
-        uint8_t b[kHostNoticeBytes]{};
+        uint8_t b[kPongBytes]{};
         for (;;) {
-            fd_set rd;
-            FD_ZERO(&rd);
-            FD_SET(s, &rd);
-            timeval tv{0, 0};
-            if (select(0, &rd, nullptr, nullptr, &tv) != 1) return false;
-            const int n = recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), MSG_PEEK);
-            if (isReplacedNotice(b, n)) {
-                recv(s, reinterpret_cast<char*>(b), int(sizeof(b)), 0);
+            // H2 r9: pongs in front of the notice are read and dropped.
+            const Peek p = peekPastPongs(s, b);
+            if (!p.readable) return false;
+            const int n = p.n;
+            if (isReplacedNotice(b, std::min(n, kHostNoticeBytes))) {
+                recv(s, reinterpret_cast<char*>(b), kHostNoticeBytes, 0);
                 return true;
             }
-            if (!isNoticePrefix(b, n)) return false;
+            if (!isNoticePrefix(b, n) && !isPongPrefix(b, n)) return false;
             if (std::chrono::steady_clock::now() >= deadline) return false;
             if (cancel && cancel->load()) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -706,13 +964,17 @@ private:
     // One queue item. A click that waits for a reconnect is one item
     // holding two frames, its pointer position (0x24) then the button: they
     // age out, are pushed out of a full queue, are discarded and are sent
-    // together, so a click never lands without its position.
+    // together, so a click never lands without its position. H2: when the
+    // connection it goes out on has POINTER_SYNC (Async::pointerSync), the
+    // 0x24 goes out as a 0x27 with the seq and port kept in `udp`
+    // (withPointerSync, at flush time).
     enum class Kind : uint8_t { Event, Move, PositionedClick, Release };
     struct Queued {
         std::vector<uint8_t> bytes;
         std::chrono::steady_clock::time_point at;
         Kind kind = Kind::Event;
         uint64_t generation = 0;  // Async::generation when queued
+        uint64_t udp = 0;         // PositionedClick: MRM1 port << 32 | seq of its position (0: TCP)
     };
     struct Async {
         std::mutex m;
@@ -762,6 +1024,19 @@ private:
         std::vector<uint8_t> renegotiate;
         bool renegotiateHevc = false;
         std::optional<VideoConfigResult> renegotiated;
+        // H2 (Pepper's review of 8f8a33b, item 5b): buttons go out behind a
+        // 0x27 POINTER_SYNC, as the newest ACK said (HOST_INFO cap 0x20).
+        bool pointerSync = false;
+        // H2 r9 (Pepper's review of 0d74abe, items 1 and 2): a Windows host
+        // (the newest ACK said so, as for pointerSync) gets liveness pings,
+        // the last one at lastLivenessPing. liveGen moves on with each
+        // connection that goes live; boundGen and boundPort: the connection
+        // and the MRM1 port last named to the host (notePointerUdp).
+        bool liveness = false;
+        std::chrono::steady_clock::time_point lastLivenessPing{};
+        uint64_t liveGen = 1;
+        uint64_t boundGen = 0;
+        uint16_t boundPort = 0;
         std::function<void()> beforeRenegotiate;  // tests only (r5)
         ReconnectStats stats;
     };
@@ -770,6 +1045,31 @@ private:
         std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, 0, uint8_t(payload.size())};
         b.insert(b.end(), payload.begin(), payload.end());
         return b;
+    }
+    // H2 r9: n liveness pings, MRC1 0x01 with 4 bytes ("LIVE"; the host
+    // echoes them in its pong and reads nothing else in them).
+    static std::vector<uint8_t> livenessPings(int n) {
+        std::vector<uint8_t> b;
+        for (int i = 0; i < n; ++i) {
+            const auto p = frameBytes(0x01, {'L', 'I', 'V', 'E'});
+            b.insert(b.end(), p.begin(), p.end());
+        }
+        return b;
+    }
+
+    // H2: a positioned click (0x24 position, then the button) with its
+    // position as MRC1 0x27 POINTER_SYNC instead: [nx BE16, ny BE16, MRM1
+    // seq BE32, MRM1 port BE16] (udp = port << 32 | seq; 0 when the
+    // position went by TCP: the host then only moves there).
+    static std::vector<uint8_t> withPointerSync(const std::vector<uint8_t>& click, uint64_t udp) {
+        if (click.size() < 12 || click[5] != 0x24 || click[6] != 0 || click[7] != 4) return click;
+        const uint32_t seq = uint32_t(udp);
+        const uint16_t port = uint16_t(udp >> 32);
+        std::vector<uint8_t> out{'M', 'R', 'C', '1', 1, 0x27, 0, uint8_t(jl::hostinfo::kPointerSyncBytes),
+                                 click[8], click[9], click[10], click[11], uint8_t(seq >> 24), uint8_t(seq >> 16),
+                                 uint8_t(seq >> 8), uint8_t(seq), uint8_t(port >> 8), uint8_t(port)};
+        out.insert(out.end(), click.begin() + 12, click.end());
+        return out;
     }
 
     // Calls f(offset, size, type, payload, payloadSize) for each MRC1 frame
@@ -790,6 +1090,7 @@ private:
     // the pointer position queued with it (PositionedClick) along, so a
     // click the user made before focus left cannot move the Mac cursor
     // after the reconnect. `positionsSkipped` counts those positions.
+    // H2: a POINTER_SYNC (0x27) in front of a button is left out with it.
     static std::vector<uint8_t> wireBytesLocked(const Async& a, const std::vector<uint8_t>& item,
                                                 uint64_t* positionsSkipped = nullptr) {
         auto skipFrame = [&](uint8_t type, const uint8_t* p, size_t n) {
@@ -803,7 +1104,7 @@ private:
         });
         std::vector<uint8_t> out;
         forEachFrame(item, [&](size_t off, size_t len, uint8_t type, const uint8_t* p, size_t n) {
-            if (buttonSkipped && type == 0x24) {
+            if (buttonSkipped && (type == 0x24 || type == 0x27)) {
                 if (positionsSkipped) ++*positionsSkipped;
                 return;
             }
@@ -1070,8 +1371,15 @@ private:
             // r6: an up for a key released on focus loss is not sent again.
             // r7: positions left out are counted once, when the item goes.
             uint64_t positionsSkipped = 0;
+            // H2 (Pepper's review of 8f8a33b, item 5b): a click's position
+            // frame is made now, as the ACK of this connection said (the
+            // worker set a.pointerSync before the flush), not when the
+            // click was queued.
+            std::vector<uint8_t> synced;
+            if (q.kind == Kind::PositionedClick && a.pointerSync) synced = withPointerSync(q.bytes, q.udp);
+            const std::vector<uint8_t>& item = synced.empty() ? q.bytes : synced;
             const std::vector<uint8_t> wire =
-                q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, q.bytes, &positionsSkipped);
+                q.kind == Kind::Release ? q.bytes : wireBytesLocked(a, item, &positionsSkipped);
             if (wire.empty()) {
                 noteWireLocked(a, q.bytes);
                 a.stats.positionsSkipped += positionsSkipped;
@@ -1129,7 +1437,8 @@ private:
         }
     }
 
-    static void enqueueLocked(Async& a, std::vector<uint8_t> b, Kind kind, std::chrono::steady_clock::time_point now) {
+    static void enqueueLocked(Async& a, std::vector<uint8_t> b, Kind kind, std::chrono::steady_clock::time_point now,
+                              uint64_t udp = 0) {
         dropAgedLocked(a, now);
         // Only the latest absolute pointer position matters (never one that
         // belongs to a click).
@@ -1143,7 +1452,7 @@ private:
             a.queue.pop_front();
             ++a.stats.dropped;
         }
-        a.queue.push_back(Queued{std::move(b), now, kind, a.generation});
+        a.queue.push_back(Queued{std::move(b), now, kind, a.generation, udp});
         ++a.stats.queued;
     }
 
@@ -1251,8 +1560,28 @@ private:
                 }
                 ++a->stats.renegotiations;
                 a->renegotiated = vc;
+                // Item 5b: the queue below goes out as this ACK says.
+                a->pointerSync = jl::hostinfo::pointerSyncFor(vc.hostInfo);
+                a->liveness = jl::hostinfo::livenessFor(vc.hostInfo);  // H2 r9
             }
-            bool alive = setNonBlocking(s, true);
+            bool alive = true;
+            if (a->liveness) {
+                // H2 r9 (Pepper's review of 0d74abe, item 1): two pings
+                // before anything else on a new connection. The host counts
+                // no ping that is a connection's first frame (every viewer's
+                // start-up ping is one), so the second one at least starts
+                // its liveness timer, before the input flushed below; then
+                // the UI thread keeps them coming (livenessTick).
+                lk.unlock();
+                alive = sendAllOn(s, livenessPings(2));
+                lk.lock();
+                if (a->stopping) { closeSocket(s); break; }
+                if (alive) {
+                    a->stats.livenessPings += 2;
+                    a->lastLivenessPing = std::chrono::steady_clock::now();
+                }
+            }
+            if (alive) alive = setNonBlocking(s, true);
             // r8 (Pepper's r7 review, item 1): each round (1) drops what aged
             // out, (2) sends the releases owed (including those that aging
             // just made owed), (3) only then sends the next input, or hands
@@ -1303,6 +1632,7 @@ private:
             }
             closeSocket(a->s);
             a->s = s;
+            ++a->liveGen;  // H2 r9: its MRM1 socket is not named yet (notePointerUdp)
             ++a->stats.reconnects;
         }
     }
@@ -1326,6 +1656,16 @@ private:
     bool sendQueued(std::vector<uint8_t> b) {
         std::shared_ptr<Async> a = async_;
         pollHostNotice();  // r2: a "replaced" notice ends the attempt before this input goes anywhere
+        const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
+        const uint64_t udp = lastPointerUdp_.load(std::memory_order_relaxed);
+        // A button with the pointer position it was made at: 0x24 then the
+        // button. Queued as that; live, and at flush time, the 0x24 becomes
+        // a 0x27 POINTER_SYNC when the connection has it (H2).
+        std::vector<uint8_t> click;
+        if (isMouseButton(b) && (ptr >> 32)) {
+            click = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16), uint8_t(ptr >> 8), uint8_t(ptr)});
+            click.insert(click.end(), b.begin(), b.end());
+        }
         SOCKET live = INVALID_SOCKET;
         std::vector<uint8_t> wire;
         Owed owed;
@@ -1336,6 +1676,10 @@ private:
             if (a->stopping) return false;
             if (!a->connecting && a->queue.empty()) live = a->s;
             if (live != INVALID_SOCKET) {
+                // H2: on the live connection a button goes behind a
+                // POINTER_SYNC when it has one, on its own otherwise (the
+                // pointer went by UDP just before).
+                if (!click.empty() && a->pointerSync) b = withPointerSync(click, udp);
                 // Only this thread uses or closes a->s while no reconnect
                 // runs, so what the Mac has down is noted here, before the
                 // send. r6: ups still owed go first.
@@ -1390,19 +1734,17 @@ private:
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
-        const uint64_t ptr = lastPointer_.load(std::memory_order_relaxed);
         Kind kind = isMouseMove(b) ? Kind::Move : Kind::Event;
-        if (isMouseButton(b) && (ptr >> 32)) {
+        uint64_t itemUdp = 0;
+        if (!click.empty()) {
             // The pointer moves by UDP; the click waits here for TCP. Its
             // position goes in the same item, right in front of it.
-            std::vector<uint8_t> item = packet(0x24, {uint8_t(ptr >> 24), uint8_t(ptr >> 16),
-                                                      uint8_t(ptr >> 8), uint8_t(ptr)});
-            item.insert(item.end(), b.begin(), b.end());
-            b = std::move(item);
+            b = std::move(click);
             kind = Kind::PositionedClick;
+            itemUdp = udp;
             ++a->stats.positioned;
         }
-        enqueueLocked(*a, std::move(b), kind, now);
+        enqueueLocked(*a, std::move(b), kind, now, itemUdp);
         if (!a->connecting && now >= a->nextTry) {
             a->connecting = true;
             a->wake = true;
@@ -1466,6 +1808,9 @@ private:
     jl::auth::Channel authChannel_ = jl::auth::Channel::Control;
     std::shared_ptr<Async> async_;
     std::atomic<uint64_t> lastPointer_{0};  // 1 << 32 | nx << 16 | ny once known
+    std::atomic<uint64_t> lastPointerUdp_{0};  // H2: MRM1 port << 32 | seq of that position (0: TCP)
+    std::atomic<bool> pointerSync_{false};     // H2: POINTER_SYNC before buttons (Async::pointerSync once async)
+    std::atomic<bool> liveness_{false};        // H2 r9: liveness pings (Async::liveness once async)
     uint64_t sentEvents_ = 0;
     uint64_t failures_ = 0;
 };

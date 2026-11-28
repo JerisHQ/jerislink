@@ -32,6 +32,18 @@
 // PR-C r5: a read-only view renegotiates its video configuration on every
 // new control session, on the worker; a failed send hands the socket to the
 // worker, which reads the "replaced" notice (the UI thread never waits).
+// H2 (Pepper's H2 review, items 1, 4 and 5): VIDEO_CONFIG asks for HOST_INFO
+// (caps 0x08); a Windows host answers with an 11-byte ACK and the HOST_INFO
+// behind it, read right there however late or split; a 0.4.x viewer that
+// does not ask gets the ACK alone, so its read-only view still sees the host
+// close and comes back (a784cd7's unasked HOST_INFO stopped that). An
+// interactive view whose start-up exchange failed renegotiates on the next
+// control session; with POINTER_SYNC each button goes behind an MRC1 0x27.
+// H2 r9 (Pepper's review of 0d74abe, items 1 and 2): to a Windows host the
+// channel sends liveness pings (the existing MRC1 ping: two ahead of a new
+// connection's input, then one a second from the UI thread) and drops their
+// pongs; it names the MRM1 socket (0x27 then 0x24) once per connection and
+// port. A macOS host gets neither.
 //
 // A loopback fake host with a password. Its challenge comes 600 ms late once
 // the viewer knows the Mac wants a password (no probe then); the first
@@ -39,6 +51,7 @@
 #include "control_channel.hpp"
 #include "read_only_session.hpp"
 #include "udp_plan.hpp"
+#include "../windows-host/host_protocol.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -2116,7 +2129,8 @@ void prcR4ReadOnlyTests() {
 // Mac's audio offer changes between sessions (on, off, on) and each answer
 // reaches the viewer (takeRenegotiated), which starts or stops audio by it.
 // A session without an ACK is closed and the next keepSession asks again.
-const Bytes kRenegotiateRequest{1, 1, 0x01 | 0x04, 0, 0, 25};  // h264, h264 decoder, audio wanted, 25 Mbps
+// H2: caps 0x08, this viewer reads a HOST_INFO behind the ACK (a Mac ignores it).
+const Bytes kRenegotiateRequest{1, 1, 0x01 | 0x04 | 0x08, 0, 0, 25};  // h264, h264 decoder, audio wanted, 25 Mbps
 
 void prcR5RenegotiateTest() {
     Secret sec;
@@ -2694,7 +2708,735 @@ void prcR14RetryCapTests() {
     setCurrent(nullptr);
     clearKnownModesForTest();
 }
+// H2: the Windows host's own VIDEO_CONFIG answer (host_protocol.hpp), so
+// these tests run the reply the host sends. Its HOST_INFO: Windows, caps
+// keyboard, pointer, cursor shape, Task Manager and POINTER_SYNC.
+const Bytes kWinInfo = jlh::hostInfoPayload(jlh::kPlatformWindows, 0x2F, 1, "0.4.1-h2dev");
+Bytes winReply(const Bytes& request) {
+    const auto d = jlh::decideVideoConfig(request.data(), request.size(), 25, 1024, 768);
+    return jlh::videoConfigReply(d, kWinInfo);
+}
+bool isWinInfo(const jl::hostinfo::Info& h) {
+    return h.format == 1 && h.windows() && h.caps == 0x2F && h.monitors == 1 && h.version == "0.4.1-h2dev";
+}
+Secret h2Secret() {
+    Secret sec;
+    randomBytes(sec.salt.data(), sec.salt.size());
+    randomBytes(sec.hostId.data(), sec.hostId.size());
+    sec.key = *deriveKey(kPw, sec.salt.data(), sec.salt.size(), sec.iter);
+    return sec;
+}
+bool isFrame(const std::pair<uint8_t, Bytes>& f, uint8_t type, const Bytes& payload) {
+    return f.first == type && f.second == payload;
+}
+Bytes be16x2(uint16_t a, uint16_t b) { return {uint8_t(a >> 8), uint8_t(a), uint8_t(b >> 8), uint8_t(b)}; }
+// H2: MRC1 0x27 POINTER_SYNC payload, [nx, ny, MRM1 seq, MRM1 UDP port].
+constexpr uint16_t kUdpPort = 50000;
+Bytes syncPayload(uint16_t nx, uint16_t ny, uint32_t seq, uint16_t port = kUdpPort) {
+    Bytes p = be16x2(nx, ny);
+    p.insert(p.end(), {uint8_t(seq >> 24), uint8_t(seq >> 16), uint8_t(seq >> 8), uint8_t(seq), uint8_t(port >> 8),
+                       uint8_t(port)});
+    return p;
+}
+// H2 r9: control frames without the liveness pings (0x01) a Windows host
+// gets; `pings` counts the ones skipped.
+std::vector<std::pair<uint8_t, Bytes>> readInput(SOCKET s, size_t n, int ms, int* pings = nullptr) {
+    std::vector<std::pair<uint8_t, Bytes>> out;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(ms);
+    while (out.size() < n) {
+        uint8_t type = 0;
+        Bytes p;
+        if (recvFrame(s, deadline, type, p) != Io::Ok) break;
+        if (type == 0x01) {
+            if (pings) ++*pings;
+            continue;
+        }
+        out.emplace_back(type, std::move(p));
+    }
+    return out;
+}
+template <typename F> bool waitFor(F f, int ms) {
+    const auto t0 = Clock::now();
+    while (!f()) {
+        if (msSince(t0) > ms) return false;
+        Sleep(5);
+    }
+    return true;
+}
 }  // namespace
+
+// H2 (Pepper's H2 review, item 1): a viewer of 0.4.x in read-only mode
+// (--no-control): its VIDEO_CONFIG has no caps 0x08. The Windows host
+// answers with the ACK only, so when the host closes the connection the
+// viewer sees it (pollHostNotice) and the session comes back, each time.
+// The second round replays what a784cd7's host did, HOST_INFO behind the
+// ACK anyway: the frame stays unread in front of the close, the viewer
+// never sees it and never reconnects. That is the bug the first round
+// shows is gone.
+void h2OldViewerReconnectTest() {
+    const Secret sec = h2Secret();
+    for (int round = 0; round < 2; ++round) {
+        const bool unasked = round == 1;
+        Listener l;
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(100);
+        control.setBackgroundReconnect(true);
+        Bytes old = ControlChannel::videoConfigPayload("h264", true, false, 25, true);
+        old[2] = uint8_t(old[2] & ~jl::hostinfo::kViewerCapHostInfo);
+        control.setRenegotiatePayloadForTest(old);
+        constexpr int kSessions = 3;
+        std::atomic<int> accepted{0};
+        int asked = 0;
+        size_t replyBytes[kSessions] = {};
+        std::thread host([&] {
+            for (int i = 0; i < kSessions; ++i) {
+                SOCKET s = l.accept(unasked ? 2500 : 8000);
+                if (s == INVALID_SOCKET) return;
+                ++accepted;
+                std::vector<std::pair<uint8_t, Bytes>> req;
+                if (hostAuth(s, sec, Answer::Ok, 50)) req = readFrames(s, 1, 3000);
+                if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); return; }
+                if (req[0].second.size() > 2 && (req[0].second[2] & jl::hostinfo::kViewerCapHostInfo)) ++asked;
+                Bytes out = winReply(req[0].second);
+                if (unasked) {
+                    const Bytes hi = frame(jl::hostinfo::kType, kWinInfo.data(), kWinInfo.size());
+                    out.insert(out.end(), hi.begin(), hi.end());
+                }
+                replyBytes[i] = out.size();
+                sendAllBytes(s, out);
+                Sleep(300);
+                closesocket(s);  // the host goes away
+            }
+        });
+        UiClock ui;
+        std::vector<VideoConfigResult> answers;
+        const auto t0 = Clock::now();
+        while (msSince(t0) < (unasked ? 3000 : 10000) && (unasked || answers.size() < size_t(kSessions))) {
+            ui.call([&] {
+                if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+                control.pollHostNotice();
+                control.keepSession();
+                return true;
+            });
+            Sleep(10);
+        }
+        host.join();
+        bool allAcked = !answers.empty();
+        for (const auto& a : answers) allAcked = allAcked && a.acked && a.negotiated && !a.hostInfo;
+        if (!unasked) {
+            expect(accepted == kSessions && answers.size() == size_t(kSessions) && allAcked,
+                   "h2 old viewer: the host closes three times, the read-only view comes back each time (" +
+                       std::to_string(accepted.load()) + " sessions, " + std::to_string(answers.size()) + " ACKs)");
+            expect(asked == 0 && replyBytes[0] == 18 && replyBytes[1] == 18 && replyBytes[2] == 18,
+                   "h2 old viewer: it did not ask, and the host sent the 10-byte ACK only (no HOST_INFO)");
+        } else {
+            expect(accepted == 1 && answers.size() == 1 && replyBytes[0] == 18 + 8 + kWinInfo.size(),
+                   "h2 old viewer: a784cd7's unasked HOST_INFO stays unread and the view never comes back (" +
+                       std::to_string(accepted.load()) + " session in 3 s): the bug the host fix removes");
+        }
+        expect(ui.maxMs < kUiBudgetMs, "h2 old viewer: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+}
+
+// H2 (Pepper's H2 review, items 1 and 4): this viewer asks (caps 0x08) and
+// reads the HOST_INFO the ACK announces right there, whole, however it
+// arrives. A read-only view renegotiates on every new control session, so
+// each session is one case: (0) ACK and HOST_INFO in one write, the host's
+// own reply; (1) the same bytes in three pieces, the HOST_INFO 200 ms
+// late (a784cd7 waited 50 ms and then left it for a poll); (2) a Mac: it
+// ignores the bit and sends a 10-byte ACK, which says "a Mac" at once;
+// (3) the host's reply, then the "replaced" notice on the live socket: it
+// is not hidden behind anything and halts the attempt.
+void h2HostInfoTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, true);
+    const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    bool auth[4] = {};
+    int asked = 0;
+    size_t ackBytes[4] = {};
+    std::thread host([&] {
+        for (int i = 0; i < 4; ++i) {
+            SOCKET s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth[i] = hostAuth(s, sec, Answer::Ok, 50);
+            const auto req = readFrames(s, 1, 3000);
+            if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); return; }
+            if (req[0].second.size() > 2 && (req[0].second[2] & jl::hostinfo::kViewerCapHostInfo)) ++asked;
+            const Bytes reply = i == 2 ? frame(0x41, macAck.data(), macAck.size()) : winReply(req[0].second);
+            ackBytes[i] = size_t((reply[6] << 8) | reply[7]);
+            if (i == 1) {
+                const size_t ackEnd = 8 + ackBytes[i];
+                sendAllBytes(s, Bytes(reply.begin(), reply.begin() + ackEnd));
+                Sleep(100);
+                sendAllBytes(s, Bytes(reply.begin() + ackEnd, reply.begin() + ackEnd + 5));
+                Sleep(100);
+                sendAllBytes(s, Bytes(reply.begin() + ackEnd + 5, reply.end()));
+            } else {
+                sendAllBytes(s, reply);
+            }
+            if (i == 3) {
+                Sleep(300);  // live for a while first
+                sendAllBytes(s, Bytes(notice, notice + sizeof(notice)));
+                shutdown(s, SD_SEND);
+                Sleep(1000);
+            } else {
+                Sleep(400);  // live for a while, then the host goes away
+            }
+            closesocket(s);
+        }
+    });
+    UiClock ui;
+    std::vector<VideoConfigResult> answers;
+    for (int i = 0; i < 1500 && terminals == 0; ++i) {
+        ui.call([&] {
+            if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+            control.pollHostNotice();
+            control.keepSession();
+            return true;
+        });
+        Sleep(10);
+    }
+    host.join();
+    const bool four = answers.size() == 4;
+    expect(auth[0] && auth[1] && auth[2] && auth[3] && four && asked == 4,
+           "h2 host info: four sessions, each asks (caps 0x08) and its ACK reaches the viewer (" +
+               std::to_string(answers.size()) + ")");
+    expect(four && ackBytes[0] == 11 && answers[0].acked && answers[0].negotiated && answers[0].hostInfo &&
+               isWinInfo(*answers[0].hostInfo),
+           "h2 host info: the host's reply (11-byte ACK, then HOST_INFO): read with the ACK (Windows, caps 0x2f, version)");
+    expect(four && answers[1].acked && answers[1].hostInfo && isWinInfo(*answers[1].hostInfo),
+           "h2 host info: in three pieces, HOST_INFO 200 ms after its ACK: still read with the ACK, nothing left behind");
+    expect(four && ackBytes[2] == 10 && answers[2].acked && answers[2].negotiated && !answers[2].hostInfo,
+           "h2 host info: a Mac (10-byte ACK, no HOST_INFO): acked, the answer says Mac");
+    expect(four && answers[3].acked && answers[3].hostInfo && isWinInfo(*answers[3].hostInfo),
+           "h2 host info: the fourth session's HOST_INFO read with its ACK too");
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect(),
+           "h2 host info: the replaced notice later on the live socket halts the attempt");
+    expect(ui.maxMs < kUiBudgetMs, "h2 host info: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 (Pepper's H2 review, items 4 and 5), interactive. The start-up
+// exchange got no ACK, so (as viewer.cpp does) the next control session
+// renegotiates: the host gets VIDEO_CONFIG before the click that started
+// the reconnect, and the answer says what the host is. The channel turns
+// POINTER_SYNC on from that ACK (cap 0x20) before the queue goes out
+// (Pepper's review of 8f8a33b, item 5b), so even the click queued before
+// the platform was known goes behind a 0x27. Each button then goes behind
+// a 0x27 with the position the viewer last showed, its MRM1 seq and the
+// UDP socket's port, live and queued. Off again: no 0x27. A button up
+// released on focus loss and its later (swallowed) up leave no stray 0x27.
+void h2InteractiveTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.notePointer(1000, 2000, 41, kUdpPort);
+    std::atomic<int> step{0};
+    std::vector<std::pair<uint8_t, Bytes>> f0, f1, f2, f3, f4, f5, f6, f7;
+    int pings[4] = {};
+    bool auth0 = false, auth1 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) return;
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        f0 = readFrames(s, 1, 3000);
+        if (f0.size() == 1 && f0[0].first == 0x40) sendAllBytes(s, winReply(f0[0].second));
+        f1 = readInput(s, 2, 3000, &pings[0]);  // H2 r9: two pings go first
+        f2 = readInput(s, 2, 5000, &pings[1]);
+        closesocket(s);
+        step = 1;
+        s = l.accept(8000);
+        if (s == INVALID_SOCKET) return;
+        auth1 = hostAuth(s, sec, Answer::Ok, 50);
+        f3 = readInput(s, 2, 5000, &pings[2]);
+        step = 2;
+        f4 = readInput(s, 1, 3000, &pings[3]);
+        step = 3;
+        f5 = readInput(s, 3, 3000, &pings[3]);
+        step = 4;
+        f6 = readInput(s, 1, 500, &pings[3]);
+        step = 5;
+        closesocket(s);
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });  // queued: starts the reconnect
+    std::optional<VideoConfigResult> vc;
+    waitFor([&] {
+        ui.call([&] { control.pollHostNotice(); vc = control.takeRenegotiated(); return true; });
+        return vc.has_value();
+    }, 8000);
+    const bool win = vc && vc->acked && vc->hostInfo && isWinInfo(*vc->hostInfo);
+    control.clearRenegotiateOnReconnect();
+    const bool syncFromAck = control.pointerSync();  // the channel set it from that ACK
+    waitFor([&] { const auto rs = control.reconnectStats(); return rs.live && !rs.connecting; }, 3000);
+    control.notePointer(3000, 4000, 42, kUdpPort);
+    ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });  // live
+    waitFor([&] { return step >= 1; }, 8000);
+    Sleep(150);  // the close has arrived
+    control.notePointer(5000, 6000, 43, kUdpPort);
+    ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });  // sees the close: queued
+    waitFor([&] { return step >= 2; }, 8000);
+    waitFor([&] { const auto rs = control.reconnectStats(); return rs.live && !rs.connecting; }, 3000);
+    control.setPointerSync(false);
+    ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });
+    waitFor([&] { return step >= 3; }, 5000);
+    control.setPointerSync(true);
+    control.notePointer(7000, 8000, 44, kUdpPort);
+    ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });
+    ui.call([&] { control.discardQueuedInput(); return true; });  // focus left: the down is released now
+    ui.call([&] { return control.sendMouseButtonExtended(0, false, 1); });  // the user's up: not sent again
+    host.join();
+    const Bytes down{0, 1, 1}, up{0, 0, 1};
+    expect(auth0 && f0.size() == 1 && f0[0].first == 0x40 && f0[0].second.size() == 6 &&
+               (f0[0].second[2] & jl::hostinfo::kViewerCapHostInfo),
+           "h2 interactive: no start-up ACK: the reconnect sends VIDEO_CONFIG (caps 0x08) before the queued click");
+    expect(win && syncFromAck,
+           "h2 interactive: the renegotiated answer says Windows (HOST_INFO read with the ACK), POINTER_SYNC on from it");
+    expect(f1.size() == 2 && isFrame(f1[0], 0x27, syncPayload(1000, 2000, 41)) && isFrame(f1[1], 0x25, down),
+           "h2 interactive: the click queued before the platform was known gets its 0x27 from that ACK, at the flush "
+           "(item 5b)");
+    expect(f2.size() == 2 && isFrame(f2[0], 0x27, syncPayload(3000, 4000, 42)) && isFrame(f2[1], 0x25, up),
+           "h2 interactive: POINTER_SYNC on, live: 0x27 (position, seq 42, UDP port) right in front of the button");
+    expect(auth1 && f3.size() == 2 && isFrame(f3[0], 0x27, syncPayload(5000, 6000, 43)) && isFrame(f3[1], 0x25, down),
+           "h2 interactive: queued for the reconnect: 0x27 then the button, and no VIDEO_CONFIG once the platform is known");
+    expect(f4.size() == 1 && isFrame(f4[0], 0x25, up), "h2 interactive: POINTER_SYNC off: the button alone");
+    expect(f5.size() == 3 && isFrame(f5[0], 0x27, syncPayload(7000, 8000, 44)) && isFrame(f5[1], 0x25, down) &&
+               isFrame(f5[2], 0x25, up) && f6.empty(),
+           "h2 interactive: released on focus loss; the later up and its 0x27 are not sent (" +
+               std::to_string(f6.size()) + " stray frames)");
+    expect(pings[0] == 2 && pings[1] == 0 && pings[2] == 2 && pings[3] == 0,
+           "h2 interactive: H2 r9: two liveness pings ahead of each new connection's input, none else here (no UI tick)");
+    expect(ui.maxMs < kUiBudgetMs, "h2 interactive: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// Pepper's review of 8f8a33b, items 4b and 5b. POINTER_SYNC was on (a
+// Windows host before) and a click waits for the reconnect.
+// Session 1: an 11-byte ACK promising HOST_INFO, then a HOST_INFO frame
+// whose payload does not decode (format 0): no ACK (4b), the connection is
+// closed and the click not sent on it. Session 2: a Mac's 10-byte ACK: the
+// channel turns POINTER_SYNC off from it before the queue goes out, so the
+// click goes as 0x24 then the button, no 0x27 to a Mac (5b).
+void h2ReviewR2Test() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);
+    control.notePointer(1000, 2000, 7, kUdpPort);
+    const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+    const Bytes badInfo{0, jl::hostinfo::kPlatformWindows, 0, 0, 0, 0x2F, 1, 0};  // format 0
+    bool auth0 = false, auth1 = false, asked0 = false, sent0 = false;
+    std::vector<std::pair<uint8_t, Bytes>> r0, r1, after0, f1;
+    std::atomic<bool> done{false};
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        r0 = readFrames(s, 1, 3000);
+        if (r0.size() == 1 && r0[0].first == 0x40) {
+            asked0 = r0[0].second.size() > 2 && (r0[0].second[2] & jl::hostinfo::kViewerCapHostInfo);
+            const Bytes good = winReply(r0[0].second);
+            const size_t ackEnd = 8 + size_t((good[6] << 8) | good[7]);
+            Bytes reply(good.begin(), good.begin() + ackEnd);
+            const Bytes bad = frame(jl::hostinfo::kType, badInfo.data(), badInfo.size());
+            reply.insert(reply.end(), bad.begin(), bad.end());
+            sent0 = ackEnd == 8 + 11 && sendAllBytes(s, reply);
+        }
+        after0 = readFrames(s, 1, 1000);  // the viewer closes it: nothing comes
+        closesocket(s);
+        s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth1 = hostAuth(s, sec, Answer::Ok, 50);
+        r1 = readFrames(s, 1, 3000);
+        if (r1.size() == 1 && r1[0].first == 0x40) sendAllBytes(s, frame(0x41, macAck.data(), macAck.size()));
+        f1 = readFrames(s, 2, 3000);
+        closesocket(s);
+        done = true;
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendMouseButtonExtended(0, true, 1); });  // queued: starts the reconnect
+    std::vector<VideoConfigResult> answers;
+    const auto t0 = Clock::now();
+    while (!done && msSince(t0) < 15000) {
+        ui.call([&] {
+            if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+            control.pollHostNotice();
+            control.keepSession();
+            return true;
+        });
+        Sleep(10);
+    }
+    host.join();
+    ui.call([&] {
+        if (auto r = control.takeRenegotiated()) answers.push_back(*r);
+        return true;
+    });
+    const auto rs = control.reconnectStats();
+    const Bytes down{0, 1, 1};
+    expect(auth0 && asked0 && sent0 && after0.empty() && rs.renegotiateFailures == 1,
+           "h2 r2 item 4b: an 11-byte ACK with a HOST_INFO that does not decode is no ACK: connection closed, "
+           "nothing sent on it (" + std::to_string(rs.renegotiateFailures) + " failed renegotiations)");
+    expect(auth1 && r1.size() == 1 && r1[0].first == 0x40 && answers.size() == 1 && answers[0].acked &&
+               !answers[0].hostInfo,
+           "h2 r2 item 4b: the next session asks again; only the Mac's ACK reaches the viewer (" +
+               std::to_string(answers.size()) + " answers)");
+    expect(f1.size() == 2 && isFrame(f1[0], 0x24, be16x2(1000, 2000)) && isFrame(f1[1], 0x25, down) &&
+               !control.pointerSync(),
+           "h2 r2 item 5b: the Mac's ACK turns POINTER_SYNC off before the flush: the queued click goes as 0x24 then "
+           "0x25");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r2: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r9 (Pepper's review of 0d74abe, item 1): to a Windows host the
+// channel sends liveness pings, the existing MRC1 ping (0x01): two on a new
+// connection before its input (the host does not count a connection's
+// first frame), then one a second from the UI thread (livenessTick), never
+// sooner, and none once liveness is off. The host's pongs are read and
+// dropped without closing anything, and a "replaced" notice behind a pong
+// is still seen and halts the attempt.
+void h2R9LivenessTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    const Bytes live{'L', 'I', 'V', 'E'};
+    const Bytes pong = frame(0x02, live.data(), live.size());
+    const uint8_t notice[ControlChannel::kHostNoticeBytes] = {'M', 'R', 'C', '1', 1, kTypeResult, 0, 1, 6};
+    std::atomic<int> step{0};
+    std::vector<std::pair<uint8_t, Bytes>> first, ticked, off;
+    double tickGapMs = 0.0;
+    bool auth0 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); step = 9; return; }
+        sendAllBytes(s, winReply(req[0].second));
+        first = readFrames(s, 3, 3000);  // the worker's two pings, then the key
+        Bytes two = pong;
+        two.insert(two.end(), pong.begin(), pong.end());
+        sendAllBytes(s, two);
+        step = 1;
+        const auto deadline = Clock::now() + std::chrono::milliseconds(4000);
+        Clock::time_point at[2];
+        while (ticked.size() < 2) {
+            uint8_t type = 0;
+            Bytes p;
+            if (recvFrame(s, deadline, type, p) != Io::Ok) break;
+            at[ticked.size()] = Clock::now();
+            ticked.emplace_back(type, std::move(p));
+        }
+        if (ticked.size() == 2) tickGapMs = std::chrono::duration<double, std::milli>(at[1] - at[0]).count();
+        step = 2;
+        off = readFrames(s, 1, 1500);  // liveness off: nothing
+        Bytes tail = pong;
+        tail.insert(tail.end(), notice, notice + sizeof(notice));
+        sendAllBytes(s, tail);  // a pong, then the notice, in one write
+        shutdown(s, SD_SEND);
+        step = 3;
+        Sleep(1000);
+        closesocket(s);
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendKey(true, 0x0041); });  // queued: starts the reconnect
+    uint64_t pongsAtTwo = 0;
+    bool liveAtTwo = false, livenessOn = false;
+    const auto t0 = Clock::now();
+    while (terminals == 0 && step != 9 && msSince(t0) < 12000) {
+        ui.call([&] {
+            control.pollHostNotice();
+            control.takeRenegotiated();
+            control.livenessTick(std::chrono::steady_clock::now());
+            return true;
+        });
+        if (step == 2 && control.liveness()) {
+            livenessOn = true;
+            const auto rs = control.reconnectStats();
+            pongsAtTwo = rs.pongs;
+            liveAtTwo = rs.live;
+            control.setLiveness(false);
+        }
+        Sleep(10);
+    }
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && first.size() == 3 && isFrame(first[0], 0x01, live) && isFrame(first[1], 0x01, live) &&
+               isFrame(first[2], 0x10, Bytes{1, 0, 0x41}),
+           "h2 r9 liveness: a Windows ACK: two pings on the new connection, then the queued key");
+    expect(ticked.size() == 2 && isFrame(ticked[0], 0x01, live) && isFrame(ticked[1], 0x01, live) &&
+               tickGapMs >= 950.0 && tickGapMs < 1600.0,
+           "h2 r9 liveness: then one ping a second from the UI thread (gap " + std::to_string(int(tickGapMs)) +
+               " ms)");
+    expect(livenessOn && pongsAtTwo == 2 && liveAtTwo,
+           "h2 r9 liveness: the two pongs are read and dropped, the connection stays live (" +
+               std::to_string(pongsAtTwo) + " pongs)");
+    expect(off.empty(), "h2 r9 liveness: off: no ping in 1.5 s");
+    expect(terminals == 1 && lastOutcome == int(Outcome::Replaced) && !mayConnect() && rs.pongs == 3,
+           "h2 r9 liveness: a notice behind a pong is still seen and halts the attempt (" +
+               std::to_string(rs.pongs) + " pongs)");
+    expect(rs.livenessPings == 4, "h2 r9 liveness: four pings in all (" + std::to_string(rs.livenessPings) + ")");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r9 liveness: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r9 (Pepper's review of 0d74abe, item 2): a Windows host takes MRM1
+// moves only from the UDP socket its owner named in a POINTER_SYNC. The
+// channel names it once per connection and port, at the first move sent
+// by UDP: 0x27 (that move's position, seq and port) then 0x24 there. A
+// second move on the same connection and port sends nothing; a new port
+// is named again. The host closes the connection: the next move asks for
+// a reconnect, and the first move on the new connection names it again.
+void h2R9PointerBindTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);  // a Windows host before
+    const uint16_t port2 = kUdpPort + 1;
+    std::atomic<int> step{0};
+    std::vector<std::pair<uint8_t, Bytes>> c1, c2, c2after;
+    int pings1 = 0, pings2 = 0;
+    bool auth0 = false, auth1 = false, renegotiated2 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() != 1 || req[0].first != 0x40) { closesocket(s); step = 9; return; }
+        sendAllBytes(s, winReply(req[0].second));
+        c1 = readInput(s, 4, 5000, &pings1);
+        closesocket(s);  // the host goes away
+        step = 1;
+        s = l.accept(8000);
+        if (s == INVALID_SOCKET) { step = 9; return; }
+        auth1 = hostAuth(s, sec, Answer::Ok, 50);
+        c2 = readInput(s, 2, 5000, &pings2);
+        renegotiated2 = !c2.empty() && c2[0].first == 0x40;
+        step = 2;
+        c2after = readInput(s, 1, 700);
+        closesocket(s);
+        step = 3;
+    });
+    UiClock ui;
+    auto waitLive = [&] {
+        return waitFor([&] {
+            ui.call([&] { control.pollHostNotice(); control.takeRenegotiated(); return true; });
+            const auto rs = control.reconnectStats();
+            return rs.live && !rs.connecting;
+        }, 8000);
+    };
+    // No connection yet: the move asks for one.
+    ui.call([&] { return control.notePointerUdp(1000, 2000, 5, kUdpPort); });
+    const bool live1 = waitLive();
+    control.clearRenegotiateOnReconnect();
+    const bool liveness1 = control.liveness();
+    bool b1 = false, b2 = false, b3 = false, b4 = false, b5 = false;
+    ui.call([&] { return b1 = control.notePointerUdp(1100, 2100, 6, kUdpPort); });
+    ui.call([&] { return b2 = control.notePointerUdp(1200, 2200, 7, kUdpPort); });   // named already
+    ui.call([&] { return b3 = control.notePointerUdp(1300, 2300, 8, port2); });      // a new UDP socket
+    waitFor([&] { return step >= 1; }, 8000);
+    Sleep(150);  // the close has arrived
+    ui.call([&] { control.pollHostNotice(); return true; });
+    ui.call([&] { return control.notePointerUdp(1400, 2400, 9, port2); });  // no connection: asks for one
+    const bool live2 = waitLive();
+    ui.call([&] { return b4 = control.notePointerUdp(1500, 2500, 10, port2); });
+    waitFor([&] { return step >= 2; }, 8000);
+    ui.call([&] { return b5 = control.notePointerUdp(1600, 2600, 11, port2); });
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && live1 && liveness1 && pings1 == 2 && b1 && !b2 && b3 && c1.size() == 4 &&
+               isFrame(c1[0], 0x27, syncPayload(1100, 2100, 6)) && isFrame(c1[1], 0x24, be16x2(1100, 2100)) &&
+               isFrame(c1[2], 0x27, syncPayload(1300, 2300, 8, port2)) && isFrame(c1[3], 0x24, be16x2(1300, 2300)),
+           "h2 r9 pointer bind: named at the first move (0x27, 0x24), not at the next, again for a new UDP port");
+    expect(auth1 && live2 && !renegotiated2 && pings2 == 2 && b4 && c2.size() == 2 &&
+               isFrame(c2[0], 0x27, syncPayload(1500, 2500, 10, port2)) && isFrame(c2[1], 0x24, be16x2(1500, 2500)),
+           "h2 r9 pointer bind: the host closed it; a move asked for a reconnect, and the new connection is named "
+           "afresh");
+    expect(!b5 && c2after.empty() && rs.pointerBinds == 3,
+           "h2 r9 pointer bind: once per connection and port (" + std::to_string(rs.pointerBinds) + " binds)");
+    expect(ui.maxMs < kUiBudgetMs,
+           "h2 r9 pointer bind: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r9: a macOS host (its 10-byte ACK, no HOST_INFO) gets none of it. With
+// liveness and POINTER_SYNC on from a Windows host before, the Mac's ACK
+// turns both off before the queue goes out: no ping on the new connection
+// or from the UI thread, and no 0x27 for a UDP move. Its control
+// connection carries the key alone, as before r9.
+void h2R9MacUnchangedTest() {
+    const Secret sec = h2Secret();
+    Listener l;
+    std::atomic<int> terminals{0};
+    std::atomic<int> lastOutcome{-1};
+    auto client = makeClient(terminals, lastOutcome);
+    setCurrent(client);
+    ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+    control.setIoTimeoutMs(100);
+    control.setBackgroundReconnect(true);
+    control.setRenegotiateOnReconnect("h264", true, false, 25, false);
+    control.setPointerSync(true);  // a Windows host before
+    control.setLiveness(true);
+    const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+    std::atomic<bool> done{false};
+    std::vector<std::pair<uint8_t, Bytes>> got;
+    bool auth0 = false;
+    std::thread host([&] {
+        SOCKET s = l.accept(8000);
+        if (s == INVALID_SOCKET) { done = true; return; }
+        auth0 = hostAuth(s, sec, Answer::Ok, 50);
+        const auto req = readFrames(s, 1, 3000);
+        if (req.size() == 1 && req[0].first == 0x40) sendAllBytes(s, frame(0x41, macAck.data(), macAck.size()));
+        got = readFrames(s, 2, 2500);
+        closesocket(s);
+        done = true;
+    });
+    UiClock ui;
+    ui.call([&] { return control.sendKey(true, 0x0041); });
+    const auto t0 = Clock::now();
+    uint16_t x = 0;
+    while (!done && msSince(t0) < 10000) {
+        ui.call([&] {
+            control.pollHostNotice();
+            control.takeRenegotiated();
+            control.livenessTick(std::chrono::steady_clock::now());
+            control.notePointerUdp(x, x, x, kUdpPort);
+            return true;
+        });
+        ++x;
+        Sleep(10);
+    }
+    host.join();
+    const auto rs = control.reconnectStats();
+    expect(auth0 && got.size() == 1 && isFrame(got[0], 0x10, Bytes{1, 0, 0x41}) && !control.liveness() &&
+               !control.pointerSync() && rs.livenessPings == 0 && rs.pointerBinds == 0,
+           "h2 r9 mac: the Mac's ACK turns liveness and POINTER_SYNC off: the key alone, no ping, no 0x27 (" +
+               std::to_string(got.size()) + " frames)");
+    expect(ui.maxMs < kUiBudgetMs, "h2 r9 mac: the UI thread never waits (max " + std::to_string(int(ui.maxMs)) + " ms)");
+    control.stop();
+    setCurrent(nullptr);
+    clearKnownModesForTest();
+}
+
+// H2 r10 (Pepper's review of f919167, item 1): the start-up connection
+// (connect, ping, VIDEO_CONFIG on the UI thread, as viewer.cpp does) gets a
+// liveness ping as background reconnects take it over, before the UI
+// thread can send any input on it. A Windows host times the connection
+// from its VIDEO_CONFIG, so a viewer that hangs right after start-up with
+// a key down loses the key 5 s later. A Mac's ACK turns liveness off: no
+// ping.
+void h2R10StartupPingTest() {
+    for (const bool windows : {true, false}) {
+        const std::string name = windows ? "h2 r10 start-up ping, Windows" : "h2 r10 start-up ping, Mac";
+        const Secret sec = h2Secret();
+        Listener l;
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(1000);
+        const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+        const Bytes live{'L', 'I', 'V', 'E'};
+        std::vector<std::pair<uint8_t, Bytes>> startup, got;
+        bool auth0 = false;
+        std::thread host([&] {
+            SOCKET s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth0 = hostAuth(s, sec, Answer::Ok, 50);
+            startup = readFrames(s, 1, 3000);  // the start-up ping
+            if (startup.size() == 1 && startup[0].first == 0x01)
+                sendAllBytes(s, frame(0x02, startup[0].second.data(), startup[0].second.size()));
+            const auto req = readFrames(s, 1, 3000);
+            if (req.size() == 1 && req[0].first == 0x40) {
+                startup.push_back(req[0]);
+                sendAllBytes(s, windows ? winReply(req[0].second) : frame(0x41, macAck.data(), macAck.size()));
+            }
+            got = readFrames(s, windows ? 3 : 2, 3000);
+            Sleep(200);
+            closesocket(s);
+        });
+        const bool pinged = control.ping();
+        const auto vc = control.negotiateVideo("h264", true, false, 25, false);
+        Sleep(300);  // the window and the video pipeline
+        control.setBackgroundReconnect(true);
+        const auto rs0 = control.reconnectStats();
+        const bool down = control.sendKey(true, 0x0041);
+        const bool up = control.sendKey(false, 0x0041);
+        host.join();
+        const bool started = auth0 && pinged && vc.acked && startup.size() == 2 && startup[0].first == 0x01 &&
+                             startup[1].first == 0x40;
+        if (windows) {
+            expect(started && vc.hostInfo && down && up && rs0.livenessPings == 1 && got.size() == 3 &&
+                       isFrame(got[0], 0x01, live) && isFrame(got[1], 0x10, Bytes{1, 0, 0x41}) &&
+                       isFrame(got[2], 0x10, Bytes{0, 0, 0x41}),
+                   name + ": one liveness ping as the connection is taken over, before the first key (" +
+                       std::to_string(got.size()) + " frames, " + std::to_string(rs0.livenessPings) + " pings)");
+        } else {
+            expect(started && !vc.hostInfo && down && up && rs0.livenessPings == 0 && got.size() == 2 &&
+                       isFrame(got[0], 0x10, Bytes{1, 0, 0x41}) && isFrame(got[1], 0x10, Bytes{0, 0, 0x41}),
+                   name + ": no ping, the keys alone (" + std::to_string(got.size()) + " frames, " +
+                       std::to_string(rs0.livenessPings) + " pings)");
+        }
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+}
 
 int main() {
     WSADATA wsa;
@@ -2716,6 +3458,14 @@ int main() {
     prcR9Tests();
     prcR14RetryCapTests();
     prcR15LostOkTest();
+    h2OldViewerReconnectTest();
+    h2HostInfoTest();
+    h2InteractiveTest();
+    h2ReviewR2Test();
+    h2R9LivenessTest();
+    h2R9PointerBindTest();
+    h2R9MacUnchangedTest();
+    h2R10StartupPingTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

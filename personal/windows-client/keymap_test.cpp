@@ -2,8 +2,11 @@
 // both presets. Mac layout (default, positional): Ctrl+A/C/V/X/Z/S/F compat,
 // Ctrl+Y redo, Win+C / Win+Space escapes. Windows layout: Ctrl = Command,
 // Win = Control. Both: viewer hotkeys, Alt+Tab left to Windows, focus-loss
-// release, live preset switch.
+// release, live preset switch. Windows host (H2): pass-through in either
+// preset, no shortcut rewritten. Key hold-back until the host is known,
+// and no held-back chord crossing the ACK (key_holdback.hpp).
 #include "keymap.hpp"
+#include "key_holdback.hpp"
 
 #include <cstdio>
 #include <set>
@@ -572,7 +575,274 @@ void testPresetSwitch() {
     }
 }
 
+// H2: a Windows host (HOST_INFO platform 2). Every key goes as itself in
+// both presets: Ctrl 1, Alt 2, Win 3, Shift 4, nothing rewritten.
+void testWindowsHostPassthrough() {
+    for (Preset p : {Preset::Mac, Preset::Windows}) {
+        const std::string name = std::string(" (saved preset ") + presetName(p) + ")";
+        {
+            Translator t;
+            t.setPreset(p);
+            t.setPassthrough(true);
+            expect(t.passthrough() && t.preset() == p, "pass-through keeps the saved preset" + name);
+            int wrong = 0;
+            for (uint32_t k = 0; k < 256; ++k) {
+                const auto d = t.keyDown(k, false, {});
+                const uint16_t want = semanticKey(k, Preset::Mac);
+                if (want == 0 ? (d.handled || !d.events.empty())
+                              : !(d.handled && d.events == std::vector<KeyEvent>{D(want)}))
+                    ++wrong;
+                const auto u = t.keyUp(k, {});
+                if (want == 0 ? (u.handled || !u.events.empty())
+                              : !(u.handled && u.events == std::vector<KeyEvent>{U(want)}))
+                    ++wrong;
+            }
+            expect(wrong == 0, "pass-through: VK 0..255 down/up send the Mac layout's codes, unchanged" + name);
+        }
+        for (char c : {'A', 'C', 'V', 'X', 'Z', 'S', 'F', 'Y'}) {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.down(vk::LControl);
+            v.tap(static_cast<uint32_t>(c));
+            v.up(vk::LControl);
+            expectEvents(v.wire, {D(1), D(uint16_t(c)), U(uint16_t(c)), U(1)},
+                         std::string("pass-through Ctrl+") + c + " stays Ctrl+" + c + name);
+            expect(v.tags.empty(), std::string("pass-through Ctrl+") + c + " has no debug tag" + name);
+        }
+        {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.down(vk::LControl);
+            v.down(vk::LShift);
+            v.tap(vk::Escape);
+            v.up(vk::LShift);
+            v.up(vk::LControl);
+            expectEvents(v.wire, {D(1), D(4), D(uint16_t(vk::Escape)), U(uint16_t(vk::Escape)), U(4), U(1)},
+                         "pass-through Ctrl+Shift+Esc goes as typed (Windows may keep it locally)" + name);
+        }
+        {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.down(vk::LWin);
+            v.tap('C');
+            v.tap(vk::Space);
+            v.up(vk::LWin);
+            expectEvents(v.wire, {D(3), D('C'), U('C'), D(SP), U(SP), U(3)},
+                         "pass-through Win+C / Win+Space (no hook) stay Win+C / Win+Space" + name);
+        }
+        {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.useHook = true;
+            v.down(vk::LWin);
+            v.down('C');
+            v.down('C', true);
+            v.up('C');
+            v.tap('E');
+            v.tap(vk::Space);
+            v.up(vk::LWin);
+            expectEvents(v.wire, {D(3), D('C'), U('C'), D('E'), U('E'), D(SP), U(SP), U(3)},
+                         "pass-through hook Win+C / Win+E / Win+Space -> Win held, key once" + name);
+            expect(v.tags == std::vector<std::string>{"shortcut.win_hook=win_down", "shortcut.win_c_hook=win_c",
+                                                      "shortcut.win_space_hook=win_space", "shortcut.win_hook=win_up"},
+                   "pass-through hook debug tags" + name);
+            expect(v.passedToWindows == 0, "pass-through hook Win+C: nothing reaches Windows" + name);
+        }
+        {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.down(vk::RControl);
+            v.down(vk::RMenu);
+            v.tap(vk::Delete);
+            v.up(vk::RMenu);
+            v.up(vk::RControl);
+            v.down(vk::LMenu);
+            v.tap(vk::F1 + 3);
+            v.up(vk::LMenu);
+            expectEvents(v.wire,
+                         {D(1), D(2), D(uint16_t(vk::Delete)), U(uint16_t(vk::Delete)), U(2), U(1), D(2),
+                          D(uint16_t(vk::F1 + 3)), U(uint16_t(vk::F1 + 3)), U(2)},
+                         "pass-through right Ctrl / right Alt are Ctrl / Alt; Alt+F4 goes through" + name);
+        }
+        for (char c : {'O', 'M', 'V'}) {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.down(vk::LControl);
+            v.down(vk::LMenu);
+            v.tap(static_cast<uint32_t>(c));
+            v.up(vk::LMenu);
+            v.up(vk::LControl);
+            expectEvents(v.wire, {D(1), D(2), U(2), U(1)},
+                         std::string("pass-through Ctrl+Alt+") + c + " stays on the viewer" + name);
+        }
+        {
+            Viewer v;
+            v.keys.setPreset(p);
+            v.keys.setPassthrough(true);
+            v.useHook = true;
+            v.tap(vk::Capital);
+            expectEvents(v.wire, {D(CAPS), U(CAPS)}, "pass-through Caps Lock unchanged" + name);
+        }
+    }
+    {
+        // HOST_INFO arrives while Ctrl+C (Mac layout) is half done: the
+        // switch forgets it, as a preset switch does.
+        Viewer v;
+        v.down(vk::LControl);
+        v.down('C');
+        expect(v.keys.suppressedKey() == 'C', "Mac-layout shortcut in progress before HOST_INFO");
+        v.keys.setPassthrough(true);
+        expect(v.keys.suppressedKey() == 0 && v.keys.releasedModifier() == 0,
+               "pass-through switch clears shortcut state");
+        Translator t;
+        expect(!t.passthrough(), "Translator starts without pass-through (Mac host)");
+        t.setPassthrough(true);
+        t.setPassthrough(false);
+        const auto o = t.keyDown(vk::LControl, false, {});
+        const auto c = t.keyDown('C', false, {true, false, false, false});
+        expect(o.events == std::vector<KeyEvent>{D(1)} &&
+                   c.events == std::vector<KeyEvent>{U(1), D(3), D('C'), U('C'), U(3)},
+               "pass-through off again: the Mac layout's Ctrl+C compat is back");
+    }
+}
+
 }  // namespace
+
+// H2, Pepper's review of 8f8a33b item 4a: a chord held back before the
+// ACK stays held back after it, until its keys are up.
+void testChordHoldBack() {
+    using jl::holdback::KeyHoldBack;
+    using jl::holdback::Reason;
+    std::set<uint32_t> down;  // keys down now
+    auto isDown = [&](uint32_t vk) { return down.count(vk) != 0; };
+    const uint32_t kCtrlVk = 0x11, kShiftVk = 0x10, kC = 'C', kV = 'V';
+
+    {
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        expect(h.keyDown(kCtrlVk, false, false, isDown) == Reason::PlatformUnknown,
+               "hold-back: Ctrl before the ACK is held back (platform unknown)");
+        down.insert(kC);
+        expect(h.keyDown(kC, false, true, isDown) == Reason::ChordOpen,
+               "hold-back: C after the ACK with the held-back Ctrl still down is held back (no lone C)");
+        expect(h.keyDown(kC, true, true, isDown) == Reason::ChordOpen, "hold-back: its auto-repeat too");
+        expect(h.buttonDown(isDown) == Reason::ChordOpen, "hold-back: a click inside the open chord is held back");
+        down.erase(kC);
+        expect(h.keyUp(kC), "hold-back: the held-back C's up is not sent");
+        expect(h.keyDown(kV, false, true, isDown) == Reason::ChordOpen,
+               "hold-back: V while the held-back Ctrl is still down is held back");
+        down.erase(kCtrlVk);
+        expect(h.keyUp(kCtrlVk), "hold-back: the held-back Ctrl's up is not sent");
+        down.erase(kV);
+        expect(h.keyUp(kV), "hold-back: the held-back V's up is not sent");
+        expect(!h.chordOpen(isDown), "hold-back: chord closed once its keys are up");
+        down = {kC};
+        expect(h.keyDown(kC, false, true, isDown) == Reason::None, "hold-back: after the chord, C goes out");
+        expect(!h.keyUp(kC), "hold-back: ... and so does its up");
+        down.clear();
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: a click with no chord open goes out");
+        expect(h.heldBack() == 4, "hold-back: count is every down held back (Ctrl, C, click, V; auto-repeat not counted)");
+    }
+    {
+        // Ctrl held back, its up went to another window (focus moved): a key
+        // that is no longer down does not keep the chord open.
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        down.clear();
+        expect(h.keyDown(kC, false, true, isDown) == Reason::None,
+               "hold-back: a held-back key whose up was lost and is up now does not hold back C");
+        down = {kCtrlVk};
+        expect(h.keyDown(kCtrlVk, false, true, isDown) == Reason::None,
+               "hold-back: a fresh press of that key after the ACK starts over and goes out");
+        expect(!h.keyUp(kCtrlVk), "hold-back: ... and its up goes out too");
+    }
+    {
+        // Chord of two modifiers before the ACK, then the letter after it.
+        KeyHoldBack h;
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        down.insert(kShiftVk);
+        expect(h.keyDown(kShiftVk, false, false, isDown) == Reason::PlatformUnknown, "hold-back: Ctrl+Shift before the ACK");
+        down.insert(kC);
+        expect(h.keyDown(kC, false, true, isDown) == Reason::ChordOpen, "hold-back: Ctrl+Shift+C does not cross the ACK");
+    }
+    {
+        // The Windows key from the hook.
+        KeyHoldBack h;
+        down.clear();
+        expect(h.winDown(false, isDown) == Reason::PlatformUnknown, "hold-back: Win before the ACK");
+        expect(h.hookTap(true, isDown) == Reason::ChordOpen, "hold-back: hook Win+C after the ACK, Win still held back");
+        expect(h.keyDown(kV, false, true, isDown) == Reason::ChordOpen, "hold-back: V while the held-back Win is down");
+        expect(h.winUp(), "hold-back: the held-back Win's up is not sent");
+        expect(!h.winUp(), "hold-back: a second Win up is sent");
+        expect(h.keyUp(kV), "hold-back: V's up is not sent");
+        expect(h.hookTap(true, isDown) == Reason::None, "hold-back: hook tap with nothing held back goes out");
+        expect(h.winDown(true, isDown) == Reason::None, "hold-back: Win after the ACK goes out");
+        expect(!h.winUp(), "hold-back: ... and its up");
+        h.winDown(false, isDown);
+        h.hookReset();
+        expect(h.hookTap(true, isDown) == Reason::None, "hold-back: focus loss forgets the held-back Win (its up will not come)");
+    }
+    {
+        // Pepper's review of f97ad11, item 2. Win goes down before the ACK
+        // and is held back; then the Files panel or the disconnect confirm
+        // opens and resets the hook, so the hook never posts that Win's up.
+        // The reset goes through resetHook, which forgets the held-back Win
+        // too: keys and clicks after it go out.
+        HookFilter hook;
+        KeyHoldBack h;
+        down.clear();
+        expect(hook.onKey(vk::LWin, true, false).post == HookFilter::Post::WinDown, "hook: Win down is posted");
+        expect(h.winDown(false, isDown) == Reason::PlatformUnknown, "hold-back: Win from the hook before the ACK");
+        jl::holdback::resetHook(hook, h);  // the Files panel or the disconnect confirm opens
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::None && !hook.winDown(),
+               "hook reset: the Win up after it is not posted");
+        down = {kV};
+        expect(h.keyDown(kV, false, true, isDown) == Reason::None, "hold-back: after resetHook, V goes out (Win not stuck)");
+        expect(!h.keyUp(kV), "hold-back: ... and its up");
+        down.clear();
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: after resetHook, a click goes out");
+        expect(!h.winUp() && h.heldBack() == 1, "hold-back: nothing else held back");
+    }
+    {
+        // The bug: a hook reset alone leaves the held-back Win, and the hook
+        // will never post its up. The next Win press still starts over.
+        HookFilter hook;
+        KeyHoldBack h;
+        down.clear();
+        hook.onKey(vk::LWin, true, false);
+        h.winDown(false, isDown);
+        hook.reset();
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::None && h.chordOpen(isDown),
+               "hold-back: a hook reset alone leaves the Win held back (what resetHook prevents)");
+        expect(hook.onKey(vk::LWin, true, false).post == HookFilter::Post::WinDown &&
+                   h.winDown(true, isDown) == Reason::None,
+               "hold-back: a fresh Win press after a lost up starts over and goes out");
+        expect(hook.onKey(vk::LWin, false, true).post == HookFilter::Post::WinUp && !h.winUp(),
+               "hold-back: ... and its up goes out");
+        down = {kV};
+        expect(h.keyDown(kV, false, true, isDown) == Reason::None, "hold-back: and V after it goes out");
+        down.clear();
+    }
+    {
+        KeyHoldBack h;
+        expect(h.hookTap(false, isDown) == Reason::PlatformUnknown, "hold-back: Caps Lock before the ACK");
+        expect(h.buttonDown(isDown) == Reason::None, "hold-back: a click before the ACK with no chord goes out");
+        down = {kCtrlVk};
+        h.keyDown(kCtrlVk, false, false, isDown);
+        h.reset();
+        expect(h.heldBack() == 0 && !h.chordOpen(isDown) && !h.keyUp(kCtrlVk),
+               "hold-back: a new session forgets everything");
+        down.clear();
+    }
+}
 
 int main() {
     testSemantics();
@@ -585,6 +855,8 @@ int main() {
     testWindowsPreset();
     testAltTab();
     testPresetSwitch();
+    testWindowsHostPassthrough();
+    testChordHoldBack();
     std::printf("keymap: %d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }
