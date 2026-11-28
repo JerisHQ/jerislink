@@ -119,18 +119,6 @@ static void testControlFrames() {
     uint8_t bad[8] = {'M', 'R', 'C', '2', 1, 1, 0, 0};
     CHECK(!jlh::parseMrc1Header(bad));
 
-    // The transition probe: 0x03, 64 bytes, zero MAC.
-    std::vector<uint8_t> probe(64, 0);
-    for (int i = 0; i < 32; ++i) probe[size_t(i)] = uint8_t(i + 1);
-    CHECK(jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 64}, probe.data()));
-    probe[63] = 1;  // a real MAC: H1 has no password to check it with
-    CHECK(!jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 64}, probe.data()));
-    CHECK(!jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 72}, probe.data()));
-    // Its answer is what conn_auth.hpp decodes as OpenIpOnly.
-    const uint8_t open = jlh::kAuthOpenIpOnly;
-    const auto r = jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1);
-    CHECK(r.size() == 9 && r[5] == 0x04 && r[7] == 1 && r[8] == 5);
-
     // PING is answered only at the viewer's 4-byte size.
     CHECK(jlh::isValidPing(jlh::Mrc1Header{0x01, 4}));
     CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x01, 0}));

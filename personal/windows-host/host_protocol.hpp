@@ -99,8 +99,6 @@ constexpr uint8_t kMsgClipboardHello = 0x30;
 constexpr uint8_t kMsgVideoConfig = 0x40, kMsgVideoConfigAck = 0x41;
 constexpr uint8_t kMsgFileHello = 0x50;
 constexpr uint8_t kMsgHostInfo = 0x06;      // H2, host -> viewer (windows-client/host_info.hpp)
-constexpr size_t kAuthProbeBytes = 64;      // client nonce (32) + MAC (32)
-constexpr uint8_t kAuthOpenIpOnly = 5;      // conn_auth.hpp Result::Status
 
 inline std::vector<uint8_t> mrc1Frame(uint8_t type, const uint8_t* payload, size_t n) {
     std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, uint8_t(n >> 8), uint8_t(n)};
@@ -142,16 +140,6 @@ private:
     const int max_;
     std::atomic<int> used_{0};
 };
-
-// The transition probe a viewer sends to a host that sent no challenge:
-// random nonce, all-zero MAC (conn_auth.hpp, design §9). H1 runs without a
-// password only, so the probe is the only AUTH it accepts.
-inline bool isTransitionProbe(const Mrc1Header& h, const uint8_t* payload) {
-    if (h.type != kMsgAuthResponse || h.length != kAuthProbeBytes) return false;
-    for (size_t i = 32; i < kAuthProbeBytes; ++i)
-        if (payload[i] != 0) return false;
-    return true;
-}
 
 // VIDEO_CONFIG_SET v1: [1, codec (0 auto, 1 h264, 2 hevc), caps, 0, bitrate BE16].
 // H1 encodes H.264 only. Same refusals as VideoSettingsController.apply.
@@ -740,6 +728,16 @@ public:
         framed_[o] = false;
         return o;
     }
+    // H3: a connection numbered by the caller (host_main.cpp: its
+    // SessionBroker token, so owners rise in the order the password
+    // admitted them, as takeovers do; an AUTH that finished later than a
+    // newer one cannot take input back). o must be above every number
+    // used before.
+    void openAs(Owner o) {
+        std::lock_guard<std::mutex> g(m_);
+        framed_[o] = false;
+        if (o >= next_) next_ = o + 1;
+    }
 
     struct Heard {
         bool refuse = false;    // a FILE_HELLO first: no file transfer here; close the connection
@@ -776,14 +774,31 @@ public:
         bool blocked = false;   // r9: o is the owner, but an up is still owed: dropped (only ups go in)
         bool silenced = false;  // r9: o lost ownership for going quiet (expire()): close it
         bool injected = false;  // what inject returned
+        bool revoked = false;   // H3: o's connection was voided (live() false): nothing changed; close it
     };
     // One input frame e from o, whose peer address is ip. When o is the
     // owner, or becomes it now, and the frame may go in, inject(HeldInput&)
     // puts it in, still under the lock; otherwise inject is not called.
     template <class Inject, class UpKey, class UpButton>
     Frame frame(Owner o, uint32_t ip, const InputEvent& e, Inject&& inject, UpKey&& upKey, UpButton&& upButton) {
+        return frameIfLive(
+            o, ip, e, [] { return true; }, std::forward<Inject>(inject), std::forward<UpKey>(upKey),
+            std::forward<UpButton>(upButton));
+    }
+    // H3: the same, first asking live() under this lock (host_main.cpp: the
+    // connection is still in the broker's epoch). A voided connection's
+    // frame changes nothing (no takeover, no binding, no injection) even
+    // when it was read before the void; retire() takes this lock, so one
+    // already past the check has gone in before the void returns.
+    template <class Live, class Inject, class UpKey, class UpButton>
+    Frame frameIfLive(Owner o, uint32_t ip, const InputEvent& e, Live&& live, Inject&& inject, UpKey&& upKey,
+                      UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         Frame r;
+        if (!live()) {
+            r.revoked = true;
+            return r;
+        }
         if (silenced_.count(o)) {
             r.silenced = true;
             return r;
@@ -826,6 +841,24 @@ public:
         lastPing_.erase(o);
         silenced_.erase(o);
         framed_.erase(o);
+        return held_.releaseOwned(o, upKey, upButton);
+    }
+    // H3: the broker voided connections (SessionBroker::onVoid: a takeover,
+    // a password or whitelist change, a block). An owner live(owner) no
+    // longer counts loses ownership now: its claims end (the ups go in),
+    // its MRM1 socket is unbound, and it never takes input back (newest_
+    // keeps it). Under this lock, so a frame of it that passed live() in
+    // frameIfLive went in before this returns. Returns how many ups
+    // Windows took; retired is set when an owner was retired.
+    template <class Live, class UpKey, class UpButton>
+    size_t retire(Live&& live, UpKey&& upKey, UpButton&& upButton, bool* retired = nullptr) {
+        std::lock_guard<std::mutex> g(m_);
+        if (retired) *retired = false;
+        if (!owner_ || live(owner_)) return 0;
+        const Owner o = owner_;
+        owner_ = 0;
+        newOwnershipLocked();
+        if (retired) *retired = true;
         return held_.releaseOwned(o, upKey, upButton);
     }
     // Ups Windows did not take, tried again (HeldInput::retryUnowned).
