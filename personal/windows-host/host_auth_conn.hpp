@@ -447,16 +447,34 @@ public:
     bool resetRequested() const { return reset_; }
     const std::string& peer() const { return ip_; }
 
+    // H3 (Pepper's review r1, item 1): asked on the accept thread, before a
+    // worker or a connection place is taken. A host with no password, or an
+    // address the guard refuses now (the blacklist, the whitelist, its own
+    // wait, the host-wide wait, a lockdown), is answered here as
+    // authenticate() answers it: one RESULT at most, sent within
+    // kAcceptSendMs, nothing read, nothing counted. True: refused; the
+    // caller closes the socket. authenticate() asks again for the rest.
+    bool refusedAtAccept() {
+        const PolicySnapshot pol = env_.policy ? env_.policy() : PolicySnapshot{};
+        if (!pol.secret) {
+            rejectNoSecret(pol);
+            return true;
+        }
+        const AuthGuard::Admission admission = env_.guard->admit(ip_);
+        if (admission.kind == AuthGuard::Admission::Challenge) return false;
+        sendLimitMs_ = kAcceptSendMs;
+        refuse(admission, false);
+        sendLimitMs_ = -1;
+        return true;
+    }
+
     // Mac authenticate: admission, CHALLENGE, RESPONSE, MAC, under the
     // guard's limits. nullopt: refused, answered and logged; the caller
     // closes the connection.
     std::optional<AuthOK> authenticate() {
         const PolicySnapshot pol = env_.policy ? env_.policy() : PolicySnapshot{};
         if (!pol.secret) {
-            // D9: the Windows host has no transition mode. Without a
-            // password nobody gets a challenge.
-            reject("Control reject peer=" + ip_ + " reason=" + pol.noSecretReason + " on " + env_.endpoint +
-                   "; connection closed");
+            rejectNoSecret(pol);
             return std::nullopt;
         }
         const AuthSecret& secret = *pol.secret;
@@ -705,11 +723,25 @@ private:
         if (env_.counters) ++env_.counters->rejected;
         log(line);
     }
+    // H3 r2: a refusal the accept thread can repeat as fast as an address
+    // connects: one line per address and event per 10 s (AuthLogThrottle).
+    void rejectThrottled(const std::string& event, const std::string& line) {
+        if (env_.counters) ++env_.counters->rejected;
+        authLog(event, line);
+    }
+    // D9: the Windows host has no transition mode. Without a password
+    // nobody gets a challenge.
+    void rejectNoSecret(const PolicySnapshot& pol) {
+        rejectThrottled("control.no_secret", "Control reject peer=" + ip_ + " reason=" + pol.noSecretReason + " on " +
+                                                 env_.endpoint + "; connection closed");
+    }
 
-    // A handshake frame: no revocation check, kHandshakeSendMs at most.
+    // A handshake frame: no revocation check, kHandshakeSendMs at most
+    // (kAcceptSendMs from the accept thread).
     bool sendHandshake(uint8_t type, const Bytes& payload) {
         SendOpts o;
         o.stopping = env_.stopping;
+        o.limitMs = sendLimitMs_;
         return sendFrame(s_, type, payload, o);
     }
 
@@ -770,8 +802,8 @@ private:
             authLog("auth.blocked", "auth.blocked peer=" + ip_ + note + "; connection closed");
             break;
         case AuthGuard::Admission::NotAllowed:
-            reject("Control reject peer=" + ip_ + " expected=whitelist on " + env_.endpoint + note +
-                   "; connection closed");
+            rejectThrottled("control.not_allowed", "Control reject peer=" + ip_ + " expected=whitelist on " +
+                                                       env_.endpoint + note + "; connection closed");
             break;
         case AuthGuard::Admission::Locked:
             sent = sendHandshake(kMsgResult, resultLocked(a.retrySeconds));
@@ -862,6 +894,36 @@ private:
     SocketHandle s_;
     std::string ip_;
     bool reset_ = false;
+    int sendLimitMs_ = -1;  // SendOpts::limitMs for handshake frames (-1: kHandshakeSendMs)
 };
+
+// H3 (Pepper's review r1, item 1): the accept thread's step for one new
+// connection, before any worker exists. Refused addresses are answered
+// here (AuthConn::refusedAtAccept) and never take a place; the rest take
+// one (ConnectionSlots: handshakes capped in all and per address). Serve:
+// the caller starts the worker, which owns the place and gives it back.
+// Anything else: the caller closes the socket (nothing was read, so a
+// plain close is a FIN).
+enum class AcceptVerdict { Serve, Refused, NoPlace, SocketFailed };
+
+inline AcceptVerdict acceptStep(AuthEnv& env, ConnectionSlots& slots, SocketHandle s, const std::string& ip,
+                                uint32_t source) {
+    // The Mac r12: viewer sockets are non-blocking; every wait is a
+    // select() slice.
+    if (!setNonBlocking(s)) {
+        if (env.log) env.log("control.closed peer=" + ip + " reason=nonblocking err=" + std::to_string(sockError()));
+        return AcceptVerdict::SocketFailed;
+    }
+    if (AuthConn(env, s, ip).refusedAtAccept()) return AcceptVerdict::Refused;
+    const ConnectionSlots::Taken t = slots.tryAcquire(source);
+    if (t == ConnectionSlots::Taken::Ok) return AcceptVerdict::Serve;
+    const std::string line = std::string("control.rejected peer=") + ip + " reason=" + slotRefusalName(t) +
+                             " handshakes_from_peer=" + std::to_string(slots.handshakesFrom(source)) +
+                             " handshakes=" + std::to_string(slots.handshakes()) +
+                             " connections=" + std::to_string(slots.inUse()) + "; connection closed";
+    if (env.authLog) env.authLog->log("control.rejected", ip, line);
+    else if (env.log) env.log(line);
+    return AcceptVerdict::NoPlace;
+}
 
 }  // namespace jlh::auth

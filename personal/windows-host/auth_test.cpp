@@ -932,9 +932,21 @@ static SocketHandle listenLoopback(uint16_t& port) {
     return l;
 }
 
-static SocketHandle connectLoopback(uint16_t port, int rcvbuf = 0) {
+// `src`: another loopback address to connect from (127.0.0.2: another
+// viewer machine as far as the host can tell).
+static SocketHandle connectLoopback(uint16_t port, int rcvbuf = 0, const char* src = nullptr) {
     SocketHandle s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (rcvbuf) setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+    if (src) {
+        sockaddr_in from{};
+        from.sin_family = AF_INET;
+        inet_pton(AF_INET, src, &from.sin_addr);
+        if (bind(s, reinterpret_cast<sockaddr*>(&from), sizeof(from)) != 0) {
+            std::printf("  (cannot bind %s, error %d)\n", src, sockError());
+            closeSock(s);
+            return kNoSocket;
+        }
+    }
 #ifdef _WIN32
     DWORD tv = 8000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
@@ -998,12 +1010,15 @@ struct Viewer {
     HostId hostId{};
     Nonce cn{};
     Channel ch = Channel::Control;
+    const char* src = nullptr;  // connect from this loopback address
 
+    Viewer() = default;
+    explicit Viewer(const char* from) : src(from) {}
     ~Viewer() {
         if (s != kNoSocket) closeSock(s);
     }
     bool open(uint16_t port, int rcvbuf = 0) {
-        s = connectLoopback(port, rcvbuf);
+        s = connectLoopback(port, rcvbuf, src);
         return s != kNoSocket;
     }
     bool readChallenge() {
@@ -1036,7 +1051,13 @@ struct Viewer {
     // Logs in; returns the session id (and checks mac_h).
     std::optional<SessionId> login(uint16_t port, const Key& k, Channel c,
                                    const std::optional<SessionId>& resume = std::nullopt) {
-        if (!open(port) || !readChallenge() || !answer(k, c, resume)) return std::nullopt;
+        if (!open(port) || !readChallenge()) return std::nullopt;
+        return finishLogin(k, c, resume);
+    }
+    // The rest of a login after readChallenge().
+    std::optional<SessionId> finishLogin(const Key& k, Channel c,
+                                         const std::optional<SessionId>& resume = std::nullopt) {
+        if (!answer(k, c, resume)) return std::nullopt;
         const Bytes r = result();
         if (r.size() != 41 || r[0] != 0) return std::nullopt;
         Mac want{};
@@ -1090,6 +1111,11 @@ struct HostRig {
     std::atomic<int> served{0};
     uint32_t seed = 1;
     std::mutex rm;
+    // runAcceptLoop(): host_main.cpp's controlListener and serveControl.
+    jlh::ConnectionSlots slots;
+    std::atomic<int> workers{0};  // connections that got a worker thread
+    std::vector<std::thread> workerThreads;
+    std::mutex wm;
 
     explicit HostRig(const Vector& v)
         : guard({}, store, &journal, testHooks(clock, &lines, &lm)),
@@ -1126,7 +1152,8 @@ struct HostRig {
     }
     ~HostRig() {
         stopping = true;
-        for (auto& t : threads) t.join();
+        for (auto& t : threads) t.join();  // the accept loop first: no new workers after it
+        for (auto& t : workerThreads) t.join();
         closeSock(listener);
     }
     void note(const std::string& s) {
@@ -1138,6 +1165,12 @@ struct HostRig {
         for (const auto& l : lines)
             if (l.rfind(prefix, 0) == 0) return true;
         return false;
+    }
+    int count(const std::string& prefix) {
+        std::lock_guard<std::mutex> g(lm);
+        int n = 0;
+        for (const auto& l : lines) n += l.rfind(prefix, 0) == 0;
+        return n;
     }
     bool waitFor(const std::string& prefix, int ms = 4000) {
         for (int i = 0; i < ms / 10; ++i) {
@@ -1166,9 +1199,46 @@ struct HostRig {
                 closeSock(s);
                 return;
             }
-            AuthConn c(env, s, ipb);
+            serveConn(s, ipb, 0, false);
+        });
+    }
+    // host_main.cpp's controlListener: every connection on this listener
+    // goes through acceptStep on this one thread; only Serve starts a
+    // worker, which holds the place taken there.
+    void runAcceptLoop() {
+        threads.emplace_back([this] {
+            while (!stopping) {
+                if (waitSocket(listener, false, 20) != 1) continue;
+                sockaddr_in a{};
+                SockLen len = sizeof(a);
+                SocketHandle s = accept(listener, reinterpret_cast<sockaddr*>(&a), &len);
+                if (s == kNoSocket) continue;
+                char ipb[32] = {};
+                inet_ntop(AF_INET, &a.sin_addr, ipb, sizeof(ipb));
+                const uint32_t source = uint32_t(a.sin_addr.s_addr);
+                if (acceptStep(env, slots, s, ipb, source) != AcceptVerdict::Serve) {
+                    closeSock(s);
+                    continue;
+                }
+                ++workers;
+                std::lock_guard<std::mutex> g(wm);
+                workerThreads.emplace_back([this, s, ip = std::string(ipb), source] { serveConn(s, ip, source, true); });
+            }
+        });
+    }
+    // serveControl after the socket is set up. `slotted`: it holds a place
+    // in `slots` (runAcceptLoop): the handshake part goes back when the
+    // password matched, the rest when the connection ends.
+    void serveConn(SocketHandle s, const std::string& ip, uint32_t source, bool slotted) {
+        {
+            AuthConn c(env, s, ip);
             auto life = std::make_shared<ConnLife>();
             const auto ok = c.authenticate();
+            bool inHandshake = true;
+            if (ok && slotted) {
+                slots.authenticated(source);
+                inHandshake = false;
+            }
             std::optional<uint64_t> token;
             if (ok) token = c.admit(*ok, life);
             if (ok && token) {
@@ -1196,8 +1266,9 @@ struct HostRig {
                 c.finish(*ok, *token, *life);
             }
             finishSocket(s, c.resetRequested());
-            ++served;
-        });
+            if (slotted) slots.release(source, inHandshake);
+        }
+        ++served;
     }
     void waitServed(int n) {
         for (int i = 0; i < 800 && served.load() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1456,6 +1527,248 @@ static void testAuthOverLoopback(const Vector& v) {
         h.waitServed(2);
         if (gFailures) h.dump();
     }
+}
+
+// ------------------------------------------ H3 r2 (Pepper's review r1)
+
+static uint32_t addrOf(const char* ip) {
+    in_addr a{};
+    inet_pton(AF_INET, ip, &a);
+    return uint32_t(a.s_addr);
+}
+
+// Item 1: the accept thread answers an address the guard refuses (here the
+// blacklist, then its own wait) by itself. It never gets a worker or a
+// place, however often it connects.
+static void testAcceptScreen(const Vector& v) {
+    HostRig h(v);
+    h.store.entries.push_back({"127.0.0.2", 1, "manual"});
+    ++h.store.stamp.b;
+    h.runAcceptLoop();
+    for (int i = 0; i < 12; ++i) {
+        Viewer x("127.0.0.2");
+        CHECK(x.open(h.port));
+        CHECK(x.result() == Bytes{3});  // BLOCKED, before any challenge
+        CHECK(x.closeKind() == 0);      // then a plain FIN
+    }
+    CHECK(h.workers == 0 && h.slots.inUse() == 0 && h.slots.handshakes() == 0);
+    CHECK(h.waitFor("auth.blocked peer=127.0.0.2; connection closed"));
+
+    // 127.0.0.4 locks itself out with five wrong answers; from then on it
+    // is refused at accept too.
+    for (int i = 0; i < 5; ++i) {
+        Viewer w("127.0.0.4");
+        CHECK(w.open(h.port) && w.readChallenge() && w.answer(keyOf(0x42), Channel::Control));
+        const Bytes r = w.result();
+        CHECK(i < 4 ? r == (Bytes{1, uint8_t(4 - i)}) : (r.size() == 5 && r[0] == 2));
+    }
+    CHECK(h.workers == 5);
+    for (int i = 0; i < 12; ++i) {
+        Viewer x("127.0.0.4");
+        CHECK(x.open(h.port));
+        const Bytes r = x.result();
+        CHECK(r.size() == 5 && r[0] == 2);  // LOCKED
+    }
+    CHECK(h.workers == 5);
+    CHECK(h.waitFor("auth.locked peer=127.0.0.4 retry_s=300 stage=1; connection closed"));
+    CHECK(h.count("auth.locked peer=127.0.0.4 retry_s=300 stage=1; connection closed") == 1);  // one per 10 s
+
+    // Not on the whitelist: closed with no frame, no worker, one log line.
+    h.guard.setWhitelist({"127.0.0.1"});
+    for (int i = 0; i < 12; ++i) {
+        Viewer x("127.0.0.5");
+        CHECK(x.open(h.port));
+        CHECK(x.endsWithoutFrame() == 0);
+    }
+    CHECK(h.workers == 5);
+    CHECK(h.waitFor("Control reject peer=127.0.0.5 expected=whitelist on 127.0.0.1:"));
+    CHECK(h.count("Control reject peer=127.0.0.5") == 1);
+    CHECK(h.counters.rejected >= 12);
+
+    // The whitelisted viewer: served as before.
+    Viewer ok;
+    CHECK(ok.login(h.port, v.key, Channel::Control).has_value());
+    CHECK(ok.ping(1));
+    CHECK(h.workers == 6);
+    if (gFailures) h.dump();
+}
+
+// Item 1: an address that opens connections and never answers holds
+// kMaxHandshakesPerSource handshakes at most; the rest are closed at
+// accept. A viewer from another address still logs in with all four
+// channels in their handshakes at once, and a third address still takes
+// over. The flood's handshakes end at the AUTH timeout, each a failure.
+static void testHandshakePlaces(const Vector& v) {
+    static_assert(jlh::kMaxHandshakes >= 2 * jlh::kMaxHandshakesPerSource, "a viewer fits beside one flood");
+    HostRig h(v);
+    h.env.authTimeoutMs = 3000;
+    h.runAcceptLoop();
+    const int per = jlh::kMaxHandshakesPerSource;
+    std::vector<std::unique_ptr<Viewer>> flood;
+    int challenged = 0, closed = 0;
+    for (int i = 0; i < 12; ++i) {
+        flood.push_back(std::make_unique<Viewer>("127.0.0.2"));
+        Viewer& x = *flood.back();
+        CHECK(x.open(h.port));
+        uint8_t t = 0;
+        Bytes p;
+        const int r = readFrame(x.s, t, p);
+        if (r == 1 && t == kMsgChallenge) ++challenged;
+        else if (r == 0) ++closed;
+    }
+    CHECK(challenged == per && closed == 12 - per);
+    CHECK(h.workers == per && h.slots.handshakesFrom(addrOf("127.0.0.2")) == per);
+    CHECK(h.waitFor("control.rejected peer=127.0.0.2 reason=source_handshakes_full"));
+
+    // The viewer, 127.0.0.1: four channels challenged at once.
+    Viewer lc, lclip, lfile, lping;
+    for (Viewer* x : {&lc, &lclip, &lfile, &lping}) CHECK(x->open(h.port) && x->readChallenge());
+    CHECK(h.slots.handshakes() == 2 * per);
+    const auto sid = lc.finishLogin(v.key, Channel::Control);
+    CHECK(sid.has_value());
+    CHECK(lclip.finishLogin(v.key, Channel::Clipboard, sid).has_value());
+    CHECK(lfile.finishLogin(v.key, Channel::File, sid).has_value());
+    CHECK(lping.finishLogin(v.key, Channel::Ping, sid).has_value());
+    CHECK(lc.ping(1) && lping.ping(2));
+    CHECK(h.slots.handshakes() == per);  // logged in: out of the handshake count
+
+    // A takeover from 127.0.0.3, again four at once, the flood still there.
+    Viewer tc("127.0.0.3"), tclip("127.0.0.3"), tfile("127.0.0.3"), tping("127.0.0.3");
+    for (Viewer* x : {&tc, &tclip, &tfile, &tping}) CHECK(x->open(h.port) && x->readChallenge());
+    const auto sidT = tc.finishLogin(v.key, Channel::Control);
+    CHECK(sidT && sid && *sidT != *sid);
+    CHECK(tclip.finishLogin(v.key, Channel::Clipboard, sidT).has_value());
+    CHECK(tfile.finishLogin(v.key, Channel::File, sidT).has_value());
+    CHECK(tping.finishLogin(v.key, Channel::Ping, sidT).has_value());
+    CHECK(lc.result() == Bytes{6});  // REPLACED
+    CHECK(h.waitFor("auth.replaced old_peer=127.0.0.1 chan=control new_peer=127.0.0.3"));
+    CHECK(tc.ping(3) && tping.ping(4));
+
+    // The flood times out: places back, four failures for 127.0.0.2.
+    for (int i = 0; i < 600 && h.slots.handshakes() != 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(h.slots.handshakes() == 0 && h.slots.handshakesFrom(addrOf("127.0.0.2")) == 0);
+    CHECK(h.guard.failures("127.0.0.2") == per);
+    if (gFailures) h.dump();
+}
+
+static SessionBroker::Admitted takeOver(SessionBroker& b, uint8_t n) {
+    return b.admit("100.64.0." + std::to_string(n), Channel::Control, keyOf(n), sidOf(n), std::nullopt, false,
+                   b.policyGeneration(), {});
+}
+
+// Item 2: a frame goes out packet by packet, each checked against the
+// session under the broker's send gate; a takeover between two packets
+// stops the frame there.
+static void testFrameSendCut() {
+    SessionBroker b(portableTags(), [](const std::string&) {});
+    CHECK(takeOver(b, 1).refused == SessionBroker::Refusal::None);
+    const uint64_t gen = b.generation();
+    std::vector<size_t> sent;
+    const FrameSend r = sendFrameWhileCurrent(
+        b, gen, 10,
+        [&](size_t i) {
+            if (i == 4) CHECK(takeOver(b, 2).refused == SessionBroker::Refusal::None);
+        },
+        [&](size_t i) {
+            sent.push_back(i);
+            return true;
+        });
+    CHECK(r.cut && r.sent == 4 && r.failed == 0);
+    CHECK((sent == std::vector<size_t>{0, 1, 2, 3}));
+    CHECK(b.generation() != gen && !b.sendIfCurrent(gen, [] {}));
+    // A send that fails is counted; the frame goes on.
+    const FrameSend r2 = sendFrameWhileCurrent(b, b.generation(), 3, [](size_t) {}, [](size_t i) { return i != 1; });
+    CHECK(!r2.cut && r2.sent == 2 && r2.failed == 1);
+}
+
+// Item 2: a void (a takeover, a policy change, a block) does not return
+// while a datagram checked against the old session is still going out,
+// and after it returns none goes out under the old session.
+static void testSendGate() {
+    for (int kind = 0; kind < 3; ++kind) {
+        SessionBroker b(portableTags(), [](const std::string&) {});
+        CHECK(takeOver(b, 1).refused == SessionBroker::Refusal::None);
+        const uint64_t gen = b.generation();
+        std::atomic<bool> inSend{false}, voidReturned{false}, returnedDuringSend{false};
+        bool ran = false;
+        std::thread sender([&] {
+            ran = b.sendIfCurrent(gen, [&] {
+                inSend = true;
+                for (int i = 0; i < 30; ++i) {  // a slow send, 300 ms
+                    if (voidReturned) {
+                        returnedDuringSend = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            });
+        });
+        while (!inSend) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::thread voider([&] {
+            if (kind == 0) (void)takeOver(b, 2);
+            else if (kind == 1) b.voidAll(CloseReason::Policy, true);
+            else (void)b.kickPeer("100.64.0.1", CloseReason::Blocked);
+            voidReturned = true;
+        });
+        sender.join();
+        voider.join();
+        CHECK(ran && voidReturned);
+        CHECK(!returnedDuringSend);
+        if (returnedDuringSend) std::printf("  (void kind %d returned during the send)\n", kind);
+        CHECK(b.generation() != gen);
+        bool late = false;
+        CHECK(!b.sendIfCurrent(gen, [&] { late = true; }) && !late);
+    }
+}
+
+// Item 3: a blacklist that is there but does not read at start is not an
+// empty one. Nobody is admitted and every open connection is held until it
+// reads (tried once a second); then its blocks apply. One that read once
+// and fails later keeps what it read (r8). No list at all is an empty one.
+static void testBlocklistUnreadAtStart() {
+    FakeClock clock;
+    MemoryBlocklist store;
+    store.entries.push_back({"100.64.0.9", 1, "manual"});
+    store.unreadable = true;
+    std::vector<std::string> lines;
+    std::mutex lm;
+    AuthGuard g({}, store, nullptr, testHooks(clock, &lines, &lm));
+    for (const char* ip : {"100.64.0.9", "100.64.0.1"}) {
+        const auto a = g.admit(ip);
+        CHECK(a.kind == AuthGuard::Admission::GlobalLocked && a.retrySeconds == AuthGuard::kPendingRetrySeconds);
+    }
+    CHECK(g.lockdownReason() == std::optional<std::string>("blocklist_unreadable"));
+    CHECK(g.inputRefusal("100.64.0.1") == std::optional<std::string>("blocklist_unreadable"));
+    clock.t = clock.t + 1.5;
+    CHECK(g.admit("100.64.0.1").kind == AuthGuard::Admission::GlobalLocked);
+    store.unreadable = false;
+    CHECK(g.admit("100.64.0.1").kind == AuthGuard::Admission::GlobalLocked);  // tried under a second ago
+    clock.t = clock.t + 1.5;
+    CHECK(g.admit("100.64.0.9").kind == AuthGuard::Admission::Blocked);
+    CHECK(g.admit("100.64.0.1").kind == AuthGuard::Admission::Challenge);
+    CHECK(!g.lockdownReason());
+    CHECK(g.inputRefusal("100.64.0.1") == std::nullopt);
+    CHECK(g.inputRefusal("100.64.0.9") == std::optional<std::string>("blocked"));
+    {
+        std::lock_guard<std::mutex> lg(lm);
+        bool down = false, cleared = false;
+        for (const auto& l : lines) {
+            down |= l.rfind("auth.lockdown reason=blocklist_unreadable source=", 0) == 0;
+            cleared |= l.rfind("auth.lockdown_cleared reason=blocklist_readable source=", 0) == 0 &&
+                       l.find(" peers=1") != std::string::npos;
+        }
+        CHECK(down && cleared);
+    }
+    store.unreadable = true;
+    ++store.stamp.b;
+    clock.t = clock.t + 2;
+    CHECK(g.admit("100.64.0.9").kind == AuthGuard::Admission::Blocked);
+    CHECK(g.admit("100.64.0.1").kind == AuthGuard::Admission::Challenge && !g.lockdownReason());
+
+    MemoryBlocklist none;
+    AuthGuard g2({}, none, nullptr, testHooks(clock));
+    CHECK(g2.admit("100.64.0.1").kind == AuthGuard::Admission::Challenge && !g2.lockdownReason());
 }
 
 // ------------------------------------------------------- settings (H3)
@@ -1887,6 +2200,25 @@ static void testRegistryStore() {
         CHECK(guard.inputRefusal("100.64.0.8") == std::optional<std::string>("blocked"));
     }
 
+    // H3 r2 (Pepper's review r1, item 3): a BlockedIPs value that does not
+    // read (here the wrong type) shuts a host starting on it until it
+    // reads; no value at all is an empty list.
+    {
+        FakeClock clock;
+        const DWORD bad = 7;
+        CHECK(RegSetKeyValueW(HKEY_CURRENT_USER, loc.path.c_str(), L"BlockedIPs", REG_DWORD, &bad, sizeof(bad)) ==
+              ERROR_SUCCESS);
+        cfg::RegistryBlocklist bl(loc);
+        CHECK(!bl.load());
+        AuthGuard guard({}, bl, nullptr, testHooks(clock));
+        CHECK(guard.admit("100.64.0.1").kind == AuthGuard::Admission::GlobalLocked);
+        CHECK(guard.lockdownReason() == std::optional<std::string>("blocklist_unreadable"));
+        CHECK(RegDeleteKeyValueW(HKEY_CURRENT_USER, loc.path.c_str(), L"BlockedIPs") == ERROR_SUCCESS);
+        CHECK(bl.load() && bl.load()->empty());
+        clock.t = clock.t + 2;
+        CHECK(guard.admit("100.64.0.1").kind == AuthGuard::Admission::Challenge && !guard.lockdownReason());
+    }
+
     CHECK(RegDeleteTreeW(HKEY_CURRENT_USER, loc.path.c_str()) == ERROR_SUCCESS);
     RegDeleteKeyExW(HKEY_CURRENT_USER, L"Software\\JerisTest", KEY_WOW64_64KEY, 0);  // only when empty
     CHECK(!cfg::readSettings(loc).exists);
@@ -1929,6 +2261,11 @@ int main(int argc, char** argv) {
     testResolveListen();
     testPolicyHolder();
     testAuthOverLoopback(vs.front());
+    testAcceptScreen(vs.front());
+    testHandshakePlaces(vs.front());
+    testFrameSendCut();
+    testSendGate();
+    testBlocklistUnreadAtStart();
 #ifdef _WIN32
     testViewerClientInterop(vs.front());
     testRegistryStore();

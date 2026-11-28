@@ -121,25 +121,87 @@ inline std::optional<Mrc1Header> parseMrc1Header(const uint8_t* h) {
 // A PING the host answers: the 4-byte payload real viewers send.
 inline bool isValidPing(const Mrc1Header& h) { return h.type == kMsgPing && h.length == kPingPayloadBytes; }
 
-// Control connection slots. The listener takes one before it starts a
-// worker, so sockets still in the handshake count against the cap too; the
-// worker gives it back on every exit path.
+// Control connection places (H3, Pepper's review r1 item 1). The listener
+// takes one before it starts a worker, after the accept-time screen
+// (AuthConn::refusedAtAccept) has turned away every address the guard
+// refuses. A place counts against kMaxControlConnections until its worker
+// ends; while its handshake runs it also counts against kMaxHandshakes, and
+// against kMaxHandshakesPerSource for its address. A connection that
+// authenticated gives its handshake place back (`authenticated`), so
+// handshakes never hold what a viewer with the password needs to log in or
+// take over, and one address never holds every handshake place. The
+// worker gives the place back on every exit path (`release`).
+constexpr int kMaxControlConnections = 16;  // a thread each, past the handshake or in it
+constexpr int kMaxHandshakes = 8;           // in the handshake, every address
+constexpr int kMaxHandshakesPerSource = 4;  // control, clipboard, file and ping may handshake at once
+
 class ConnectionSlots {
 public:
-    explicit ConnectionSlots(int max) : max_(max) {}
-    bool tryAcquire() {
-        int n = used_.load();
-        while (n < max_)
-            if (used_.compare_exchange_weak(n, n + 1)) return true;
-        return false;
+    enum class Taken { Ok, Full, HandshakesFull, SourceFull };
+
+    ConnectionSlots(int maxConnections = kMaxControlConnections, int maxHandshakes = kMaxHandshakes,
+                    int maxPerSource = kMaxHandshakesPerSource)
+        : maxConnections_(maxConnections), maxHandshakes_(maxHandshakes), maxPerSource_(maxPerSource) {}
+
+    // `source`: the peer's IPv4 address as accept gave it.
+    Taken tryAcquire(uint32_t source) {
+        std::lock_guard<std::mutex> g(m_);
+        if (used_ >= maxConnections_) return Taken::Full;
+        if (handshakes_ >= maxHandshakes_) return Taken::HandshakesFull;
+        const auto it = bySource_.find(source);
+        if (it != bySource_.end() && it->second >= maxPerSource_) return Taken::SourceFull;
+        ++used_;
+        ++handshakes_;
+        ++bySource_[source];
+        return Taken::Ok;
     }
-    void release() { --used_; }
-    int inUse() const { return used_.load(); }
+    // The handshake of one of `source`'s places ended with a password match.
+    void authenticated(uint32_t source) {
+        std::lock_guard<std::mutex> g(m_);
+        endHandshakeLocked(source);
+    }
+    // The worker ended; `inHandshake`: it never called authenticated().
+    void release(uint32_t source, bool inHandshake) {
+        std::lock_guard<std::mutex> g(m_);
+        --used_;
+        if (inHandshake) endHandshakeLocked(source);
+    }
+    int inUse() const {
+        std::lock_guard<std::mutex> g(m_);
+        return used_;
+    }
+    int handshakes() const {
+        std::lock_guard<std::mutex> g(m_);
+        return handshakes_;
+    }
+    int handshakesFrom(uint32_t source) const {
+        std::lock_guard<std::mutex> g(m_);
+        const auto it = bySource_.find(source);
+        return it == bySource_.end() ? 0 : it->second;
+    }
 
 private:
-    const int max_;
-    std::atomic<int> used_{0};
+    void endHandshakeLocked(uint32_t source) {
+        --handshakes_;
+        const auto it = bySource_.find(source);
+        if (it != bySource_.end() && --it->second <= 0) bySource_.erase(it);
+    }
+
+    const int maxConnections_, maxHandshakes_, maxPerSource_;
+    mutable std::mutex m_;
+    int used_ = 0, handshakes_ = 0;
+    std::map<uint32_t, int> bySource_;
 };
+
+inline const char* slotRefusalName(ConnectionSlots::Taken t) {
+    switch (t) {
+    case ConnectionSlots::Taken::Ok: return "ok";
+    case ConnectionSlots::Taken::Full: return "too_many";
+    case ConnectionSlots::Taken::HandshakesFull: return "handshakes_full";
+    case ConnectionSlots::Taken::SourceFull: return "source_handshakes_full";
+    }
+    return "?";
+}
 
 // VIDEO_CONFIG_SET v1: [1, codec (0 auto, 1 h264, 2 hevc), caps, 0, bitrate BE16].
 // H1 encodes H.264 only. Same refusals as VideoSettingsController.apply.

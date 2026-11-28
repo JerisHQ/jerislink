@@ -72,6 +72,7 @@ constexpr int kAuthTimeoutMs = 5000;    // CHALLENGE sent -> whole RESPONSE read
 constexpr int kHandshakeSendMs = 5000;  // one handshake frame (RESULT) going out
 constexpr int kSendSliceMs = 100;       // a send re-checks revocation this often
 constexpr int kNoticeLingerMs = 1000;   // after REPLACED + FIN, read and drop this long
+constexpr int kAcceptSendMs = 200;      // a RESULT from the accept thread (a fresh socket: it goes at once)
 
 enum class Status : uint8_t { Ok = 0, Fail = 1, Locked = 2, Blocked = 3, AuthRequired = 4, OpenIpOnly = 5, Replaced = 6 };
 enum class Channel : uint8_t { Control = 1, Clipboard = 2, File = 3, Ping = 4 };
@@ -569,7 +570,18 @@ public:
         std::lock_guard<std::mutex> g(m_);
         // r8: taken before the read, as for the journal.
         storeKnown_ = blocklist_.probeStamp();
-        const auto loaded = blocklist_.load().value_or(std::vector<BlockedEntry>{});
+        // H3 r2 (Pepper's review r1, item 3): a blacklist that exists but
+        // does not read is not an empty one. Nobody is admitted until it
+        // reads (refreshStoreLocked); a store with no list reads as {}.
+        const auto read = blocklist_.load();
+        if (!read) {
+            storeUnread_ = true;
+            storeKnown_.reset();
+            lastStoreRetry_ = h_.now();
+            log("auth.lockdown reason=blocklist_unreadable source=" + h_.storeName +
+                " (nobody is admitted until it reads)");
+        }
+        const std::vector<BlockedEntry> loaded = read.value_or(std::vector<BlockedEntry>{});
         for (const auto& e : loaded) persisted_.insert(e.ip);
         // B5 r4: a block that never reached the store before the last exit
         // is blocked again and still pending, so the host stays shut (no
@@ -612,6 +624,7 @@ public:
     std::optional<std::string> lockdownReason() {
         std::lock_guard<std::mutex> g(m_);
         refreshLocked(false);
+        if (storeUnread_) return std::string("blocklist_unreadable");
         if (journalHoldLocked()) return std::string("pending_journal_unreadable");
         return std::nullopt;
     }
@@ -622,6 +635,7 @@ public:
     std::optional<std::string> inputRefusal(const std::string& ip) {
         std::lock_guard<std::mutex> g(m_);
         refreshLocked(false);
+        if (storeUnread_) return std::string("blocklist_unreadable");
         if (journalHoldLocked()) return std::string("pending_journal_unreadable");
         if (containsIp(blocked_, ip)) return std::string("blocked");
         return std::nullopt;
@@ -808,11 +822,18 @@ private:
     // block removed from outside (released in the settings window) is
     // released here too, with its count; one still pending stays.
     void refreshStoreLocked() {
+        if (storeUnread_) {
+            // H3 r2: not read since start; tried again at most once per
+            // kPendingRetryInterval (the policy watch asks every second).
+            const double t = h_.now();
+            if (t - lastStoreRetry_ < kPendingRetryInterval) return;
+            lastStoreRetry_ = t;
+        }
         const auto stamp = blocklist_.probeStamp();
         if (stamp && storeKnown_ && *stamp == *storeKnown_) return;
         const auto entries = blocklist_.load();
         if (!entries) {
-            if (!storeUnreadableLogged_) {
+            if (!storeUnreadableLogged_ && !storeUnread_) {
                 storeUnreadableLogged_ = true;
                 log("auth.blocklist_unreadable source=" + h_.storeName + " (kept the blacklist as it was)");
             }
@@ -820,6 +841,17 @@ private:
         }
         storeUnreadableLogged_ = false;
         storeKnown_ = stamp;
+        if (storeUnread_) {
+            storeUnread_ = false;
+            for (const auto& e : *entries) {
+                persisted_.insert(e.ip);
+                addBlocked(e);
+            }
+            log("auth.lockdown_cleared reason=blocklist_readable source=" + h_.storeName +
+                " peers=" + std::to_string(entries->size()));
+            retryPendingLocked(true);
+            return;
+        }
         std::vector<BlockedEntry> added;
         for (const auto& e : *entries)
             if (!persisted_.count(e.ip)) added.push_back(e);
@@ -874,6 +906,12 @@ private:
     Admission admitLocked(const std::string& ip) {
         refreshLocked(false);
         Admission a;
+        if (storeUnread_) {
+            // H3 r2: whether `ip` is blacklisted is not known yet.
+            a.kind = Admission::GlobalLocked;
+            a.retrySeconds = kPendingRetrySeconds;
+            return a;
+        }
         if (containsIp(blocked_, ip)) {
             a.kind = Admission::Blocked;
             return a;
@@ -1058,6 +1096,8 @@ private:
     std::optional<StoreStamp> journalKnown_;
     std::optional<StoreStamp> storeKnown_;
     bool storeUnreadableLogged_ = false;
+    bool storeUnread_ = false;    // H3 r2: the blacklist has not read once since start
+    double lastStoreRetry_ = 0;
     double lastJournalRetry_ = -1e300;
     double lastPendingRetry_ = -1e300;
     std::vector<std::string> newlyBlocked_;
@@ -1323,6 +1363,23 @@ public:
     // The session and its generation (one atomic load when unchanged:
     // readers cache by generation()).
     uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+
+    // H3 r2 (Pepper's review r1, item 2): one UDP datagram for session
+    // generation `gen`, sent by `send` only while `gen` is still the
+    // session. The check and the send hold the send gate, which every
+    // change of session (a takeover, a block, a policy change, a close)
+    // takes to move the generation: a change waits for a datagram already
+    // being sent, and no datagram starts under the old key after it, so
+    // once the call that voided returns (before a takeover's AUTH_OK goes
+    // out) nothing more goes to the old viewer. False: not current, not
+    // sent. `send` must not call into the broker.
+    template <class Send>
+    bool sendIfCurrent(uint64_t gen, Send&& send) {
+        std::lock_guard<std::mutex> g(sendGate_);
+        if (generation_.load(std::memory_order_acquire) != gen) return false;
+        send();
+        return true;
+    }
     std::shared_ptr<const UdpSession> current() {
         std::lock_guard<std::mutex> g(m_);
         return announced_;
@@ -1394,7 +1451,11 @@ private:
             announcedKey_.reset();
         }
         announced_ = src ? std::shared_ptr<const UdpSession>(s) : nullptr;
-        generation_.store(s->generation, std::memory_order_release);
+        {
+            // H3 r2: after any datagram already past sendIfCurrent's check.
+            std::lock_guard<std::mutex> sg(sendGate_);
+            generation_.store(s->generation, std::memory_order_release);
+        }
         return s;
     }
 
@@ -1451,6 +1512,7 @@ private:
     std::optional<Key> announcedKey_;
     std::unordered_map<uint64_t, CloseReason> why_;  // voided tokens, until their end()
     std::atomic<uint64_t> generation_{0};
+    std::mutex sendGate_;  // H3 r2: taken under m_ (never the other way round)
     uint64_t replaced_ = 0, resumeRefused_ = 0;
 
     std::mutex qm_;
@@ -1460,6 +1522,33 @@ private:
     bool qStop_ = false;
     std::thread worker_;
 };
+
+// H3 r2 (Pepper's review r1, item 2): one video frame's packets to the
+// session generation `gen` belongs to. `pace(i)` runs before packet i,
+// outside the gate; packet i then goes out only while `gen` is still the
+// session (SessionBroker::sendIfCurrent). A takeover, a block or a policy
+// change that lands mid-frame ends the frame there (`cut`): nothing more
+// under the old key, the next frame starts the new session with an IDR.
+// `send(i)`: false when the socket refused packet i.
+struct FrameSend {
+    size_t sent = 0, failed = 0;
+    bool cut = false;
+};
+template <class Pace, class Send>
+FrameSend sendFrameWhileCurrent(SessionBroker& broker, uint64_t gen, size_t packets, Pace&& pace, Send&& send) {
+    FrameSend r;
+    for (size_t i = 0; i < packets; ++i) {
+        pace(i);
+        bool ok = false;
+        if (!broker.sendIfCurrent(gen, [&] { ok = send(i); })) {
+            r.cut = true;
+            break;
+        }
+        if (ok) ++r.sent;
+        else ++r.failed;
+    }
+    return r;
+}
 
 // ------------------------------------------------------------- UDP checks
 

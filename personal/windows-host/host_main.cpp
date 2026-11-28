@@ -94,7 +94,6 @@ constexpr DWORD kMaxRetransmitS = 13;
 constexpr int kUpRetryMs = 250;
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
-constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
 constexpr int kCursorPollMs = 16;           // cursor shape check
 constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
 constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
@@ -231,7 +230,7 @@ struct State {
     std::atomic<uint64_t> pongDrops{0};
     std::atomic<bool> running{true};
     std::atomic<int> controlConnections{0};  // past the handshake: these keep the stream active
-    jlh::ConnectionSlots controlSlots{kMaxControlConnections};
+    jlh::ConnectionSlots controlSlots;  // H3 r2: handshakes capped in all and per address
     std::atomic<bool> keyframeRequested{false};
     std::atomic<int> bitrateMbps{25};
     std::atomic<int> streamW{0}, streamH{0};
@@ -303,7 +302,8 @@ bool applyPointerSync(State& st, uint32_t peerAddr, const jlh::InputEvent& sync,
 }
 
 // Runs on its own thread holding one of st.controlSlots, taken by the
-// listener; every return path closes the socket and gives the slot back.
+// listener; every return path closes the socket and gives the place back.
+// H3 r2: the handshake place goes back as soon as the password matched.
 // H3: the connection authenticates first (AuthConn, the Mac's
 // ControlServer). Only an admitted connection opens its owner in
 // InputClaims, numbered by its broker token (InputClaims::openAs), counts
@@ -321,24 +321,23 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
         State& st;
         SOCKET c;
         const jlh::auth::AuthConn& ac;
+        uint32_t source;
         jlh::HeldInput::Owner owner = 0;  // 0: never admitted, no claims opened
         bool established = false;
         bool claimsClosed = false;
+        bool inHandshake = true;
         ~Release() {
             if (owner && !claimsClosed)  // before its first frame: it holds nothing
                 st.claims.close(owner, [this](uint16_t v) { return st.input.upKey(v); },
                                 [this](uint8_t b) { return st.input.upButton(b); });
             if (established) --st.controlConnections;
             jlh::auth::finishSocket(c, ac.resetRequested());
-            st.controlSlots.release();
+            st.controlSlots.release(source, inHandshake);
         }
-    } guard{st, c, ac};
-    // H3 (the Mac r12): viewer sockets are non-blocking; every wait is a
-    // select() slice that asks whether the connection was voided first.
-    if (!jlh::auth::setNonBlocking(c)) {
-        logf("control.closed peer=%s reason=nonblocking err=%d", peer.c_str(), WSAGetLastError());
-        return;
-    }
+    } guard{st, c, ac, peerAddr};
+    // H3 (the Mac r12): the listener made the socket non-blocking
+    // (acceptStep); every wait is a select() slice that asks whether the
+    // connection was voided first.
     BOOL nodelay = TRUE;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     // Limits on a dead connection. The host writes to an idle control
@@ -374,6 +373,8 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
 
     const auto ok = ac.authenticate();  // refusals are answered and logged there
     if (!ok) return;
+    st.controlSlots.authenticated(peerAddr);
+    guard.inHandshake = false;
     const auto life = std::make_shared<jlh::auth::ConnLife>();
     const auto token = ac.admit(*ok, life);  // a control login takes over here
     if (!token) return;
@@ -588,22 +589,23 @@ void controlListener(State& st, SOCKET ls) {
             if (!st.running) break;
             continue;
         }
-        // H3: any address may try the password (the whitelist, when set,
-        // and the blacklist are AuthConn's first step); slots count
-        // connections still in the handshake too, which the AUTH timeout
-        // (5 s) bounds.
-        if (!st.controlSlots.tryAcquire()) {
-            logf("control.rejected peer=%s reason=too_many", ipString(from.sin_addr).c_str());
+        // H3 r2 (Pepper's review r1, item 1): an address the guard refuses
+        // (blacklist, whitelist, its wait, the host-wide wait, a lockdown)
+        // is answered and closed here, before a worker or a place; the
+        // rest take a place, with handshakes capped in all and per address
+        // (the AUTH timeout, 5 s, bounds each, and counts as a failure).
+        const std::string peer = ipString(from.sin_addr);
+        const uint32_t source = uint32_t(from.sin_addr.s_addr);
+        if (jlh::auth::acceptStep(*st.auth, st.controlSlots, c, peer, source) != jlh::auth::AcceptVerdict::Serve) {
             closesocket(c);
             continue;
         }
         try {
-            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr))
-                .detach();
+            std::thread(serveControl, std::ref(st), c, peer, source).detach();
         } catch (const std::exception&) {
-            logf("control.rejected peer=%s reason=no_thread", ipString(from.sin_addr).c_str());
+            logf("control.rejected peer=%s reason=no_thread", peer.c_str());
             closesocket(c);
-            st.controlSlots.release();
+            st.controlSlots.release(source, true);
         }
     }
 }
@@ -630,7 +632,9 @@ struct SessionView {
 
 // One datagram to `to`, sealed with the session's h2v tag (flag 0x80 on
 // byte 4, 8 bytes appended). False: not sent (no taggers, too long, or the
-// socket refused it).
+// socket refused it). H3 r2: callers send under the broker's send gate
+// (SessionBroker::sendIfCurrent), so no datagram goes out under a session
+// that was voided before it started.
 bool sendSealed(SOCKET s, const jlh::auth::UdpSession& sess, const uint8_t* p, size_t n, const sockaddr_in& to) {
     if (!sess.tags) return false;
     uint8_t out[2048];
@@ -769,13 +773,18 @@ void mrm1Listener(State& st, SOCKET u) {
         } else if (m->type == jlh::kMrm1Ping) {
             // The Mac r9: a blocked viewer (or a journal lockdown) gets no
             // pong. The pong goes only while the session it came in is
-            // still the current one, sealed with its key.
-            if (st.guard->inputRefusal(peer) || st.broker->generation() != sv.s->generation) {
+            // still the current one, sealed with its key (H3 r2: checked
+            // and sent under the broker's send gate).
+            if (st.guard->inputRefusal(peer)) {
                 ++st.pongDrops;
                 continue;
             }
             const auto pong = jlh::mrm1Pong(b, size_t(n));
-            if (!sendSealed(u, *sv.s, pong.data(), pong.size(), from)) ++st.pongDrops;
+            bool sent = false;
+            if (!st.broker->sendIfCurrent(sv.s->generation,
+                                          [&] { sent = sendSealed(u, *sv.s, pong.data(), pong.size(), from); }) ||
+                !sent)
+                ++st.pongDrops;
         }
     }
 }
@@ -855,7 +864,11 @@ void cursorLoop(State& st) {
         const bool changed = !haveShape || shape != last;
         if (!changed && now - lastSent < std::chrono::milliseconds(kCursorResendMs)) continue;
         const auto pkt = jlh::mrm1Cursor(seq++, shape);
-        if (sendSealed(st.mrm1Sock, *sv.s, pkt.data(), pkt.size(), peer))
+        bool sent = false;
+        if (!st.broker->sendIfCurrent(sv.s->generation,
+                                      [&] { sent = sendSealed(st.mrm1Sock, *sv.s, pkt.data(), pkt.size(), peer); }))
+            continue;  // the session moved: the next poll starts over for the new one
+        if (sent)
             ++st.cursorSent;
         else
             ++st.cursorSendFail;
@@ -973,31 +986,39 @@ public:
     ~VideoSender() { closesocket(s_); }
     void setBitrate(int mbps) { pacer_.setBitrate(mbps); }
 
-    // Returns packets sent; a datagram the socket refused is counted in
-    // takeFailed() (design §8.4: H1 counted only what went out).
-    // H3: to the session's viewer, sealed with its key (the Mac
-    // UDPFrameSender: 1200-byte packets plus the 8-byte tag).
-    size_t send(const std::vector<uint8_t>& au, bool key, const jlh::auth::UdpSession& sess, const in_addr& viewer) {
+    // A datagram the socket refused is counted in takeFailed() (design
+    // §8.4: H1 counted only what went out). H3: to the session's viewer,
+    // sealed with its key (the Mac UDPFrameSender: 1200-byte packets plus
+    // the 8-byte tag). H3 r2 (Pepper's review r1, item 2): every packet is
+    // checked against the session and sent under the broker's send gate;
+    // a session change mid-frame ends the frame (cut).
+    jlh::auth::FrameSend send(const std::vector<uint8_t>& au, bool key, jlh::auth::SessionBroker& broker,
+                              const jlh::auth::UdpSession& sess, const in_addr& viewer) {
         to_.sin_addr = viewer;
         const auto packets = jlh::packetizeMr02(nextFrameId_++, au.data(), au.size(), key);
-        size_t sent = 0;
-        for (const auto& p : packets) {
-            int64_t now = nowUs();
-            int64_t wait = pacer_.waitUs(now, p.size());
-            if (wait > 0) {
-                spinUntil(now + wait);
-                now = nowUs();
-            }
-            pacer_.spend(now, p.size() + jlh::auth::kTagBytes);
-            if (sendSealed(s_, sess, p.data(), p.size(), to_)) {
-                ++sent;
-                bytes_ += p.size() + jlh::auth::kTagBytes;
-            } else {
-                ++failed_;
+        const auto r = jlh::auth::sendFrameWhileCurrent(
+            broker, sess.generation, packets.size(),
+            [&](size_t i) {
+                const size_t n = packets[i].size();
+                int64_t now = nowUs();
+                const int64_t wait = pacer_.waitUs(now, n);
+                if (wait > 0) {
+                    spinUntil(now + wait);
+                    now = nowUs();
+                }
+                pacer_.spend(now, n + jlh::auth::kTagBytes);
+            },
+            [&](size_t i) {
+                const auto& p = packets[i];
+                if (sendSealed(s_, sess, p.data(), p.size(), to_)) {
+                    bytes_ += p.size() + jlh::auth::kTagBytes;
+                    return true;
+                }
                 lastError_ = WSAGetLastError();
-            }
-        }
-        return sent;
+                return false;
+            });
+        failed_ += r.failed;
+        return r;
     }
     uint64_t takeBytes() { const uint64_t b = bytes_; bytes_ = 0; return b; }
     uint64_t takeFailed() { const uint64_t f = failed_; failed_ = 0; return f; }
@@ -1164,7 +1185,13 @@ void videoLoop(State& st) {
             ++nSessionDrops;
             continue;
         }
-        nPackets += sender.send(au, key, *sv.s, sv.addr);
+        const auto frameSent = sender.send(au, key, *st.broker, *sv.s, sv.addr);
+        nPackets += frameSent.sent;
+        if (frameSent.cut) {
+            // H3 r2: the session moved mid-frame; the rest was not sent.
+            ++nSessionDrops;
+            continue;
+        }
         ++nEncoded;
         lastSend = Clock::now();
 

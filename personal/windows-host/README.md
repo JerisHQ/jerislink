@@ -109,6 +109,23 @@ each other's change.
 - A whitelist that is not empty closes every other address's connection
   before any challenge (`Control reject ... expected=whitelist`). The
   blacklist wins over the whitelist.
+- Connection places (H3 r2): an address the guard refuses at that moment
+  (blacklist, whitelist, its lock, the host-wide stop, a lockdown) is
+  answered and closed on the listener thread, before any worker, and
+  takes no place. Every other connection takes one of 16 places; while
+  its handshake runs it also holds one of 8 handshake places, at most 4
+  per address (control, clipboard, file and ping log in at once). A
+  connection whose password matched gives its handshake place back at
+  once. Past a limit: `control.rejected reason=source_handshakes_full`
+  (or `handshakes_full`, `too_many`) and a plain close. Refusal lines
+  are logged once per address and kind per 10 s (` suppressed=N` on the
+  next one).
+- A blacklist that cannot be read when the host starts (`BlockedIPs` of
+  the wrong type, a read error) is not taken as empty: `auth.lockdown
+  reason=blocklist_unreadable`, every login gets RESULT locked (retry
+  5 s) and input and pongs stop, until a read succeeds (retried at most
+  once a second; `auth.lockdown_cleared`). An absent `BlockedIPs` is
+  an empty list.
 - Takeover: a manual control login with the right password takes over.
   Every older connection is void at once and closed, its viewer is told
   REPLACED, and nothing of the old session is reused: every reconnect is a
@@ -144,12 +161,16 @@ each other's change.
   a 64-packet anti-replay window that starts fresh with each session. A
   ping from a blacklisted or locked-down address gets no pong.
 - Video and the cursor shape go only to the session viewer (video to its
-  38402), tagged. With no session the stream idles (`stream.idle
+  38402), tagged. H3 r2: each datagram (video packet, cursor, pong) is
+  checked against the current session and sent under the session
+  broker's send gate, so a takeover, block or policy change waits for a
+  send in progress, and nothing goes out under the old session after it.
+  A frame cut part way counts in `session_drops`. With no session the stream idles (`stream.idle
   reason=no_session`); each new session starts on a keyframe.
 
 Log lines: `auth.ok`, `auth.fail`, `auth.locked`, `auth.blocked`,
-`auth.global_locked`, `auth.replaced`, `auth.policy_changed`,
-`auth.block_added`, `auth.block_removed`, `control.open ... auth=password`,
+`auth.global_locked`, `auth.lockdown`, `auth.lockdown_cleared`, `auth.replaced`, `auth.policy_changed`,
+`auth.block_added`, `auth.block_removed`, `control.rejected`, `control.open ... auth=password`,
 `mrm1.session`, `stream.start ... gen=`.
 
 ## Ports (same as the macOS host)
