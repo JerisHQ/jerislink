@@ -80,7 +80,15 @@ Builds are unsigned (design doc D14).
   then presses or releases, and MRM1 moves from that UDP socket up to that
   seq arriving later are dropped as stale. Each viewer UDP socket keeps its
   own seq order (a new socket starts at 1); one not heard from for 10 s
-  starts over.
+  starts over. The 10-byte 0x27 format (with cap 0x20) was approved by
+  Morris on 2026-11-28 at 01:19 HKT. It is the only wire addition in H2.
+- H2 development builds must be used in pairs: a host and a viewer from the
+  same build. Mixing an earlier H2 development viewer or host with this one
+  is not supported. For example, a build with the early 8-byte 0x27
+  (8f8a33b) and a build with the 10-byte 0x27 each drop the other's
+  POINTER_SYNC as malformed. Supported: 0.4.x viewers and the viewer from
+  this build with this host, and the viewer from this build with the macOS
+  host.
 - MRM1 moves are taken from one UDP socket only, and the cursor shape goes
   to that socket and nowhere else. Moves from any other socket are dropped
   (`pointer_udp_not_owner` in `stats`).
@@ -96,6 +104,22 @@ Builds are unsigned (design doc D14).
     never sent a 0x27 takes moves from the first socket on its own TCP peer
     address that moves, and from that one only. With no owner, the socket
     that moved last does (hover before the first click).
+  - The 0.4.x rule only works when that viewer is the only one on its
+    address. The host classifies each control connection by its first
+    frame. CLIPBOARD_HELLO (the clipboard connection) and FILE_HELLO (a
+    file panel, refused) do not count. Any other first frame counts as a
+    control connection from its address until it closes. When an address
+    has two or more control connections (for example two viewers on one
+    PC; the host takes UDP from one address only), the host cannot tell
+    which UDP socket belongs to which viewer. So no move goes in by the
+    0.4.x rule, either for an owner or for hover, and the socket that had
+    the binding stops getting the cursor shape (`control.shared_address
+    ... legacy_udp=off`, `mrm1.legacy_off`, `pointer_udp_legacy_off` in
+    `stats`). Once the 0.4.x owner is alone again, it takes moves from the
+    socket it first moved from. If a different socket from its address
+    moves after that, the 0.4.x rule stays off for this owner until
+    ownership changes (it reconnects, or another connection takes over).
+    A viewer that names its socket with 0x27 is not affected.
   - When the owner changes (a takeover, its close, going quiet), the socket
     its moves came from is done: it moves nothing and gets no cursor shape,
     not under the next owner and not with no owner. A replaced viewer's late
@@ -140,13 +164,17 @@ Builds are unsigned (design doc D14).
   owes the ups of what it pressed.
 - Liveness (a hung viewer app): this viewer sends the existing MRC1 ping
   (0x01) on its control connection once a second from its input thread
-  (to a Windows host only; no new message or capability bit). Its
-  VIDEO_CONFIG asks for HOST_INFO (caps 0x08), which an older viewer never
-  does: that arms the connection, timed from then, so the 5 s run from the
-  capability exchange, before the first input (`input.liveness
-  from=video_config`). A ping that is not the connection's first frame
-  arms it too and restarts the time (`from=ping`). This viewer pings once
-  more as the start-up connection goes live, before any input. An armed
+  (to a Windows host only; no new message or capability bit). Every
+  viewer's first frame on a connection is one start-up ping, and that ping
+  does not count. Only a ping after the first frame (a liveness ping) arms
+  the connection (`input.liveness from=ping`), and each one restarts the
+  5 s. This viewer sends one as the start-up connection goes live, and two
+  at the start of every reconnect, always before any input. So its
+  connection is armed before its first key or click (`input.open
+  liveness=on`). A 0.4.x viewer never sends a ping after the first frame
+  and is never armed (`input.open liveness=off`). Asking for HOST_INFO
+  (VIDEO_CONFIG caps 0x08) does not arm a connection: r10 did that, but H2
+  r1 to r8 development viewers ask for HOST_INFO and never ping. An armed
   owner that sends no ping for more than 5 s loses ownership and what it
   holds goes up (checked every 250 ms: `input.owner_silent`,
   `input_silenced` in `stats`); its connection is closed at once (its
@@ -180,14 +208,18 @@ the host closes the connection; a frame the viewer sends just as it does
 is lost, and what follows goes on the reconnect. A replaced viewer that
 is still online can neither move the pointer nor press anything. A 0.4.x
 viewer whose control connection reconnects while the host still holds
-the old one (up to about 13 s) cannot hover until the old one closes; its
-clicks still land where it clicked. After a 0.4.x viewer's connection
-closes with no owner after it, its hover moves nothing until its next
-click. A 0.4.x viewer taking over from another viewer: its first click
-lands where the pointer was. Two viewers on one machine with no owner:
-the one that moved last has the pointer. A viewer (any) gets no cursor
-shape before its moves are taken (a read-only view, this viewer before
-its first move).
+the old one (up to about 13 s) cannot move the pointer until the old one
+closes, but its first click still lands where it clicked. After a 0.4.x
+viewer's connection closes with no owner after it, its hover moves nothing
+until its next click. A 0.4.x viewer taking over from another viewer: its
+first click lands where the pointer was. A 0.4.x viewer that shares its PC
+with another connected viewer, or whose address had a second UDP socket
+move: its UDP moves are dropped, so it cannot move the Windows pointer.
+Its clicks go in where the pointer is (a click queued for a reconnect
+goes in at its own position). It can move the pointer again once it is
+alone on its address (after a second socket: once it reconnects). A
+viewer (any) gets no cursor shape before its moves are taken (a
+read-only view, this viewer before its first move).
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),
