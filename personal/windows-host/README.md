@@ -81,18 +81,27 @@ Builds are unsigned (design doc D14).
   seq arriving later are dropped as stale. Each viewer UDP socket keeps its
   own seq order (a new socket starts at 1); one not heard from for 10 s
   starts over.
-- MRM1 moves are taken only from the input owner's own UDP socket: the
-  owner's viewer address and the port its last POINTER_SYNC named. Until
-  the owner names one, and from any other socket (an old owner's late
-  datagrams after a takeover included), moves are dropped
-  (`pointer_udp_not_owner` in `stats`). The naming is cleared when the
-  owner changes, closes or goes quiet (below). This viewer names its socket
-  on each new control connection with its first move (a 0x27, then a 0x24
-  at the same position), so hover works without a click. An H2 viewer
-  before r9 names it only with a click: until its first click on a
-  connection its moves do not move the host pointer. A 0.4.x viewer never
-  sends 0x27, so its moves never do; for both, a click still lands where it
-  was made (the 0x27 or 0x24 in front of it moves the pointer).
+- MRM1 moves are taken from one UDP socket only, and the cursor shape goes
+  to that socket and nowhere else. Moves from any other socket are dropped
+  (`pointer_udp_not_owner` in `stats`).
+  - A viewer that sends POINTER_SYNC names it: the owner's viewer address
+    and the port its last 0x27 named. This viewer names its socket on each
+    new control connection with its first move (a 0x27, then a 0x24 at the
+    same position), so hover works without a click. An H2 viewer before r9
+    names it only with a click; until then its moves are dropped.
+  - A 0.4.x viewer never sends 0x27. It moves the pointer over MRM1 from one
+    UDP socket for the whole session, and its clicks (MRC1 0x25) carry no
+    position: they go in where its moves put the pointer (a click queued
+    for a reconnect goes behind a 0x24 with its position). So an owner that
+    never sent a 0x27 takes moves from the first socket on its own TCP peer
+    address that moves, and from that one only. With no owner, the socket
+    that moved last does (hover before the first click).
+  - When the owner changes (a takeover, its close, going quiet), the socket
+    its moves came from is done: it moves nothing and gets no cursor shape,
+    not under the next owner and not with no owner. A replaced viewer's late
+    datagrams never move the pointer, and the new owner's drag and cursor
+    shape are not disturbed. Only once that connection has closed may the
+    same 0.4.x viewer's next connection take the socket again, as above.
 - MRC1 0x60 (the overlay's Force Quit button, "Task Manager" on Windows)
   releases held keys (mouse buttons stay as they are) and presses
   Ctrl+Shift+Esc.
@@ -131,13 +140,19 @@ Builds are unsigned (design doc D14).
   owes the ups of what it pressed.
 - Liveness (a hung viewer app): this viewer sends the existing MRC1 ping
   (0x01) on its control connection once a second from its input thread
-  (to a Windows host only; no new message or capability bit). A ping that
-  is not the connection's first frame arms the connection
-  (`input.liveness`). An armed owner that sends no ping for more than 5 s
-  loses ownership and what it holds goes up (checked every 250 ms:
-  `input.owner_silent`, `input_silenced` in `stats`); its connection is
-  closed at its next frame, unanswered (`control.silenced_closed`), and
-  the viewer reconnects. Worst case 5.25 s plus the last ping's one-way
+  (to a Windows host only; no new message or capability bit). Its
+  VIDEO_CONFIG asks for HOST_INFO (caps 0x08), which an older viewer never
+  does: that arms the connection, timed from then, so the 5 s run from the
+  capability exchange, before the first input (`input.liveness
+  from=video_config`). A ping that is not the connection's first frame
+  arms it too and restarts the time (`from=ping`). This viewer pings once
+  more as the start-up connection goes live, before any input. An armed
+  owner that sends no ping for more than 5 s loses ownership and what it
+  holds goes up (checked every 250 ms: `input.owner_silent`,
+  `input_silenced` in `stats`); its connection is closed at once (its
+  reader checks every 50 ms: `control.silenced_closed
+  reason=liveness_timeout`), its slot is free again, and the viewer
+  reconnects. Worst case 5.25 s plus the last ping's one-way
   time after the hang; at least about 4 s (the last ping went out up to a
   second before). 1 s pings: a lost segment's retransmission or a short UI
   stall (a modal loop, a slow frame) stays well inside 5 s. A viewer that
@@ -152,17 +167,27 @@ Builds are unsigned (design doc D14).
   input, about 5 s after this viewer's app hangs, or about 13 s after the
   viewer's machine or the network goes away.
 - Cursor shape: polled every 16 ms, sent as MRM1 0x31 on a change and once
-  a second to the viewer's MRM1 address.
+  a second, to the UDP socket MRM1 moves are taken from now (above), and at
+  once to a new one; while there is none, nowhere.
 - Typed keys are never logged; the `stats` line has counters only.
 
 Known limits: AltGr characters on European layouts (right Alt arrives as
 Alt), Win+L (Windows ignores it from SendInput), Ctrl+Alt+Del and anything
 on the secure desktop. An older viewer (no liveness pings) that hangs
 while its machine stays up (the OS still answers keep-alive) keeps what
-it holds down until it reconnects or exits. Input sent right after a hang
-of more than 5 s, before the viewer reconnects, is dropped (the host
-closes that connection at its next frame). A replaced viewer that is
-still online can neither move the pointer nor press anything.
+it holds down until it reconnects or exits. After a hang of more than 5 s
+the host closes the connection; a frame the viewer sends just as it does
+is lost, and what follows goes on the reconnect. A replaced viewer that
+is still online can neither move the pointer nor press anything. A 0.4.x
+viewer whose control connection reconnects while the host still holds
+the old one (up to about 13 s) cannot hover until the old one closes; its
+clicks still land where it clicked. After a 0.4.x viewer's connection
+closes with no owner after it, its hover moves nothing until its next
+click. A 0.4.x viewer taking over from another viewer: its first click
+lands where the pointer was. Two viewers on one machine with no owner:
+the one that moved last has the pointer. A viewer (any) gets no cursor
+shape before its moves are taken (a read-only view, this viewer before
+its first move).
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),

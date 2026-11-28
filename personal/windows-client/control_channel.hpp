@@ -108,6 +108,22 @@ public:
             s_ = INVALID_SOCKET;
             a->pointerSync = pointerSync_.load(std::memory_order_relaxed);
             a->liveness = liveness_.load(std::memory_order_relaxed);
+            // H2 r10 (Pepper's review of f919167, item 1): the start-up
+            // connection gets a liveness ping as it is adopted, before the
+            // UI thread can send any input on it (viewer.cpp pumps messages
+            // before its first livenessTick). Its first frame was the
+            // start-up ping, so this one counts. Nothing else uses the
+            // socket yet; a failed send hands it over like any live send.
+            bool lost = false;
+            if (a->liveness && a->s != INVALID_SOCKET) {
+                if (sendAllOn(a->s, livenessPings(1))) {
+                    ++a->stats.livenessPings;
+                    a->lastLivenessPing = std::chrono::steady_clock::now();
+                } else {
+                    lost = true;
+                }
+            }
+            if (lost) handOverForNoticeLocked(*a, a->s);  // no worker yet: nothing else holds a
             a->worker = std::thread(workerLoop, a, localIp_, remoteIp_, port_, ioTimeoutMs_, authChannel_);
             async_ = std::move(a);
         } else {

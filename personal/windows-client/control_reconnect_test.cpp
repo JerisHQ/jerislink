@@ -3372,6 +3372,72 @@ void h2R9MacUnchangedTest() {
     clearKnownModesForTest();
 }
 
+// H2 r10 (Pepper's review of f919167, item 1): the start-up connection
+// (connect, ping, VIDEO_CONFIG on the UI thread, as viewer.cpp does) gets a
+// liveness ping as background reconnects take it over, before the UI
+// thread can send any input on it. A Windows host times the connection
+// from its VIDEO_CONFIG, so a viewer that hangs right after start-up with
+// a key down loses the key 5 s later. A Mac's ACK turns liveness off: no
+// ping.
+void h2R10StartupPingTest() {
+    for (const bool windows : {true, false}) {
+        const std::string name = windows ? "h2 r10 start-up ping, Windows" : "h2 r10 start-up ping, Mac";
+        const Secret sec = h2Secret();
+        Listener l;
+        std::atomic<int> terminals{0};
+        std::atomic<int> lastOutcome{-1};
+        auto client = makeClient(terminals, lastOutcome);
+        setCurrent(client);
+        ControlChannel control("127.0.0.1", "127.0.0.1", l.port);
+        control.setIoTimeoutMs(1000);
+        const Bytes macAck{1, 0, 1, 0x20, 0, 25, 0, 0, 0, 0};
+        const Bytes live{'L', 'I', 'V', 'E'};
+        std::vector<std::pair<uint8_t, Bytes>> startup, got;
+        bool auth0 = false;
+        std::thread host([&] {
+            SOCKET s = l.accept(8000);
+            if (s == INVALID_SOCKET) return;
+            auth0 = hostAuth(s, sec, Answer::Ok, 50);
+            startup = readFrames(s, 1, 3000);  // the start-up ping
+            if (startup.size() == 1 && startup[0].first == 0x01)
+                sendAllBytes(s, frame(0x02, startup[0].second.data(), startup[0].second.size()));
+            const auto req = readFrames(s, 1, 3000);
+            if (req.size() == 1 && req[0].first == 0x40) {
+                startup.push_back(req[0]);
+                sendAllBytes(s, windows ? winReply(req[0].second) : frame(0x41, macAck.data(), macAck.size()));
+            }
+            got = readFrames(s, windows ? 3 : 2, 3000);
+            Sleep(200);
+            closesocket(s);
+        });
+        const bool pinged = control.ping();
+        const auto vc = control.negotiateVideo("h264", true, false, 25, false);
+        Sleep(300);  // the window and the video pipeline
+        control.setBackgroundReconnect(true);
+        const auto rs0 = control.reconnectStats();
+        const bool down = control.sendKey(true, 0x0041);
+        const bool up = control.sendKey(false, 0x0041);
+        host.join();
+        const bool started = auth0 && pinged && vc.acked && startup.size() == 2 && startup[0].first == 0x01 &&
+                             startup[1].first == 0x40;
+        if (windows) {
+            expect(started && vc.hostInfo && down && up && rs0.livenessPings == 1 && got.size() == 3 &&
+                       isFrame(got[0], 0x01, live) && isFrame(got[1], 0x10, Bytes{1, 0, 0x41}) &&
+                       isFrame(got[2], 0x10, Bytes{0, 0, 0x41}),
+                   name + ": one liveness ping as the connection is taken over, before the first key (" +
+                       std::to_string(got.size()) + " frames, " + std::to_string(rs0.livenessPings) + " pings)");
+        } else {
+            expect(started && !vc.hostInfo && down && up && rs0.livenessPings == 0 && got.size() == 2 &&
+                       isFrame(got[0], 0x10, Bytes{1, 0, 0x41}) && isFrame(got[1], 0x10, Bytes{0, 0, 0x41}),
+                   name + ": no ping, the keys alone (" + std::to_string(got.size()) + " frames, " +
+                       std::to_string(rs0.livenessPings) + " pings)");
+        }
+        control.stop();
+        setCurrent(nullptr);
+        clearKnownModesForTest();
+    }
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -3399,6 +3465,7 @@ int main() {
     h2R9LivenessTest();
     h2R9PointerBindTest();
     h2R9MacUnchangedTest();
+    h2R10StartupPingTest();
     WSACleanup();
     std::printf("%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;

@@ -29,6 +29,7 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <windows.h>
+#include "control_read.hpp"  // after the Winsock headers it uses
 #ifndef TCP_MAXRT
 #define TCP_MAXRT 5  // ws2ipdef.h, Windows Vista and later
 #endif
@@ -228,13 +229,11 @@ struct State {
     jlh::Mrm1Session pointer;  // guarded by pointerMutex
     std::atomic<uint64_t> inputMalformed{0}, pointerUdp{0}, pointerUdpStale{0}, pointerSyncs{0};
     std::atomic<uint64_t> cursorSent{0}, cursorSendFail{0}, cursorChanges{0};
-    // The MRM1 socket and the newest MRM1 session's viewer address: the
-    // cursor shape goes there, from port 38412 (the viewer checks both).
+    // The MRM1 socket. The cursor shape goes from it (port 38412, the
+    // viewer checks both) to the viewer socket the host takes pointer
+    // moves from (r10: InputClaims::cursorPeer, Pepper's review of
+    // f919167, item 3), never to whichever socket was heard from last.
     SOCKET mrm1Sock = INVALID_SOCKET;
-    std::mutex mrm1PeerMutex;
-    sockaddr_in mrm1Peer{};
-    bool haveMrm1Peer = false;
-    uint32_t mrm1Generation = 0;  // bumped for each new MRM1 session
 };
 State* gState = nullptr;
 
@@ -381,7 +380,20 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     auto upKey = [&st](uint16_t v) { return st.input.upKey(v); };
     auto upButton = [&st](uint8_t b) { return st.input.upButton(b); };
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
-    while (st.running && readFrame(hdr, -1)) {
+    // r10 (Pepper's review of f919167, item 1): the connection is read in
+    // short slices (control_read.hpp), and reading stops as soon as it
+    // loses ownership for going quiet (InputClaims::expire, run by
+    // inputRetryLoop): it is closed then, its slot comes back, and nothing
+    // it sends afterwards is read. Not only at its next frame, which a hung
+    // viewer never sends.
+    const auto stopReading = [&] { return jlh::stopLiveRead(st.running.load(), st.claims, owner); };
+    for (;;) {
+        const jlh::ReadResult rr = jlh::readMrc1FrameUntil(c, hdr, payload, jlh::kReadSliceMs, stopReading);
+        if (rr == jlh::ReadResult::Stopped && st.running) {
+            logf("control.silenced_closed peer=%s channel=%s reason=liveness_timeout", peer.c_str(), role);
+            goto done;
+        }
+        if (rr != jlh::ReadResult::Ok) break;
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
             else if (hdr.type == jlh::kMsgPing) role = "ping";
@@ -410,7 +422,7 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
                 }
                 if (!armedLogged) {
                     armedLogged = true;
-                    logf("input.liveness peer=%s channel=%s timeout_ms=%lld", peer.c_str(), role,
+                    logf("input.liveness peer=%s channel=%s timeout_ms=%lld from=ping", peer.c_str(), role,
                          (long long)jlh::kLivenessTimeoutMs);
                 }
             }
@@ -435,6 +447,20 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
                 hostInfoLogged = true;
                 logf("host.info peer=%s platform=windows caps=0x%02x monitors=%d version=%s", peer.c_str(),
                      unsigned(kHostCaps), monitors, JERISLINK_VERSION_STRING);
+            }
+            // r10 (Pepper's review of f919167, item 1): a viewer that reads
+            // HOST_INFO pings a Windows host (r9 or later), so its liveness
+            // timer starts here, at the capability exchange, before it can
+            // send any input, not at its first counted ping. A viewer that
+            // hangs right after start-up with a key down so loses it 5 s
+            // later. 0.4.x never asks for HOST_INFO and is never armed.
+            if (d.hostInfo) {
+                st.claims.arm(owner, msSinceStart());
+                if (!armedLogged) {
+                    armedLogged = true;
+                    logf("input.liveness peer=%s channel=%s timeout_ms=%lld from=video_config", peer.c_str(), role,
+                         (long long)jlh::kLivenessTimeoutMs);
+                }
             }
             break;
         }
@@ -580,17 +606,12 @@ void mrm1Listener(State& st, SOCKET u) {
             newSession = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port), msSinceStart());
         }
         if (newSession) {
-            // Another viewer socket than the current one (a new one, or an
-            // older one whose datagram came late): the cursor loop sends the
-            // shape there. Pointer order is that socket's own and is kept
-            // across the switch (Mrm1Session, Pepper's review of f97ad11,
-            // item 3).
-            {
-                std::lock_guard<std::mutex> g(st.mrm1PeerMutex);
-                st.mrm1Peer = from;
-                st.haveMrm1Peer = true;
-                ++st.mrm1Generation;
-            }
+            // Another viewer socket than the last one heard (a new one, or
+            // an older one whose datagram came late). Pointer order is that
+            // socket's own and is kept across the switch (Mrm1Session,
+            // Pepper's review of f97ad11, item 3). r10 (Pepper's review of
+            // f919167, item 3): the cursor shape no longer follows it; it
+            // goes where InputClaims takes moves from (cursorLoop).
             logf("mrm1.session peer=%s:%u", ipString(from.sin_addr).c_str(), unsigned(ntohs(from.sin_port)));
         }
         if (m->type == jlh::kMrm1Pointer) {
@@ -598,7 +619,9 @@ void mrm1Listener(State& st, SOCKET u) {
             // only from the input owner's own MRM1 socket, the one its
             // POINTER_SYNC named, and not while an up is owed. Then only the
             // newest move counts; a late datagram, or one older than the
-            // last POINTER_SYNC, is dropped.
+            // last POINTER_SYNC, is dropped. r10 (item 2): a 0.4.x owner,
+            // which names none, and a 0.4.x viewer hovering before its first
+            // click, by the legacy rule (host_protocol.hpp).
             const auto r = st.claims.udpMove(from.sin_addr.s_addr, ntohs(from.sin_port), [&] {
                 std::lock_guard<std::mutex> g(st.pointerMutex);
                 if (!st.pointer.takePointer(m->seq)) return false;
@@ -637,6 +660,10 @@ void mrm1Listener(State& st, SOCKET u) {
 // stopped for more than kLivenessTimeoutMs (host_protocol.hpp) loses
 // ownership here, and what it holds is let go (InputClaims::expire). One
 // that never pinged (an older viewer) is not touched.
+// r10 (Pepper's review of f919167, item 1): a connection whose VIDEO_CONFIG
+// asked for HOST_INFO counts from then (InputClaims::arm), and the expired
+// connection's reader stops within kReadSliceMs and closes it, giving its
+// slot back (serveControl).
 void inputRetryLoop(State& st) {
     auto upKey = [&st](uint16_t v) { return st.input.upKey(v); };
     auto upButton = [&st](uint8_t b) { return st.input.upButton(b); };
@@ -658,13 +685,18 @@ void inputRetryLoop(State& st) {
 
 // ------------------------------------------------------------------- cursor
 
-// Sends the cursor shape (MRM1 0x31) to the newest MRM1 session while a
-// viewer is present: on a change at once, otherwise once a second so a lost
-// datagram is repaired. Each session's seq starts from the tick count, so a
-// viewer that outlives a host restart does not take the new packets for
-// old ones.
+// Sends the cursor shape (MRM1 0x31) while a viewer is present: on a change
+// at once, otherwise once a second so a lost datagram is repaired. Each
+// destination's seq starts from the tick count, so a viewer that outlives a
+// host restart does not take the new packets for old ones.
+// r10 (Pepper's review of f919167, item 3): the destination is the viewer
+// socket the host takes pointer moves from (InputClaims::cursorPeer: the
+// owner's own socket, or a 0.4.x viewer's by the legacy rule), never the
+// socket heard from last, so a replaced viewer's late datagram cannot take
+// the cursor shape from the new owner. None: nothing is sent.
 void cursorLoop(State& st) {
-    uint32_t gen = 0, seq = 0;
+    uint64_t gen = 0;
+    uint32_t seq = 0;
     bool haveShape = false;
     jlh::CursorShape last = jlh::CursorShape::Arrow;
     auto lastSent = Clock::now();
@@ -674,16 +706,14 @@ void cursorLoop(State& st) {
         const bool active = st.controlConnections.load() > 0 ||
                             msSinceStart() - st.lastActivityMs.load() < kActiveGraceMs;
         if (!active) continue;
+        const jlh::InputClaims::CursorPeer to = st.claims.cursorPeer();
+        if (!to.named) continue;
         sockaddr_in peer{};
-        uint32_t g = 0;
-        {
-            std::lock_guard<std::mutex> lk(st.mrm1PeerMutex);
-            if (!st.haveMrm1Peer) continue;
-            peer = st.mrm1Peer;
-            g = st.mrm1Generation;
-        }
-        if (g != gen) {
-            gen = g;
+        peer.sin_family = AF_INET;
+        peer.sin_addr.s_addr = to.ip;  // as recvfrom gave it: network order
+        peer.sin_port = htons(to.port);
+        if (to.gen != gen) {
+            gen = to.gen;
             seq = uint32_t(GetTickCount64());
             haveShape = false;
         }

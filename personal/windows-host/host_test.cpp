@@ -8,6 +8,7 @@
 
 #include "color_convert.hpp"
 #include "host_protocol.hpp"
+#include "control_read.hpp"  // r10; its Winsock headers before any windows.h
 
 #include "../windows-client/h264_nal_summary.hpp"
 #include "../windows-client/host_info.hpp"
@@ -32,6 +33,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 static int gFailures = 0;
 #define CHECK(cond)                                                        \
@@ -977,6 +984,10 @@ struct OwnerHost {
     size_t blocked = 0;                                   // r9: input frames dropped: an up still owed
     size_t closedSilenced = 0;                            // r9: frames the host closes a silenced owner at
     int64_t now = 0;                                      // r9: the host's clock, ms
+    // r10: where the pointer is (0..65535, -1 never moved), and each button
+    // down with the position it went in at: "Bd0@1000,2000".
+    int px = -1, py = -1;
+    std::vector<std::string> clicks;
 
     Owner open() { return claims.open(); }
     bool sendKey(uint16_t v, bool down) {
@@ -1031,12 +1042,17 @@ struct OwnerHost {
         }
         if (e.kind == jlh::InputEvent::Kind::Button) {
             if (!e.down) return held.releaseButton(e.button, o, upButton) != jlh::HeldInput::Up::Failed;
+            clicks.push_back("Bd" + std::to_string(e.button) + "@" + std::to_string(px) + "," + std::to_string(py));
             sendButton(e.button, true);
             held.pressButton(e.button, o);
             return true;
         }
         if (e.kind == jlh::InputEvent::Kind::TaskManager)
             return jlh::taskManagerChord(held, [this](uint16_t v, bool down) { return sendKey(v, down); });
+        if (e.kind == jlh::InputEvent::Kind::MoveNorm) {
+            px = e.x;
+            py = e.y;
+        }
         win.push_back("M");
         return true;
     }
@@ -1052,16 +1068,24 @@ struct OwnerHost {
             if (!h) return;
             const uint8_t* p = bytes.data() + off + jlh::kMrc1HeaderBytes;
             off += jlh::kMrc1HeaderBytes + h->length;
+            if (h->type == jlh::kMsgVideoConfig) {
+                // r10: serveControl arms a connection whose VIDEO_CONFIG
+                // asked for HOST_INFO.
+                if (jlh::decideVideoConfig(p, h->length, 25, 0, 0).hostInfo) claims.arm(o, now);
+                continue;
+            }
             const auto e = jlh::decodeInput(*h, p);
-            if (!e) continue;  // ping, VIDEO_CONFIG, clipboard: no part in input
+            if (!e) continue;  // ping, clipboard: no part in input
             if (pending.size() <= o) pending.resize(o + 1);
             const auto f = claims.frame(
                 o, kViewerIp, *e,
                 [&](jlh::HeldInput& held) {
                     return jlh::stepInput(
                         pending[o], *e,
-                        [&](const jlh::InputEvent&, const jlh::InputEvent* b) {
+                        [&](const jlh::InputEvent& sync, const jlh::InputEvent* b) {
                             win.push_back("M");
+                            px = sync.x;
+                            py = sync.y;
                             return b ? apply(*b, o, held) : true;
                         },
                         [&](const jlh::InputEvent& ev) { return apply(ev, o, held); });
@@ -1106,6 +1130,22 @@ struct OwnerHost {
         else ++udpRefused;
         return r;
     }
+    // r10: the same, to (nx, ny): the pointer goes there when it goes in.
+    jlh::InputClaims::Udp pointerTo(uint16_t port, int nx, int ny) {
+        const auto r = claims.udpMove(kViewerIp, port, [&] {
+            px = nx;
+            py = ny;
+            return true;
+        });
+        if (r == jlh::InputClaims::Udp::Moved) ++udpMoves;
+        else ++udpRefused;
+        return r;
+    }
+    // r10: where cursorLoop sends the shape now.
+    bool cursorTo(uint16_t port) const {
+        const auto c = claims.cursorPeer();
+        return c.named && c.ip == kViewerIp && c.port == port;
+    }
     size_t close(Owner o) {
         return claims.close(o, [this](uint16_t v) { return sendKey(v, false); },
                             [this](uint8_t b) { return sendButton(b, false); });
@@ -1122,6 +1162,32 @@ std::vector<uint8_t> keyFrame(uint16_t semantic, bool down) {
 }
 std::vector<uint8_t> pingFrame() { return jlh::mrc1Frame(jlh::kMsgPing, std::vector<uint8_t>(jlh::kPingPayloadBytes, 7)); }
 std::vector<uint8_t> clipboardHelloFrame() { return jlh::mrc1Frame(jlh::kMsgClipboardHello, std::vector<uint8_t>{}); }
+// r10: a viewer's VIDEO_CONFIG: H.264, 25 Mbit/s; hostInfo sets caps 0x08
+// (r9 and later), as 0.4.x never does.
+std::vector<uint8_t> videoConfigFrame(bool hostInfo) {
+    return jlh::mrc1Frame(jlh::kMsgVideoConfig, {1, 1, uint8_t(hostInfo ? 0x09 : 0x01), 0, 0, 25});
+}
+// r10: an r9+ viewer's registration on a connection: POINTER_SYNC naming
+// its socket at port, then the pointer move.
+std::vector<uint8_t> registration(int nx, int ny, uint32_t seq, uint16_t port) {
+    auto out = syncedButton(nx, ny, seq, 0, true, port);
+    out.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);
+    const auto mv = jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)});
+    out.insert(out.end(), mv.begin(), mv.end());
+    return out;
+}
+// r10: a 0.4.x click: the button alone (MRC1 0x25), no position.
+std::vector<uint8_t> plainButton(uint8_t b, bool down) {
+    return jlh::mrc1Frame(jlh::kMsgMouseButtonExt, {b, uint8_t(down ? 1 : 0), 1});
+}
+// r10: a 0.4.x click queued for a reconnect: 0x24 with its position, then
+// the button.
+std::vector<uint8_t> tcpPositionedButton(int nx, int ny, uint8_t b, bool down) {
+    auto out = jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {uint8_t(nx >> 8), uint8_t(nx), uint8_t(ny >> 8), uint8_t(ny)});
+    const auto btn = plainButton(b, down);
+    out.insert(out.end(), btn.begin(), btn.end());
+    return out;
+}
 }  // namespace
 
 // Pepper's review of 6175b5e, item 1, and Morris's PR-C rule (the newer
@@ -1639,13 +1705,16 @@ static void testPointerOwner() {
     {
         OwnerHost h;
         const auto A = h.open();
-        // No owner yet, or an owner that named no socket: no UDP move.
-        CHECK(h.pointer(kA) == Udp::NotOwner);
+        // r10: no owner yet, a socket hovers (a 0.4.x viewer before its
+        // first click); an owner that named no socket (0.4.x) moves from the
+        // first socket on its address that moves, and from that one only.
+        CHECK(h.pointer(kA) == Udp::Moved);
         h.tcp(A, keyFrame('Q', true));
-        CHECK(h.claims.owner() == A && h.pointer(kA) == Udp::NotOwner);
+        CHECK(h.claims.owner() == A && h.pointer(kA) == Udp::Moved && h.pointer(kB) == Udp::NotOwner);
         h.tcp(A, keyFrame('Q', false));
         // A's click names its socket: A drags over MRM1.
         h.tcp(A, syncedButton(1000, 1000, 1, 0, true, kA));
+        h.udpMoves = 0;
         CHECK(h.pointer(kA) == Udp::Moved && h.pointer(kA) == Udp::Moved && h.udpMoves == 2);
         CHECK(h.pointer(kB) == Udp::NotOwner);  // another socket: B, not the owner yet
         // B (another viewer, its own socket) takes over with a pointer move:
@@ -1681,7 +1750,8 @@ static void testPointerOwner() {
     {
         // The same viewer reconnects its control connection and keeps its
         // UDP socket: the new connection names it again (its registration)
-        // before UDP moves go in; until then they are dropped.
+        // before UDP moves go in; until then they are dropped. (r10: and
+        // A1, still open, spent kA: A2 cannot take it by moving.)
         OwnerHost h;
         const auto A1 = h.open();
         h.tcp(A1, syncedButton(1000, 1000, 1, 0, true, kA));
@@ -1748,6 +1818,459 @@ static void testUpPending() {
         h.win.clear();
         h.tcp(A, keyFrame('Z', true));
         CHECK(h.got({"Kd90"}) && h.claims.held().keyOwnedBy('Z', A));
+    }
+}
+
+// r10 (Pepper's review of f919167, item 1): the liveness timer starts at the
+// capability exchange, before the first input: a viewer that hangs right
+// after start-up with a key down loses it 5 s later, and its connection is
+// closed then.
+static void testStartupHang() {
+    using jlh::vk::LControl;
+    const int64_t T = jlh::kLivenessTimeoutMs;
+    {
+        // Hangs right after start-up: an r9+ viewer's ping (its first frame,
+        // not counted) and VIDEO_CONFIG asking for HOST_INFO at t = 0; Ctrl
+        // goes down at once, before any liveness ping, and the UI hangs.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());
+        h.tcp(A, videoConfigFrame(true));
+        h.now = 10;
+        h.tcp(A, keyFrame(1, true));
+        CHECK(h.claims.owner() == A && h.keyDown(LControl));
+        h.win.clear();
+        for (h.now = 250; h.now <= T; h.now += 250) CHECK(h.expire().owner == 0);
+        CHECK(h.win.empty() && h.keyDown(LControl) && !jlh::stopLiveRead(true, h.claims, A));
+        h.now = T + 250;
+        const auto x = h.expire();
+        CHECK(x.owner == A && x.silentMs == T + 250 && x.released == 1);
+        CHECK(h.got({"Ku162"}) && !h.keyDown(LControl) && h.claims.owner() == 0);
+        // Its reader stops now (serveControl closes it), with no frame from it.
+        CHECK(jlh::stopLiveRead(true, h.claims, A));
+        CHECK(h.close(A) == 0 && !h.claims.silenced(A));
+        const auto B = h.open();
+        h.tcp(B, keyFrame('C', true));
+        CHECK(h.last.tookOver && h.last.replaced == 0 && h.claims.owner() == B && h.got({"Ku162", "Kd67"}));
+    }
+    {
+        // The same with a press and a drag: the button goes down with its
+        // POINTER_SYNC, the drag comes over MRM1, then the hang.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());
+        h.tcp(A, videoConfigFrame(true));
+        h.tcp(A, syncedButton(1000, 1000, 1, 0, true));
+        CHECK(h.pointer() == jlh::InputClaims::Udp::Moved && h.buttonDown(0));
+        h.now = T;
+        CHECK(h.expire().owner == 0 && h.buttonDown(0));
+        h.now = T + 250;
+        CHECK(h.expire().owner == A && !h.buttonDown(0) && jlh::stopLiveRead(true, h.claims, A));
+        CHECK(h.pointer() == jlh::InputClaims::Udp::NotOwner);
+    }
+    {
+        // Pings count as before; a later VIDEO_CONFIG does not move the time
+        // (the worker sends one on a new connection; it is not the UI).
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());
+        h.tcp(A, videoConfigFrame(true));
+        h.tcp(A, keyFrame(1, true));
+        h.now = 1000;
+        CHECK(!h.ping(A));
+        h.now = 1000 + T;
+        h.tcp(A, videoConfigFrame(true));
+        CHECK(h.expire().owner == 0);
+        h.now = 1000 + T + 250;
+        CHECK(h.expire().owner == A && !h.keyDown(LControl));
+    }
+    {
+        // 0.4.x: its VIDEO_CONFIG never asks for HOST_INFO and it never
+        // pings after start-up: not armed, so Ctrl held for 60 s with no
+        // frame stays down and the connection stays open (the r8 rule).
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());
+        h.tcp(A, videoConfigFrame(false));
+        h.tcp(A, keyFrame(1, true));
+        h.win.clear();
+        for (h.now = 0; h.now <= 60'000; h.now += 250) CHECK(h.expire().owner == 0);
+        CHECK(h.win.empty() && h.keyDown(LControl) && h.claims.owner() == A);
+        CHECK(!jlh::stopLiveRead(true, h.claims, A));
+    }
+    {
+        // A connection armed by its VIDEO_CONFIG that never sends input (a
+        // read-only view) is never the owner: the owner is not touched, and
+        // it is not closed for its silence.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, keyFrame(1, true));
+        const auto R = h.open();
+        h.tcp(R, pingFrame());
+        h.tcp(R, videoConfigFrame(true));
+        for (h.now = 0; h.now <= 60'000; h.now += 250) CHECK(h.expire().owner == 0);
+        CHECK(h.claims.owner() == A && h.keyDown(LControl) && !jlh::stopLiveRead(true, h.claims, R));
+        // The host shutting down stops every reader.
+        CHECK(jlh::stopLiveRead(false, h.claims, A));
+    }
+}
+
+namespace {
+void closeHandle(jlh::SocketHandle s) {
+#ifdef _WIN32
+    closesocket(s);
+#else
+    ::close(s);
+#endif
+}
+bool sendAllOn(jlh::SocketHandle s, const std::vector<uint8_t>& b) {
+    size_t off = 0;
+    while (off < b.size()) {
+        const auto r = send(s, reinterpret_cast<const char*>(b.data() + off), int(b.size() - off), 0);
+        if (r <= 0) return false;
+        off += size_t(r);
+    }
+    return true;
+}
+template <class Pred>
+bool waitFor(Pred&& done, int ms) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > until) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+}  // namespace
+
+// r10 (Pepper's review of f919167, item 1), on a real loopback socket: the
+// reader of a live connection as serveControl runs it (readMrc1FrameUntil
+// with stopLiveRead) stops as soon as expire silences the owner, though the
+// viewer sends nothing more. The connection is closed and its slot comes
+// back then, not at a next frame that a hung viewer never sends.
+static void testSilencedConnectionCloses() {
+#ifdef _WIN32
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        CHECK(false);
+        return;
+    }
+    const jlh::SocketHandle bad = INVALID_SOCKET;
+    int len = sizeof(sockaddr_in);
+#else
+    const jlh::SocketHandle bad = -1;
+    socklen_t len = sizeof(sockaddr_in);
+#endif
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const jlh::SocketHandle ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const jlh::SocketHandle cl = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    jlh::SocketHandle sv = bad;
+    if (ls != bad && cl != bad && bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0 && listen(ls, 1) == 0 &&
+        getsockname(ls, reinterpret_cast<sockaddr*>(&a), &len) == 0 &&
+        connect(cl, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0)
+        sv = accept(ls, nullptr, nullptr);
+    if (ls != bad) closeHandle(ls);
+    CHECK(sv != bad);
+    if (sv == bad) {
+        if (cl != bad) closeHandle(cl);
+        return;
+    }
+    jlh::ConnectionSlots slots{8};
+    CHECK(slots.tryAcquire());  // the listener took one for this connection
+    OwnerHost h;
+    const auto A = h.open();
+    std::atomic<bool> running{true}, finished{false};
+    std::atomic<int> frames{0}, how{-1};
+    std::thread reader([&] {
+        jlh::Mrc1Header hdr;
+        std::vector<uint8_t> payload;
+        for (;;) {
+            const auto r = jlh::readMrc1FrameUntil(sv, hdr, payload, jlh::kReadSliceMs,
+                                                   [&] { return jlh::stopLiveRead(running.load(), h.claims, A); });
+            if (r != jlh::ReadResult::Ok) {
+                how = int(r);
+                break;
+            }
+            ++frames;
+        }
+        closeHandle(sv);  // serveControl's Release: the socket, then the slot
+        slots.release();
+        finished = true;
+    });
+    // The viewer's start-up, then Ctrl down; the host's claims take the
+    // same bytes.
+    auto startup = pingFrame();
+    for (const auto& fr : {videoConfigFrame(true), keyFrame(1, true)}) startup.insert(startup.end(), fr.begin(), fr.end());
+    CHECK(sendAllOn(cl, startup));
+    h.tcp(A, startup);
+    CHECK(waitFor([&] { return frames.load() == 3; }, 5000));
+    // The UI hangs: nothing more comes. Not silenced yet: still open.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4 * jlh::kReadSliceMs));
+    CHECK(!finished.load() && slots.inUse() == 1);
+    h.now = jlh::kLivenessTimeoutMs + 250;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(h.expire().owner == A && !h.keyDown(jlh::vk::LControl));
+    const bool closed = waitFor([&] { return finished.load(); }, 2000);
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(closed && how.load() == int(jlh::ReadResult::Stopped) && slots.inUse() == 0);
+    if (closed) {
+        CHECK(ms < 1000);  // one read slice (50 ms) in practice
+        char b = 0;
+        CHECK(recv(cl, &b, 1, 0) <= 0);  // the viewer sees the host close
+    }
+    running = false;  // shutting down stops the reader in any case
+    reader.join();
+    CHECK(h.close(A) == 0);  // serveControl's done
+    closeHandle(cl);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+// r10 (Pepper's review of f919167, item 2): a 0.4.x viewer never sends a
+// POINTER_SYNC, its pointer moves over MRM1 only, and its clicks carry no
+// position (except one queued for a reconnect). Its hover, drag and clicks
+// work again; a replaced connection's UDP never moves the pointer.
+static void testLegacyPointer() {
+    using Udp = jlh::InputClaims::Udp;
+    constexpr uint16_t kOld = 50000, kNew = 50001, kOther = 50002;
+    using Clicks = std::vector<std::string>;
+    {
+        // A fresh 0.4.x viewer: it hovers before its first click (no owner
+        // yet), clicks where it hovered, drags, lets go, hovers, clicks.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, pingFrame());
+        h.tcp(A, videoConfigFrame(false));
+        CHECK(h.pointerTo(kOld, 1000, 2000) == Udp::Moved && h.pointerTo(kOld, 1100, 2100) == Udp::Moved);
+        CHECK(h.px == 1100 && h.py == 2100 && h.cursorTo(kOld));
+        h.tcp(A, plainButton(0, true));
+        CHECK(h.last.tookOver && h.claims.owner() == A && h.clicks == Clicks{"Bd0@1100,2100"});
+        // A socket on another address (another machine the host allows)
+        // is not this viewer: only the owner's TCP peer address binds.
+        CHECK(h.claims.udpMove(kViewerIp + 1, kOld, [] { return true; }) == Udp::NotOwner && h.px == 1100);
+        for (int i = 1; i <= 10; ++i) CHECK(h.pointerTo(kOld, 1100 + 100 * i, 2100) == Udp::Moved);
+        CHECK(h.px == 2100 && h.buttonDown(0) && h.cursorTo(kOld));
+        h.tcp(A, plainButton(0, false));
+        CHECK(!h.buttonDown(0) && h.pointerTo(kOld, 3000, 3000) == Udp::Moved);
+        h.tcp(A, plainButton(0, true));
+        h.tcp(A, plainButton(0, false));
+        CHECK(h.clicks == Clicks({"Bd0@1100,2100", "Bd0@3000,3000"}) && !h.claims.anyHeld());
+        // Another socket on the same address (another viewer that has not
+        // clicked) moves nothing and gets no cursor shape.
+        CHECK(h.pointerTo(kOther, 9000, 9000) == Udp::NotOwner && h.px == 3000 && h.cursorTo(kOld));
+        // 0.4.x is never armed: it keeps the r8 rules.
+        h.now = 60'000;
+        CHECK(h.expire().owner == 0 && h.claims.owner() == A);
+    }
+    {
+        // Two fresh viewers hover with no owner: the latest to move has the
+        // pointer and the cursor shape; one that started and quit without
+        // clicking does not keep it.
+        OwnerHost h;
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved && h.cursorTo(kOld));
+        CHECK(h.pointerTo(kOther, 2000, 2000) == Udp::Moved && h.cursorTo(kOther) && h.px == 2000);
+    }
+    {
+        // Late UDP after a takeover by an r9+ viewer (its own socket): the
+        // old viewer's datagrams, late or still coming, never move the
+        // pointer and never take the cursor shape; the new owner's drag and
+        // click go in where it put them.
+        OwnerHost h;
+        const auto A = h.open();
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A, plainButton(0, true));
+        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::Moved && h.buttonDown(0));  // A drags
+        const auto B = h.open();
+        h.tcp(B, pingFrame());
+        h.tcp(B, videoConfigFrame(true));
+        h.win.clear();
+        h.tcp(B, registration(4000, 4000, 5, kNew));
+        CHECK(h.last.tookOver && h.last.replaced == 1 && h.got({"Bu0", "M", "M"}) && h.claims.owner() == B);
+        CHECK(h.cursorTo(kNew) && h.px == 4000);
+        for (int i = 0; i < 20; ++i) {
+            CHECK(h.pointerTo(kOld, 1300 + i, 1300) == Udp::NotOwner);
+            CHECK(h.pointerTo(kNew, 4000 + i, 4000) == Udp::Moved);
+        }
+        CHECK(h.px == 4019 && h.cursorTo(kNew));
+        h.tcp(B, syncedButton(4100, 4100, 40, 0, true, kNew));
+        CHECK(h.clicks.back() == "Bd0@4100,4100");
+        // A's frames are dropped as in r8; its UDP still moves nothing,
+        // after B closes too.
+        h.tcp(A, plainButton(0, false));
+        CHECK(!h.last.admitted && h.buttonDown(0));
+        h.tcp(B, syncedButton(4100, 4100, 41, 0, false, kNew));
+        h.close(B);
+        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::NotOwner && h.px == 4100 && !h.cursorTo(kOld));
+    }
+    {
+        // A 0.4.x viewer takes over from another 0.4.x viewer (two sockets).
+        // The replaced one's late datagram, before the new owner's first
+        // move or after it, moves nothing; the new owner's moves go in.
+        // (The new owner's first click lands where the pointer was: it
+        // carries no position, and its hover could not move the pointer
+        // while the other one owned input.)
+        OwnerHost h;
+        const auto A = h.open();
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A, plainButton(0, true));
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved);
+        CHECK(h.pointerTo(kOther, 5000, 5000) == Udp::NotOwner);  // B hovers: A owns input
+        const auto B = h.open();
+        h.tcp(B, plainButton(0, true));
+        CHECK(h.last.replaced == 1 && h.claims.owner() == B && h.clicks.back() == "Bd0@1100,1100");
+        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner && h.px == 1100 && !h.cursorTo(kOld));
+        CHECK(h.pointerTo(kOther, 5100, 5100) == Udp::Moved && h.cursorTo(kOther));
+        CHECK(h.pointerTo(kOld, 1300, 1300) == Udp::NotOwner && h.px == 5100 && h.cursorTo(kOther));
+        // A closes; its socket still moves nothing under B.
+        h.close(A);
+        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::NotOwner && h.px == 5100);
+    }
+    {
+        // The same 0.4.x viewer reconnects its control connection, keeping
+        // its UDP socket, while the host still holds the old one: the click
+        // queued for the reconnect carries its position; the socket moves
+        // nothing while the old connection is open, and the new
+        // connection's moves go in from it once the old one has closed.
+        OwnerHost h;
+        const auto A1 = h.open();
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A1, plainButton(0, true));
+        h.tcp(A1, plainButton(0, false));
+        CHECK(h.pointerTo(kOld, 1500, 1500) == Udp::Moved);
+        const auto A2 = h.open();
+        h.tcp(A2, tcpPositionedButton(1600, 1600, 0, true));
+        CHECK(h.last.tookOver && h.claims.owner() == A2 && h.clicks.back() == "Bd0@1600,1600");
+        CHECK(h.pointerTo(kOld, 1700, 1700) == Udp::NotOwner && h.px == 1600);
+        CHECK(h.close(A1) == 0);
+        CHECK(h.pointerTo(kOld, 1800, 1800) == Udp::Moved && h.px == 1800 && h.cursorTo(kOld));
+        h.tcp(A2, plainButton(0, false));
+        CHECK(!h.claims.anyHeld());
+    }
+    {
+        // The old connection closed first (the host saw it go): with no
+        // owner its socket moves nothing; the reconnect's click carries its
+        // position, and the socket moves again after it. A new viewer's
+        // socket hovers meanwhile.
+        OwnerHost h;
+        const auto A1 = h.open();
+        h.tcp(A1, plainButton(0, true));
+        h.tcp(A1, plainButton(0, false));
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved);
+        h.close(A1);
+        CHECK(h.claims.owner() == 0 && h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner && !h.cursorTo(kOld));
+        CHECK(h.px == 1100);
+        const auto A2 = h.open();
+        h.tcp(A2, tcpPositionedButton(1300, 1300, 0, true));
+        CHECK(h.clicks.back() == "Bd0@1300,1300" && h.pointerTo(kOld, 1400, 1400) == Udp::Moved);
+        h.tcp(A2, plainButton(0, false));
+        h.close(A2);
+        CHECK(h.pointerTo(kOld, 1500, 1500) == Udp::NotOwner);
+        CHECK(h.pointerTo(kOther, 2000, 2000) == Udp::Moved && h.cursorTo(kOther));
+    }
+    {
+        // An owner replaced or expired while its connection stays open:
+        // its socket moves nothing, under a newer owner that named none
+        // either. Here an r9+ owner expires and a 0.4.x viewer on the same
+        // address clicks before the old connection closes.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, videoConfigFrame(true));
+        h.tcp(A, registration(1000, 1000, 1, kNew));
+        CHECK(h.pointerTo(kNew, 1100, 1100) == Udp::Moved);
+        h.now = jlh::kLivenessTimeoutMs + 250;
+        CHECK(h.expire().owner == A);
+        CHECK(h.pointerTo(kNew, 1200, 1200) == Udp::NotOwner);
+        const auto B = h.open();
+        h.tcp(B, plainButton(0, true));
+        CHECK(h.claims.owner() == B && h.pointerTo(kNew, 1300, 1300) == Udp::NotOwner && h.px == 1100);
+        CHECK(h.pointerTo(kOld, 2000, 2000) == Udp::Moved && h.cursorTo(kOld));
+        CHECK(h.pointerTo(kNew, 1400, 1400) == Udp::NotOwner && h.px == 2000);
+    }
+    {
+        // An r9+ owner is never on the legacy rule once it sent a
+        // POINTER_SYNC, even one that named no socket (port 0: a click
+        // queued for its reconnect): a closed 0.4.x viewer's socket on the
+        // same address moves nothing before the owner names its own.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, plainButton(0, true));
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A, plainButton(0, false));
+        h.close(A);
+        const auto B = h.open();
+        h.tcp(B, syncedButton(2000, 2000, 0, 0, true, 0));
+        CHECK(h.claims.owner() == B && h.clicks.back() == "Bd0@2000,2000");
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::NotOwner && h.px == 2000 && !h.cursorTo(kOld));
+        h.tcp(B, registration(2100, 2100, 1, kNew));
+        CHECK(h.pointerTo(kNew, 2200, 2200) == Udp::Moved && h.px == 2200 && h.cursorTo(kNew));
+        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner);
+    }
+    {
+        // The 8-byte 0x27 of 8f8a33b (never released) shares cap 0x20 with
+        // the 10-byte form. The host drops a 0x27 of any other length whole
+        // (decodeInput; serveControl counts it as malformed and reads on),
+        // so a viewer built from 8f8a33b is a 0.4.x viewer here: its click
+        // goes in where its hover put the pointer, and its hover and drag
+        // go in by the legacy rule.
+        OwnerHost h;
+        const auto A = h.open();
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        auto click8 = jlh::mrc1Frame(jlh::kMsgPointerSync, {0x0b, 0xb8, 0x0b, 0xb8, 0, 0, 0, 1});  // 3000,3000 seq 1
+        const auto down = plainButton(0, true);
+        click8.insert(click8.end(), down.begin(), down.end());
+        const auto hd = jlh::parseMrc1Header(click8.data());
+        CHECK(hd && hd->length == 8 && !jlh::decodeInput(*hd, click8.data() + jlh::kMrc1HeaderBytes));
+        h.tcp(A, click8);
+        CHECK(h.claims.owner() == A && h.clicks == Clicks{"Bd0@1000,1000"});
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved && h.cursorTo(kOld) && h.buttonDown(0));
+        h.tcp(A, plainButton(0, false));
+        CHECK(!h.claims.anyHeld());
+    }
+}
+
+// r10 (Pepper's review of f919167, item 3): the cursor shape goes only to
+// the socket the host takes moves from. A replaced viewer's late
+// datagrams do not take it: the new owner keeps getting shapes, from the
+// same sequence (gen unchanged).
+static void testCursorDestination() {
+    constexpr uint16_t kOld = 50000, kNew = 50001;
+    {
+        OwnerHost h;
+        CHECK(!h.claims.cursorPeer().named);  // nobody: nothing is sent
+        const auto A = h.open();
+        h.pointerTo(kOld, 1000, 1000);
+        h.tcp(A, plainButton(0, true));
+        h.pointerTo(kOld, 1100, 1100);
+        CHECK(h.cursorTo(kOld));
+        const auto B = h.open();
+        h.tcp(B, registration(4000, 4000, 5, kNew));
+        const auto c0 = h.claims.cursorPeer();
+        CHECK(h.cursorTo(kNew));
+        for (int i = 0; i < 10; ++i) h.pointerTo(kOld, 1200 + i, 1200);
+        CHECK(h.cursorTo(kNew) && h.claims.cursorPeer().gen == c0.gen);
+        h.pointerTo(kNew, 4100, 4100);
+        CHECK(h.cursorTo(kNew) && h.claims.cursorPeer().gen == c0.gen);
+        // B's click and A's close change nothing either.
+        h.tcp(B, syncedButton(4200, 4200, 9, 0, true, kNew));
+        h.close(A);
+        h.pointerTo(kOld, 1300, 1300);
+        CHECK(h.cursorTo(kNew) && h.claims.cursorPeer().gen == c0.gen);
+    }
+    {
+        // An r9+ owner and an older H2 viewer's late datagram from another
+        // socket on the same address: the same.
+        OwnerHost h;
+        const auto A = h.open();
+        h.tcp(A, registration(1000, 1000, 1, kOld));
+        const auto B = h.open();
+        h.tcp(B, registration(2000, 2000, 1, kNew));
+        const auto c0 = h.claims.cursorPeer();
+        h.pointerTo(kOld, 1100, 1100);
+        CHECK(h.cursorTo(kNew) && h.claims.cursorPeer().gen == c0.gen);
     }
 }
 
@@ -1936,6 +2459,10 @@ int main() {
     testLiveness();
     testPointerOwner();
     testUpPending();
+    testStartupHang();
+    testSilencedConnectionCloses();
+    testLegacyPointer();
+    testCursorDestination();
     testTaskManagerChord();
     testAnnexB();
     testColor();

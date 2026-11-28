@@ -659,7 +659,9 @@ constexpr int64_t kLivenessTimeoutMs = 5'000;
 //   from the owner's own MRM1 socket: its address and the port its newest
 //   POINTER_SYNC (0x27) named (udpMove()). Until the owner names one, and
 //   from a takeover, close or expire on, no UDP move goes in, so a
-//   replaced viewer's late datagram never moves the pointer.
+//   replaced viewer's late datagram never moves the pointer. (r10: an
+//   owner that never sent a POINTER_SYNC, a 0.4.x viewer, and a viewer
+//   hovering with no owner, follow the legacy rule below.)
 // - An up before anything new (item 3). While an up Windows did not take
 //   is owed (an entry with no owner), only key and button ups go in, since
 //   they can only let go. Every other frame (a down, a move, a wheel, a
@@ -669,6 +671,38 @@ constexpr int64_t kLivenessTimeoutMs = 5'000;
 //   that lasts, and a down replayed late would land wherever the user is
 //   by then. So a new owner's C never goes in while the old owner's Ctrl
 //   may still be down: never Ctrl+C.
+//
+// r10 (Pepper's review of f919167, items 1 to 3; still no new message on
+// the wire, 0x27 stays the only addition):
+// - Timing starts at the capability exchange (item 1). A viewer that asks
+//   for HOST_INFO (VIDEO_CONFIG caps 0x08, so r9 or later: it pings a
+//   Windows host) is armed by that VIDEO_CONFIG (arm()), before it can
+//   send any input, with or without a ping. A viewer that hangs right
+//   after start-up with a key down loses it 5 s later like any other.
+//   0.4.x never sets 0x08 and is never armed. An owner that goes quiet is
+//   also closed at once (host_main.cpp: the connection's reader stops when
+//   it is silenced), and its slot comes back.
+// - A 0.4.x viewer's pointer (item 2). It never sends POINTER_SYNC, and its
+//   clicks carry no position (except a click queued for a reconnect): the
+//   button goes in where its UDP moves put the pointer. So an owner that
+//   has sent no POINTER_SYNC on this connection takes UDP moves from its
+//   own address, from one socket: the first one that moves after it
+//   became the owner (bound_), except a spent one (below). With no owner
+//   (a 0.4.x viewer hovers before its first click), moves go in from the
+//   latest socket to move whose owner has not ended (retired, below): a
+//   fresh start's hover and first click land where the viewer shows them.
+// - Ended owners' sockets. When an owner ends, the socket its moves came
+//   from (the one it named, or the one it moved from) is retired: with no
+//   owner it moves nothing. On a takeover or expiry it is also spent while
+//   that connection stays open: no move from it goes in under any owner,
+//   so a replaced or expired connection never moves the pointer again.
+//   Once that connection has closed, a newer owner that named no socket
+//   may take it: 0.4.x keeps one UDP socket for its whole session and its
+//   reconnects use it, so after a reconnect it is the new connection's.
+// - The socket whose moves go in (bound_) is where the cursor shape goes
+//   (item 3, cursorPeer()): the owner's named socket, a legacy owner's
+//   socket, or with no owner the hovering one. A datagram from any other
+//   socket changes nothing, so a newer owner keeps getting shapes.
 //
 // Admission (with the takeover it may make) and the injection of the frame
 // are one step under this object's lock (frame()), and so are close(),
@@ -713,15 +747,21 @@ public:
             if (owner_) {
                 r.replaced = 1;
                 r.released = held_.releaseOwned(owner_, upKey, upButton);
+                retireLocked(owner_);  // r10: its socket moves nothing while it is open
             }
             owner_ = newest_ = o;
-            udp_ = Endpoint{};
+            ownerIp_ = ip;
+            newOwnershipLocked();
             r.tookOver = true;
         }
         r.admitted = true;
         // r9: the owner's MRM1 socket, from its own POINTER_SYNC (port 0:
-        // that position went by TCP; nothing to name).
-        if (e.kind == InputEvent::Kind::PointerSync && e.port) udp_ = Endpoint{true, ip, e.port};
+        // that position went by TCP; nothing to name). r10: any POINTER_SYNC
+        // ends the legacy rule for this owner.
+        if (e.kind == InputEvent::Kind::PointerSync) {
+            ownerSynced_ = true;
+            if (e.port) bindLocked(Endpoint{true, ip, e.port});
+        }
         if (held_.anyUnowned() && !isUp(e)) {
             r.blocked = true;
             return r;
@@ -736,9 +776,14 @@ public:
     size_t close(Owner o, UpKey&& upKey, UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         if (owner_ == o) {
+            retireLocked(0);  // r10: closed, so not spent
             owner_ = 0;
-            udp_ = Endpoint{};
+            newOwnershipLocked();
         }
+        // r10: a socket it was replaced on is no longer spent (the same
+        // 0.4.x viewer's next connection may use it).
+        for (auto& s : socks_)
+            if (s.spentBy == o) s.spentBy = 0;
         lastPing_.erase(o);
         silenced_.erase(o);
         return held_.releaseOwned(o, upKey, upButton);
@@ -758,6 +803,20 @@ public:
         if (silenced_.count(o)) return true;
         lastPing_[o] = nowMs;
         return false;
+    }
+    // r10 (Pepper's review of f919167, item 1): o's VIDEO_CONFIG asked for
+    // HOST_INFO (caps 0x08: a viewer that pings a Windows host) at nowMs.
+    // o is armed from then on as if it had pinged then, so the timer runs
+    // before o's first input even if no ping comes. A later ping counts as
+    // usual; arm() never moves an existing time.
+    void arm(Owner o, int64_t nowMs) {
+        std::lock_guard<std::mutex> g(m_);
+        if (!silenced_.count(o)) lastPing_.emplace(o, nowMs);
+    }
+    // r10: o lost ownership for going quiet; its reader closes it.
+    bool silenced(Owner o) const {
+        std::lock_guard<std::mutex> g(m_);
+        return silenced_.count(o) != 0;
     }
     struct Expired {
         Owner owner = 0;       // the owner that went quiet; 0: none did
@@ -779,8 +838,9 @@ public:
         x.silentMs = nowMs - it->second;
         silenced_.insert(owner_);
         x.released = held_.releaseOwned(owner_, upKey, upButton);
+        retireLocked(owner_);  // r10: as on a takeover, until it closes
         owner_ = 0;
-        udp_ = Endpoint{};
+        newOwnershipLocked();
         return x;
     }
 
@@ -788,18 +848,45 @@ public:
     enum class Udp {
         Moved,      // move() went in
         Stale,      // move() returned false (an older seq)
-        NotOwner,   // not the owner's MRM1 socket, or no owner: dropped
+        NotOwner,   // not the socket the host takes moves from now: dropped
         UpPending,  // an up is still owed: dropped
     };
     // r9: an MRM1 pointer move from (ip, port). move() (the host takes its
-    // pointer lock in it) runs only for the owner's own socket and only
-    // while no up is owed, under this lock.
+    // pointer lock in it) runs only for the socket the host takes moves
+    // from (r10: the class comment says which) and only while no up is
+    // owed, under this lock.
     template <class Move>
     Udp udpMove(uint32_t ip, uint16_t port, Move&& move) {
         std::lock_guard<std::mutex> g(m_);
-        if (!owner_ || !udp_.named || udp_.ip != ip || udp_.port != port) return Udp::NotOwner;
+        const Sock& s = heardLocked(ip, port);
+        if (owner_ && bound_.named) {
+            if (!bound_.is(ip, port)) return Udp::NotOwner;
+        } else if (owner_) {
+            // r10: a legacy owner's first socket to move. A synced owner
+            // binds only by POINTER_SYNC.
+            if (ownerSynced_ || ip != ownerIp_ || s.spentBy) return Udp::NotOwner;
+            bindLocked(Endpoint{true, ip, port});
+        } else {
+            // r10: no owner: the latest socket to move whose owner has not
+            // ended.
+            if (s.spentBy || s.retired) return Udp::NotOwner;
+            bindLocked(Endpoint{true, ip, port});
+        }
         if (held_.anyUnowned()) return Udp::UpPending;
         return move() ? Udp::Moved : Udp::Stale;
+    }
+    // r10 (Pepper's review of f919167, item 3): where the cursor shape goes,
+    // the socket the host takes moves from now (none: nowhere). gen moves
+    // on whenever that changes, so the shape goes out at once to a new one.
+    struct CursorPeer {
+        bool named = false;
+        uint32_t ip = 0;
+        uint16_t port = 0;
+        uint64_t gen = 0;
+    };
+    CursorPeer cursorPeer() const {
+        std::lock_guard<std::mutex> g(m_);
+        return CursorPeer{bound_.named, bound_.ip, bound_.port, boundGen_};
     }
 
     // The input owner; 0 when there is none.
@@ -825,12 +912,88 @@ private:
         bool named = false;
         uint32_t ip = 0;
         uint16_t port = 0;
+        bool is(uint32_t i, uint16_t p) const { return named && ip == i && port == p; }
     };
+    // r10: a viewer MRM1 socket the host has heard from (or that an owner
+    // ended on).
+    struct Sock {
+        uint32_t ip = 0;
+        uint16_t port = 0;
+        uint64_t lastHeard = 0;  // order of the last datagram (heard_)
+        Owner spentBy = 0;       // the replaced (or expired) connection, still open, it was bound for
+        bool retired = false;    // an owner ended while it was bound: moves nothing with no owner
+    };
+    // More than one per control connection (kMaxControlConnections, 8, in
+    // host_main.cpp), so a spent socket never has to make room.
+    static constexpr size_t kMaxSocks = 16;
+
+    Sock* findLocked(uint32_t ip, uint16_t port) {
+        for (auto& s : socks_)
+            if (s.ip == ip && s.port == port) return &s;
+        return nullptr;
+    }
+    // The socket's entry, made if new; heard now. The one heard from least
+    // recently makes room, never a spent, retired or bound one while
+    // another can.
+    Sock& heardLocked(uint32_t ip, uint16_t port) {
+        Sock* s = findLocked(ip, port);
+        if (!s) {
+            if (socks_.size() >= kMaxSocks) {
+                auto victim = socks_.end();
+                bool victimPinned = true;
+                for (auto it = socks_.begin(); it != socks_.end(); ++it) {
+                    const bool pinned = it->spentBy || it->retired || bound_.is(it->ip, it->port);
+                    if (victim == socks_.end() || (victimPinned && !pinned) ||
+                        (victimPinned == pinned && it->lastHeard < victim->lastHeard)) {
+                        victim = it;
+                        victimPinned = pinned;
+                    }
+                }
+                socks_.erase(victim);
+            }
+            socks_.push_back(Sock{ip, port, 0, 0, false});
+            s = &socks_.back();
+        }
+        s->lastHeard = ++heard_;
+        return *s;
+    }
+    void bindLocked(const Endpoint& e) {
+        if (e.named == bound_.named && e.ip == bound_.ip && e.port == bound_.port) return;
+        bound_ = e;
+        ++boundGen_;
+    }
+    // The owner ends (a takeover, its close, expiry): the socket its moves
+    // came from (named, or bound by the legacy rule) is retired, and spent
+    // while openOwner (the owner, replaced or expired) stays open; 0: it
+    // closed.
+    void retireLocked(Owner openOwner) {
+        if (!bound_.named) return;
+        Sock* s = findLocked(bound_.ip, bound_.port);
+        if (!s) s = &heardLocked(bound_.ip, bound_.port);
+        s->retired = true;
+        s->spentBy = openOwner;
+    }
+    // Ownership changed (a takeover, the owner's close, expiry): no socket
+    // is bound, and a new owner starts on the legacy rule.
+    void newOwnershipLocked() {
+        ownerSynced_ = false;
+        bindLocked(Endpoint{});
+    }
+
     mutable std::mutex m_;
     Owner next_ = 1;
     Owner owner_ = 0;   // the input owner, 0 none
     Owner newest_ = 0;  // the newest connection that has been the owner
-    Endpoint udp_;      // r9: the owner's MRM1 socket, once its POINTER_SYNC named it
+    // r10: the owner sent a POINTER_SYNC (a viewer of r9 or later), and its
+    // TCP peer address.
+    bool ownerSynced_ = false;
+    uint32_t ownerIp_ = 0;
+    // r9: the owner's MRM1 socket, once its POINTER_SYNC named it. r10: or
+    // the socket bound by the legacy rule; the cursor shape goes there.
+    Endpoint bound_;
+    uint64_t boundGen_ = 0;
+    std::vector<Sock> socks_;  // r10
+    uint64_t heard_ = 0;
     std::map<Owner, int64_t> lastPing_;  // r9: armed connections, and their last liveness ping
     std::set<Owner> silenced_;           // r9: owners that went quiet and are not closed yet
     HeldInput held_;
