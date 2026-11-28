@@ -269,29 +269,6 @@ constexpr uint8_t kMsgForceQuitOpen = 0x60;
 constexpr uint8_t kMsgPointerSync = 0x27;
 constexpr uint16_t kPointerSyncBytes = 10;
 
-// H2 r13: a frame that only a viewer's session connection sends: its
-// VIDEO_CONFIG, or input (the types serveControl hands to InputClaims::
-// frame). A 0.4.x viewer's start-up preflight connection sends one ping
-// and closes; its clipboard and file connections open with CLIPBOARD_HELLO
-// and FILE_HELLO. None of them sends one of these.
-inline bool isSessionFrame(uint8_t type) {
-    switch (type) {
-    case kMsgVideoConfig:
-    case kMsgKey:
-    case kMsgMouseMoveRel:
-    case kMsgMouseButton:
-    case kMsgMouseScroll:
-    case kMsgMouseMoveAbs:
-    case kMsgMouseMoveNorm:
-    case kMsgMouseButtonExt:
-    case kMsgPointerSync:
-    case kMsgForceQuitOpen:
-        return true;
-    default:
-        return false;
-    }
-}
-
 // One input frame, decoded. Integers on the wire are big-endian.
 struct InputEvent {
     enum class Kind { Key, MoveRel, Button, Scroll, MoveAbsPixels, MoveNorm, TaskManager, PointerSync };
@@ -682,9 +659,8 @@ constexpr int64_t kLivenessTimeoutMs = 5'000;
 //   from the owner's own MRM1 socket: its address and the port its newest
 //   POINTER_SYNC (0x27) named (udpMove()). Until the owner names one, and
 //   from a takeover, close or expire on, no UDP move goes in, so a
-//   replaced viewer's late datagram never moves the pointer. (r10: an
-//   owner that never sent a POINTER_SYNC, a 0.4.x viewer, and a viewer
-//   hovering with no owner, follow the legacy rule below.)
+//   replaced viewer's late datagram never moves the pointer. With no owner
+//   no UDP move goes in either (r14: again, below).
 // - An up before anything new (item 3). While an up Windows did not take
 //   is owed (an entry with no owner), only key and button ups go in, since
 //   they can only let go. Every other frame (a down, a move, a wheel, a
@@ -695,143 +671,55 @@ constexpr int64_t kLivenessTimeoutMs = 5'000;
 //   by then. So a new owner's C never goes in while the old owner's Ctrl
 //   may still be down: never Ctrl+C.
 //
-// r10 (Pepper's review of f919167, items 1 to 3; still no new message on
-// the wire, 0x27 stays the only addition):
-// - Timing starts at the capability exchange (item 1). A viewer that asks
-//   for HOST_INFO (VIDEO_CONFIG caps 0x08, so r9 or later: it pings a
-//   Windows host) is armed by that VIDEO_CONFIG (arm()), before it can
-//   send any input, with or without a ping. A viewer that hangs right
-//   after start-up with a key down loses it 5 s later like any other.
-//   0.4.x never sets 0x08 and is never armed. An owner that goes quiet is
-//   also closed at once (host_main.cpp: the connection's reader stops when
-//   it is silenced), and its slot comes back.
-// - A 0.4.x viewer's pointer (item 2). It never sends POINTER_SYNC, and its
-//   clicks carry no position (except a click queued for a reconnect): the
-//   button goes in where its UDP moves put the pointer. So an owner that
-//   has sent no POINTER_SYNC on this connection takes UDP moves from its
-//   own address, from one socket: the first one that moves after it
-//   became the owner (bound_), except a spent one (below). With no owner
-//   (a 0.4.x viewer hovers before its first click), moves go in from the
-//   latest socket to move whose owner has not ended (retired, below): a
-//   fresh start's hover and first click land where the viewer shows them.
-// - Ended owners' sockets. When an owner ends, the socket its moves came
-//   from (the one it named, or the one it moved from) is retired: with no
-//   owner it moves nothing. On a takeover or expiry it is also spent while
-//   that connection stays open: no move from it goes in under any owner,
-//   so a replaced or expired connection never moves the pointer again.
-//   Once that connection has closed, a newer owner that named no socket
-//   may take it: 0.4.x keeps one UDP socket for its whole session and its
-//   reconnects use it, so after a reconnect it is the new connection's.
-// - The socket whose moves go in (bound_) is where the cursor shape goes
-//   (item 3, cursorPeer()): the owner's named socket, a legacy owner's
-//   socket, or with no owner the hovering one. A datagram from any other
-//   socket changes nothing, so a newer owner keeps getting shapes.
+// r10 to r13 (Pepper's reviews of f919167, 5880264, 9f803c6 and 35d72ff;
+// no new message on the wire, 0x27 stays the only addition). What stays:
+// - An owner silenced for going quiet is closed at once (host_main.cpp:
+//   the connection's reader stops when it is silenced), and its slot comes
+//   back (r10, item 1).
+// - The cursor shape goes to the socket the host takes moves from (bound_,
+//   cursorPeer()) and nowhere else, so a datagram from any other socket
+//   cannot take the shape from the owner (r10, item 3).
+// - A viewer opts into liveness by pinging (r11, item 1). Only a
+//   connection's first liveness ping arms it (a valid ping that is not its
+//   first frame, heard()). Only a viewer that pings a Windows host sends
+//   one: 0.4.x sends a single ping per connection, as its first frame, and
+//   is never armed. This viewer sends it before any input on every
+//   connection (control_channel.hpp: as it adopts the start-up connection,
+//   and twice before a reconnect's first input), so the timer runs from
+//   before the first input. H2 development builds go in pairs: a host and
+//   a viewer of the same build. An earlier H2 development viewer with this
+//   host, or the other way round, is not supported (one with the early
+//   8-byte 0x27, 8f8a33b, and one with the 10-byte 0x27 drop each other's
+//   POINTER_SYNC as malformed).
+// - A connection's first frame FILE_HELLO is a file panel's: refused
+//   (heard()).
+// - A 0.4.x viewer run with --mouse-move-transport tcp sends its moves as
+//   MRC1 0x24 on its control connection (r12); they go in like any other
+//   input frame of the owner.
+// What went: r10 to r13 also let an owner that never sent a POINTER_SYNC
+// (a 0.4.x viewer), and a viewer hovering with no owner, move the pointer
+// by UDP from a socket the host took to be theirs, judged by its address,
+// by the connections open from that address when the host first heard the
+// socket, and (r13) by handovers on the address.
 //
-// r11 (Pepper's review of 5880264, items 1 to 3; still no new message on
-// the wire, 0x27 stays the only addition):
-// - A viewer opts into liveness by pinging (item 1). r10 armed a connection
-//   whose VIDEO_CONFIG asked for HOST_INFO, but caps 0x08 (there since H2
-//   r1) says only that the viewer reads HOST_INFO, not that it pings: H2 r1
-//   to r8 development viewers ask and never ping, so their keys held for
-//   5 s were let go. Now only a connection's first liveness ping arms it
-//   (a valid ping that is not its first frame, heard()). Only a viewer that
-//   pings a Windows host sends one: 0.4.x sends a single ping per
-//   connection, as its first frame, and is never armed. This viewer sends
-//   it before any input on every connection (control_channel.hpp: as it
-//   adopts the start-up connection, and twice before a reconnect's first
-//   input), so the timer still runs from before the first input (r10's
-//   item 1). H2 development builds go in pairs: a host and a viewer of the
-//   same build. An earlier H2 development viewer with this host, or the
-//   other way round, is not supported (one with the early 8-byte 0x27,
-//   8f8a33b, and one with the 10-byte 0x27 drop each other's POINTER_SYNC
-//   as malformed).
-// - The legacy rule needs a viewer alone on its address (item 2). Each
-//   connection's first frame says what it is (heard()): CLIPBOARD_HELLO the
-//   clipboard's, FILE_HELLO a file panel's (refused), anything else a
-//   control connection, counted for its address until it closes. A legacy
-//   owner takes UDP moves only while it is the only control connection from
-//   its address, and with no owner a socket hovers only while its address
-//   has exactly one. With two (two viewers on one PC: the host takes UDP
-//   from one address only, host_main.cpp, allowAddr), which viewer a
-//   socket belongs to cannot be told, so no UDP move goes in under the
-//   legacy rule and its binding is dropped. Alone again, the legacy owner
-//   takes moves from the socket it moved from first (legacyPort_). A move
-//   from another socket of its address after that turns the legacy rule off
-//   for this owner (legacyOff_) until ownership changes. Known limit: a
-//   0.4.x viewer that shares its address with another connected viewer, or
-//   after such a second socket, cannot move the Windows pointer; its clicks
-//   go in where the pointer is (a click queued for a reconnect, at its TCP
-//   position). It moves again once alone (after a second socket: once it
-//   reconnects). A synced owner, which names its socket, is not affected.
-// - The cursor shape (item 3): with the binding dropped, cursorPeer() names
-//   no socket and no shape is sent.
-//
-// r12 (Pepper's review of 9f803c6, item 2; still no new message on the
-// wire, 0x27 stays the only addition): a UDP socket is taken as a 0.4.x
-// viewer's only when the host can tell whose it is. Otherwise that viewer
-// stays TCP-only (README: run it with --mouse-move-transport tcp).
-// - A connection counts for its address from the moment the host accepts
-//   it (host_main.cpp opens it in controlListener), not from its first
-//   frame: until that frame says what it is, it may be a second viewer.
-//   Its opening drops a binding made by the legacy rule (sharedLocked()),
-//   as a second control connection's first frame did in r11.
-// - Each socket remembers the connections open from its address when the
-//   host first heard it (any valid MRM1 datagram: udpHeard(), udpMove()),
-//   less those whose first frame then said they are not a viewer's
-//   (CLIPBOARD_HELLO, FILE_HELLO). A socket is a connection's only when
-//   that connection is the one in that list (Sock::only()): a 0.4.x viewer
-//   opens its MRM1 socket after its control connection's start-up ping
-//   was answered, so a fresh viewer alone on its PC passes.
-// - A legacy owner takes moves from one socket: the first to move under
-//   this ownership, and only when it is the owner's. A first socket that
-//   is not, or any other socket after it, turns the legacy rule off until
-//   ownership changes. r10's allowance is gone: a socket an ended owner
-//   moved from never becomes a newer connection's, so a 0.4.x viewer whose
-//   control connection reconnected (it keeps its socket) stays TCP-only.
-// - With no owner, a socket hovers only when it is the one control
-//   connection's on its address. When the connection a hover binding was
-//   made for closes, the binding goes (close()), so its socket's late
-//   datagrams get no cursor shape and move nothing.
-// (r12's known limit, a closed viewer's late first datagram taken as the
-// one alone after it, is what r13 removes.)
-//
-// r13 (Pepper's review of 35d72ff; still no new message on the wire, 0x27
-// stays the only addition): after a handover on an address, no UDP socket
-// from it is taken by the legacy rule again until the host restarts.
-// - A connection is a viewer's session connection once it sends a
-//   VIDEO_CONFIG or input (isSessionFrame()). A 0.4.x viewer opens one per
-//   start, after a preflight connection that sends one ping and closes, and
-//   opens its MRM1 socket only after that VIDEO_CONFIG was answered. Its
-//   clipboard and file connections are not session connections.
-// - A handover on an address: a second session connection from it while
-//   this host runs, whether the first is still open (two viewers on one PC)
-//   or closed (a viewer quit and started again, another viewer took the
-//   PC, or a 0.4.x viewer's control connection reconnected). From then on
-//   neither the legacy owner rule nor the no-owner hover takes a socket
-//   from that address (handedOver_), so no binding is made there by the
-//   legacy rule and no cursor shape goes to one. A 0.4.x viewer there is
-//   TCP-only: its clicks go in where the pointer is, and it moves the
-//   pointer once it runs with --mouse-move-transport tcp (README). An old
-//   viewer's late first datagram can no longer be taken as the new
-//   viewer's: the host cannot tell them apart, so it takes neither. Only a
-//   socket an owner names in its own POINTER_SYNC (0x27) is known to be
-//   that owner's; that path is unchanged, so an r9+ viewer is not affected.
-// - The legacy rule now also needs the connection it would take a socket
-//   for to be a session connection: a closed viewer's late first datagram
-//   that comes while a new 0.4.x viewer's preflight connection is alone on
-//   the address is not taken either.
-// - A single 0.4.x viewer that never had a handover keeps r12's rules: its
-//   hover, drag and clicks go in by UDP as before.
-// - After a handover, UDP comes back for a 0.4.x viewer on that address
-//   only when the host restarts and that viewer is the first to start
-//   there. A 0.4.x viewer that runs through a host restart keeps its old
-//   socket; the new host mostly hears it before the viewer reconnects, and
-//   then it is TCP-only (r12). Starting it again is a handover.
-// Known limit: a 0.4.x viewer that had no session connection in this
-// host's run (its control connection never got as far as its VIDEO_CONFIG,
-// and the viewer went on without one) is not known to the host. A late
-// first datagram of its socket, coming while one session connection is
-// alone on its address before any handover, is taken as that one's.
+// r14 (Pepper's review of 524e4d1; still no new message on the wire): an
+// MRM1 datagram carries nothing that ties its socket to a control
+// connection. A 0.4.x viewer whose control connection failed (it never got
+// a session, or it closed) keeps sending MRM1 from its socket, and another
+// viewer that connects from the same address cannot be told apart from
+// it: the host could take the first viewer's late datagram as the new
+// one's, so the pointer moves and the cursor shape goes to the wrong
+// viewer. No rule over addresses, timing or connection counts rules that
+// out, so the host takes UDP moves only from a socket an owner named in
+// its own POINTER_SYNC (r9's rule):
+// - An owner that has sent no POINTER_SYNC (0.4.x) takes no UDP move
+//   (Udp::LegacyOff), and with no owner none goes in (Udp::NotOwner).
+//   Nothing is bound for them, so no cursor shape is sent.
+// - A 0.4.x viewer with this host runs with --mouse-move-transport tcp
+//   (README): its moves go by TCP (r12), and it gets no cursor shape.
+//   Without the flag its moves do nothing and its clicks go in where the
+//   host's pointer is.
+// - An r9+ viewer, which names its socket, is not affected.
 //
 // Admission (with the takeover it may make) and the injection of the frame
 // are one step under this object's lock (frame()), and so are close(),
@@ -844,55 +732,35 @@ class InputClaims {
 public:
     using Owner = HeldInput::Owner;
 
-    // A connection the host accepted from ip (network order). Owners are
-    // numbered from 1 in the order the connections opened. r12: called at
-    // accept, before the handshake; it counts for its address from now on
-    // (the class comment says why).
-    Owner open(uint32_t ip) {
+    // A connection the host accepted. Owners are numbered from 1 in the
+    // order the connections opened (host_main.cpp opens one at accept).
+    Owner open() {
         std::lock_guard<std::mutex> g(m_);
         const Owner o = next_++;
-        conns_[o] = Conn{ip, false, false};
-        if (controlsLocked(ip) > 1) sharedLocked(ip);
+        framed_[o] = false;
         return o;
     }
 
     struct Heard {
         bool refuse = false;    // a FILE_HELLO first: no file transfer here; close the connection
-        size_t controls = 0;    // r11: o's first frame made it a control connection; this many from its address
-                                // now (r12: with those whose first frame has not come)
         bool liveness = false;  // a liveness ping: valid, and not o's first frame
         bool armed = false;     // its first one: o is armed from now on
         bool silenced = false;  // o lost ownership for going quiet: close it, no pong
-        bool handover = false;  // r13: o became a second session connection from its address: no legacy UDP
-                                // from that address until the host restarts
     };
-    // r11 (Pepper's review of 5880264, items 1 and 2): every MRC1 frame
+    // r11 (Pepper's review of 5880264, item 1): every MRC1 frame
     // serveControl reads on o, in order, before it handles it, at nowMs.
     // The class comment says what o's first frame and its pings make it.
     Heard heard(Owner o, const Mrc1Header& h, int64_t nowMs) {
         std::lock_guard<std::mutex> g(m_);
         Heard r;
-        const auto it = conns_.find(o);
-        if (it == conns_.end()) return r;
-        Conn& c = it->second;
-        const bool first = !c.framed;
-        if (first) {
-            c.framed = true;
-            if (h.type == kMsgFileHello || h.type == kMsgClipboardHello) {
-                r.refuse = h.type == kMsgFileHello;
-                // r12: not a viewer's control connection: sockets heard
-                // while it was open are not made ambiguous by it.
-                for (auto& s : socks_) s.with.erase(std::remove(s.with.begin(), s.with.end(), o), s.with.end());
-                return r;
-            }
-            c.control = true;
-            r.controls = controlsLocked(c.ip);
-            if (r.controls > 1) sharedLocked(c.ip);
+        const auto it = framed_.find(o);
+        if (it == framed_.end()) return r;
+        if (!it->second) {
+            // A first-frame ping (every viewer's start-up ping) arms nothing.
+            it->second = true;
+            r.refuse = h.type == kMsgFileHello;
+            return r;
         }
-        // r13: a first frame can make it a session connection too (a 0.4.x
-        // reconnect's queued click).
-        if (isSessionFrame(h.type)) r.handover = sessionLocked(c);
-        if (first) return r;  // a first-frame ping (every viewer's start-up ping) arms nothing
         if (!isValidPing(h)) return r;
         r.liveness = true;
         r.armed = !lastPing_.count(o) && !silenced_.count(o);
@@ -925,20 +793,18 @@ public:
             if (owner_) {
                 r.replaced = 1;
                 r.released = held_.releaseOwned(owner_, upKey, upButton);
-                retireLocked(owner_);  // r10: its socket moves nothing while it is open
             }
             owner_ = newest_ = o;
-            ownerIp_ = ip;
             newOwnershipLocked();
             r.tookOver = true;
         }
         r.admitted = true;
         // r9: the owner's MRM1 socket, from its own POINTER_SYNC (port 0:
-        // that position went by TCP; nothing to name). r10: any POINTER_SYNC
-        // ends the legacy rule for this owner.
+        // that position went by TCP; nothing to name). r14: an owner that
+        // never sent one takes no UDP move.
         if (e.kind == InputEvent::Kind::PointerSync) {
             ownerSynced_ = true;
-            if (e.port) bindLocked(Endpoint{true, ip, e.port}, o);
+            if (e.port) bindLocked(Endpoint{true, ip, e.port});
         }
         if (held_.anyUnowned() && !isUp(e)) {
             r.blocked = true;
@@ -954,22 +820,12 @@ public:
     size_t close(Owner o, UpKey&& upKey, UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         if (owner_ == o) {
-            retireLocked(0);  // r10: closed, so not spent
             owner_ = 0;
             newOwnershipLocked();
         }
-        // r12: a hover binding made for it goes too: its socket's datagrams
-        // may go on after its TCP is gone, and no connection can be shown to
-        // own them.
-        if (boundFor_ == o) bindLocked(Endpoint{});
-        // r10: a socket it was replaced on is no longer spent. r12: no newer
-        // connection takes it (Sock::only()); a move from it under a legacy
-        // owner turns the rule off.
-        for (auto& s : socks_)
-            if (s.spentBy == o) s.spentBy = 0;
         lastPing_.erase(o);
         silenced_.erase(o);
-        conns_.erase(o);  // r11: no longer counted for its address
+        framed_.erase(o);
         return held_.releaseOwned(o, upKey, upButton);
     }
     // Ups Windows did not take, tried again (HeldInput::retryUnowned).
@@ -1018,7 +874,6 @@ public:
         x.silentMs = nowMs - it->second;
         silenced_.insert(owner_);
         x.released = held_.releaseOwned(owner_, upKey, upButton);
-        retireLocked(owner_);  // r10: as on a takeover, until it closes
         owner_ = 0;
         newOwnershipLocked();
         return x;
@@ -1028,56 +883,22 @@ public:
     enum class Udp {
         Moved,      // move() went in
         Stale,      // move() returned false (an older seq)
-        NotOwner,   // not the socket the host takes moves from now: dropped
+        NotOwner,   // no owner, or not the socket the owner named: dropped
         UpPending,  // an up is still owed: dropped
-        LegacyOff,  // r11: the legacy rule is off (not one viewer alone on the address): dropped
+        LegacyOff,  // r14: the owner named no socket (0.4.x without --mouse-move-transport tcp): dropped
     };
     // r9: an MRM1 pointer move from (ip, port). move() (the host takes its
-    // pointer lock in it) runs only for the socket the host takes moves
-    // from (r10, r11: the class comment says which) and only while no up is
-    // owed, under this lock.
+    // pointer lock in it) runs only for the socket the owner named in its
+    // own POINTER_SYNC (r14: no other; the class comment says why) and only
+    // while no up is owed, under this lock.
     template <class Move>
     Udp udpMove(uint32_t ip, uint16_t port, Move&& move) {
         std::lock_guard<std::mutex> g(m_);
-        const Sock& s = heardLocked(ip, port);
-        if (owner_ && ownerSynced_) {
-            // r9: a synced owner's moves come from the socket it named only.
-            if (!bound_.is(ip, port)) return Udp::NotOwner;
-        } else if (owner_) {
-            // r10: a legacy owner's socket: its first to move.
-            if (ip != ownerIp_ || s.spentBy) return Udp::NotOwner;
-            // r11: and only while it is the only control connection from
-            // its address, and that socket stays its only one. r12: that
-            // first socket must be the owner's (Sock::only()). r13: never
-            // on an address that had a handover.
-            if (legacyOff_ || handedOver_.count(ip) || !soleSessionLocked(owner_)) return Udp::LegacyOff;
-            if (legacyPort_ ? port != legacyPort_ : !s.only(owner_)) {
-                legacyOff_ = true;
-                bindLocked(Endpoint{});
-                return Udp::LegacyOff;
-            }
-            legacyPort_ = port;
-            bindLocked(Endpoint{true, ip, port}, owner_);
-        } else {
-            // r10: no owner: the latest socket to move whose owner has not
-            // ended. r11: from an address with one control connection. r12:
-            // that connection's socket (Sock::only()); one whose first frame
-            // has not come counts (controlsLocked()). r13: a session
-            // connection's, on an address that had no handover.
-            if (s.spentBy || s.retired) return Udp::NotOwner;
-            if (handedOver_.count(ip) || controlsLocked(ip) != 1 || s.with.size() != 1 ||
-                !soleSessionLocked(s.with[0]))
-                return Udp::LegacyOff;
-            bindLocked(Endpoint{true, ip, port}, s.with[0]);
-        }
+        if (!owner_) return Udp::NotOwner;
+        if (!ownerSynced_) return Udp::LegacyOff;
+        if (!bound_.is(ip, port)) return Udp::NotOwner;
         if (held_.anyUnowned()) return Udp::UpPending;
         return move() ? Udp::Moved : Udp::Stale;
-    }
-    // r12: any other valid MRM1 datagram from (ip, port) (0x40, 0x43): the
-    // host has heard that socket (Sock::with); nothing else changes.
-    void udpHeard(uint32_t ip, uint16_t port) {
-        std::lock_guard<std::mutex> g(m_);
-        heardLocked(ip, port);
     }
     // r10 (Pepper's review of f919167, item 3): where the cursor shape goes,
     // the socket the host takes moves from now (none: nowhere). gen moves
@@ -1091,11 +912,6 @@ public:
     CursorPeer cursorPeer() const {
         std::lock_guard<std::mutex> g(m_);
         return CursorPeer{bound_.named, bound_.ip, bound_.port, boundGen_};
-    }
-    // r13: ip had a handover while this host runs: no legacy UDP from it.
-    bool handedOver(uint32_t ip) const {
-        std::lock_guard<std::mutex> g(m_);
-        return handedOver_.count(ip) != 0;
     }
 
     // The input owner; 0 when there is none.
@@ -1123,166 +939,36 @@ private:
         uint16_t port = 0;
         bool is(uint32_t i, uint16_t p) const { return named && ip == i && port == p; }
     };
-    // r10: a viewer MRM1 socket the host has heard from (or that an owner
-    // ended on).
-    struct Sock {
-        uint32_t ip = 0;
-        uint16_t port = 0;
-        uint64_t lastHeard = 0;  // order of the last datagram (heard_)
-        Owner spentBy = 0;       // the replaced (or expired) connection, still open, it was bound for
-        bool retired = false;    // an owner ended while it was bound: moves nothing with no owner
-        // r12: the connections open from its address (a control connection,
-        // or one whose first frame had not come) when the host first heard
-        // it, less those that turned out not to be a viewer's (heard()).
-        std::vector<Owner> with;
-        // r12: it is o's: o was the one such connection.
-        bool only(Owner o) const { return with.size() == 1 && with[0] == o; }
-    };
-    // More than one per control connection (kMaxControlConnections, 8, in
-    // host_main.cpp), so a spent socket never has to make room.
-    static constexpr size_t kMaxSocks = 16;
-
-    Sock* findLocked(uint32_t ip, uint16_t port) {
-        for (auto& s : socks_)
-            if (s.ip == ip && s.port == port) return &s;
-        return nullptr;
-    }
-    // The socket's entry, made if new; heard now. The one heard from least
-    // recently makes room, never a spent, retired or bound one while
-    // another can.
-    Sock& heardLocked(uint32_t ip, uint16_t port) {
-        Sock* s = findLocked(ip, port);
-        if (!s) {
-            if (socks_.size() >= kMaxSocks) {
-                auto victim = socks_.end();
-                bool victimPinned = true;
-                for (auto it = socks_.begin(); it != socks_.end(); ++it) {
-                    const bool pinned = it->spentBy || it->retired || bound_.is(it->ip, it->port);
-                    if (victim == socks_.end() || (victimPinned && !pinned) ||
-                        (victimPinned == pinned && it->lastHeard < victim->lastHeard)) {
-                        victim = it;
-                        victimPinned = pinned;
-                    }
-                }
-                socks_.erase(victim);
-            }
-            socks_.push_back(Sock{ip, port, 0, 0, false, {}});
-            s = &socks_.back();
-            for (const auto& [o, c] : conns_)
-                if (c.ip == ip && (c.control || !c.framed)) s->with.push_back(o);
-        }
-        s->lastHeard = ++heard_;
-        return *s;
-    }
-    // r12: forConn, the connection the binding is made for (0: none).
-    void bindLocked(const Endpoint& e, Owner forConn = 0) {
-        boundFor_ = e.named ? forConn : 0;
+    void bindLocked(const Endpoint& e) {
         if (e.named == bound_.named && e.ip == bound_.ip && e.port == bound_.port) return;
         bound_ = e;
         ++boundGen_;
     }
-    // The owner ends (a takeover, its close, expiry): the socket its moves
-    // came from (named, or bound by the legacy rule) is retired, and spent
-    // while openOwner (the owner, replaced or expired) stays open; 0: it
-    // closed. r11: a legacy owner's socket too while its binding is
-    // dropped (legacyPort_).
-    void retireLocked(Owner openOwner) {
-        Endpoint e = bound_;
-        if (!e.named && owner_ && !ownerSynced_ && legacyPort_) e = Endpoint{true, ownerIp_, legacyPort_};
-        if (!e.named) return;
-        Sock* s = findLocked(e.ip, e.port);
-        if (!s) {
-            s = &heardLocked(e.ip, e.port);
-            s->with.clear();  // r12: not heard now; no one's
-        }
-        s->retired = true;
-        s->spentBy = openOwner;
-    }
     // Ownership changed (a takeover, the owner's close, expiry): no socket
-    // is bound, and a new owner starts on the legacy rule.
+    // is bound until the new owner names one.
     void newOwnershipLocked() {
         ownerSynced_ = false;
-        legacyPort_ = 0;
-        legacyOff_ = false;
         bindLocked(Endpoint{});
     }
-    // r11: control connections from ip now. r12: and those whose first
-    // frame has not come (each may be one).
-    size_t controlsLocked(uint32_t ip) const {
-        size_t n = 0;
-        for (const auto& [o, c] : conns_)
-            if ((c.control || !c.framed) && c.ip == ip) ++n;
-        return n;
-    }
-    // r11: o is a control connection and the only one from its address.
-    bool soleControlLocked(Owner o) const {
-        const auto it = conns_.find(o);
-        return it != conns_.end() && it->second.control && controlsLocked(it->second.ip) == 1;
-    }
-    // r13: and a session connection.
-    bool soleSessionLocked(Owner o) const {
-        const auto it = conns_.find(o);
-        return it != conns_.end() && it->second.session && soleControlLocked(o);
-    }
-    // r11: a second control connection from ip (r12: or one whose first
-    // frame has not come): a binding there made by the legacy rule (a
-    // legacy owner's socket, or the hovering one) is dropped. A synced
-    // owner's named socket stays.
-    void sharedLocked(uint32_t ip) {
-        if (bound_.named && bound_.ip == ip && !(owner_ && ownerSynced_)) bindLocked(Endpoint{});
-    }
-    // r11: what a connection's first frame said it is.
-    struct Conn {
-        uint32_t ip = 0;       // its peer address
-        bool framed = false;   // its first frame came
-        bool control = false;  // that frame was not CLIPBOARD_HELLO or FILE_HELLO
-        bool session = false;  // r13: it then sent a VIDEO_CONFIG or input (isSessionFrame())
-    };
-    // r13: control connection c sent a session frame. Its address's second
-    // session connection (or a later one) makes it handed over: no binding
-    // is made there by the legacy rule again. (One made before went when c
-    // opened, sharedLocked(), or when the connection it was made for
-    // closed.) Returns true when c is such a connection.
-    bool sessionLocked(Conn& c) {
-        if (!c.control || c.session) return false;
-        c.session = true;
-        if (sessionAddrs_.insert(c.ip).second) return false;  // the first from its address
-        handedOver_.insert(c.ip);
-        return true;
+    bool pingLocked(Owner o, int64_t nowMs) {
+        if (silenced_.count(o)) return true;
+        lastPing_[o] = nowMs;
+        return false;
     }
 
     mutable std::mutex m_;
     Owner next_ = 1;
     Owner owner_ = 0;   // the input owner, 0 none
     Owner newest_ = 0;  // the newest connection that has been the owner
-    // r10: the owner sent a POINTER_SYNC (a viewer of r9 or later), and its
-    // TCP peer address.
-    bool ownerSynced_ = false;
-    uint32_t ownerIp_ = 0;
-    // r9: the owner's MRM1 socket, once its POINTER_SYNC named it. r10: or
-    // the socket bound by the legacy rule; the cursor shape goes there.
+    bool ownerSynced_ = false;  // r10: the owner sent a POINTER_SYNC (a viewer of r9 or later)
+    // r9: the owner's MRM1 socket, once its POINTER_SYNC named it; the
+    // cursor shape goes there (r10).
     Endpoint bound_;
     uint64_t boundGen_ = 0;
-    Owner boundFor_ = 0;  // r12: the connection bound_ was made for
-    std::vector<Sock> socks_;  // r10
-    uint64_t heard_ = 0;
-    // r11: a legacy owner's first socket to move (0: none yet), and whether
-    // a second socket of its address turned the legacy rule off for it.
-    uint16_t legacyPort_ = 0;
-    bool legacyOff_ = false;
-    std::map<Owner, Conn> conns_;        // r11: open connections
-    // r13: addresses a session connection came from while this host runs,
-    // and those a second one came from (a handover: no legacy UDP).
-    std::set<uint32_t> sessionAddrs_, handedOver_;
+    std::map<Owner, bool> framed_;       // r11: open connections, and whether their first frame came
     std::map<Owner, int64_t> lastPing_;  // r9: armed connections, and their last liveness ping
     std::set<Owner> silenced_;           // r9: owners that went quiet and are not closed yet
     HeldInput held_;
-
-    bool pingLocked(Owner o, int64_t nowMs) {
-        if (silenced_.count(o)) return true;
-        lastPing_[o] = nowMs;
-        return false;
-    }
 };
 
 // The captured monitor in virtual-desktop pixels.

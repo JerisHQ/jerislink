@@ -994,7 +994,7 @@ struct OwnerHost {
     size_t fileRefused = 0;          // r11: connections closed at a FILE_HELLO first frame
     size_t armedOnes = 0;            // r11: liveness pings that armed a connection (heard)
     Owner open(uint32_t ip = kViewerIp) {
-        const Owner o = claims.open(ip);
+        const Owner o = claims.open();
         ips[o] = ip;
         return o;
     }
@@ -1166,9 +1166,6 @@ struct OwnerHost {
         else ++udpRefused;
         return r;
     }
-    // r12: any other valid MRM1 datagram from port (a 0x40 keyframe
-    // request, a 0x43 ping): mrm1Listener hands it to udpHeard.
-    void udpOther(uint16_t port, uint32_t ip = kViewerIp) { claims.udpHeard(ip, port); }
     // r10: where cursorLoop sends the shape now.
     bool cursorTo(uint16_t port, uint32_t ip = kViewerIp) const {
         const auto c = claims.cursorPeer();
@@ -1482,8 +1479,8 @@ static void testAdmitInjectOrder() {
             log("Bu" + std::to_string(b));
             return true;
         };
-        const auto A = claims.open(kViewerIp);
-        const auto B = claims.open(kViewerIp);
+        const auto A = claims.open();
+        const auto B = claims.open();
         jlh::InputEvent press;  // a down: no up is owed here, so nothing blocks it
         press.kind = jlh::InputEvent::Kind::Key;
         press.down = true;
@@ -1752,24 +1749,16 @@ static void testPointerOwner() {
     {
         OwnerHost h;
         const auto A = h.open();
-        // r11: no control connection from the address has said what it is
-        // yet (no first frame): nothing hovers.
-        CHECK(h.pointer(kA) == Udp::LegacyOff);
-        h.tcp(A, pingFrame());  // every viewer's start-up ping
-        // r13: a connection that has sent only a ping is no session
-        // connection (a 0.4.x viewer's preflight): nothing hovers. A 0.4.x
-        // viewer opens its MRM1 socket after its VIDEO_CONFIG.
-        CHECK(h.pointer(kA) == Udp::LegacyOff);
-        h.tcp(A, videoConfigFrame(false));
-        // r10: no owner yet, a socket hovers (a 0.4.x viewer before its
-        // first click); an owner that named no socket (0.4.x) moves from the
-        // first socket on its address that moves, and from that one only.
-        CHECK(h.pointer(kA) == Udp::Moved);
+        // No owner yet: no UDP move, whatever the connection has sent (r14:
+        // a 0.4.x viewer's hover neither).
+        CHECK(h.pointer(kA) == Udp::NotOwner);
+        h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));
+        CHECK(h.pointer(kA) == Udp::NotOwner && h.cursorNowhere());
+        // r14: an owner that named no socket (0.4.x) takes no UDP move from
+        // any socket.
         h.tcp(A, keyFrame('Q', true));
-        CHECK(h.claims.owner() == A && h.pointer(kA) == Udp::Moved);
-        // r11: a second port on the legacy owner's address turns the legacy
-        // rule off for this ownership: neither port moves the pointer.
-        CHECK(h.pointer(kB) == Udp::LegacyOff && h.pointer(kA) == Udp::LegacyOff && h.cursorNowhere());
+        CHECK(h.claims.owner() == A && h.pointer(kA) == Udp::LegacyOff && h.pointer(kB) == Udp::LegacyOff);
+        CHECK(h.udpMoves == 0 && h.cursorNowhere());
         h.tcp(A, keyFrame('Q', false));
         // A's click names its socket: A drags over MRM1.
         h.tcp(A, syncedButton(1000, 1000, 1, 0, true, kA));
@@ -1809,8 +1798,7 @@ static void testPointerOwner() {
     {
         // The same viewer reconnects its control connection and keeps its
         // UDP socket: the new connection names it again (its registration)
-        // before UDP moves go in; until then they are dropped. (r10: and
-        // A1, still open, spent kA: A2 cannot take it by moving.)
+        // before UDP moves go in; until then they are dropped.
         OwnerHost h;
         const auto A1 = h.open();
         h.tcp(A1, syncedButton(1000, 1000, 1, 0, true, kA));
@@ -1818,7 +1806,7 @@ static void testPointerOwner() {
         CHECK(h.pointer(kA) == Udp::Moved);
         const auto A2 = h.open();
         h.tcp(A2, keyFrame('Z', true));  // takes over; names nothing
-        CHECK(h.claims.owner() == A2 && h.pointer(kA) == Udp::NotOwner);
+        CHECK(h.claims.owner() == A2 && h.pointer(kA) == Udp::LegacyOff);
         auto reg = syncedButton(1500, 1500, 9, 0, true, kA);
         reg.resize(jlh::kMrc1HeaderBytes + jlh::kPointerSyncBytes);
         const auto mv = jlh::mrc1Frame(jlh::kMsgMouseMoveNorm, {5, 220, 5, 220});
@@ -2097,251 +2085,170 @@ static void testSilencedConnectionCloses() {
 #endif
 }
 
-// r10 (Pepper's review of f919167, item 2): a 0.4.x viewer never sends a
-// POINTER_SYNC, its pointer moves over MRM1 only, and its clicks carry no
-// position (except one queued for a reconnect). Its hover, drag and clicks
-// work again; a replaced connection's UDP never moves the pointer.
-static void testLegacyPointer() {
+// H2 r14 (Pepper's review of 524e4d1): a viewer that sends no POINTER_SYNC
+// (0.4.x, or a build with the 8-byte 0x27 of 8f8a33b) moves the pointer by
+// TCP only. With no owner no UDP move goes in (NotOwner), an owner that
+// named no socket takes none from any socket (LegacyOff), and no cursor
+// shape is sent for either. r10 to r13 took such a viewer's UDP moves when
+// the host judged the socket to be its own; that rule is gone
+// (host_protocol.hpp, InputClaims). An r9+ viewer is not affected.
+static void testLegacyUdpOff() {
     using Udp = jlh::InputClaims::Udp;
-    constexpr uint16_t kOld = 50000, kNew = 50001, kOther = 50002;
     using Clicks = std::vector<std::string>;
+    constexpr uint16_t kOld = 50000, kNew = 50001, kOther = 50002;
+    const auto startup = cat({pingFrame(), videoConfigFrame(false)});  // a 0.4.x viewer's session connection
     {
-        // A fresh 0.4.x viewer: it hovers before its first click (no owner
-        // yet), clicks where it hovered, drags, lets go, hovers, clicks.
+        // A fresh 0.4.x viewer alone on its PC, run without the tcp flag:
+        // its hover and drag move nothing and get no cursor shape; its
+        // clicks go in where the host's pointer is.
         OwnerHost h;
         const auto A = h.open();
-        h.tcp(A, pingFrame());
-        h.tcp(A, videoConfigFrame(false));
-        CHECK(h.pointerTo(kOld, 1000, 2000) == Udp::Moved && h.pointerTo(kOld, 1100, 2100) == Udp::Moved);
-        CHECK(h.px == 1100 && h.py == 2100 && h.cursorTo(kOld));
+        h.tcp(A, startup);
+        CHECK(h.pointerTo(kOld, 1000, 2000) == Udp::NotOwner && h.px == -1 && h.cursorNowhere());
         h.tcp(A, plainButton(0, true));
-        CHECK(h.last.tookOver && h.claims.owner() == A && h.clicks == Clicks{"Bd0@1100,2100"});
-        // A socket on another address (another machine the host allows)
-        // is not this viewer: only the owner's TCP peer address binds.
-        CHECK(h.claims.udpMove(kViewerIp + 1, kOld, [] { return true; }) == Udp::NotOwner && h.px == 1100);
-        for (int i = 1; i <= 10; ++i) CHECK(h.pointerTo(kOld, 1100 + 100 * i, 2100) == Udp::Moved);
-        CHECK(h.px == 2100 && h.buttonDown(0) && h.cursorTo(kOld));
+        CHECK(h.last.tookOver && h.claims.owner() == A && h.clicks == Clicks{"Bd0@-1,-1"});
+        for (int i = 1; i <= 10; ++i) CHECK(h.pointerTo(kOld, 1000 + 100 * i, 2000) == Udp::LegacyOff);
+        CHECK(h.px == -1 && h.udpMoves == 0 && h.buttonDown(0) && h.cursorNowhere());
         h.tcp(A, plainButton(0, false));
-        CHECK(!h.buttonDown(0) && h.pointerTo(kOld, 3000, 3000) == Udp::Moved);
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.clicks == Clicks({"Bd0@1100,2100", "Bd0@3000,3000"}) && !h.claims.anyHeld());
-        // r11: another viewer on the same address connects (its own control
-        // connection) without clicking: the legacy rule is off for that
-        // address while both are open. Neither socket moves the pointer and
-        // neither gets the cursor shape; A's clicks still go in where the
-        // pointer is.
+        CHECK(!h.claims.anyHeld() && h.pointerTo(kOld, 3000, 3000) == Udp::LegacyOff && h.cursorNowhere());
+        // No other socket either, on its address or another one.
+        CHECK(h.pointerTo(kOther, 3000, 3000) == Udp::LegacyOff);
+        CHECK(h.pointerTo(kOld, 3000, 3000, kViewerIp + 1) == Udp::LegacyOff && h.px == -1);
+        // Its clipboard connection and a refused file connection change
+        // nothing.
         const auto C = h.open();
-        h.tcp(C, pingFrame());
-        CHECK(h.cursorNowhere());
-        CHECK(h.pointerTo(kOther, 9000, 9000) == Udp::LegacyOff && h.px == 3000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kOld, 3100, 3100) == Udp::LegacyOff && h.px == 3000 && h.cursorNowhere());
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.claims.owner() == A && h.clicks.back() == "Bd0@3000,3000" && h.clicks.size() == 3);
+        h.tcp(C, clipboardHelloFrame());
+        const auto F = h.open();
+        h.tcp(F, jlh::mrc1Frame(jlh::kMsgFileHello, std::vector<uint8_t>{}));
+        CHECK(h.fileRefused == 1 && h.claims.owner() == A);
+        CHECK(h.pointerTo(kOld, 3100, 3100) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
         // 0.4.x is never armed: it keeps the r8 rules.
         h.now = 60'000;
         CHECK(h.expire().owner == 0 && h.claims.owner() == A);
     }
     {
-        // Two fresh viewers on two machines hover with no owner: the latest
-        // to move has the pointer and the cursor shape; one that started and
-        // quit without clicking does not keep it.
+        // Two fresh 0.4.x viewers on two machines hover with no owner:
+        // neither moves the pointer or gets the shape (r10 to r13: the
+        // latest to move did).
         OwnerHost h;
         const auto A = h.open(kViewerIp);
-        h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));  // r13: a session connection
+        h.tcp(A, startup);
         const auto B = h.open(kViewerIp + 1);
-        h.tcp(B, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved && h.cursorTo(kOld));
-        CHECK(h.pointerTo(kOther, 2000, 2000, kViewerIp + 1) == Udp::Moved && h.cursorTo(kOther, kViewerIp + 1) && h.px == 2000);
+        h.tcp(B, startup);
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::NotOwner);
+        CHECK(h.pointerTo(kOther, 2000, 2000, kViewerIp + 1) == Udp::NotOwner);
+        CHECK(h.px == -1 && h.cursorNowhere());
     }
     {
-        // Late UDP after a takeover by an r9+ viewer (its own socket): the
-        // old viewer's datagrams, late or still coming, never move the
-        // pointer and never take the cursor shape; the new owner's drag and
-        // click go in where it put them.
+        // An r9+ viewer takes over from a 0.4.x owner on the same PC: the
+        // socket it names moves the pointer and gets the shape; the 0.4.x
+        // viewer's datagrams, still coming, change neither.
         OwnerHost h;
         const auto A = h.open();
-        h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A, startup);
         h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::Moved && h.buttonDown(0));  // A drags
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::LegacyOff && h.buttonDown(0));
         const auto B = h.open();
-        h.tcp(B, pingFrame());
-        h.tcp(B, videoConfigFrame(true));
+        h.tcp(B, cat({pingFrame(), videoConfigFrame(true)}));
         h.win.clear();
         h.tcp(B, registration(4000, 4000, 5, kNew));
         CHECK(h.last.tookOver && h.last.replaced == 1 && h.got({"Bu0", "M", "M"}) && h.claims.owner() == B);
-        CHECK(h.cursorTo(kNew) && h.px == 4000);
+        CHECK(h.px == 4000 && h.cursorTo(kNew));
+        const auto c0 = h.claims.cursorPeer();
         for (int i = 0; i < 20; ++i) {
             CHECK(h.pointerTo(kOld, 1300 + i, 1300) == Udp::NotOwner);
             CHECK(h.pointerTo(kNew, 4000 + i, 4000) == Udp::Moved);
         }
-        CHECK(h.px == 4019 && h.cursorTo(kNew));
+        CHECK(h.px == 4019 && h.cursorTo(kNew) && h.claims.cursorPeer().gen == c0.gen);
         h.tcp(B, syncedButton(4100, 4100, 40, 0, true, kNew));
         CHECK(h.clicks.back() == "Bd0@4100,4100");
-        // A's frames are dropped as in r8; its UDP still moves nothing,
-        // after B closes too.
-        h.tcp(A, plainButton(0, false));
-        CHECK(!h.last.admitted && h.buttonDown(0));
         h.tcp(B, syncedButton(4100, 4100, 41, 0, false, kNew));
         h.close(B);
-        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::NotOwner && h.px == 4100 && !h.cursorTo(kOld));
+        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::NotOwner && h.pointerTo(kNew, 4200, 4200) == Udp::NotOwner);
+        CHECK(h.px == 4100 && h.cursorNowhere());
     }
     {
-        // A 0.4.x viewer takes over from another 0.4.x viewer on another
-        // machine. The replaced one's late datagram, before the new owner's
-        // first move or after it, moves nothing; the new owner's moves go
-        // in. (The new owner's first click lands where the pointer was: it
-        // carries no position, and its hover could not move the pointer
-        // while the other one owned input.) Two 0.4.x viewers on one
-        // address: testSameAddressLegacy.
-        constexpr uint32_t kIpB = kViewerIp + 1;
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
-        h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved);
-        const auto B = h.open(kIpB);
-        h.tcp(B, pingFrame());
-        CHECK(h.pointerTo(kOther, 5000, 5000, kIpB) == Udp::NotOwner);  // B hovers: A owns input
-        h.tcp(B, plainButton(0, true));
-        CHECK(h.last.replaced == 1 && h.claims.owner() == B && h.clicks.back() == "Bd0@1100,1100");
-        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner && h.px == 1100 && !h.cursorTo(kOld));
-        CHECK(h.pointerTo(kOther, 5100, 5100, kIpB) == Udp::Moved && h.cursorTo(kOther, kIpB));
-        CHECK(h.pointerTo(kOld, 1300, 1300) == Udp::NotOwner && h.px == 5100 && h.cursorTo(kOther, kIpB));
-        // A closes; its socket still moves nothing under B.
-        h.close(A);
-        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::NotOwner && h.px == 5100);
-    }
-    {
-        // The same 0.4.x viewer reconnects its control connection, keeping
-        // its UDP socket, while the host still holds the old one: the click
-        // queued for the reconnect carries its position; the socket moves
-        // nothing while the old connection is open (r11: two control
-        // connections on one address, so the legacy rule is off). r12
-        // (Pepper's review of 9f803c6, item 2): nor once the old one has
-        // closed. The socket was A1's, and the host cannot tell whether the
-        // viewer behind A2 is the one sending from it: the legacy rule goes
-        // off for A2, which is TCP-only from then (README:
-        // --mouse-move-transport tcp). r10 and r11 let A2 take it.
-        OwnerHost h;
-        const auto A1 = h.open();
-        h.tcp(A1, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
-        h.tcp(A1, plainButton(0, true));
-        h.tcp(A1, plainButton(0, false));
-        CHECK(h.pointerTo(kOld, 1500, 1500) == Udp::Moved);
-        const auto A2 = h.open();
-        h.tcp(A2, tcpPositionedButton(1600, 1600, 0, true));
-        CHECK(h.last.tookOver && h.claims.owner() == A2 && h.clicks.back() == "Bd0@1600,1600");
-        CHECK(h.pointerTo(kOld, 1700, 1700) == Udp::NotOwner && h.px == 1600 && h.cursorNowhere());
-        CHECK(h.close(A1) == 0);
-        CHECK(h.pointerTo(kOld, 1800, 1800) == Udp::LegacyOff && h.px == 1600 && h.cursorNowhere());
-        CHECK(h.pointerTo(kOld, 1900, 1900) == Udp::LegacyOff && h.px == 1600 && h.cursorNowhere());
-        h.tcp(A2, plainButton(0, false));
-        CHECK(!h.claims.anyHeld());
-    }
-    {
-        // The old connection closed first (the host saw it go): with no
-        // owner its socket moves nothing; the reconnect's click carries its
-        // position. r12: the socket was A1's, so it moves nothing under A2
-        // either (r10 and r11 let it). A socket heard before its connection
-        // opened never hovers; one first heard while one connection is
-        // alone on the address does.
-        OwnerHost h;
-        const auto A1 = h.open();
-        h.tcp(A1, plainButton(0, true));
-        h.tcp(A1, plainButton(0, false));
-        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved);
-        h.close(A1);
-        CHECK(h.claims.owner() == 0 && h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner && !h.cursorTo(kOld));
-        CHECK(h.px == 1100);
-        const auto A2 = h.open();
-        h.tcp(A2, tcpPositionedButton(1300, 1300, 0, true));
-        CHECK(h.clicks.back() == "Bd0@1300,1300");
-        CHECK(h.pointerTo(kOld, 1400, 1400) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-        h.tcp(A2, plainButton(0, false));
-        h.close(A2);
-        CHECK(h.pointerTo(kOld, 1500, 1500) == Udp::NotOwner);
-        // r11: a socket with no control connection on its address hovers
-        // nothing. r12: nor once a connection opens (it was not heard while
-        // that one was open); a socket first heard after that did. r13: not
-        // here: A1 and A2 were two session connections from this address,
-        // a handover, so no socket from it hovers until the host restarts.
-        CHECK(h.pointerTo(kOther, 1900, 1900) == Udp::LegacyOff && h.px == 1300);
-        const auto C = h.open();
-        h.tcp(C, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.claims.handedOver(kViewerIp));
-        CHECK(h.pointerTo(kOther, 2000, 2000) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-        CHECK(h.pointerTo(kNew, 2100, 2100) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-    }
-    {
-        // An owner replaced or expired while its connection stays open:
-        // its socket moves nothing, under a newer owner that named none
-        // either. Here an r9+ owner expires and a 0.4.x viewer on the same
-        // address clicks before the old connection closes. (r11: the
-        // 0.4.x socket moved the pointer once the old connection was gone.
-        // r12: it was first heard while both were open, so it is not B's:
-        // the legacy rule goes off for B.)
+        // A 0.4.x viewer takes over from an r9+ owner (here one that went
+        // quiet and expired): no socket moves the pointer under it, and no
+        // shape is sent.
         OwnerHost h;
         const auto A = h.open();
         h.tcp(A, cat({pingFrame(), videoConfigFrame(true), pingFrame()}));
         CHECK(h.claims.armed(A));
         h.tcp(A, registration(1000, 1000, 1, kNew));
-        CHECK(h.pointerTo(kNew, 1100, 1100) == Udp::Moved);
+        CHECK(h.pointerTo(kNew, 1100, 1100) == Udp::Moved && h.cursorTo(kNew));
         h.now = jlh::kLivenessTimeoutMs + 250;
         CHECK(h.expire().owner == A);
-        CHECK(h.pointerTo(kNew, 1200, 1200) == Udp::NotOwner);
+        CHECK(h.pointerTo(kNew, 1200, 1200) == Udp::NotOwner && h.cursorNowhere());
         const auto B = h.open();
+        h.tcp(B, startup);
         h.tcp(B, plainButton(0, true));
-        CHECK(h.claims.owner() == B && h.pointerTo(kNew, 1300, 1300) == Udp::NotOwner && h.px == 1100);
-        CHECK(h.pointerTo(kOld, 1900, 1900) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
+        CHECK(h.claims.owner() == B && h.clicks.back() == "Bd0@1100,1100");
+        CHECK(h.pointerTo(kNew, 1300, 1300) == Udp::LegacyOff && h.pointerTo(kOld, 1900, 1900) == Udp::LegacyOff);
+        CHECK(h.px == 1100 && h.cursorNowhere());
         h.close(A);
         CHECK(h.pointerTo(kOld, 2000, 2000) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        // A's socket, no longer spent once A closed, moves nothing either.
-        CHECK(h.pointerTo(kNew, 1400, 1400) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        CHECK(h.pointerTo(kOld, 2100, 2100) == Udp::LegacyOff && h.px == 1100);
+        h.tcp(B, plainButton(0, false));
+        CHECK(!h.claims.anyHeld());
     }
     {
-        // An r9+ owner is never on the legacy rule once it sent a
-        // POINTER_SYNC, even one that named no socket (port 0: a click
-        // queued for its reconnect): a closed 0.4.x viewer's socket on the
-        // same address moves nothing before the owner names its own.
+        // A 0.4.x viewer's control connection reconnects, keeping its UDP
+        // socket: the click it queued for the reconnect carries its position
+        // (by TCP), so it goes in there; the socket moves nothing, before
+        // or after the old connection closes.
+        OwnerHost h;
+        const auto A1 = h.open();
+        h.tcp(A1, startup);
+        h.tcp(A1, plainButton(0, true));
+        h.tcp(A1, plainButton(0, false));
+        const auto A2 = h.open();
+        h.tcp(A2, tcpPositionedButton(1600, 1600, 0, true));
+        CHECK(h.last.tookOver && h.claims.owner() == A2 && h.clicks.back() == "Bd0@1600,1600");
+        CHECK(h.pointerTo(kOld, 1700, 1700) == Udp::LegacyOff && h.px == 1600 && h.cursorNowhere());
+        CHECK(h.close(A1) == 0);
+        CHECK(h.pointerTo(kOld, 1800, 1800) == Udp::LegacyOff && h.px == 1600 && h.cursorNowhere());
+        h.tcp(A2, plainButton(0, false));
+        CHECK(!h.claims.anyHeld());
+    }
+    {
+        // An r9+ owner whose first POINTER_SYNC named no socket (port 0: a
+        // click queued for its reconnect) takes no UDP move until it names
+        // one, then only from that one. A closed 0.4.x viewer's socket on
+        // the same address moves nothing throughout.
         OwnerHost h;
         const auto A = h.open();
+        h.tcp(A, startup);
         h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
         h.tcp(A, plainButton(0, false));
         h.close(A);
         const auto B = h.open();
         h.tcp(B, syncedButton(2000, 2000, 0, 0, true, 0));
         CHECK(h.claims.owner() == B && h.clicks.back() == "Bd0@2000,2000");
-        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::NotOwner && h.px == 2000 && !h.cursorTo(kOld));
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::NotOwner && h.px == 2000 && h.cursorNowhere());
         h.tcp(B, registration(2100, 2100, 1, kNew));
         CHECK(h.pointerTo(kNew, 2200, 2200) == Udp::Moved && h.px == 2200 && h.cursorTo(kNew));
-        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner);
+        CHECK(h.pointerTo(kOld, 1200, 1200) == Udp::NotOwner && h.px == 2200 && h.cursorTo(kNew));
+        h.tcp(B, syncedButton(2200, 2200, 2, 0, false, kNew));
+        CHECK(!h.claims.anyHeld());
     }
     {
         // The 8-byte 0x27 of 8f8a33b (never released) shares cap 0x20 with
         // the 10-byte form. The host drops a 0x27 of any other length whole
         // (decodeInput; serveControl counts it as malformed and reads on),
         // so a viewer built from 8f8a33b is a 0.4.x viewer here: its click
-        // goes in where its hover put the pointer, and its hover and drag
-        // go in by the legacy rule.
+        // goes in where the host's pointer is, and its UDP moves nothing.
         OwnerHost h;
         const auto A = h.open();
-        h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));
-        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::Moved);
+        h.tcp(A, startup);
+        CHECK(h.pointerTo(kOld, 1000, 1000) == Udp::NotOwner);
         auto click8 = jlh::mrc1Frame(jlh::kMsgPointerSync, {0x0b, 0xb8, 0x0b, 0xb8, 0, 0, 0, 1});  // 3000,3000 seq 1
         const auto down = plainButton(0, true);
         click8.insert(click8.end(), down.begin(), down.end());
         const auto hd = jlh::parseMrc1Header(click8.data());
         CHECK(hd && hd->length == 8 && !jlh::decodeInput(*hd, click8.data() + jlh::kMrc1HeaderBytes));
         h.tcp(A, click8);
-        CHECK(h.claims.owner() == A && h.clicks == Clicks{"Bd0@1000,1000"});
-        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::Moved && h.cursorTo(kOld) && h.buttonDown(0));
+        CHECK(h.claims.owner() == A && h.clicks == Clicks{"Bd0@-1,-1"});
+        CHECK(h.pointerTo(kOld, 1100, 1100) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere() && h.buttonDown(0));
         h.tcp(A, plainButton(0, false));
         CHECK(!h.claims.anyHeld());
     }
@@ -2361,7 +2268,7 @@ static void testCursorDestination() {
         h.pointerTo(kOld, 1000, 1000);
         h.tcp(A, plainButton(0, true));
         h.pointerTo(kOld, 1100, 1100);
-        CHECK(h.cursorTo(kOld));
+        CHECK(h.cursorNowhere());  // r14: a 0.4.x owner (or a hover) gets no shape
         const auto B = h.open();
         h.tcp(B, registration(4000, 4000, 5, kNew));
         const auto c0 = h.claims.cursorPeer();
@@ -2490,174 +2397,25 @@ static void testLivenessOptIn() {
     }
 }
 
-// r11 (Pepper's review of 5880264, items 2 and 3): the 0.4.x rule (UDP
-// moves from the owner's address) holds only while the owner is the one
-// control connection on its address, and only from the first port it
-// moved from. Otherwise the 0.4.x socket moves nothing and the cursor
-// shape goes nowhere. r12 (Pepper's review of 9f803c6, items 1 and 2):
-// and only from a socket first heard while that connection was alone on
-// the address. Where a 0.4.x click goes in then is not checked as right:
-// its moves never reached the host. Such a viewer is TCP-only (README:
-// --mouse-move-transport tcp; testLegacyTcpMoves).
-static void testSameAddressLegacy() {
-    using Udp = jlh::InputClaims::Udp;
-    constexpr uint16_t kA = 50000, kB = 50001, kC = 50002;
-    const auto startup = cat({pingFrame(), videoConfigFrame(false)});
-    {
-        // Two 0.4.x viewers on one PC, both connected, neither clicked:
-        // neither socket hovers.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));  // alone: it hovers
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.cursorNowhere());  // the second connection drops the binding
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff);
-        CHECK(h.px == 1000 && h.cursorNowhere());
-        // B clicks: it owns input; neither socket moves the pointer or takes
-        // the cursor shape. r12 (item 1): r11 checked here that the click
-        // went in at 1000,1000, where A's hover had left the pointer, as if
-        // that were right. It is not where B's user clicked, and the host
-        // cannot know where that was. The fix is the viewer's: B reconnects
-        // with --mouse-move-transport tcp (testLegacyTcpMoves).
-        h.tcp(B, plainButton(0, true));
-        CHECK(h.claims.owner() == B && h.buttonDown(0));
-        CHECK(h.pointerTo(kB, 2100, 2100) == Udp::LegacyOff && h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff);
-        CHECK(h.px == 1000 && h.cursorNowhere());
-        h.tcp(B, plainButton(0, false));
-        // A quits: B is alone on the address. r11 let B's socket move the
-        // pointer then. r12: it was first heard while A was open too, so it
-        // cannot be shown to be B's: it moves nothing and gets no shape.
-        h.close(A);
-        CHECK(h.pointerTo(kB, 2200, 2200) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kB, 2300, 2300) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-    }
-    {
-        // The owner has not moved yet (no port bound) when a second
-        // connection on its address opens: the first socket to move is not
-        // taken as the owner's. r10 bound whichever moved first.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.claims.owner() == A && h.cursorNowhere());
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.pointerTo(kB, 3000, 3000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        // B closes: A is alone again. r11 bound A's first move then. r12:
-        // both sockets were first heard while B was open, so neither is
-        // A's: the legacy rule goes off for A. (A socket heard while A was
-        // alone binds again: testUnconfirmedUdp.)
-        h.close(B);
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        CHECK(h.pointerTo(kB, 3100, 3100) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-    }
-    {
-        // The owner's bound port changes (another socket on its address, a
-        // viewer whose control connection the host has not seen): the
-        // legacy rule is off for this ownership, from both ports; the shape
-        // goes nowhere. r12: a new ownership binds afresh only a socket of
-        // its own; the same viewer's reconnect keeps its socket, which was
-        // the old connection's, so it is TCP-only.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA) && h.buttonDown(0));
-        CHECK(h.pointerTo(kC, 5000, 5000) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        h.tcp(A, plainButton(0, false));
-        CHECK(!h.claims.anyHeld() && h.clicks.size() == 1);
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.cursorNowhere());  // still off
-        // The same viewer reconnects (the old connection gone): its queued
-        // click carries its position; its socket moves nothing (r11 bound
-        // it).
-        h.close(A);
-        const auto A2 = h.open();
-        h.tcp(A2, tcpPositionedButton(1300, 1300, 0, true));
-        CHECK(h.claims.owner() == A2 && h.clicks.back() == "Bd0@1300,1300");
-        CHECK(h.pointerTo(kA, 1400, 1400) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-        CHECK(h.pointerTo(kC, 1500, 1500) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-        h.tcp(A2, plainButton(0, false));
-    }
-    {
-        // Handover on one address: the 0.4.x viewer's control connection
-        // drops and comes back while the old one is still open. Its socket
-        // moves nothing while both are open. r11 let it move again once the
-        // old one closed; r12: it was A1's, so it moves nothing and gets no
-        // shape after that either.
-        OwnerHost h;
-        const auto A1 = h.open();
-        h.tcp(A1, startup);
-        h.tcp(A1, plainButton(0, true));
-        h.tcp(A1, plainButton(0, false));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved);
-        const auto A2 = h.open();
-        h.tcp(A2, tcpPositionedButton(1100, 1100, 0, true));
-        CHECK(h.claims.owner() == A2 && h.pointerTo(kA, 1200, 1200) == Udp::NotOwner && h.cursorNowhere());
-        h.close(A1);
-        CHECK(h.pointerTo(kA, 1300, 1300) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        h.tcp(A2, plainButton(0, false));
-    }
-    {
-        // A clipboard connection (CLIPBOARD_HELLO first) is not a viewer:
-        // the 0.4.x viewer stays alone on its address. A FILE_HELLO
-        // connection is refused and closed, and not counted either.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        const auto Clip = h.open();
-        h.tcp(Clip, clipboardHelloFrame());
-        const auto F = h.open();
-        h.tcp(F, jlh::mrc1Frame(jlh::kMsgFileHello, std::vector<uint8_t>{}));
-        CHECK(h.fileRefused == 1);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::Moved && h.cursorTo(kA));
-        h.tcp(A, plainButton(0, false));
-    }
-    {
-        // An r9+ owner names its socket: a 0.4.x viewer on its address
-        // changes nothing for it, and the 0.4.x socket moves nothing and
-        // gets no shape.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        const auto B = h.open();
-        h.tcp(B, cat({pingFrame(), videoConfigFrame(true), pingFrame()}));
-        h.tcp(B, registration(4000, 4000, 1, kB));
-        CHECK(h.claims.owner() == B && h.cursorTo(kB));
-        CHECK(h.pointerTo(kB, 4100, 4100) == Udp::Moved && h.cursorTo(kB));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::NotOwner && h.px == 4100 && h.cursorTo(kB));
-        // A third connection on the address keeps B's binding.
-        const auto C = h.open();
-        h.tcp(C, startup);
-        CHECK(h.cursorTo(kB) && h.pointerTo(kB, 4200, 4200) == Udp::Moved);
-    }
-}
-
 // r12 (Pepper's review of 9f803c6, item 1): the host cannot switch a 0.4.x
-// viewer to TCP moves. When the legacy rule is off for one (two viewer
-// connections on one PC, a port change, a socket the host cannot tell is
-// its own), its user reconnects it with --mouse-move-transport tcp
-// (README). Its moves then come on its control connection, in order with
-// its clicks, so presses, drags and releases go in where they were made,
-// whatever the UDP side does. It opens no MRM1 socket then (0.4.1
-// udp_plan.hpp), so it gets no cursor shape.
+// viewer to TCP moves; its user starts it with --mouse-move-transport tcp
+// (README; r14: always, with this host). Its moves then come on its
+// control connection, in order with its clicks, so presses, drags and
+// releases go in where they were made, whatever the UDP side does. It
+// opens no MRM1 socket then (0.4.1 udp_plan.hpp), so it gets no cursor
+// shape.
 static void testLegacyTcpMoves() {
     using Udp = jlh::InputClaims::Udp;
     constexpr uint16_t kA = 50000, kC = 50002;
     const auto startup = cat({pingFrame(), videoConfigFrame(false)});
     {
-        // Same address: 0.4.x viewer A (UDP moves) is connected and
-        // hovering; viewer B on the same PC runs with tcp.
+        // Same address: 0.4.x viewer A (no flag) is connected and hovering
+        // (r14: its hover moves nothing); viewer B on the same PC runs with
+        // tcp.
         OwnerHost h;
         const auto A = h.open();
         h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved);
+        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::NotOwner && h.px == -1);
         const auto B = h.open();
         h.tcp(B, startup);
         // B's first move takes input (any input frame does) and goes in.
@@ -2690,16 +2448,15 @@ static void testLegacyTcpMoves() {
         CHECK(h.clicks.back() == "Bd0@6000,6100" && h.ups.back() == "Bu0@6200,6300");
     }
     {
-        // Port change: 0.4.x viewer A (UDP moves) had the legacy rule turned
-        // off by a second socket (kC) on its address. Its user quits it and
-        // starts it again with tcp (A2, same address, new port if any). The
-        // stray socket and A's old one go on sending.
+        // 0.4.x viewer A run without the flag: its UDP moves nothing (r14).
+        // Its user quits it and starts it again with tcp (A2, same address).
+        // A's old socket and a stray one (kC) go on sending.
         OwnerHost h;
         const auto A = h.open();
         h.tcp(A, startup);
         h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        CHECK(h.pointerTo(kC, 5000, 5000) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
+        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
+        CHECK(h.pointerTo(kC, 5000, 5000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
         h.tcp(A, plainButton(0, false));
         h.close(A);
         const auto A2 = h.open();
@@ -2726,395 +2483,87 @@ static void testLegacyTcpMoves() {
     }
 }
 
-// r12 (Pepper's review of 9f803c6, item 2): a UDP socket moves the pointer
-// or gets the cursor shape only when the host can tell whose it is: first
-// heard while that connection was the only one open on its address,
-// counting a connection whose first frame has not come.
-static void testUnconfirmedUdp() {
+// H2 r14 (Pepper's review of 524e4d1, host_protocol.hpp:1040 and :1246): a
+// 0.4.x viewer whose control connection never completed a session with
+// this host keeps sending MRM1 from its socket. Its late datagrams, the
+// first one above all, never move the pointer and never change where the
+// cursor shape goes, whoever is connected from its address then: a viewer
+// hovering, a 0.4.x viewer that clicked, one run with tcp, or an r9+
+// viewer. r13 took such a first datagram as a lone session connection's
+// (its known limit). r13's own case, a session connection that closed, is
+// here too.
+static void testNoSessionLateUdp() {
     using Udp = jlh::InputClaims::Udp;
-    constexpr uint16_t kA = 50000, kB = 50001;
-    const auto startup = cat({pingFrame(), videoConfigFrame(false)});
-    {
-        // The first TCP frame comes late. Legacy owner A has its socket
-        // bound; connection P is accepted and sends nothing yet. It may be a
-        // second viewer: A's binding goes; no socket moves the pointer or
-        // gets the shape.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        const auto P = h.open();  // accepted; no frame yet
-        CHECK(h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        // P's first frame: a viewer's start-up ping. Still two.
-        h.tcp(P, startup);
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.pointerTo(kB, 2100, 2100) == Udp::LegacyOff);
-        CHECK(h.px == 1000 && h.cursorNowhere());
-        // P clicks and A closes: P is alone, but kB was first heard while A
-        // was open: not P's. The legacy rule goes off for P.
-        h.tcp(P, plainButton(0, true));
-        h.tcp(P, plainButton(0, false));
-        h.close(A);
-        CHECK(h.pointerTo(kB, 2200, 2200) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1300, 1300) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-    }
-    {
-        // The late first frame says CLIPBOARD_HELLO: A is alone again, and
-        // its socket (heard while A was alone) moves and gets the shape.
-        // So does a socket first heard while that connection was unknown.
-        // A pending connection that closes with no frame leaves A alone too.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));  // hover
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::Moved && h.cursorTo(kA));
-        const auto Clip = h.open();
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        h.tcp(Clip, clipboardHelloFrame());
-        CHECK(h.pointerTo(kA, 1300, 1300) == Udp::Moved && h.px == 1300 && h.cursorTo(kA));
-        const auto Q = h.open();
-        CHECK(h.pointerTo(kA, 1400, 1400) == Udp::LegacyOff && h.px == 1300 && h.cursorNowhere());
-        h.close(Q);  // its handshake failed
-        CHECK(h.pointerTo(kA, 1500, 1500) == Udp::Moved && h.px == 1500 && h.cursorTo(kA));
-
-        OwnerHost g;
-        const auto G = g.open();
-        g.tcp(G, startup);
-        const auto GClip = g.open();
-        CHECK(g.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && g.px == -1 && g.cursorNowhere());
-        g.tcp(GClip, clipboardHelloFrame());
-        CHECK(g.pointerTo(kA, 1100, 1100) == Udp::Moved && g.px == 1100 && g.cursorTo(kA));
-    }
-    {
-        // No owner, the first frame late: A hovers; P is accepted: the
-        // hover binding goes. A socket first heard while P is unknown never
-        // hovers, even once A has gone and P is alone.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        const auto P = h.open();
-        CHECK(h.cursorNowhere() && h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == 1000);
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        h.tcp(P, startup);
-        h.close(A);
-        CHECK(h.pointerTo(kB, 2100, 2100) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-    }
-    {
-        // The old TCP closed, its UDP still arrives (hover, no owner). r11
-        // kept sending A's socket the shape after A closed, and let it hover
-        // again once another connection was alone on the address.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        h.close(A);
-        CHECK(h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        // r13: B is the address's second session connection (A quit and
-        // started again, or another viewer took the PC): a handover. r12
-        // let B's own socket, first heard while B was alone, hover and get
-        // the shape; the host cannot tell it from A's late first datagram
-        // (testHandover), so neither does now. B's click goes in where the
-        // pointer is, and B moves the pointer once run with tcp.
-        CHECK(h.claims.handedOver(kViewerIp));
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == 1000 && h.cursorNowhere());
-        h.tcp(B, plainButton(0, true));
-        CHECK(h.clicks.back() == "Bd0@1000,1000");
-        CHECK(h.pointerTo(kB, 2100, 2100) == Udp::LegacyOff && h.pointerTo(kA, 1300, 1300) == Udp::LegacyOff);
-        CHECK(h.px == 1000 && h.cursorNowhere());
-        h.tcp(B, tcpMove(2200, 2200));
-        h.tcp(B, tcpButtonAt(2300, 2300, 0, false));
-        CHECK(h.ups.back() == "Bu0@2300,2300" && !h.claims.anyHeld() && h.cursorNowhere());
-    }
-    {
-        // The old TCP closed, its UDP still arrives (legacy owner). r10 and
-        // r11 let the next connection's ownership take A's socket.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.tcp(A, plainButton(0, true));
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        h.close(A);
-        CHECK(!h.claims.anyHeld() && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::NotOwner && h.px == 1000 && h.cursorNowhere());
-        const auto B = h.open();
-        h.tcp(B, tcpPositionedButton(3000, 3000, 0, true));  // a reconnect's queued click
-        CHECK(h.claims.owner() == B && h.clicks.back() == "Bd0@3000,3000");
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 3000 && h.cursorNowhere());
-        CHECK(h.pointerTo(kB, 3100, 3100) == Udp::LegacyOff && h.px == 3000 && h.cursorNowhere());
-        h.tcp(B, tcpMove(3200, 3300));  // a viewer run with tcp
-        h.tcp(B, tcpButtonAt(3400, 3500, 0, false));
-        CHECK(h.ups.back() == "Bu0@3400,3500" && !h.claims.anyHeld() && h.cursorNowhere());
-    }
-    {
-        // A socket's first datagram need not be a move: a keyframe request
-        // (0x40) heard while A and B are both open makes it neither's,
-        // though its first move comes after A has gone.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        const auto B = h.open();
-        h.tcp(B, startup);
-        h.udpOther(kB);
-        h.close(A);
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        h.tcp(B, plainButton(0, true));
-        CHECK(h.pointerTo(kB, 2100, 2100) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        h.tcp(B, plainButton(0, false));
-    }
-    {
-        // r13: the blocks above now also had a handover (two session
-        // connections from one address). Without one, the r12 rules still
-        // hold: a socket first heard while a second connection was open
-        // (here a preflight: accepted, one ping, closed; no session
-        // connection) is not taken once that one has gone, by a legacy
-        // owner or by the hover, and neither is a socket whose first
-        // datagram was a keyframe request then. The viewer's own socket,
-        // first heard while it is alone, still hovers.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        const auto P = h.open();
-        h.udpOther(kB);  // a keyframe request (0x40): heard while A and P are open
-        h.tcp(P, pingFrame());
-        h.close(P);
-        CHECK(!h.claims.handedOver(kViewerIp));
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == -1 && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.px == 1000 && h.cursorTo(kA));
-
-        OwnerHost g;
-        const auto G = g.open();
-        g.tcp(G, startup);
-        g.tcp(G, plainButton(0, true));
-        g.tcp(G, plainButton(0, false));
-        const auto Q = g.open();
-        CHECK(g.pointerTo(kB, 2000, 2000) == Udp::LegacyOff);  // first heard while G and Q are open
-        g.tcp(Q, pingFrame());
-        g.close(Q);
-        CHECK(!g.claims.handedOver(kViewerIp));
-        CHECK(g.pointerTo(kB, 2100, 2100) == Udp::LegacyOff && g.px == -1 && g.cursorNowhere());
-        CHECK(g.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && g.px == -1 && g.cursorNowhere());  // off for G (r12)
-    }
-}
-
-// H2 r13 (Pepper's review of 35d72ff): after a handover on an address (a
-// second session connection from it while the host runs, the first one
-// still open or closed), no UDP socket from it is taken by the legacy rule
-// until the host restarts. Above all, a closed viewer's first datagram that
-// comes late never moves the pointer and never changes where the cursor
-// shape goes, whatever is open on its address then.
-static void testHandover() {
-    using Udp = jlh::InputClaims::Udp;
-    using Clicks = std::vector<std::string>;
     constexpr uint16_t kA = 50000, kB = 50001, kNew = 50002;
-    constexpr uint32_t kIpB = kViewerIp + 1;
-    const auto startup = cat({pingFrame(), videoConfigFrame(false)});  // a 0.4.x session connection
     const auto same = [](const jlh::InputClaims::CursorPeer& a, const jlh::InputClaims::CursorPeer& b) {
         return a.named == b.named && a.ip == b.ip && a.port == b.port && a.gen == b.gen;
     };
     {
-        // Pepper's case. 0.4.x viewer A's session connection closes before
-        // the host has heard its socket. Viewer B starts on the same PC: its
-        // preflight (one ping, then closed), then its session connection,
-        // alone on the address. A's first datagram comes now, late.
+        // Nothing connected: A's datagram moves nothing.
         OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.close(A);
-        const auto P = h.open();
-        h.tcp(P, pingFrame());
-        h.close(P);
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.claims.handedOver(kViewerIp));
-        const auto before = h.claims.cursorPeer();
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::LegacyOff);
-        CHECK(h.px == -1 && h.udpMoves == 0 && same(h.claims.cursorPeer(), before) && h.cursorNowhere());
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::LegacyOff && h.px == -1 && same(h.claims.cursorPeer(), before));
-        // B's own socket is TCP-only too: the host cannot tell it from A's.
-        CHECK(h.pointerTo(kB, 2000, 2000) == Udp::LegacyOff && h.px == -1 && same(h.claims.cursorPeer(), before));
-        // B run with tcp (README): its moves and clicks go in by TCP. A's
-        // datagrams move nothing under B as the owner either.
-        h.tcp(B, tcpMove(3000, 3000));
-        CHECK(h.claims.owner() == B && h.px == 3000);
-        const auto owned = h.claims.cursorPeer();
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 3000 && same(h.claims.cursorPeer(), owned));
-        h.tcp(B, tcpButtonAt(3100, 3100, 0, true));
-        CHECK(h.pointerTo(kA, 1300, 1300) == Udp::LegacyOff && h.px == 3100 && h.cursorNowhere());
-        h.tcp(B, tcpButtonAt(3200, 3200, 0, false));
-        CHECK(h.clicks == Clicks{"Bd0@3100,3100"} && h.ups.back() == "Bu0@3200,3200" && !h.claims.anyHeld());
+        CHECK(h.pointerTo(kA, 1000, 1000) != Udp::Moved && h.px == -1 && h.cursorNowhere());
     }
-    {
-        // A's first datagram comes while B's preflight connection (a ping
-        // only: no session connection) is alone on the address, before any
-        // handover: not taken (r12 took it as the preflight's). Then while
-        // B's session connection has pinged but not yet sent its
-        // VIDEO_CONFIG; then after it.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.close(A);
-        const auto P = h.open();
-        h.tcp(P, pingFrame());
-        CHECK(!h.claims.handedOver(kViewerIp));
-        const auto before = h.claims.cursorPeer();
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && h.px == -1 && same(h.claims.cursorPeer(), before));
-        h.close(P);
-        const auto B = h.open();
-        h.tcp(B, pingFrame());
-        CHECK(h.pointerTo(kB, 1100, 1100) == Udp::LegacyOff && h.px == -1 && same(h.claims.cursorPeer(), before));
-        h.tcp(B, videoConfigFrame(false));
-        CHECK(h.claims.handedOver(kViewerIp));
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.pointerTo(kB, 1300, 1300) == Udp::LegacyOff);
-        CHECK(h.px == -1 && same(h.claims.cursorPeer(), before));
-    }
-    {
-        // A legacy owner: A clicked and closed without its socket ever
-        // being heard; B starts and clicks (run with tcp, so its click puts
-        // the pointer at 3000). A's first datagram comes then: r12 took it
-        // as B's first socket.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        h.close(A);
-        const auto B = h.open();
-        h.tcp(B, startup);
-        h.tcp(B, tcpButtonAt(3000, 3000, 0, true));
-        CHECK(h.claims.owner() == B && h.px == 3000);
-        const auto before = h.claims.cursorPeer();
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::LegacyOff && h.px == 3000 && same(h.claims.cursorPeer(), before));
-        CHECK(h.cursorNowhere());
-        h.tcp(B, tcpButtonAt(3100, 3100, 0, false));
-        CHECK(h.ups.back() == "Bu0@3100,3100" && !h.claims.anyHeld());
-    }
-    {
-        // Two session connections at once (a second viewer on the PC, or
-        // behind the same address): the binding goes, as in r11, and stays
-        // gone once A is alone again (r12 took A's socket back).
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        h.tcp(A, plainButton(0, true));
-        h.tcp(A, plainButton(0, false));
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::Moved && h.cursorTo(kA));
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.claims.handedOver(kViewerIp) && h.cursorNowhere());
-        h.close(B);
-        CHECK(h.pointerTo(kA, 1200, 1200) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        h.tcp(A, plainButton(0, true));
-        CHECK(h.clicks.back() == "Bd0@1100,1100");
-        CHECK(h.pointerTo(kA, 1300, 1300) == Udp::LegacyOff && h.px == 1100 && h.cursorNowhere());
-        h.tcp(A, plainButton(0, false));
-        CHECK(!h.claims.anyHeld());
-    }
-    {
-        // A fresh 0.4.x viewer alone, never handed over: its preflight (and
-        // a start-up ping that was tried again on a new connection), its
-        // session connection, its clipboard connection and a refused file
-        // connection make no handover. It hovers, clicks where it hovered,
-        // drags, lets go and hovers, by UDP, with the cursor shape, as in
-        // r12; a second VIDEO_CONFIG (its H.264 fallback) changes nothing.
-        OwnerHost h;
-        const auto P = h.open();
-        h.tcp(P, pingFrame());
-        h.close(P);
-        const auto R = h.open();
-        h.tcp(R, pingFrame());
-        h.close(R);
-        const auto C = h.open();
-        h.tcp(C, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved && h.cursorTo(kA));
-        const auto K = h.open();
-        h.tcp(K, clipboardHelloFrame());
-        const auto F = h.open();
-        h.tcp(F, jlh::mrc1Frame(jlh::kMsgFileHello, std::vector<uint8_t>{}));
-        h.close(F);
-        h.tcp(C, videoConfigFrame(false));
-        CHECK(!h.claims.handedOver(kViewerIp));
-        CHECK(h.pointerTo(kA, 1100, 1100) == Udp::Moved && h.px == 1100 && h.cursorTo(kA));
-        h.tcp(C, plainButton(0, true));
-        CHECK(h.claims.owner() == C && h.clicks == Clicks{"Bd0@1100,1100"});
-        for (int i = 1; i <= 10; ++i) CHECK(h.pointerTo(kA, 1100 + 100 * i, 1100) == Udp::Moved);
-        CHECK(h.px == 2100 && h.buttonDown(0) && h.cursorTo(kA));
-        h.tcp(C, plainButton(0, false));
-        CHECK(h.ups.back() == "Bu0@2100,1100" && !h.claims.anyHeld());
-        CHECK(h.pointerTo(kA, 2500, 2500) == Udp::Moved && h.px == 2500 && h.cursorTo(kA));
-        CHECK(!h.claims.handedOver(kViewerIp));
-        // Its clipboard connection closing changes nothing either.
-        h.close(K);
-        CHECK(h.pointerTo(kA, 2600, 2600) == Udp::Moved && h.px == 2600 && h.cursorTo(kA));
-    }
-    {
-        // A handover is per address: a 0.4.x viewer on another machine
-        // starts fresh and moves by UDP.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.close(A);
-        const auto B = h.open();
-        h.tcp(B, startup);
-        CHECK(h.claims.handedOver(kViewerIp) && !h.claims.handedOver(kIpB));
-        const auto D = h.open(kIpB);
-        h.tcp(D, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000, kIpB) == Udp::Moved && h.cursorTo(kA, kIpB));
-        h.tcp(D, plainButton(0, true));
-        CHECK(h.claims.owner() == D && h.clicks.back() == "Bd0@1000,1000");
-        CHECK(h.pointerTo(kA, 1100, 1100, kIpB) == Udp::Moved && h.px == 1100);
-        h.tcp(D, plainButton(0, false));
-    }
-    {
-        // An r9+ viewer is not affected: on an address that had a handover,
-        // the socket it names in its own POINTER_SYNC moves the pointer and
-        // gets the shape; a closed 0.4.x viewer's late datagram moves
-        // nothing and leaves the shape where it is.
-        OwnerHost h;
-        const auto A = h.open();
-        h.tcp(A, startup);
-        h.close(A);
-        const auto B = h.open();
-        h.tcp(B, startup);
-        h.close(B);
-        const auto N = h.open();
-        h.tcp(N, cat({pingFrame(), videoConfigFrame(true)}));
-        CHECK(h.claims.handedOver(kViewerIp));
-        h.tcp(N, registration(4000, 4000, 1, kNew));
-        CHECK(h.claims.owner() == N && h.px == 4000 && h.cursorTo(kNew));
-        CHECK(h.pointerTo(kNew, 4100, 4100) == Udp::Moved && h.px == 4100 && h.cursorTo(kNew));
-        const auto before = h.claims.cursorPeer();
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::NotOwner && h.px == 4100 && same(h.claims.cursorPeer(), before));
-        h.tcp(N, syncedButton(4200, 4200, 2, 0, true, kNew));
-        h.tcp(N, syncedButton(4200, 4200, 3, 0, false, kNew));
-        CHECK(h.clicks.back() == "Bd0@4200,4200" && !h.claims.anyHeld());
-    }
-    {
-        // A 0.4.x viewer's control connection reconnects: its first frame
-        // is the click it queued (input, so a session connection). That is
-        // a handover: the viewer is TCP-only from then on.
-        OwnerHost h;
-        const auto A1 = h.open();
-        h.tcp(A1, startup);
-        CHECK(h.pointerTo(kA, 1000, 1000) == Udp::Moved);
-        h.close(A1);
-        const auto A2 = h.open();
-        h.tcp(A2, tcpPositionedButton(1500, 1500, 0, true));
-        CHECK(h.claims.handedOver(kViewerIp) && h.clicks.back() == "Bd0@1500,1500");
-        CHECK(h.pointerTo(kA, 1600, 1600) == Udp::LegacyOff && h.px == 1500 && h.cursorNowhere());
-        h.tcp(A2, plainButton(0, false));
-        CHECK(!h.claims.anyHeld());
+    // How viewer A's control connection failed: this host never accepted
+    // one (A ran before a host restart, or met a full slot table); one was
+    // accepted and closed with no frame; one sent its start-up ping and
+    // closed; one sent its start-up ping and hangs, still open; (r13's
+    // case) a session connection that closed.
+    enum { NeverAccepted, NoFrame, PingOnly, PingStillOpen, SessionClosed };
+    // Then viewer B starts on the same PC (its preflight: one ping, then
+    // closed) and its session connection: still hovering (no input yet), a
+    // 0.4.x click, run with tcp (a press at 3000,3000), or an r9+ viewer
+    // that names its socket.
+    enum { Hover, LegacyClick, TcpFlag, Synced };
+    for (int failed = NeverAccepted; failed <= SessionClosed; ++failed) {
+        for (int then = Hover; then <= Synced; ++then) {
+            const int failuresBefore = gFailures;
+            OwnerHost h;
+            if (failed != NeverAccepted) {
+                const auto A = h.open();
+                if (failed == PingOnly || failed == PingStillOpen) h.tcp(A, pingFrame());
+                if (failed == SessionClosed) h.tcp(A, cat({pingFrame(), videoConfigFrame(false)}));
+                if (failed != PingStillOpen) h.close(A);
+            }
+            const auto P = h.open();
+            h.tcp(P, pingFrame());
+            h.close(P);
+            const auto B = h.open();
+            h.tcp(B, cat({pingFrame(), videoConfigFrame(then == Synced)}));
+            if (then == LegacyClick) h.tcp(B, plainButton(0, true));
+            if (then == TcpFlag) h.tcp(B, tcpButtonAt(3000, 3000, 0, true));
+            if (then == Synced) h.tcp(B, registration(4000, 4000, 1, kNew));
+            CHECK(then == Synced ? h.cursorTo(kNew) : h.cursorNowhere());
+            const int px = h.px, py = h.py;
+            const auto before = h.claims.cursorPeer();
+            // A's first datagram comes now, late, then more of them.
+            for (int i = 0; i < 5; ++i) {
+                CHECK(h.pointerTo(kA, 1000 + i, 1000 + i) != Udp::Moved);
+                CHECK(h.px == px && h.py == py && same(h.claims.cursorPeer(), before));
+            }
+            CHECK(h.udpMoves == 0);
+            // B's own socket: only the one an r9+ viewer named moves the
+            // pointer. The host cannot tell a 0.4.x viewer's from A's.
+            if (then == Synced) {
+                CHECK(h.pointerTo(kNew, 4100, 4100) == Udp::Moved && h.px == 4100 && same(h.claims.cursorPeer(), before));
+                CHECK(h.pointerTo(kA, 1100, 1100) != Udp::Moved && h.px == 4100 && h.cursorTo(kNew));
+            } else {
+                CHECK(h.pointerTo(kB, 2000, 2000) != Udp::Moved && h.px == px && same(h.claims.cursorPeer(), before));
+            }
+            // B's press and release go in where B made them (by TCP), or for
+            // a 0.4.x click, where the host's pointer is.
+            if (then == LegacyClick) {
+                CHECK(h.clicks.back() == "Bd0@-1,-1");
+                h.tcp(B, plainButton(0, false));
+            }
+            if (then == TcpFlag) {
+                h.tcp(B, tcpMove(3200, 3300));
+                CHECK(h.pointerTo(kA, 1100, 1100) != Udp::Moved && h.px == 3200 && h.py == 3300);
+                h.tcp(B, tcpButtonAt(3400, 3500, 0, false));
+                CHECK(h.clicks.back() == "Bd0@3000,3000" && h.ups.back() == "Bu0@3400,3500");
+            }
+            CHECK(h.claims.owner() == (then == Hover ? 0 : B) && !h.claims.anyHeld());
+            if (gFailures != failuresBefore) std::printf("  (testNoSessionLateUdp: failed=%d then=%d)\n", failed, then);
+        }
     }
 }
 
@@ -3305,13 +2754,11 @@ int main() {
     testUpPending();
     testStartupHang();
     testSilencedConnectionCloses();
-    testLegacyPointer();
+    testLegacyUdpOff();
     testCursorDestination();
     testLivenessOptIn();
-    testSameAddressLegacy();
     testLegacyTcpMoves();
-    testUnconfirmedUdp();
-    testHandover();
+    testNoSessionLateUdp();
     testTaskManagerChord();
     testAnnexB();
     testColor();

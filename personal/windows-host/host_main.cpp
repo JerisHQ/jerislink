@@ -223,7 +223,8 @@ struct State {
     // owed, UDP moves from another socket than the owner's or while an up
     // was owed.
     std::atomic<uint64_t> inputSilenced{0}, inputUpPending{0}, pointerUdpNotOwner{0}, pointerUdpUpPending{0};
-    // r11: UDP moves dropped while the legacy rule was off.
+    // r14: UDP moves dropped because the owner named no socket (a 0.4.x
+    // viewer run without --mouse-move-transport tcp).
     std::atomic<uint64_t> pointerUdpLegacyOff{0};
     // MRM1 pointer order. A UDP move and a POINTER_SYNC (control thread) both
     // take this, then the injector's own lock, in that order.
@@ -403,25 +404,15 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
             goto done;
         }
         if (rr != jlh::ReadResult::Ok) break;
-        // r11 (InputClaims::heard, Pepper's review of 5880264, items 1 and
-        // 2): the first frame says what this connection is (a control
-        // connection is counted for its address), and a ping after it is a
-        // liveness ping.
+        // r11 (InputClaims::heard, Pepper's review of 5880264, item 1): a
+        // ping after the first frame is a liveness ping; a FILE_HELLO first
+        // is refused.
         const jlh::InputClaims::Heard heard = st.claims.heard(owner, hdr, msSinceStart());
         if (first) {
             if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
             else if (hdr.type == jlh::kMsgPing) role = "ping";
             logf("control.open peer=%s channel=%s auth=open_ip_only", peer.c_str(), role);
-            if (heard.controls > 1)
-                logf("control.shared_address peer=%s channel=%s controls=%zu legacy_udp=off", peer.c_str(), role,
-                     heard.controls);
         }
-        // r13 (Pepper's review of 35d72ff): a second session connection
-        // from this address while the host runs. No 0.4.x UDP move from it
-        // goes in again until the host restarts (README: 0.4.x then runs
-        // with --mouse-move-transport tcp); r9+ viewers name their socket.
-        if (heard.handover)
-            logf("control.handover peer=%s channel=%s legacy_udp=off until=host_restart", peer.c_str(), role);
         if (heard.refuse) {
             // No file transfer in H1: the viewer reads a close as refused.
             logf("control.file_refused peer=%s reason=not_in_h1", peer.c_str());
@@ -587,9 +578,9 @@ void controlListener(State& st, SOCKET ls) {
             closesocket(c);
             continue;
         }
-        // r12 (Pepper's review of 9f803c6, item 2): counted for its address
-        // from now, before its handshake and first frame (InputClaims).
-        const jlh::HeldInput::Owner owner = st.claims.open(uint32_t(from.sin_addr.s_addr));
+        // Numbered in accept order (InputClaims::open): a newer connection
+        // takes input over from an older one.
+        const jlh::HeldInput::Owner owner = st.claims.open();
         try {
             std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr), owner)
                 .detach();
@@ -636,10 +627,9 @@ void mrm1Listener(State& st, SOCKET u) {
             // only from the input owner's own MRM1 socket, the one its
             // POINTER_SYNC named, and not while an up is owed. Then only the
             // newest move counts; a late datagram, or one older than the
-            // last POINTER_SYNC, is dropped. r10 (item 2): a 0.4.x owner,
-            // which names none, and a 0.4.x viewer hovering before its first
-            // click, by the legacy rule (host_protocol.hpp). r13: never from
-            // an address that had a handover.
+            // last POINTER_SYNC, is dropped. r14 (Pepper's review of
+            // 524e4d1): a 0.4.x owner names none, so none of its UDP moves
+            // goes in (LegacyOff); it runs with --mouse-move-transport tcp.
             const auto r = st.claims.udpMove(from.sin_addr.s_addr, ntohs(from.sin_port), [&] {
                 std::lock_guard<std::mutex> g(st.pointerMutex);
                 if (!st.pointer.takePointer(m->seq)) return false;
@@ -652,9 +642,8 @@ void mrm1Listener(State& st, SOCKET u) {
             case jlh::InputClaims::Udp::NotOwner: ++st.pointerUdpNotOwner; break;
             case jlh::InputClaims::Udp::UpPending: ++st.pointerUdpUpPending; break;
             case jlh::InputClaims::Udp::LegacyOff: {
-                // r11 (Pepper's review of 5880264, item 2): not one viewer
-                // alone on its address, or a second socket of it. r13: or
-                // its address had a handover.
+                // r14: the owner never sent a POINTER_SYNC (0.4.x without
+                // --mouse-move-transport tcp).
                 const uint64_t k = ++st.pointerUdpLegacyOff;
                 if (k <= 3 || k % 500 == 0)
                     logf("mrm1.legacy_off peer=%s:%u total=%llu", ipString(from.sin_addr).c_str(),
@@ -663,8 +652,6 @@ void mrm1Listener(State& st, SOCKET u) {
             }
             }
         } else if (m->type == jlh::kMrm1KeyframeRequest) {
-            // r12: InputClaims notes every socket it hears (Sock::with).
-            st.claims.udpHeard(from.sin_addr.s_addr, ntohs(from.sin_port));
             st.keyframeRequested = true;
             const uint64_t k = ++st.keyframeRequests;
             if (k <= 3 || k - lastLoggedKfr >= 50) {
@@ -672,7 +659,6 @@ void mrm1Listener(State& st, SOCKET u) {
                 lastLoggedKfr = k;
             }
         } else if (m->type == jlh::kMrm1Ping) {
-            st.claims.udpHeard(from.sin_addr.s_addr, ntohs(from.sin_port));
             const auto pong = jlh::mrm1Pong(b, size_t(n));
             sendto(u, reinterpret_cast<const char*>(pong.data()), int(pong.size()), 0,
                    reinterpret_cast<const sockaddr*>(&from), len);
@@ -722,9 +708,10 @@ void inputRetryLoop(State& st) {
 // host restart does not take the new packets for old ones.
 // r10 (Pepper's review of f919167, item 3): the destination is the viewer
 // socket the host takes pointer moves from (InputClaims::cursorPeer: the
-// owner's own socket, or a 0.4.x viewer's by the legacy rule), never the
-// socket heard from last, so a replaced viewer's late datagram cannot take
-// the cursor shape from the new owner. None: nothing is sent.
+// socket the owner named in its POINTER_SYNC), never the socket heard from
+// last, so a replaced viewer's late datagram cannot take the cursor shape
+// from the new owner. None (r14: a 0.4.x owner, or no owner): nothing is
+// sent.
 void cursorLoop(State& st) {
     uint64_t gen = 0;
     uint32_t seq = 0;
