@@ -99,8 +99,6 @@ constexpr uint8_t kMsgClipboardHello = 0x30;
 constexpr uint8_t kMsgVideoConfig = 0x40, kMsgVideoConfigAck = 0x41;
 constexpr uint8_t kMsgFileHello = 0x50;
 constexpr uint8_t kMsgHostInfo = 0x06;      // H2, host -> viewer (windows-client/host_info.hpp)
-constexpr size_t kAuthProbeBytes = 64;      // client nonce (32) + MAC (32)
-constexpr uint8_t kAuthOpenIpOnly = 5;      // conn_auth.hpp Result::Status
 
 inline std::vector<uint8_t> mrc1Frame(uint8_t type, const uint8_t* payload, size_t n) {
     std::vector<uint8_t> b{'M', 'R', 'C', '1', 1, type, uint8_t(n >> 8), uint8_t(n)};
@@ -123,34 +121,86 @@ inline std::optional<Mrc1Header> parseMrc1Header(const uint8_t* h) {
 // A PING the host answers: the 4-byte payload real viewers send.
 inline bool isValidPing(const Mrc1Header& h) { return h.type == kMsgPing && h.length == kPingPayloadBytes; }
 
-// Control connection slots. The listener takes one before it starts a
-// worker, so sockets still in the handshake count against the cap too; the
-// worker gives it back on every exit path.
+// Control connection places (H3, Pepper's review r1 item 1). The listener
+// takes one before it starts a worker, after the accept-time screen
+// (AuthConn::refusedAtAccept) has turned away every address the guard
+// refuses. A place counts against kMaxControlConnections until its worker
+// ends; while its handshake runs it also counts against kMaxHandshakes, and
+// against kMaxHandshakesPerSource for its address. A connection that
+// authenticated gives its handshake place back (`authenticated`), so
+// handshakes never hold what a viewer with the password needs to log in or
+// take over, and one address never holds every handshake place. The
+// worker gives the place back on every exit path (`release`).
+constexpr int kMaxControlConnections = 16;  // a thread each, past the handshake or in it
+constexpr int kMaxHandshakes = 8;           // in the handshake, every address
+constexpr int kMaxHandshakesPerSource = 4;  // control, clipboard, file and ping may handshake at once
+
 class ConnectionSlots {
 public:
-    explicit ConnectionSlots(int max) : max_(max) {}
-    bool tryAcquire() {
-        int n = used_.load();
-        while (n < max_)
-            if (used_.compare_exchange_weak(n, n + 1)) return true;
-        return false;
+    enum class Taken { Ok, Full, HandshakesFull, SourceFull };
+
+    ConnectionSlots(int maxConnections = kMaxControlConnections, int maxHandshakes = kMaxHandshakes,
+                    int maxPerSource = kMaxHandshakesPerSource)
+        : maxConnections_(maxConnections), maxHandshakes_(maxHandshakes), maxPerSource_(maxPerSource) {}
+
+    // `source`: the peer's IPv4 address as accept gave it.
+    Taken tryAcquire(uint32_t source) {
+        std::lock_guard<std::mutex> g(m_);
+        if (used_ >= maxConnections_) return Taken::Full;
+        if (handshakes_ >= maxHandshakes_) return Taken::HandshakesFull;
+        const auto it = bySource_.find(source);
+        if (it != bySource_.end() && it->second >= maxPerSource_) return Taken::SourceFull;
+        ++used_;
+        ++handshakes_;
+        ++bySource_[source];
+        return Taken::Ok;
     }
-    void release() { --used_; }
-    int inUse() const { return used_.load(); }
+    // The handshake of one of `source`'s places ended with a password match.
+    void authenticated(uint32_t source) {
+        std::lock_guard<std::mutex> g(m_);
+        endHandshakeLocked(source);
+    }
+    // The worker ended; `inHandshake`: it never called authenticated().
+    void release(uint32_t source, bool inHandshake) {
+        std::lock_guard<std::mutex> g(m_);
+        --used_;
+        if (inHandshake) endHandshakeLocked(source);
+    }
+    int inUse() const {
+        std::lock_guard<std::mutex> g(m_);
+        return used_;
+    }
+    int handshakes() const {
+        std::lock_guard<std::mutex> g(m_);
+        return handshakes_;
+    }
+    int handshakesFrom(uint32_t source) const {
+        std::lock_guard<std::mutex> g(m_);
+        const auto it = bySource_.find(source);
+        return it == bySource_.end() ? 0 : it->second;
+    }
 
 private:
-    const int max_;
-    std::atomic<int> used_{0};
+    void endHandshakeLocked(uint32_t source) {
+        --handshakes_;
+        const auto it = bySource_.find(source);
+        if (it != bySource_.end() && --it->second <= 0) bySource_.erase(it);
+    }
+
+    const int maxConnections_, maxHandshakes_, maxPerSource_;
+    mutable std::mutex m_;
+    int used_ = 0, handshakes_ = 0;
+    std::map<uint32_t, int> bySource_;
 };
 
-// The transition probe a viewer sends to a host that sent no challenge:
-// random nonce, all-zero MAC (conn_auth.hpp, design §9). H1 runs without a
-// password only, so the probe is the only AUTH it accepts.
-inline bool isTransitionProbe(const Mrc1Header& h, const uint8_t* payload) {
-    if (h.type != kMsgAuthResponse || h.length != kAuthProbeBytes) return false;
-    for (size_t i = 32; i < kAuthProbeBytes; ++i)
-        if (payload[i] != 0) return false;
-    return true;
+inline const char* slotRefusalName(ConnectionSlots::Taken t) {
+    switch (t) {
+    case ConnectionSlots::Taken::Ok: return "ok";
+    case ConnectionSlots::Taken::Full: return "too_many";
+    case ConnectionSlots::Taken::HandshakesFull: return "handshakes_full";
+    case ConnectionSlots::Taken::SourceFull: return "source_handshakes_full";
+    }
+    return "?";
 }
 
 // VIDEO_CONFIG_SET v1: [1, codec (0 auto, 1 h264, 2 hevc), caps, 0, bitrate BE16].
@@ -740,6 +790,16 @@ public:
         framed_[o] = false;
         return o;
     }
+    // H3: a connection numbered by the caller (host_main.cpp: its
+    // SessionBroker token, so owners rise in the order the password
+    // admitted them, as takeovers do; an AUTH that finished later than a
+    // newer one cannot take input back). o must be above every number
+    // used before.
+    void openAs(Owner o) {
+        std::lock_guard<std::mutex> g(m_);
+        framed_[o] = false;
+        if (o >= next_) next_ = o + 1;
+    }
 
     struct Heard {
         bool refuse = false;    // a FILE_HELLO first: no file transfer here; close the connection
@@ -776,14 +836,31 @@ public:
         bool blocked = false;   // r9: o is the owner, but an up is still owed: dropped (only ups go in)
         bool silenced = false;  // r9: o lost ownership for going quiet (expire()): close it
         bool injected = false;  // what inject returned
+        bool revoked = false;   // H3: o's connection was voided (live() false): nothing changed; close it
     };
     // One input frame e from o, whose peer address is ip. When o is the
     // owner, or becomes it now, and the frame may go in, inject(HeldInput&)
     // puts it in, still under the lock; otherwise inject is not called.
     template <class Inject, class UpKey, class UpButton>
     Frame frame(Owner o, uint32_t ip, const InputEvent& e, Inject&& inject, UpKey&& upKey, UpButton&& upButton) {
+        return frameIfLive(
+            o, ip, e, [] { return true; }, std::forward<Inject>(inject), std::forward<UpKey>(upKey),
+            std::forward<UpButton>(upButton));
+    }
+    // H3: the same, first asking live() under this lock (host_main.cpp: the
+    // connection is still in the broker's epoch). A voided connection's
+    // frame changes nothing (no takeover, no binding, no injection) even
+    // when it was read before the void; retire() takes this lock, so one
+    // already past the check has gone in before the void returns.
+    template <class Live, class Inject, class UpKey, class UpButton>
+    Frame frameIfLive(Owner o, uint32_t ip, const InputEvent& e, Live&& live, Inject&& inject, UpKey&& upKey,
+                      UpButton&& upButton) {
         std::lock_guard<std::mutex> g(m_);
         Frame r;
+        if (!live()) {
+            r.revoked = true;
+            return r;
+        }
         if (silenced_.count(o)) {
             r.silenced = true;
             return r;
@@ -826,6 +903,24 @@ public:
         lastPing_.erase(o);
         silenced_.erase(o);
         framed_.erase(o);
+        return held_.releaseOwned(o, upKey, upButton);
+    }
+    // H3: the broker voided connections (SessionBroker::onVoid: a takeover,
+    // a password or whitelist change, a block). An owner live(owner) no
+    // longer counts loses ownership now: its claims end (the ups go in),
+    // its MRM1 socket is unbound, and it never takes input back (newest_
+    // keeps it). Under this lock, so a frame of it that passed live() in
+    // frameIfLive went in before this returns. Returns how many ups
+    // Windows took; retired is set when an owner was retired.
+    template <class Live, class UpKey, class UpButton>
+    size_t retire(Live&& live, UpKey&& upKey, UpButton&& upButton, bool* retired = nullptr) {
+        std::lock_guard<std::mutex> g(m_);
+        if (retired) *retired = false;
+        if (!owner_ || live(owner_)) return 0;
+        const Owner o = owner_;
+        owner_ = 0;
+        newOwnershipLocked();
+        if (retired) *retired = true;
         return held_.releaseOwned(o, upKey, upButton);
     }
     // Ups Windows did not take, tried again (HeldInput::retryUnowned).

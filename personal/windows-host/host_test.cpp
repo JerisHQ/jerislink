@@ -119,18 +119,6 @@ static void testControlFrames() {
     uint8_t bad[8] = {'M', 'R', 'C', '2', 1, 1, 0, 0};
     CHECK(!jlh::parseMrc1Header(bad));
 
-    // The transition probe: 0x03, 64 bytes, zero MAC.
-    std::vector<uint8_t> probe(64, 0);
-    for (int i = 0; i < 32; ++i) probe[size_t(i)] = uint8_t(i + 1);
-    CHECK(jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 64}, probe.data()));
-    probe[63] = 1;  // a real MAC: H1 has no password to check it with
-    CHECK(!jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 64}, probe.data()));
-    CHECK(!jlh::isTransitionProbe(jlh::Mrc1Header{0x03, 72}, probe.data()));
-    // Its answer is what conn_auth.hpp decodes as OpenIpOnly.
-    const uint8_t open = jlh::kAuthOpenIpOnly;
-    const auto r = jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1);
-    CHECK(r.size() == 9 && r[5] == 0x04 && r[7] == 1 && r[8] == 5);
-
     // PING is answered only at the viewer's 4-byte size.
     CHECK(jlh::isValidPing(jlh::Mrc1Header{0x01, 4}));
     CHECK(!jlh::isValidPing(jlh::Mrc1Header{0x01, 0}));
@@ -140,16 +128,38 @@ static void testControlFrames() {
 }
 
 static void testConnectionSlots() {
-    jlh::ConnectionSlots slots(8);
+    using Taken = jlh::ConnectionSlots::Taken;
+    constexpr uint32_t A = 0x0100007F, B = 0x0200007F, C = 0x0300007F;  // 127.0.0.1/2/3, network order
+    // H3 r2 (Pepper's review r1, item 1): one address holds at most
+    // kMaxHandshakesPerSource handshakes; the rest of the handshake places
+    // stay for other addresses.
+    jlh::ConnectionSlots slots;
     int taken = 0;
-    for (int i = 0; i < 20; ++i) taken += slots.tryAcquire() ? 1 : 0;
-    CHECK(taken == 8 && slots.inUse() == 8);
-    slots.release();
-    CHECK(slots.inUse() == 7);
-    CHECK(slots.tryAcquire());
-    CHECK(!slots.tryAcquire());
-    for (int i = 0; i < 8; ++i) slots.release();
-    CHECK(slots.inUse() == 0);
+    for (int i = 0; i < 20; ++i) taken += slots.tryAcquire(A) == Taken::Ok ? 1 : 0;
+    CHECK(taken == jlh::kMaxHandshakesPerSource && slots.handshakesFrom(A) == jlh::kMaxHandshakesPerSource);
+    CHECK(slots.tryAcquire(A) == Taken::SourceFull);
+    for (int i = 0; i < jlh::kMaxHandshakesPerSource; ++i) CHECK(slots.tryAcquire(B) == Taken::Ok);
+    CHECK(slots.handshakes() == jlh::kMaxHandshakes);
+    CHECK(slots.tryAcquire(C) == Taken::HandshakesFull);
+    // A handshake that matched gives its handshake place back, not its
+    // connection place.
+    for (int i = 0; i < jlh::kMaxHandshakesPerSource; ++i) slots.authenticated(B);
+    CHECK(slots.handshakesFrom(B) == 0 && slots.handshakes() == jlh::kMaxHandshakesPerSource);
+    CHECK(slots.inUse() == jlh::kMaxHandshakes);
+    CHECK(slots.tryAcquire(C) == Taken::Ok);
+    // Connection places cap everything.
+    for (int i = 0; i < jlh::kMaxControlConnections; ++i)
+        if (slots.tryAcquire(B) == Taken::Ok) slots.authenticated(B);
+    CHECK(slots.inUse() == jlh::kMaxControlConnections);
+    CHECK(slots.tryAcquire(0x0400007F) == Taken::Full);
+    // Released: A's four still in the handshake, C's one, the rest past it.
+    for (int i = 0; i < jlh::kMaxHandshakesPerSource; ++i) slots.release(A, true);
+    slots.release(C, true);
+    while (slots.inUse() > 0) slots.release(B, false);
+    CHECK(slots.handshakes() == 0 && slots.handshakesFrom(A) == 0 && slots.handshakesFrom(C) == 0);
+    CHECK(slots.tryAcquire(A) == Taken::Ok);
+    slots.release(A, true);
+    CHECK(slots.inUse() == 0 && slots.handshakes() == 0);
 }
 
 static void testVideoConfig() {
@@ -2033,8 +2043,9 @@ static void testSilencedConnectionCloses() {
         if (cl != bad) closeHandle(cl);
         return;
     }
-    jlh::ConnectionSlots slots{8};
-    CHECK(slots.tryAcquire());  // the listener took one for this connection
+    jlh::ConnectionSlots slots;
+    CHECK(slots.tryAcquire(1) == jlh::ConnectionSlots::Taken::Ok);  // the listener took one for this connection
+    slots.authenticated(1);
     OwnerHost h;
     const auto A = h.open();
     std::atomic<bool> running{true}, finished{false};
@@ -2051,8 +2062,8 @@ static void testSilencedConnectionCloses() {
             }
             ++frames;
         }
-        closeHandle(sv);  // serveControl's Release: the socket, then the slot
-        slots.release();
+        closeHandle(sv);  // serveControl's Release: the socket, then the place
+        slots.release(1, false);
         finished = true;
     });
     // The viewer's start-up (r11: with the liveness ping as the connection

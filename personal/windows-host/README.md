@@ -1,4 +1,4 @@
-# JerisLink Windows host (H1 + H2, dev only)
+# JerisLink Windows host (H1 + H2 + H3, dev only)
 
 Phase H1 of the Windows host design (2026-11-27): capture the screen, encode
 H.264 with the Media Foundation software encoder and send it as MR02 to one
@@ -8,42 +8,178 @@ Phase H2: keyboard and mouse from the viewer (SendInput), the remote cursor
 shape, Task Manager from the overlay button, and a HOST_INFO frame that
 tells the viewer it is talking to Windows.
 
-Not in H1/H2: secure desktop (UAC prompts, lock screen, sign-in screen),
-elevated windows (UIPI: this non-elevated host cannot type into them),
+Phase H3: the connection password, as the macOS host v0.4.0 (PR-C) does it
+(lockout, blacklist, whitelist, takeover, UDP tags), the settings in the
+registry with the key under DPAPI, and a connection settings window. There
+is no mode without a password any more.
+
+Not in H1 to H3: secure desktop (UAC prompts, lock screen, sign-in screen),
 audio, clipboard, files, NACK/retransmit, ABR, HEVC, hardware encoders,
-connection password, service/installer. The viewer's requests for those
-are refused or ignored the way an older macOS host would.
+service/installer. The viewer's requests for those are refused or ignored
+the way an older macOS host would.
 
-## Dev mode only
-
-There is no connection password yet. The host refuses to start unless it is
-told all three:
+## Running (H3)
 
 ```
-JerisLinkHost.exe --dev-no-password --bind <this PC's tailnet IPv4> --allow <viewer IPv4>
+JerisLinkHost.exe --connection-settings
+JerisLinkHost.exe [--bind <this PC's tailnet IPv4>]
                   [--fps 30] [--bitrate 25] [--max-size 1920x1080]
                   [--capture auto|dda|gdi] [--log host.log] [--seconds N]
                   [--snapshot frame.bmp]
 JerisLinkHost.exe --probe [--capture auto|dda|gdi] [--snapshot frame.bmp]
 ```
 
-- `--bind` must be one specific address (not `0.0.0.0`); control and MRM1
-  listen only there.
-- `--allow` is the one viewer address; anything else is dropped.
+- Both the host and the settings window run elevated: the key is readable
+  by SYSTEM and Administrators only (design D8). The host exits 77 when it
+  is not elevated; `--connection-settings` asks UAC once and restarts
+  itself elevated.
+- No password, no network (D9): with no password set the host does not
+  listen and exits 78. `--dev-no-password` and `--allow` were removed
+  (exit 64). Builds are unsigned (D14).
+- Where it listens (D11): `--bind`, else the registry's `BindIP`, else this
+  PC's lowest tailnet IPv4 (100.64.0.0/10). Never `0.0.0.0` or another
+  interface: a `--bind` outside the tailnet range exits 64. With no tailnet
+  address up yet the host logs it once and waits (checks every 2 s).
+  `ListenMode` `loopback` (registry only) listens on 127.0.0.1, for tests.
+  `BindIP` and `ListenMode` have no field in the window and apply on the
+  next start.
 - `--probe` captures one frame, encodes ten and exits: a quick check that
-  capture and the encoder work on this machine.
+  capture and the encoder work on this machine. It needs no password.
 - `--snapshot` writes the captured frame as BMP (after 10 s of streaming,
   or at once with `--probe`).
+- Exit codes: 64 bad arguments, 77 not elevated, 78 no password, or the
+  settings do not read, or the registry's listen settings are wrong.
 
-Builds are unsigned (design doc D14).
+## Connection settings window
+
+`JerisLinkHost.exe --connection-settings`, the same parts and Chinese
+messages as the macOS host's 連線設定 window, in the viewer's green or blue
+theme (`../windows-client/ui_theme.hpp`):
+
+- 密碼: set or change, typed twice; at least 10 characters with an upper
+  case letter, a lower case letter and a symbol. There is no 清除密碼
+  button (D9). Every set makes a new salt and keeps the host id.
+- 白名單: tailnet addresses, one per line (commas and spaces also split).
+  Empty: any address may try the password. Anything outside 100.64.0.0/10
+  is refused.
+- 黑名單: add or remove an address. It takes effect at once on a running
+  host: its connections are closed and it is refused from then on.
+- Recent wrong passwords, per address.
+- 主題: green or blue (the window only).
+
+A running host sees every change through a registry watch
+(RegNotifyChangeKeyValue, plus a 1 s check).
+
+## Registry (D7, D8)
+
+`HKLM\SOFTWARE\Jeris\JerisLinkHost`, 64-bit view (Users can read it, only
+Administrators and SYSTEM write):
+
+| Value | Type | Meaning |
+| --- | --- | --- |
+| `ListenMode` | REG_SZ | `tailnet` (default) or `loopback` |
+| `BindIP` | REG_SZ | a tailnet IPv4 on this PC; absent or empty: the lowest one |
+| `AllowedIPs` | REG_MULTI_SZ | the whitelist; empty: any address |
+| `BlockedIPs` | REG_MULTI_SZ | the blacklist, `ip<TAB>unix seconds<TAB>reason` per row |
+| `PasswordSet` | REG_DWORD | 1 once a password is set (for display; `Secret` decides) |
+| `Theme` | REG_SZ | `green` (default) or `blue` |
+| `LogPath` | REG_SZ | the host log when `--log` is not given |
+| `Serial` | REG_QWORD | moved by every write, read as the change stamp |
+| `Secret\Key` | REG_BINARY | DPAPI (`CRYPTPROTECT_LOCAL_MACHINE`) of K, salt, iterations, host id; `Secret`'s DACL is SYSTEM and Administrators only, not inherited |
+| `Journal\PendingBlocks` | REG_MULTI_SZ | blocks not yet written to `BlockedIPs` |
+| `Failures\Records`, `Failures\Times` | | the window's failure list |
+
+The password itself is never stored or logged: only K =
+PBKDF2-SHA256(password, salt, 600000), under DPAPI. Read-modify-writes run
+under the mutex `Global\JerisLinkHostConfig` (SYSTEM and Administrators
+only), so the host adding a block and the window removing one cannot lose
+each other's change.
+
+## Password (same rules as the macOS host v0.4.0)
+
+- Every TCP connection authenticates first: MRC1 0x05 CHALLENGE, 0x03
+  RESPONSE, 0x04 RESULT, the MACs of `../windows-client/conn_auth.hpp` and
+  `../protocol/auth_vectors.json`. 5 s for the whole RESPONSE. No new wire
+  in H3.
+- Wrong passwords, per address: each 5th locks it for 5, 10, then 15
+  minutes (RESULT locked with the seconds left), the 20th blacklists it
+  (persisted). 20 wrong passwords from anyone inside 60 s stop every
+  challenge for 5 minutes. A block that could not be written goes to a
+  pending journal and keeps the host shut until it is written.
+- A whitelist that is not empty closes every other address's connection
+  before any challenge (`Control reject ... expected=whitelist`). The
+  blacklist wins over the whitelist.
+- Connection places (H3 r2): an address the guard refuses at that moment
+  (blacklist, whitelist, its lock, the host-wide stop, a lockdown) is
+  answered and closed on the listener thread, before any worker, and
+  takes no place. Every other connection takes one of 16 places; while
+  its handshake runs it also holds one of 8 handshake places, at most 4
+  per address (control, clipboard, file and ping log in at once). A
+  connection whose password matched gives its handshake place back at
+  once. Past a limit: `control.rejected reason=source_handshakes_full`
+  (or `handshakes_full`, `too_many`) and a plain close. Refusal lines
+  are logged once per address and kind per 10 s (` suppressed=N` on the
+  next one).
+- A blacklist that cannot be read when the host starts (`BlockedIPs` of
+  the wrong type, a read error) is not taken as empty: `auth.lockdown
+  reason=blocklist_unreadable`, every login gets RESULT locked (retry
+  5 s) and input and pongs stop, until a read succeeds (retried at most
+  once a second; `auth.lockdown_cleared`). An absent `BlockedIPs` is
+  an empty list.
+- Takeover: a manual control login with the right password takes over.
+  Every older connection is void at once and closed, its viewer is told
+  REPLACED, and nothing of the old session is reused: every reconnect is a
+  fresh password exchange. A reconnect the viewer makes on its own (the
+  `jl-auto1` trailer) never takes over while a control connection is open.
+  Clipboard, file and ping channels get in only on the newest control
+  session.
+- A password or whitelist change while the host runs voids every
+  connection at once, with no notice (the viewer reconnects and has to log
+  in again). The macOS host restarts its control service instead. REPLACED
+  is sent only on a takeover.
+- After a failure RESULT, a lock or block RESULT that answers a RESPONSE,
+  and REPLACED, the host sends
+  FIN and reads and drops what the viewer still sends until it closes, for
+  at most 1 s, then closes. A close with input unread (a bad header or a
+  wrong-length RESPONSE leaves its payload behind) is an RST, and Windows
+  can throw the RESULT away before the viewer reads it. The macOS host
+  drains only after REPLACED.
+- Input and VIDEO_CONFIG are taken only on the control channel. Input
+  owners (H2, below) are numbered by the session broker's token, so a
+  newer login is always the newer owner.
+- A void (a takeover, a password or whitelist change, a block) also ends
+  the input owner's turn at once, before a takeover's AUTH_OK goes out:
+  what it holds goes up, its MRM1 socket is unbound, and an input frame
+  of it that was already going in lands first; nothing of it goes in
+  afterwards, even a frame read before the void (the macOS host's r11
+  rule; `input.owner_voided`, `input.dropped reason=voided`,
+  `input_owner_voided` in `stats`).
+- UDP: only the session viewer's address is heard, and every datagram
+  both ways carries the 8-byte tag under the session key
+  (`../windows-client/udp_tag.hpp`). MRM1 is checked in the macOS host's
+  order: session, address, tag (`udp.bad_tag`, rate limited), format, then
+  a 64-packet anti-replay window that starts fresh with each session. A
+  ping from a blacklisted or locked-down address gets no pong.
+- Video and the cursor shape go only to the session viewer (video to its
+  38402), tagged. H3 r2: each datagram (video packet, cursor, pong) is
+  checked against the current session and sent under the session
+  broker's send gate, so a takeover, block or policy change waits for a
+  send in progress, and nothing goes out under the old session after it.
+  A frame cut part way counts in `session_drops`. With no session the stream idles (`stream.idle
+  reason=no_session`); each new session starts on a keyframe.
+
+Log lines: `auth.ok`, `auth.fail`, `auth.locked`, `auth.blocked`,
+`auth.global_locked`, `auth.lockdown`, `auth.lockdown_cleared`, `auth.replaced`, `auth.policy_changed`,
+`auth.block_added`, `auth.block_removed`, `control.rejected`, `control.open ... auth=password`,
+`mrm1.session`, `stream.start ... gen=`.
 
 ## Ports (same as the macOS host)
 
 | Port | Proto | Use |
 | --- | --- | --- |
-| 38400 | TCP on `--bind` | MRC1 control: transition probe, ping, video config, input, HOST_INFO |
-| 38412 | UDP on `--bind` | MRM1: keyframe request, ping, pointer moves; cursor shape back |
-| 38402 | UDP to the viewer | MR02 video, 1200-byte packets |
+| 38400 | TCP on the bind address | MRC1 control: AUTH, transition probe, ping, video config, input, HOST_INFO |
+| 38412 | UDP on the bind address | MRM1: keyframe request, ping, pointer moves; cursor shape back (tagged) |
+| 38402 | UDP to the session viewer | MR02 video, 1200-byte packets plus the 8-byte tag |
 
 ## How it works
 
@@ -234,7 +370,10 @@ the Windows host only; nothing changes for the macOS host.
 
 The log prints one `stats` line a second: size, capture/sent fps, Mbit/s,
 keyframes, encode time, video send failures (`send_fail`, `send_err`),
-input and cursor counters.
+input and cursor counters, and (H3) the password and UDP counters
+(`auth_fail`, `auth_rejected`, `auth_old_viewer`, `auth_resume_refused`,
+`input_owner_voided`, `replaced`, `udp_no_session`, `udp_rejected`, `udp_bad_tag`, `udp_bad`,
+`udp_replay`, `udp_stale`, `udp_late_ok`, `pong_drops`, `session_drops`).
 
 ## Build
 
@@ -242,6 +381,7 @@ input and cursor counters.
 cmake -S . -B build -A x64
 cmake --build build --config Release
 build\Release\JerisLinkHostTest.exe
+build\Release\JerisLinkHostAuthTest.exe ..\protocol\auth_vectors.json
 ```
 
 `JerisLinkHostTest` checks the wire formats against the viewer's own
@@ -249,3 +389,16 @@ parsers (`../windows-client/video_receiver.hpp`, `h264_nal_summary.hpp`,
 `host_info.hpp`) and key codes (`keymap.hpp`), input decoding, pointer
 mapping, the colour values, and on Windows a loopback through the real MF
 encoder. It injects no input.
+
+`JerisLinkHostAuthTest` (H3) checks the password exchange against
+`../protocol/auth_vectors.json`, CNG against the portable HMAC, the
+lockout, blacklist, whitelist and takeover rules, the UDP tags and replay
+window, the settings texts, and the viewer's own client code
+(`../windows-client/conn_auth.hpp`) against this host over loopback. On
+Windows it also runs the registry store under
+`HKCU\Software\JerisTest\<unique>` (never HKLM) and deletes it. It also
+builds and runs on Linux (the portable parts):
+
+```
+c++ -std=c++20 -I. -I.. -o auth_test auth_test.cpp && ./auth_test ../protocol/auth_vectors.json
+```

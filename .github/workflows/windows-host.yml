@@ -19,31 +19,39 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Configure
         run: cmake -S . -B build -A x64
-      - name: Build host and test (unsigned, dev only)
-        run: cmake --build build --config Release --target JerisLinkHost JerisLinkHostTest
+      - name: Build host and tests (unsigned, dev only)
+        run: cmake --build build --config Release --target JerisLinkHost JerisLinkHostTest JerisLinkHostAuthTest
       - name: Host unit test (MR02 through the viewer's receiver, pacer, MRC1 probe / ping / video config, HOST_INFO through the viewer's decoder, input decode / keymap / pointer mapping, MRM1, Annex B, BT.709 colour, MF software encoder loopback)
         run: build\Release\JerisLinkHostTest.exe
-      - name: Host refuses to start without dev mode, a specific bind and an allowed viewer (exit 64)
+      - name: Host auth test (shared vectors, CNG against the portable HMAC, lockout / blacklist / takeover, UDP tags, the viewer's own client over loopback, registry store under HKCU)
+        run: build\Release\JerisLinkHostAuthTest.exe ..\protocol\auth_vectors.json
+      - name: Host never listens without a password (78 elevated / 77 not elevated) and refuses removed or non-tailnet options (64)
         shell: pwsh
         run: |
           $exe = (Resolve-Path build\Release\JerisLinkHost.exe).Path
+          $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          $noPassword = if ($admin) { 78 } else { 77 }
+          Write-Host "elevated: $admin, expected exit without a password: $noPassword"
           $cases = @(
-            '',
-            '--bind 127.0.0.1 --allow 127.0.0.1',
-            '--dev-no-password --bind 0.0.0.0 --allow 127.0.0.1',
-            '--dev-no-password --bind 127.0.0.1'
+            @('', $noPassword),
+            @('--bind 100.64.0.1', $noPassword),
+            @('--dev-no-password', 64),
+            @('--allow 100.64.0.1', 64),
+            @('--bind 127.0.0.1', 64),
+            @('--bind 0.0.0.0', 64),
+            @('--probe --connection-settings', 64)
           )
           foreach ($c in $cases) {
             $a = @()
-            if ($c) { $a = $c -split ' ' }
+            if ($c[0]) { $a = $c[0] -split ' ' }
             & $exe @a
             $code = $LASTEXITCODE
-            Write-Host "args: [$c] exit: $code"
-            if ($code -ne 64) { throw "expected exit 64, got $code for: [$c]" }
+            Write-Host "args: [$($c[0])] exit: $code"
+            if ($code -ne $c[1]) { throw "expected exit $($c[1]), got $code for: [$($c[0])]" }
           }
-          Write-Host 'OK: host refuses to start without --dev-no-password, a specific --bind and --allow'
+          Write-Host 'OK: no password, no listening; --dev-no-password, --allow and non-tailnet --bind are refused'
           exit 0
       - uses: actions/upload-artifact@v4
         with:
-          name: jerislink-windows-host-h2-unsigned
+          name: jerislink-windows-host-h3-unsigned
           path: personal/windows-host/build/Release/JerisLinkHost.exe

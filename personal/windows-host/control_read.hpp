@@ -70,6 +70,17 @@ ReadResult waitReadable(SocketHandle s, int sliceMs, Stop&& stop) {
     }
 }
 
+// A recv() that failed only because nothing was there yet (non-blocking
+// socket, after select said readable) or a signal came: try again.
+inline bool recvWouldRetry() {
+#ifdef _WIN32
+    const int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK || e == WSAEINTR;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
 // Exactly n bytes, or why not.
 template <class Stop>
 ReadResult recvExactUntil(SocketHandle s, uint8_t* p, size_t n, int sliceMs, Stop&& stop) {
@@ -77,6 +88,7 @@ ReadResult recvExactUntil(SocketHandle s, uint8_t* p, size_t n, int sliceMs, Sto
         const ReadResult w = waitReadable(s, sliceMs, stop);
         if (w != ReadResult::Ok) return w;
         const auto r = recv(s, reinterpret_cast<char*>(p), int(n), 0);
+        if (r < 0 && recvWouldRetry()) continue;  // H3: viewer sockets are non-blocking
         if (r <= 0) return ReadResult::Closed;
         p += r;
         n -= size_t(r);

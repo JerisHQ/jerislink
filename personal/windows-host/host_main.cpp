@@ -1,4 +1,4 @@
-// JerisLink Windows host, H2 (design doc 2026-11-27, phases H1 and H2).
+// JerisLink Windows host, H3 (design doc 2026-11-27, phases H1 to H3).
 //
 // H1: captures the screen, encodes H.264 with the Media Foundation software
 // encoder and sends it as MR02 to one viewer, so the existing viewer shows
@@ -7,17 +7,32 @@
 // in with SendInput, the Force Quit button (MRC1 0x60) opens Task Manager,
 // the cursor shape goes back as MRM1 0x31, and MRC1 0x06 HOST_INFO tells a
 // new viewer it talks to Windows.
-// No audio, clipboard, files, NACK or ABR yet; no password: this dev build
-// runs only with --dev-no-password and one allowed viewer IP.
+// H3: the connection password, as the macOS host v0.4.0 (PR-C) does it
+// (host_auth.hpp, host_auth_conn.hpp): every TCP connection authenticates
+// (0x05 CHALLENGE, 0x03 RESPONSE, 0x04 RESULT), the newest manual control
+// login takes over and every older connection is void at once, failures
+// lock the address and the 20th blacklists it, and every UDP datagram both
+// ways carries an 8-byte tag under the session key. The settings live in
+// HKLM\SOFTWARE\Jeris\JerisLinkHost (host_config_win.hpp; the key under
+// DPAPI); the connection settings window (settings_window.cpp) sets them.
+// There is no mode without a password (D9): with none set the host does not
+// listen.
+// No audio, clipboard, files, NACK or ABR yet.
 //
-//   JerisLinkHost.exe --dev-no-password --bind <host ip> --allow <viewer ip>
-//                     [--fps 30] [--bitrate 25] [--max-size 1920x1080]
-//                     [--capture auto|dda|gdi] [--log file] [--seconds N]
-//                     [--snapshot file.bmp]
+//   JerisLinkHost.exe [--bind <tailnet ip>] [--fps 30] [--bitrate 25]
+//                     [--max-size 1920x1080] [--capture auto|dda|gdi]
+//                     [--log file] [--seconds N] [--snapshot file.bmp]
+//   JerisLinkHost.exe --connection-settings
 //   JerisLinkHost.exe --probe [--capture ...] [--snapshot file.bmp]
 //
-// Ports as the macOS host: control TCP 38400, MRM1 UDP 38412 on --bind;
-// video to <viewer ip>:38402 from --bind.
+// Runs elevated (the key is readable by SYSTEM and Administrators only).
+// Ports as the macOS host: control TCP 38400, MRM1 UDP 38412 on the bind
+// address (--bind, else the registry's BindIP, else this PC's lowest
+// tailnet IPv4; never another interface); video to the session viewer's
+// 38402 from the bind address.
+// Exit codes: 64 bad arguments, 77 not elevated, 78 no password (or the
+// settings do not read, or the registry's listen settings are wrong). With
+// no tailnet address up yet the host waits for one.
 
 #include "capture.hpp"
 #include "color_convert.hpp"
@@ -33,17 +48,23 @@
 #ifndef TCP_MAXRT
 #define TCP_MAXRT 5  // ws2ipdef.h, Windows Vista and later
 #endif
+#include "host_auth_conn.hpp"
+#include "host_config_win.hpp"
+#include "settings_window.hpp"
 #include <mfapi.h>
 #include <objbase.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -61,7 +82,6 @@ using Clock = std::chrono::steady_clock;
 constexpr uint16_t kControlPort = 38400;
 constexpr uint16_t kVideoPort = 38402;
 constexpr uint16_t kMrm1Port = 38412;
-constexpr int kActiveGraceMs = 10'000;    // viewer counts as present this long after its last packet
 // TCP limits on control connections (serveControl): keep-alive's first
 // probe after this much silence, then one a second, and Windows gives up
 // after 10 unanswered probes (about 13 s in all); data the viewer has not
@@ -74,17 +94,15 @@ constexpr DWORD kMaxRetransmitS = 13;
 constexpr int kUpRetryMs = 250;
 constexpr int kKeyframeMinGapMs = 200;    // forced IDRs closer than this are merged
 constexpr int kStaticRefreshMs = 1000;    // a static screen is re-sent this often
-constexpr int kMaxControlConnections = 8;   // includes sockets still in the handshake
-constexpr int kHandshakeMs = 10'000;        // whole probe read; the viewer sends it ~300 ms after connect
 constexpr int kCursorPollMs = 16;           // cursor shape check
 constexpr int kCursorResendMs = 1000;       // unchanged shape re-sent this often (UDP loss repair)
 constexpr uint32_t kHostCaps = jlh::kHostCapKeyboard | jlh::kHostCapPointer | jlh::kHostCapCursorShape |
                                jlh::kHostCapTaskManager | jlh::kHostCapPointerSync;
 
 struct Options {
-    bool devNoPassword = false;
     bool probe = false;
-    std::string bindIp, allowIp, logPath, snapshotPath;
+    bool connectionSettings = false;
+    std::string bindIp, logPath, snapshotPath;
     int fps = 30;
     int bitrateMbps = 25;
     int maxW = 1920, maxH = 1080;
@@ -101,14 +119,14 @@ int64_t msSinceStart() {
 }
 
 void logf(const char* fmt, ...) {
-    char msg[1024];
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char line[1200];
+    char line[2200];
     std::snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d.%03d %s\n", st.wYear, st.wMonth, st.wDay,
                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
     std::lock_guard<std::mutex> g(gLogMutex);
@@ -134,10 +152,14 @@ bool parseArgs(int argc, char** argv, Options& o, std::string& err) {
             return true;
         };
         std::string v;
-        if (k == "--dev-no-password") o.devNoPassword = true;
+        if (k == "--dev-no-password" || k == "--allow") {
+            // H3 (D9): no mode without a password, no single allowed IP.
+            err = k + " was removed in H3: set a password with --connection-settings";
+            return false;
+        }
         else if (k == "--probe") o.probe = true;
+        else if (k == "--connection-settings") o.connectionSettings = true;
         else if (k == "--bind") { if (!val(o.bindIp)) return false; }
-        else if (k == "--allow") { if (!val(o.allowIp)) return false; }
         else if (k == "--log") { if (!val(o.logPath)) return false; }
         else if (k == "--snapshot") { if (!val(o.snapshotPath)) return false; }
         else if (k == "--fps") { if (!val(v)) return false; o.fps = std::atoi(v.c_str()); }
@@ -155,20 +177,14 @@ bool parseArgs(int argc, char** argv, Options& o, std::string& err) {
     }
     if (o.fps < 1 || o.fps > 240) { err = "--fps must be 1..240"; return false; }
     if (o.bitrateMbps < 4 || o.bitrateMbps > 100) { err = "--bitrate must be 4..100"; return false; }
-    if (o.probe) return true;
-    // No password support yet: refuse to listen unless told this is a dev
-    // run, and only for one viewer IP on one host address.
-    if (!o.devNoPassword) {
-        err = "this dev build runs only with --dev-no-password (no password support yet)";
+    if (o.probe && o.connectionSettings) {
+        err = "--probe and --connection-settings do not go together";
         return false;
     }
-    in_addr a{};
-    if (o.bindIp.empty() || !parseIpv4(o.bindIp, a) || a.s_addr == INADDR_ANY) {
-        err = "--bind <host IPv4> is required (not 0.0.0.0)";
-        return false;
-    }
-    if (o.allowIp.empty() || !parseIpv4(o.allowIp, a) || a.s_addr == INADDR_ANY) {
-        err = "--allow <viewer IPv4> is required";
+    if (o.probe || o.connectionSettings) return true;
+    // D11: only a tailnet address, never 0.0.0.0 or another interface.
+    if (!o.bindIp.empty() && !jlh::auth::isTailnetIpv4(o.bindIp)) {
+        err = "--bind must be a tailnet IPv4 on this PC (100.64.0.0/10), got " + o.bindIp;
         return false;
     }
     return true;
@@ -200,25 +216,37 @@ bool writeBmp(const std::string& path, const jlh::CapturedFrame& f) {
 
 struct State {
     Options opt;
-    in_addr bindAddr{}, allowAddr{};
+    in_addr bindAddr{};
+    std::string bindIp;
+    // H3: the password (main() builds these before anything listens). The
+    // broker says which viewer the UDP paths serve and under which key
+    // (SessionBroker::current); nobody else is sent to or heard.
+    jlh::auth::AuthEnv* auth = nullptr;
+    jlh::auth::SessionBroker* broker = nullptr;
+    jlh::auth::AuthGuard* guard = nullptr;
+    jlh::auth::BadTagLog* mrm1BadTag = nullptr;
+    // UDP counters (the Mac's mouse_udp_* names, in the stats line).
+    std::atomic<uint64_t> udpNoSession{0}, udpRejected{0}, udpBad{0}, udpReplay{0}, udpStale{0}, udpLateOk{0};
+    std::atomic<uint64_t> pongDrops{0};
     std::atomic<bool> running{true};
-    std::atomic<int64_t> lastActivityMs{-1'000'000};
     std::atomic<int> controlConnections{0};  // past the handshake: these keep the stream active
-    jlh::ConnectionSlots controlSlots{kMaxControlConnections};
+    jlh::ConnectionSlots controlSlots;  // H3 r2: handshakes capped in all and per address
     std::atomic<bool> keyframeRequested{false};
     std::atomic<int> bitrateMbps{25};
     std::atomic<int> streamW{0}, streamH{0};
     // counters, read by the stats line
-    std::atomic<uint64_t> keyframeRequests{0}, pings{0}, rejected{0};
-    // H2 input. One injector for every connection: one viewer IP may connect,
-    // but over more than one control connection at a time (a reconnect, or
-    // a second viewer), so each connection gets its own owner number
-    // (InputClaims::open), and only the input owner's frames go in (r8).
+    std::atomic<uint64_t> keyframeRequests{0}, pings{0};
+    // H2 input. One injector for every connection. More than one control
+    // connection can be open at a time (a reconnect, a takeover in flight),
+    // so each gets its own owner number, H3: its broker token
+    // (InputClaims::openAs), and only the input owner's frames go in (r8).
     jlh::InputInjector input;
     // Who the input owner is and what it holds down. Its lock comes first:
     // then pointerMutex, then the injector's own.
     jlh::InputClaims claims;
     std::atomic<uint64_t> inputTakeovers{0}, inputDropped{0}, inputUpRetried{0};
+    // H3: input owners retired because the broker voided them.
+    std::atomic<uint64_t> inputOwnerVoided{0};
     // r9: owners that went quiet (expire), frames dropped while an up was
     // owed, UDP moves from another socket than the owner's or while an up
     // was owed.
@@ -240,8 +268,6 @@ struct State {
 };
 State* gState = nullptr;
 
-void touch(State& s) { s.lastActivityMs = msSinceStart(); }
-
 BOOL WINAPI onConsoleCtrl(DWORD) {
     if (gState) gState->running = false;
     return TRUE;
@@ -251,37 +277,6 @@ std::string ipString(const in_addr& a) {
     char b[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &a, b, sizeof(b));
     return b;
-}
-
-// deadlineMs < 0: no deadline (the socket blocks). Otherwise every recv
-// gets only the time left, so a peer trickling bytes cannot hold the
-// handshake open past the deadline. If the timeout cannot be set, the read
-// fails rather than block without one.
-bool recvExact(SOCKET s, uint8_t* p, size_t n, int64_t deadlineMs = -1) {
-    while (n) {
-        if (deadlineMs >= 0) {
-            const int64_t left = deadlineMs - msSinceStart();
-            if (left <= 0) return false;
-            const DWORD t = DWORD(left);
-            if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t)) != 0)
-                return false;
-        }
-        const int r = recv(s, reinterpret_cast<char*>(p), int(n), 0);
-        if (r <= 0) return false;
-        p += r;
-        n -= size_t(r);
-    }
-    return true;
-}
-
-bool sendAll(SOCKET s, const std::vector<uint8_t>& b) {
-    size_t off = 0;
-    while (off < b.size()) {
-        const int r = send(s, reinterpret_cast<const char*>(b.data() + off), int(b.size() - off), 0);
-        if (r <= 0) return false;
-        off += size_t(r);
-    }
-    return true;
 }
 
 // ---------------------------------------------------------- control channel
@@ -307,53 +302,44 @@ bool applyPointerSync(State& st, uint32_t peerAddr, const jlh::InputEvent& sync,
 }
 
 // Runs on its own thread holding one of st.controlSlots, taken by the
-// listener; every return path closes the socket and gives the slot back.
-// r12 (Pepper's review of 9f803c6, item 2): the listener opened owner in
-// InputClaims at accept, so the connection counts for its address from
-// then; every return path closes it there too (done: below, or the guard).
-void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh::HeldInput::Owner owner) {
+// listener; every return path closes the socket and gives the place back.
+// H3 r2: the handshake place goes back as soon as the password matched.
+// H3: the connection authenticates first (AuthConn, the Mac's
+// ControlServer). Only an admitted connection opens its owner in
+// InputClaims, numbered by its broker token (InputClaims::openAs), counts
+// as a viewer and is read from; every frame goes through admitMessage (the
+// policy, the blacklist, the channel) and every frame back through
+// sendChecked. A takeover, a password or whitelist change, a block or the
+// journal lockdown voids it in the broker; its reader stops within one
+// read slice, and a control line replaced by a newer login gets REPLACED
+// (AuthConn::finish).
+void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr) {
     auto upKey = [&st](uint16_t v) { return st.input.upKey(v); };
     auto upButton = [&st](uint8_t b) { return st.input.upButton(b); };
+    jlh::auth::AuthConn ac(*st.auth, c, peer);
     struct Release {
         State& st;
         SOCKET c;
-        jlh::HeldInput::Owner owner;
+        const jlh::auth::AuthConn& ac;
+        uint32_t source;
+        jlh::HeldInput::Owner owner = 0;  // 0: never admitted, no claims opened
         bool established = false;
         bool claimsClosed = false;
+        bool inHandshake = true;
         ~Release() {
-            if (!claimsClosed)  // before its first frame: it holds nothing
+            if (owner && !claimsClosed)  // before its first frame: it holds nothing
                 st.claims.close(owner, [this](uint16_t v) { return st.input.upKey(v); },
                                 [this](uint8_t b) { return st.input.upButton(b); });
             if (established) --st.controlConnections;
-            closesocket(c);
-            st.controlSlots.release();
+            jlh::auth::finishSocket(c, ac.resetRequested());
+            st.controlSlots.release(source, inHandshake);
         }
-    } guard{st, c, owner};
+    } guard{st, c, ac, peerAddr};
+    // H3 (the Mac r12): the listener made the socket non-blocking
+    // (acceptStep); every wait is a select() slice that asks whether the
+    // connection was voided first.
     BOOL nodelay = TRUE;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    uint8_t h[jlh::kMrc1HeaderBytes];
-    std::vector<uint8_t> payload;
-    auto readFrame = [&](jlh::Mrc1Header& hdr, int64_t deadlineMs) {
-        if (!recvExact(c, h, sizeof(h), deadlineMs)) return false;
-        auto parsed = jlh::parseMrc1Header(h);
-        if (!parsed) return false;
-        hdr = *parsed;
-        payload.resize(hdr.length);
-        return hdr.length == 0 || recvExact(c, payload.data(), hdr.length, deadlineMs);
-    };
-
-    jlh::Mrc1Header hdr;
-    if (!readFrame(hdr, msSinceStart() + kHandshakeMs) || !jlh::isTransitionProbe(hdr, payload.data())) {
-        logf("control.refused peer=%s reason=no_transition_probe", peer.c_str());
-        return;
-    }
-    const uint8_t open = jlh::kAuthOpenIpOnly;
-    if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgAuthResult, &open, 1))) return;
-    const DWORD noTimeout = 0;  // the viewer keeps idle channels open
-    if (setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout)) != 0) {
-        logf("control.closed peer=%s reason=rcvtimeo err=%d", peer.c_str(), WSAGetLastError());
-        return;
-    }
     // Limits on a dead connection. The host writes to an idle control
     // connection only to answer a ping, so without them a dropped network
     // would keep the connection and its slot open, and for the input owner
@@ -371,7 +357,8 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
     //   own, longer retransmission limit.
     // r8 (InputClaims): a connection where either cannot be set is closed
     // here, before it can send anything, so it is never the input owner and
-    // every owner has both limits.
+    // every owner has both limits. H3: set before the password, so nothing
+    // after it can fail this way.
     tcp_keepalive ka{1, kKeepAliveIdleMs, kKeepAliveIntervalMs};
     DWORD kaBytes = 0;
     if (WSAIoctl(c, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &kaBytes, nullptr, nullptr) != 0) {
@@ -383,10 +370,26 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
         logf("control.closed peer=%s reason=maxrt err=%d", peer.c_str(), WSAGetLastError());
         return;
     }
+
+    const auto ok = ac.authenticate();  // refusals are answered and logged there
+    if (!ok) return;
+    st.controlSlots.authenticated(peerAddr);
+    guard.inHandshake = false;
+    const auto life = std::make_shared<jlh::auth::ConnLife>();
+    const auto token = ac.admit(*ok, life);  // a control login takes over here
+    if (!token) return;
+    const jlh::HeldInput::Owner owner = *token;
+    st.claims.openAs(owner);
+    guard.owner = owner;
+    const bool isControl = ok->channel == jlh::auth::Channel::Control;
+    const char* role = jlh::auth::channelName(ok->channel);
     ++st.controlConnections;
     guard.established = true;
-    touch(st);
-    const char* role = "control";
+    logf("control.open peer=%s channel=%s auth=password session=%s", peer.c_str(), role,
+         isControl ? jlh::auth::hex(ok->sessionId).c_str() : "-");
+
+    jlh::Mrc1Header hdr;
+    std::vector<uint8_t> payload;
     bool first = true;
     bool hostInfoLogged = false, inputSeen = false, droppedLogged = false, upPending = false;
     std::optional<jlh::InputEvent> pendingSync;  // a POINTER_SYNC waiting for its button
@@ -395,36 +398,41 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
     // loses ownership for going quiet (InputClaims::expire, run by
     // inputRetryLoop): it is closed then, its slot comes back, and nothing
     // it sends afterwards is read. Not only at its next frame, which a hung
-    // viewer never sends.
-    const auto stopReading = [&] { return jlh::stopLiveRead(st.running.load(), st.claims, owner); };
+    // viewer never sends. H3: also as soon as the broker voided it.
+    const auto stopReading = [&] {
+        return life->revoked() || jlh::stopLiveRead(st.running.load(), st.claims, owner);
+    };
+    // A pong or a VIDEO_CONFIG reply. A control line voided by a takeover is
+    // kept for its REPLACED notice; anything else refused is reset.
+    const auto reply = [&](const char* kind, const std::vector<uint8_t>& framed) {
+        return ac.sendCheckedFramed(life.get(), kind, framed, -1, isControl) == jlh::auth::CheckedSend::Sent;
+    };
     for (;;) {
         const jlh::ReadResult rr = jlh::readMrc1FrameUntil(c, hdr, payload, jlh::kReadSliceMs, stopReading);
-        if (rr == jlh::ReadResult::Stopped && st.running) {
+        if (rr == jlh::ReadResult::Stopped && st.running && !life->revoked()) {
             logf("control.silenced_closed peer=%s channel=%s reason=liveness_timeout", peer.c_str(), role);
             goto done;
         }
         if (rr != jlh::ReadResult::Ok) break;
+        // H3 (the Mac serveAdmitted): nothing a voided connection read is
+        // acted on, a blocked peer is reset, and a channel takes only the
+        // messages it authenticated for.
+        if (!ac.admitMessage(*ok, *life, hdr.type, first)) break;
         // r11 (InputClaims::heard, Pepper's review of 5880264, item 1): a
         // ping after the first frame is a liveness ping; a FILE_HELLO first
         // is refused.
         const jlh::InputClaims::Heard heard = st.claims.heard(owner, hdr, msSinceStart());
-        if (first) {
-            if (hdr.type == jlh::kMsgClipboardHello) role = "clipboard";
-            else if (hdr.type == jlh::kMsgPing) role = "ping";
-            logf("control.open peer=%s channel=%s auth=open_ip_only", peer.c_str(), role);
-        }
         if (heard.refuse) {
-            // No file transfer in H1: the viewer reads a close as refused.
-            logf("control.file_refused peer=%s reason=not_in_h1", peer.c_str());
+            // No file transfer yet: the viewer reads a close as refused.
+            logf("control.file_refused peer=%s reason=not_in_h3", peer.c_str());
             break;
         }
         first = false;
-        // Only frames this host handles count as viewer activity.
+        // H3: input and VIDEO_CONFIG only on the control channel.
         switch (hdr.type) {
         case jlh::kMsgPing:
             if (!jlh::isValidPing(hdr)) break;  // like the Mac host: no reply to other sizes
             ++st.pings;
-            touch(st);
             // r9 (InputClaims): a ping after the first frame is the viewer
             // UI's liveness signal; the first one arms this connection (r11:
             // nothing else does). One that lost ownership for going quiet is
@@ -436,10 +444,10 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
             if (heard.armed)
                 logf("input.liveness peer=%s channel=%s timeout_ms=%lld from=ping input_seen=%s", peer.c_str(), role,
                      (long long)jlh::kLivenessTimeoutMs, inputSeen ? "yes" : "no");
-            if (!sendAll(c, jlh::mrc1Frame(jlh::kMsgPong, payload))) goto done;
+            if (!reply("ping", jlh::mrc1Frame(jlh::kMsgPong, payload))) goto done;
             break;
         case jlh::kMsgVideoConfig: {
-            touch(st);
+            if (!isControl) break;
             const auto d = jlh::decideVideoConfig(payload.data(), payload.size(), st.bitrateMbps.load(),
                                                   st.streamW.load(), st.streamH.load());
             if (d.accepted && d.bitrateChanged) st.bitrateMbps = d.bitrateMbps;
@@ -449,7 +457,7 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
             const int monitors = std::clamp(GetSystemMetrics(SM_CMONITORS), 0, 255);
             const auto out = jlh::videoConfigReply(
                 d, jlh::hostInfoPayload(jlh::kPlatformWindows, kHostCaps, uint8_t(monitors), JERISLINK_VERSION_STRING));
-            if (!sendAll(c, out)) goto done;
+            if (!reply("video_config", out)) goto done;
             logf("video.config peer=%s status=%u codec=h264 bitrate_mbps=%d flags=0x%02x size=%dx%d host_info=%s",
                  peer.c_str(), unsigned(d.ack[1]), d.bitrateMbps, unsigned(d.ack[3]), st.streamW.load(),
                  st.streamH.load(), d.hostInfo ? "sent" : "not_asked");
@@ -472,12 +480,12 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
         case jlh::kMsgMouseButtonExt:
         case jlh::kMsgPointerSync:
         case jlh::kMsgForceQuitOpen: {
+            if (!isControl) break;
             const auto e = jlh::decodeInput(hdr, payload.data());
             if (!e) {
                 ++st.inputMalformed;  // wrong length or button: dropped whole, like the Mac host
                 break;
             }
-            touch(st);
             if (!inputSeen) {
                 inputSeen = true;
                 // r11: liveness=on: this connection pinged before its first
@@ -494,8 +502,12 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
             // only counts, in the stats line.
             // r9: an owner that went quiet is closed; while an up is owed
             // only ups go in; a POINTER_SYNC names the owner's MRM1 socket.
-            const auto f = st.claims.frame(
-                owner, peerAddr, *e,
+            // H3: the epoch is asked again under the claims lock, which a
+            // void takes (SessionBroker::onVoid, InputClaims::retire): a
+            // frame read before a takeover goes in before the new viewer's
+            // AUTH_OK, or not at all (the Mac r11 whileLive rule).
+            const auto f = st.claims.frameIfLive(
+                owner, peerAddr, *e, [&] { return !life->revoked(); },
                 [&](jlh::HeldInput& held) {
                     return jlh::stepInput(
                         pendingSync, *e,
@@ -505,6 +517,11 @@ void serveControl(State& st, SOCKET c, std::string peer, uint32_t peerAddr, jlh:
                         [&](const jlh::InputEvent& ev) { return st.input.apply(ev, owner, held); });
                 },
                 upKey, upButton);
+            if (f.revoked) {
+                ++st.inputDropped;
+                logf("input.dropped peer=%s channel=%s reason=voided; connection closing", peer.c_str(), role);
+                goto done;
+            }
             if (f.tookOver) {
                 st.inputTakeovers += f.replaced;
                 logf("input.owner peer=%s channel=%s replaced=%zu released=%zu still_held=%s", peer.c_str(), role,
@@ -555,7 +572,12 @@ done:
             logf("input.released peer=%s channel=%s released=%zu still_held=%s", peer.c_str(), role, n,
                  st.claims.anyHeld() ? "yes" : "no");
     }
-    logf("control.closed peer=%s channel=%s", peer.c_str(), role);
+    // REPLACED for a control line a newer login took over; then it leaves
+    // the broker.
+    const auto why = life->kickReason();
+    ac.finish(*ok, *token, *life);
+    logf("control.closed peer=%s channel=%s reason=%s", peer.c_str(), role,
+         why ? jlh::auth::closeReasonName(*why) : "closed");
 }
 
 void controlListener(State& st, SOCKET ls) {
@@ -567,60 +589,150 @@ void controlListener(State& st, SOCKET ls) {
             if (!st.running) break;
             continue;
         }
-        if (from.sin_addr.s_addr != st.allowAddr.s_addr) {
-            ++st.rejected;
-            logf("control.rejected peer=%s reason=not_allowed", ipString(from.sin_addr).c_str());
+        // H3 r2 (Pepper's review r1, item 1): an address the guard refuses
+        // (blacklist, whitelist, its wait, the host-wide wait, a lockdown)
+        // is answered and closed here, before a worker or a place; the
+        // rest take a place, with handshakes capped in all and per address
+        // (the AUTH timeout, 5 s, bounds each, and counts as a failure).
+        const std::string peer = ipString(from.sin_addr);
+        const uint32_t source = uint32_t(from.sin_addr.s_addr);
+        if (jlh::auth::acceptStep(*st.auth, st.controlSlots, c, peer, source) != jlh::auth::AcceptVerdict::Serve) {
             closesocket(c);
             continue;
         }
-        if (!st.controlSlots.tryAcquire()) {
-            logf("control.rejected peer=%s reason=too_many", ipString(from.sin_addr).c_str());
-            closesocket(c);
-            continue;
-        }
-        // Numbered in accept order (InputClaims::open): a newer connection
-        // takes input over from an older one.
-        const jlh::HeldInput::Owner owner = st.claims.open();
         try {
-            std::thread(serveControl, std::ref(st), c, ipString(from.sin_addr), uint32_t(from.sin_addr.s_addr), owner)
-                .detach();
+            std::thread(serveControl, std::ref(st), c, peer, source).detach();
         } catch (const std::exception&) {
-            logf("control.rejected peer=%s reason=no_thread", ipString(from.sin_addr).c_str());
-            st.claims.close(owner, [&st](uint16_t v) { return st.input.upKey(v); },
-                            [&st](uint8_t b) { return st.input.upButton(b); });
+            logf("control.rejected peer=%s reason=no_thread", peer.c_str());
             closesocket(c);
-            st.controlSlots.release();
+            st.controlSlots.release(source, true);
         }
     }
 }
 
 // --------------------------------------------------------------------- MRM1
 
+// The viewer the UDP paths serve (SessionBroker::current), looked up again
+// only when the broker's generation moved: one atomic load per datagram
+// while it holds.
+struct SessionView {
+    uint64_t gen = UINT64_MAX;  // never a real generation: the first look fetches
+    std::shared_ptr<const jlh::auth::UdpSession> s;  // nullptr: no viewer
+    in_addr addr{};
+
+    void refresh(jlh::auth::SessionBroker& b) {
+        const uint64_t g = b.generation();
+        if (g == gen) return;
+        s = b.current();
+        gen = s ? s->generation : g;
+        addr = in_addr{};
+        if (s && !parseIpv4(s->peerIp, addr)) s.reset();
+    }
+};
+
+// One datagram to `to`, sealed with the session's h2v tag (flag 0x80 on
+// byte 4, 8 bytes appended). False: not sent (no taggers, too long, or the
+// socket refused it). H3 r2: callers send under the broker's send gate
+// (SessionBroker::sendIfCurrent), so no datagram goes out under a session
+// that was voided before it started.
+bool sendSealed(SOCKET s, const jlh::auth::UdpSession& sess, const uint8_t* p, size_t n, const sockaddr_in& to) {
+    if (!sess.tags) return false;
+    uint8_t out[2048];
+    if (n + jlh::auth::kTagBytes > sizeof(out)) return false;
+    const size_t m = sess.tags->seal(p, n, out);
+    if (!m) return false;
+    return sendto(s, reinterpret_cast<const char*>(out), int(m), 0, reinterpret_cast<const sockaddr*>(&to),
+                  sizeof(to)) == int(m);
+}
+
+// H3 (the Mac MouseMoveUDPServer, PR-C): a datagram counts only when it
+// comes from the session's viewer address with a good v2h tag; then the tag
+// comes off and the datagram is checked for format and against a 64-packet
+// anti-replay window, fresh for each session generation (a new AUTH). Only
+// after all three does anything move: the pointer, the socket, keyframe
+// requests, pongs. A forged, replayed or malformed datagram changes nothing
+// and is never answered (bad tags: one log line per 10 s, BadTagLog).
+// A port change within one generation (NAT rebinding) keeps the window, so
+// a recorded datagram cannot be replayed from another port.
 void mrm1Listener(State& st, SOCKET u) {
     uint8_t b[2048];
     uint64_t lastLoggedKfr = 0;
+    SessionView sv;
+    uint64_t windowGen = 0;  // the generation `window` belongs to (0: none yet)
+    jlh::auth::SeqReplayWindow window;
     while (st.running) {
         sockaddr_in from{};
         int len = sizeof(from);
-        const int n = recvfrom(u, reinterpret_cast<char*>(b), sizeof(b), 0, reinterpret_cast<sockaddr*>(&from), &len);
+        int n = recvfrom(u, reinterpret_cast<char*>(b), sizeof(b), 0, reinterpret_cast<sockaddr*>(&from), &len);
         if (n <= 0) continue;
-        if (from.sin_addr.s_addr != st.allowAddr.s_addr) { ++st.rejected; continue; }
+        sv.refresh(*st.broker);
+        if (!sv.s) {
+            ++st.udpNoSession;
+            continue;
+        }
+        if (from.sin_addr.s_addr != sv.addr.s_addr) {
+            ++st.udpRejected;
+            continue;
+        }
+        const std::string& peer = sv.s->peerIp;
+        if (!sv.s->tags || !sv.s->tags->verify(b, size_t(n))) {
+            st.mrm1BadTag->drop(peer, sv.s->tags ? jlh::auth::badTagReason(b, size_t(n)) : "no_taggers");
+            continue;
+        }
+        n -= int(jlh::auth::kTagBytes);
+        b[jlh::auth::kUdpVersionByte] &= uint8_t(~jlh::auth::kUdpTagFlag);
+        const bool newGen = sv.s->generation != windowGen;
         const auto m = jlh::parseMrm1(b, size_t(n));
-        if (!m) continue;  // only a valid 0x24, 0x40 or 0x43 counts as viewer activity
-        touch(st);
-        bool newSession;
+        if (!m) {
+            // 0x41 NACK, 0x42 receiver report, 0x45 audio: not yet, not
+            // counted. Anything else is malformed.
+            const bool known = n >= 10 && std::memcmp(b, "MRM1", 4) == 0 && b[4] == 1 &&
+                               (b[5] == 0x41 || b[5] == 0x42 || b[5] == 0x45);
+            if (!known) ++st.udpBad;
+            continue;
+        }
+        jlh::auth::SeqReplayWindow w = newGen ? jlh::auth::SeqReplayWindow{} : window;
+        switch (w.check(m->seq)) {
+        case jlh::auth::SeqReplayWindow::Verdict::Newest:
+            break;
+        case jlh::auth::SeqReplayWindow::Verdict::Late:
+            w.mark(m->seq);
+            if (m->type == jlh::kMrm1Pointer) {
+                // A move sets the pointer: only the newest counts.
+                window = w;
+                ++st.udpStale;
+                continue;
+            }
+            ++st.udpLateOk;
+            break;
+        case jlh::auth::SeqReplayWindow::Verdict::Duplicate:
+            ++st.udpReplay;
+            continue;
+        case jlh::auth::SeqReplayWindow::Verdict::TooOld:
+            ++st.udpStale;
+            continue;
+        }
+        // Accepted: now the state moves.
+        window = w;
+        if (newGen) {
+            windowGen = sv.s->generation;
+            logf("mrm1.session gen=%llu peer=%s:%u", (unsigned long long)windowGen, peer.c_str(),
+                 unsigned(ntohs(from.sin_port)));
+        }
+        bool newSocket;
         {
             std::lock_guard<std::mutex> g(st.pointerMutex);
-            newSession = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port), msSinceStart());
+            newSocket = st.pointer.note(from.sin_addr.s_addr, ntohs(from.sin_port), msSinceStart());
         }
-        if (newSession) {
-            // Another viewer socket than the last one heard (a new one, or
-            // an older one whose datagram came late). Pointer order is that
-            // socket's own and is kept across the switch (Mrm1Session,
-            // Pepper's review of f97ad11, item 3). r10 (Pepper's review of
-            // f919167, item 3): the cursor shape no longer follows it; it
-            // goes where InputClaims takes moves from (cursorLoop).
-            logf("mrm1.session peer=%s:%u", ipString(from.sin_addr).c_str(), unsigned(ntohs(from.sin_port)));
+        if (newSocket && !newGen) {
+            // Another viewer socket than the last one heard. Pointer order
+            // is that socket's own and is kept across the switch
+            // (Mrm1Session, Pepper's review of f97ad11, item 3). r10
+            // (Pepper's review of f919167, item 3): the cursor shape does
+            // not follow it; it goes where InputClaims takes moves from
+            // (cursorLoop).
+            logf("mrm1.socket peer=%s:%u gen=%llu", peer.c_str(), unsigned(ntohs(from.sin_port)),
+                 (unsigned long long)windowGen);
         }
         if (m->type == jlh::kMrm1Pointer) {
             // r9 (InputClaims::udpMove, Pepper's review of 0d74abe, item 2):
@@ -646,8 +758,8 @@ void mrm1Listener(State& st, SOCKET u) {
                 // --mouse-move-transport tcp).
                 const uint64_t k = ++st.pointerUdpLegacyOff;
                 if (k <= 3 || k % 500 == 0)
-                    logf("mrm1.legacy_off peer=%s:%u total=%llu", ipString(from.sin_addr).c_str(),
-                         unsigned(ntohs(from.sin_port)), (unsigned long long)k);
+                    logf("mrm1.legacy_off peer=%s:%u total=%llu", peer.c_str(), unsigned(ntohs(from.sin_port)),
+                         (unsigned long long)k);
                 break;
             }
             }
@@ -659,12 +771,21 @@ void mrm1Listener(State& st, SOCKET u) {
                 lastLoggedKfr = k;
             }
         } else if (m->type == jlh::kMrm1Ping) {
+            // The Mac r9: a blocked viewer (or a journal lockdown) gets no
+            // pong. The pong goes only while the session it came in is
+            // still the current one, sealed with its key (H3 r2: checked
+            // and sent under the broker's send gate).
+            if (st.guard->inputRefusal(peer)) {
+                ++st.pongDrops;
+                continue;
+            }
             const auto pong = jlh::mrm1Pong(b, size_t(n));
-            sendto(u, reinterpret_cast<const char*>(pong.data()), int(pong.size()), 0,
-                   reinterpret_cast<const sockaddr*>(&from), len);
+            bool sent = false;
+            if (!st.broker->sendIfCurrent(sv.s->generation,
+                                          [&] { sent = sendSealed(u, *sv.s, pong.data(), pong.size(), from); }) ||
+                !sent)
+                ++st.pongDrops;
         }
-        // 0x41 NACK, 0x42 receiver report, 0x45 audio: not yet, dropped by
-        // parseMrm1.
     }
 }
 
@@ -712,26 +833,29 @@ void inputRetryLoop(State& st) {
 // last, so a replaced viewer's late datagram cannot take the cursor shape
 // from the new owner. None (r14: a 0.4.x owner, or no owner): nothing is
 // sent.
+// H3: only while there is a session, only to its viewer's address, sealed
+// with its key; a new session starts the seq again.
 void cursorLoop(State& st) {
-    uint64_t gen = 0;
+    uint64_t gen = 0, sessionGen = 0;
     uint32_t seq = 0;
     bool haveShape = false;
     jlh::CursorShape last = jlh::CursorShape::Arrow;
     auto lastSent = Clock::now();
     uint64_t changesLogged = 0;
+    SessionView sv;
     while (st.running) {
         Sleep(kCursorPollMs);
-        const bool active = st.controlConnections.load() > 0 ||
-                            msSinceStart() - st.lastActivityMs.load() < kActiveGraceMs;
-        if (!active) continue;
+        sv.refresh(*st.broker);
+        if (!sv.s) continue;
         const jlh::InputClaims::CursorPeer to = st.claims.cursorPeer();
-        if (!to.named) continue;
+        if (!to.named || to.ip != sv.addr.s_addr) continue;
         sockaddr_in peer{};
         peer.sin_family = AF_INET;
         peer.sin_addr.s_addr = to.ip;  // as recvfrom gave it: network order
         peer.sin_port = htons(to.port);
-        if (to.gen != gen) {
+        if (to.gen != gen || sv.s->generation != sessionGen) {
             gen = to.gen;
+            sessionGen = sv.s->generation;
             seq = uint32_t(GetTickCount64());
             haveShape = false;
         }
@@ -740,8 +864,11 @@ void cursorLoop(State& st) {
         const bool changed = !haveShape || shape != last;
         if (!changed && now - lastSent < std::chrono::milliseconds(kCursorResendMs)) continue;
         const auto pkt = jlh::mrm1Cursor(seq++, shape);
-        if (sendto(st.mrm1Sock, reinterpret_cast<const char*>(pkt.data()), int(pkt.size()), 0,
-                   reinterpret_cast<const sockaddr*>(&peer), sizeof(peer)) == int(pkt.size()))
+        bool sent = false;
+        if (!st.broker->sendIfCurrent(sv.s->generation,
+                                      [&] { sent = sendSealed(st.mrm1Sock, *sv.s, pkt.data(), pkt.size(), peer); }))
+            continue;  // the session moved: the next poll starts over for the new one
+        if (sent)
             ++st.cursorSent;
         else
             ++st.cursorSendFail;
@@ -854,35 +981,44 @@ public:
         int sndbuf = 4 << 20;
         setsockopt(s_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
         to_.sin_family = AF_INET;
-        to_.sin_addr = st.allowAddr;
         to_.sin_port = htons(kVideoPort);
     }
     ~VideoSender() { closesocket(s_); }
     void setBitrate(int mbps) { pacer_.setBitrate(mbps); }
 
-    // Returns packets sent; a datagram the socket refused is counted in
-    // takeFailed() (design §8.4: H1 counted only what went out).
-    size_t send(const std::vector<uint8_t>& au, bool key) {
+    // A datagram the socket refused is counted in takeFailed() (design
+    // §8.4: H1 counted only what went out). H3: to the session's viewer,
+    // sealed with its key (the Mac UDPFrameSender: 1200-byte packets plus
+    // the 8-byte tag). H3 r2 (Pepper's review r1, item 2): every packet is
+    // checked against the session and sent under the broker's send gate;
+    // a session change mid-frame ends the frame (cut).
+    jlh::auth::FrameSend send(const std::vector<uint8_t>& au, bool key, jlh::auth::SessionBroker& broker,
+                              const jlh::auth::UdpSession& sess, const in_addr& viewer) {
+        to_.sin_addr = viewer;
         const auto packets = jlh::packetizeMr02(nextFrameId_++, au.data(), au.size(), key);
-        size_t sent = 0;
-        for (const auto& p : packets) {
-            int64_t now = nowUs();
-            int64_t wait = pacer_.waitUs(now, p.size());
-            if (wait > 0) {
-                spinUntil(now + wait);
-                now = nowUs();
-            }
-            pacer_.spend(now, p.size());
-            if (sendto(s_, reinterpret_cast<const char*>(p.data()), int(p.size()), 0,
-                       reinterpret_cast<const sockaddr*>(&to_), sizeof(to_)) == int(p.size())) {
-                ++sent;
-                bytes_ += p.size();
-            } else {
-                ++failed_;
+        const auto r = jlh::auth::sendFrameWhileCurrent(
+            broker, sess.generation, packets.size(),
+            [&](size_t i) {
+                const size_t n = packets[i].size();
+                int64_t now = nowUs();
+                const int64_t wait = pacer_.waitUs(now, n);
+                if (wait > 0) {
+                    spinUntil(now + wait);
+                    now = nowUs();
+                }
+                pacer_.spend(now, n + jlh::auth::kTagBytes);
+            },
+            [&](size_t i) {
+                const auto& p = packets[i];
+                if (sendSealed(s_, sess, p.data(), p.size(), to_)) {
+                    bytes_ += p.size() + jlh::auth::kTagBytes;
+                    return true;
+                }
                 lastError_ = WSAGetLastError();
-            }
-        }
-        return sent;
+                return false;
+            });
+        failed_ += r.failed;
+        return r;
     }
     uint64_t takeBytes() { const uint64_t b = bytes_; bytes_ = 0; return b; }
     uint64_t takeFailed() { const uint64_t f = failed_; failed_ = 0; return f; }
@@ -926,14 +1062,18 @@ void videoLoop(State& st) {
     uint64_t sendFailTotal = 0;
     double encMsSum = 0;
     jlh::DesktopRect desktop{};
+    SessionView sv;
+    uint64_t streamGen = 0, nSessionDrops = 0;
 
     while (st.running) {
         if (o.seconds > 0 && msSinceStart() > int64_t(o.seconds) * 1000) break;
-        const bool active = st.controlConnections.load() > 0 ||
-                            msSinceStart() - st.lastActivityMs.load() < kActiveGraceMs;
+        // H3: the stream runs while a control connection holds the session
+        // (SessionBroker::current), and goes only to that viewer.
+        sv.refresh(*st.broker);
+        const bool active = sv.s != nullptr;
         if (!active) {
             if (streaming) {
-                logf("stream.idle reason=no_viewer_traffic");
+                logf("stream.idle reason=no_session");
                 streaming = false;
                 cap.close();
                 enc.close();
@@ -942,11 +1082,15 @@ void videoLoop(State& st) {
             Sleep(100);
             continue;
         }
-        if (!streaming) {
+        if (!streaming || sv.s->generation != streamGen) {
+            // A new session (a new AUTH, a takeover): the viewer gets a
+            // fresh IDR before anything else (the Mac newSessionHandler).
+            if (!streaming) streamStart = Clock::now();
             streaming = true;
             needKey = true;
-            streamStart = Clock::now();
-            logf("stream.start viewer=%s:%u", o.allowIp.c_str(), unsigned(kVideoPort));
+            streamGen = sv.s->generation;
+            logf("stream.start viewer=%s:%u gen=%llu udp=%s", sv.s->peerIp.c_str(), unsigned(kVideoPort),
+                 (unsigned long long)streamGen, sv.s->tags ? "tagged" : "no_taggers");
         }
         if (std::strcmp(cap.backend(), "none") == 0) {
             if (!cap.open(o.capture, err)) {
@@ -1034,7 +1178,20 @@ void videoLoop(State& st) {
         if (au.empty()) continue;
         if (key) { ++nKeys; lastKey = Clock::now(); needKey = false; }
         else if (needKey) continue;  // nothing but a keyframe may start a stream
-        nPackets += sender.send(au, key);
+        // Not to a session that ended while this frame was encoded: the
+        // next one starts with its own IDR (top of the loop).
+        sv.refresh(*st.broker);
+        if (!sv.s || sv.s->generation != streamGen) {
+            ++nSessionDrops;
+            continue;
+        }
+        const auto frameSent = sender.send(au, key, *st.broker, *sv.s, sv.addr);
+        nPackets += frameSent.sent;
+        if (frameSent.cut) {
+            // H3 r2: the session moved mid-frame; the rest was not sent.
+            ++nSessionDrops;
+            continue;
+        }
         ++nEncoded;
         lastSend = Clock::now();
 
@@ -1046,10 +1203,13 @@ void videoLoop(State& st) {
             logf("stats size=%dx%d source=%dx%d capture_fps=%.1f sent_fps=%.1f mbps=%.2f keyframes=%llu "
                  "keyframe_requests=%llu enc_ms_avg=%.1f packets=%llu send_fail=%llu send_fail_total=%llu "
                  "send_err=%d control_conns=%d pings=%llu input=%llu input_fail=%llu input_ignored=%llu input_up_held=%llu "
-                 "input_takeover=%llu input_dropped=%llu input_up_retry=%llu input_silenced=%llu input_up_pending=%llu "
+                 "input_takeover=%llu input_owner_voided=%llu input_dropped=%llu input_up_retry=%llu input_silenced=%llu input_up_pending=%llu "
                  "input_malformed=%llu input_err=%lu pointer_udp=%llu pointer_udp_stale=%llu pointer_udp_not_owner=%llu "
                  "pointer_udp_up_pending=%llu pointer_udp_legacy_off=%llu pointer_sync=%llu cursor_sent=%llu "
-                 "cursor_fail=%llu cursor_changes=%llu backend=%s",
+                 "cursor_fail=%llu cursor_changes=%llu auth_fail=%llu auth_rejected=%llu auth_old_viewer=%llu "
+                 "auth_resume_refused=%llu replaced=%llu udp_no_session=%llu udp_rejected=%llu udp_bad_tag=%llu "
+                 "udp_bad=%llu udp_replay=%llu udp_stale=%llu udp_late_ok=%llu pong_drops=%llu session_drops=%llu "
+                 "backend=%s",
                  st.streamW.load(), st.streamH.load(), srcW, srcH, nCaptured / secs, nEncoded / secs,
                  sender.takeBytes() * 8.0 / 1e6 / secs, (unsigned long long)nKeys,
                  (unsigned long long)st.keyframeRequests.load(), nEncoded ? encMsSum / nEncoded : 0.0,
@@ -1057,8 +1217,8 @@ void videoLoop(State& st) {
                  sendFail ? sender.lastError() : 0, st.controlConnections.load(), (unsigned long long)st.pings.load(),
                  (unsigned long long)st.input.injected(), (unsigned long long)st.input.failed(),
                  (unsigned long long)st.input.ignored(), (unsigned long long)st.input.upsHeld(),
-                 (unsigned long long)st.inputTakeovers.load(), (unsigned long long)st.inputDropped.load(),
-                 (unsigned long long)st.inputUpRetried.load(), (unsigned long long)st.inputSilenced.load(),
+                 (unsigned long long)st.inputTakeovers.load(), (unsigned long long)st.inputOwnerVoided.load(),
+                 (unsigned long long)st.inputDropped.load(), (unsigned long long)st.inputUpRetried.load(), (unsigned long long)st.inputSilenced.load(),
                  (unsigned long long)st.inputUpPending.load(), (unsigned long long)st.inputMalformed.load(),
                  st.input.lastError(), (unsigned long long)st.pointerUdp.load(),
                  (unsigned long long)st.pointerUdpStale.load(), (unsigned long long)st.pointerUdpNotOwner.load(),
@@ -1066,7 +1226,15 @@ void videoLoop(State& st) {
                  (unsigned long long)st.pointerSyncs.load(),
                  (unsigned long long)st.cursorSent.load(),
                  (unsigned long long)st.cursorSendFail.load(), (unsigned long long)st.cursorChanges.load(),
-                 cap.backend());
+                 (unsigned long long)st.auth->counters->failures.load(),
+                 (unsigned long long)st.auth->counters->rejected.load(),
+                 (unsigned long long)st.auth->counters->oldViewers.load(),
+                 (unsigned long long)st.broker->resumesRefused(), (unsigned long long)st.broker->replaced(),
+                 (unsigned long long)st.udpNoSession.load(), (unsigned long long)st.udpRejected.load(),
+                 (unsigned long long)st.mrm1BadTag->total(), (unsigned long long)st.udpBad.load(),
+                 (unsigned long long)st.udpReplay.load(), (unsigned long long)st.udpStale.load(),
+                 (unsigned long long)st.udpLateOk.load(), (unsigned long long)st.pongDrops.load(),
+                 (unsigned long long)nSessionDrops, cap.backend());
             nCaptured = nEncoded = nKeys = nPackets = 0;
             encMsSum = 0;
         }
@@ -1092,6 +1260,21 @@ SOCKET listenOn(const in_addr& addr, uint16_t port, int type) {
     return s;
 }
 
+// H3: the connection settings window. Not elevated: this exe again with one
+// UAC prompt, and this process ends. Started from Explorer or a shortcut
+// (a console of its own, nothing else on it): the console goes away.
+int runSettings() {
+    if (!jlh::config::isElevated()) {
+        if (jlh::config::relaunchElevated(L"--connection-settings")) return 0;
+        std::fprintf(stderr, "JerisLinkHost: the connection settings need administrator rights (UAC refused, "
+                             "error %lu)\n", GetLastError());
+        return 77;
+    }
+    DWORD pids[2];
+    if (GetConsoleProcessList(pids, 2) == 1) FreeConsole();
+    return jlh::settingsui::runConnectionSettings(jlh::config::Location{});
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1100,11 +1283,13 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, o, err)) {
         std::fprintf(stderr, "JerisLinkHost: %s\n", err.c_str());
         std::fprintf(stderr,
-                     "usage: JerisLinkHost --dev-no-password --bind <host ip> --allow <viewer ip> [--fps N] "
-                     "[--bitrate Mbps] [--max-size WxH] [--capture auto|dda|gdi] [--log file] [--seconds N] "
-                     "[--snapshot file.bmp]\n       JerisLinkHost --probe [--capture ...] [--snapshot file.bmp]\n");
+                     "usage: JerisLinkHost [--bind <tailnet ip>] [--fps N] [--bitrate Mbps] [--max-size WxH] "
+                     "[--capture auto|dda|gdi] [--log file] [--seconds N] [--snapshot file.bmp]\n"
+                     "       JerisLinkHost --connection-settings\n"
+                     "       JerisLinkHost --probe [--capture ...] [--snapshot file.bmp]\n");
         return 64;
     }
+    if (o.connectionSettings) return runSettings();
     if (!o.logPath.empty()) gLogFile = std::fopen(o.logPath.c_str(), "a");
     // Physical pixels on HiDPI screens: duplication and GDI see the real mode.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1112,7 +1297,7 @@ int main(int argc, char** argv) {
         logf("init FAIL com/mf");
         return 1;
     }
-    logf("JerisLinkHost %s (H2: capture + MF software H.264 + MR02 + SendInput + cursor shape)",
+    logf("JerisLinkHost %s (H3: capture + MF software H.264 + MR02 + SendInput + cursor shape + password)",
          JERISLINK_VERSION_STRING);
     if (o.probe) {
         const int rc = runProbe(o);
@@ -1120,24 +1305,120 @@ int main(int argc, char** argv) {
         return rc;
     }
 
+    // H3: the password key is readable by SYSTEM and Administrators only.
+    if (!jlh::config::isElevated()) {
+        logf("host.not_elevated: run JerisLinkHost as administrator; nothing listens");
+        MFShutdown();
+        return 77;
+    }
+    const jlh::config::Location loc;
+    const jlh::config::Settings settings = jlh::config::readSettings(loc);
+    if (!gLogFile && !settings.logPath.empty()) {
+        gLogFile = std::fopen(settings.logPath.c_str(), "a");
+        if (!gLogFile) logf("host.log_open FAIL path=%s errno=%d", settings.logPath.c_str(), errno);
+    }
+    if (!settings.problem.empty()) logf("host.settings_problem %s (defaults used)", settings.problem.c_str());
+
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
     static State st;
     gState = &st;
     st.opt = o;
     st.bitrateMbps = o.bitrateMbps;
-    parseIpv4(o.bindIp, st.bindAddr);
-    parseIpv4(o.allowIp, st.allowAddr);
+    const auto logLine = [](const std::string& s) { logf("%s", s.c_str()); };
+    const auto monoSeconds = [] {
+        return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    };
+
+    // The password, the whitelist and the blacklist (registry), before
+    // anything listens (D9: no password, no listening).
+    static jlh::config::RegistryBlocklist blocklist(loc);
+    static jlh::config::RegistryPendingBlocks journal(loc);
+    static jlh::config::RegistryFailureLog failureStore(loc);
+    static jlh::config::RegistryPolicySource policySource(loc);
+    static jlh::auth::AuthGuard guard({}, blocklist, &journal, jlh::auth::AuthGuard::defaultHooks(logLine));
+    static jlh::auth::SessionBroker broker(jlh::auth::win::tagsFactory(), logLine);
+    static jlh::auth::AuthLogThrottle throttle(monoSeconds, logLine);
+    static jlh::auth::AuthFailureLog failureLog(failureStore);
+    static jlh::auth::AuthCounters counters;
+    static jlh::auth::BadTagLog mrm1BadTag("mrm1", monoSeconds, logLine);
+    static jlh::settings::PolicyHolder holder(policySource, guard, broker, logLine);
+    holder.load();
+    if (!holder.passwordSet()) {
+        logf("auth.no_password: set one with JerisLinkHost --connection-settings; nothing listens");
+        MFShutdown();
+        return 78;
+    }
+
+    // Where to listen (D11): --bind, else the registry's BindIP, else this
+    // PC's lowest tailnet IPv4; with none up yet, wait for one.
+    jlh::settings::ListenPlan plan;
+    for (bool waitLogged = false;;) {
+        if (!o.bindIp.empty()) {
+            plan = jlh::settings::resolveListen("tailnet", o.bindIp, jlh::config::localIpv4());
+        } else {
+            plan = jlh::settings::resolveListen(settings.listenMode, settings.bindIp, jlh::config::localIpv4());
+        }
+        if (plan.kind == jlh::settings::ListenPlan::NotConfigured) {
+            logf("net.listen_not_configured %s; nothing listens", plan.why.c_str());
+            MFShutdown();
+            return 78;
+        }
+        if (plan.kind == jlh::settings::ListenPlan::Ready) break;
+        if (!waitLogged) {
+            waitLogged = true;
+            logf("net.waiting %s; trying again every 2 s", plan.why.c_str());
+        }
+        Sleep(2000);
+    }
+    st.bindIp = plan.bindIp;
+    parseIpv4(st.bindIp, st.bindAddr);
+
+    static jlh::auth::AuthEnv env;
+    env.hmac = jlh::auth::win::hmac;
+    env.random = jlh::auth::win::random;
+    env.guard = &guard;
+    env.broker = &broker;
+    env.failureLog = &failureLog;
+    env.authLog = &throttle;
+    env.counters = &counters;
+    env.log = logLine;
+    env.wallNow = [] { return int64_t(std::time(nullptr)); };
+    env.stopping = [] { return !gState->running.load(); };
+    env.policy = [] { return holder.snapshot(); };
+    env.refreshPolicy = [] { holder.refresh(false); };
+    env.endpoint = st.bindIp + ":" + std::to_string(kControlPort);
+    st.auth = &env;
+    st.broker = &broker;
+    // A void (a takeover, a password or whitelist change, a block) retires
+    // a voided input owner at once: its keys and buttons go up, its MRM1
+    // socket is unbound, and an injection of it already past its check
+    // finishes before the void returns (InputClaims::retire).
+    broker.onVoid([] {
+        bool retired = false;
+        const size_t n = st.claims.retire([](uint64_t o) { return st.broker->live(o); },
+                                          [](uint16_t v) { return st.input.upKey(v); },
+                                          [](uint8_t b) { return st.input.upButton(b); }, &retired);
+        if (retired) {
+            ++st.inputOwnerVoided;
+            logf("input.owner_voided released=%zu still_held=%s", n, st.claims.anyHeld() ? "yes" : "no");
+        }
+    });
+    st.guard = &guard;
+    st.mrm1BadTag = &mrm1BadTag;
     SetConsoleCtrlHandler(onConsoleCtrl, TRUE);
-    logf("WARNING dev mode: no password; only %s may connect", o.allowIp.c_str());
 
     SOCKET ctl = listenOn(st.bindAddr, kControlPort, SOCK_STREAM);
     SOCKET mrm1 = listenOn(st.bindAddr, kMrm1Port, SOCK_DGRAM);
     if (ctl == INVALID_SOCKET || mrm1 == INVALID_SOCKET) return 2;
     st.mrm1Sock = mrm1;
-    logf("listening control=tcp:%s:%u mrm1=udp:%s:%u video_to=%s:%u fps=%d bitrate_mbps=%d max=%dx%d",
-         o.bindIp.c_str(), unsigned(kControlPort), o.bindIp.c_str(), unsigned(kMrm1Port), o.allowIp.c_str(),
-         unsigned(kVideoPort), o.fps, o.bitrateMbps, o.maxW, o.maxH);
+    // Settings changes (the window, regedit): the password or whitelist
+    // voids every connection, a blacklisted address loses its own at once.
+    static jlh::config::PolicyWatcher watcher(loc, [] { holder.tick(); });
+    logf("listening control=tcp:%s:%u mrm1=udp:%s:%u video_to=<session viewer>:%u mode=%s auth=password "
+         "whitelist=%zu fps=%d bitrate_mbps=%d max=%dx%d",
+         st.bindIp.c_str(), unsigned(kControlPort), st.bindIp.c_str(), unsigned(kMrm1Port), unsigned(kVideoPort),
+         plan.mode.c_str(), settings.whitelist.size(), o.fps, o.bitrateMbps, o.maxW, o.maxH);
     std::thread(controlListener, std::ref(st), ctl).detach();
     std::thread(mrm1Listener, std::ref(st), mrm1).detach();
     std::thread(cursorLoop, std::ref(st)).detach();
