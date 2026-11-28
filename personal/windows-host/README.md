@@ -120,6 +120,13 @@ each other's change.
   connection at once, with no notice (the viewer reconnects and has to log
   in again). The macOS host restarts its control service instead. REPLACED
   is sent only on a takeover.
+- After a failure RESULT, a lock or block RESULT that answers a RESPONSE,
+  and REPLACED, the host sends
+  FIN and reads and drops what the viewer still sends until it closes, for
+  at most 1 s, then closes. A close with input unread (a bad header or a
+  wrong-length RESPONSE leaves its payload behind) is an RST, and Windows
+  can throw the RESULT away before the viewer reads it. The macOS host
+  drains only after REPLACED.
 - Input and VIDEO_CONFIG are taken only on the control channel. Input
   owners (H2, below) are numbered by the session broker's token, so a
   newer login is always the newer owner.

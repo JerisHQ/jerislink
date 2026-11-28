@@ -763,9 +763,10 @@ private:
     // started: the viewer learns why, nothing is counted.
     void refuse(const AuthGuard::Admission& a, bool afterChallenge) {
         const std::string note = afterChallenge ? " after_challenge=1 counted=0" : "";
+        bool sent = false;
         switch (a.kind) {
         case AuthGuard::Admission::Blocked:
-            sendHandshake(kMsgResult, resultStatus(Status::Blocked));
+            sent = sendHandshake(kMsgResult, resultStatus(Status::Blocked));
             authLog("auth.blocked", "auth.blocked peer=" + ip_ + note + "; connection closed");
             break;
         case AuthGuard::Admission::NotAllowed:
@@ -773,12 +774,12 @@ private:
                    "; connection closed");
             break;
         case AuthGuard::Admission::Locked:
-            sendHandshake(kMsgResult, resultLocked(a.retrySeconds));
+            sent = sendHandshake(kMsgResult, resultLocked(a.retrySeconds));
             authLog("auth.locked", "auth.locked peer=" + ip_ + " retry_s=" + std::to_string(a.retrySeconds) +
                                        " stage=" + std::to_string(a.stage) + note + "; connection closed");
             break;
         case AuthGuard::Admission::GlobalLocked:
-            sendHandshake(kMsgResult, resultLocked(a.retrySeconds));
+            sent = sendHandshake(kMsgResult, resultLocked(a.retrySeconds));
             authLog("auth.global_locked", "auth.global_locked peer=" + ip_ +
                                               " retry_s=" + std::to_string(a.retrySeconds) + note +
                                               "; connection closed");
@@ -786,6 +787,8 @@ private:
         case AuthGuard::Admission::Challenge:
             break;
         }
+        // After the challenge the viewer's answer may be partly unread.
+        if (afterChallenge) lingerAfterNotice(sent);
     }
 
     // The viewer closed (or the socket failed) before answering: nothing
@@ -838,9 +841,21 @@ private:
             break;
         }
         if (f.globalTriggered) log("auth.global_locked retry_s=" + std::to_string(uint32_t(AuthGuard::kGlobalWait)));
-        sendHandshake(kMsgResult, result);
+        const bool sent = sendHandshake(kMsgResult, result);
         // Windows: its other open connections close now.
         if (f.outcome.kind == AuthGuard::FailureOutcome::Blacklisted) kickNewlyBlocked(*env_.guard, *env_.broker);
+        lingerAfterNotice(sent);
+    }
+
+    // A failure answer can leave the viewer's input unread (a bad header or
+    // length leaves its payload behind). A plain close then sends an RST,
+    // and Windows may throw away the RESULT before the viewer reads it. So:
+    // FIN, then read and drop until the viewer closes, at most
+    // noticeLingerMs (the same drain as after REPLACED).
+    void lingerAfterNotice(bool sent) {
+        if (!sent) return;
+        shutdownWrite(s_);
+        drainAfterNotice(s_, env_.noticeLingerMs);
     }
 
     AuthEnv& env_;

@@ -1053,6 +1053,13 @@ struct Viewer {
         Bytes p;
         return readFrame(s, t, p) == 1 && t == 0x02 && p == (Bytes{n, 0, 0, 0});
     }
+    // After the last frame: 0 for a clean FIN, -1 for a reset (or a read
+    // error), 1 if more bytes came.
+    int closeKind() {
+        uint8_t b = 0;
+        const long r = rawRecv(s, &b, 1);
+        return r > 0 ? 1 : r == 0 ? 0 : -1;
+    }
     // The connection ended with no frame (0) or something came (1/-1).
     int endsWithoutFrame() {
         uint8_t t = 0;
@@ -1376,11 +1383,15 @@ static void testAuthOverLoopback(const Vector& v) {
         Viewer bh;
         CHECK(bh.open(h.port) && bh.readChallenge() && sendAllBlocking(bh.s, frame(0x77, Bytes(3, 0))));
         CHECK(bh.result() == (Bytes{1, 3}));
+        // The unread payload is drained: a FIN, not a reset (an RST can
+        // throw the RESULT away on Windows).
+        CHECK(bh.closeKind() == 0);
         CHECK(h.waitFor("auth.fail peer=127.0.0.1 chan=unknown reason=bad_header failures=2 tries=3"));
         h.serveNext();
         Viewer bl;
         CHECK(bl.open(h.port) && bl.readChallenge() && sendAllBlocking(bl.s, frame(kMsgResponse, Bytes(65, 1))));
         CHECK(bl.result() == (Bytes{1, 2}));
+        CHECK(bl.closeKind() == 0);
         CHECK(h.waitFor("auth.fail peer=127.0.0.1 chan=unknown reason=bad_response failures=3 tries=2"));
         // r9: an OK that did not go out drops the session.
         h.env.failAuthOKForTest = [](const AuthOK& ok) { return ok.channel == Channel::Control; };
